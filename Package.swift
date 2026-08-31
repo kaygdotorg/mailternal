@@ -36,8 +36,14 @@ let package = Package(
         .target(name: "MailternalSync", dependencies: [
             "MailternalInterfaces", "MailternalIMAP", "MailternalMIME", "MailternalStore",
         ]),
-        .testTarget(name: "MailternalIMAPTests", dependencies: ["MailternalIMAP"]),
-        .testTarget(name: "MailternalMIMETests", dependencies: ["MailternalMIME"]),
+        .testTarget(name: "MailternalIMAPTests", dependencies: [
+            "MailternalIMAP",
+            .product(name: "NIO", package: "swift-nio"),
+            .product(name: "NIOEmbedded", package: "swift-nio"),
+            .product(name: "NIOIMAP", package: "swift-nio-imap"),
+        ]),
+        .testTarget(name: "MailternalMIMETests", dependencies: ["MailternalMIME"],
+                    resources: [.copy("Corpus")]),
         .testTarget(name: "MailternalStoreTests", dependencies: ["MailternalStore"]),
         .testTarget(name: "MailternalSanitizerTests", dependencies: ["MailternalSanitizer"]),
         .testTarget(name: "MailternalSyncTests", dependencies: ["MailternalSync"]),
