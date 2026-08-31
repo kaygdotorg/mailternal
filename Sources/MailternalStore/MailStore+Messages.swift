@@ -1,0 +1,382 @@
+import Foundation
+import GRDB
+
+extension MailStore {
+    /// Inserts or updates messages in bounded transactions (row count + decoded
+    /// bytes). Cancellation is checked between batches; already-committed batches
+    /// remain durable (spec: sync.md backfill).
+    public func upsertMessages(
+        _ messages: [IncomingMessage],
+        budget: WriteBudget = .backfill
+    ) async throws -> BatchWriteResult {
+        var index = 0
+        var committed = 0
+        var txs = 0
+        var bytes = 0
+        var lastUID: IMAPUID?
+        while index < messages.count {
+            try Task.checkCancellation()
+            var rowCount = 0
+            var byteCount = 0
+            var end = index
+            while end < messages.count {
+                let extra = messages[end].decodedBytes
+                if rowCount > 0 && (rowCount >= budget.maxRows || byteCount + extra > budget.maxDecodedBytes) {
+                    break
+                }
+                rowCount += 1
+                byteCount += extra
+                end += 1
+            }
+            let slice = Array(messages[index..<end])
+            try await write { db in
+                for message in slice {
+                    try MailStore.upsertMessage(db, message)
+                }
+            }
+            index = end
+            committed += rowCount
+            bytes += byteCount
+            txs += 1
+            lastUID = slice.last?.uid
+        }
+        return BatchWriteResult(
+            committedCount: committed,
+            transactionCount: txs,
+            committedDecodedBytes: bytes,
+            lastCommittedUID: lastUID
+        )
+    }
+
+    /// Expunges UIDs in budgeted transactions. FTS delete triggers fire per row.
+    public func deleteUIDs(
+        generation: MailboxGeneration,
+        uids: [IMAPUID],
+        budget: WriteBudget = .backfill
+    ) async throws -> BatchWriteResult {
+        var index = 0
+        var committed = 0
+        var txs = 0
+        var lastUID: IMAPUID?
+        while index < uids.count {
+            try Task.checkCancellation()
+            let end = min(index + budget.maxRows, uids.count)
+            let slice = Array(uids[index..<end])
+            let gen = generation
+            try await write { db in
+                let genID = try MailStore.requireGenerationID(db, gen)
+                for uid in slice {
+                    try db.execute(
+                        sql: "DELETE FROM messages WHERE generation_id = ? AND uid = ?",
+                        arguments: [genID, Int64(uid.rawValue)]
+                    )
+                }
+            }
+            index = end
+            committed += slice.count
+            txs += 1
+            lastUID = slice.last
+        }
+        return BatchWriteResult(
+            committedCount: committed,
+            transactionCount: txs,
+            committedDecodedBytes: 0,
+            lastCommittedUID: lastUID
+        )
+    }
+
+    /// Applies remote flag deltas. A pending local `\Seen` wins over inbound unseen
+    /// until the store is acknowledged (spec: sync.md Seen queue).
+    public func applyFlags(
+        generation: MailboxGeneration,
+        deltas: [FlagDelta]
+    ) async throws {
+        guard !deltas.isEmpty else { return }
+        try await write { db in
+            let genID = try MailStore.requireGenerationID(db, generation)
+            let folderID = generation.folder.rawValue
+            let uv = Int64(generation.uidValidity)
+            for delta in deltas {
+                let pending = try Int.fetchOne(
+                    db,
+                    sql: """
+                        SELECT EXISTS(
+                            SELECT 1 FROM seen_queue
+                            WHERE folder_id = ? AND uid_validity = ? AND uid = ?
+                        )
+                        """,
+                    arguments: [folderID, uv, Int64(delta.uid.rawValue)]
+                ) == 1
+                try db.execute(
+                    sql: """
+                        UPDATE messages SET
+                            is_read = ?, is_flagged = ?, is_answered = ?,
+                            is_draft = ?, is_deleted = ?, extra_flags_json = ?
+                        WHERE generation_id = ? AND uid = ?
+                        """,
+                    arguments: [
+                        delta.flags.isRead || pending,
+                        delta.flags.isFlagged,
+                        delta.flags.isAnswered,
+                        delta.flags.isDraft,
+                        delta.flags.isDeleted,
+                        try StoreJSON.encode(delta.flags.extra),
+                        genID,
+                        Int64(delta.uid.rawValue),
+                    ]
+                )
+            }
+        }
+    }
+
+    /// Keyset page over the folder's live generation, ordered
+    /// `(internalDate DESC, uid DESC)`. Bodies are not selected.
+    public func page(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int
+    ) async throws -> MessagePage {
+        try await read { db in
+            try MailStore.fetchPage(db, folder: folder, after: cursor, limit: limit)
+        }
+    }
+
+    /// ValueObservation of the visible page window (spec: sync.md Storage).
+    public func observePage(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int
+    ) -> AsyncStream<MessagePage> {
+        observe { db in
+            try MailStore.fetchPage(db, folder: folder, after: cursor, limit: limit)
+        }
+    }
+
+    public func detail(_ id: MessageID) async throws -> MessageDetail {
+        try await read { db in
+            try MailStore.fetchDetail(db, id: id)
+        }
+    }
+
+    public func messageID(generation: MailboxGeneration, uid: IMAPUID) async throws -> MessageID? {
+        try await read { db in
+            guard let genID = try MailStore.generationID(db, generation) else { return nil }
+            guard let id = try Int64.fetchOne(
+                db,
+                sql: "SELECT id FROM messages WHERE generation_id = ? AND uid = ?",
+                arguments: [genID, Int64(uid.rawValue)]
+            ) else { return nil }
+            return MessageID(rawValue: id)
+        }
+    }
+
+    static func fetchPage(
+        _ db: Database,
+        folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int
+    ) throws -> MessagePage {
+        let cap = max(limit, 0)
+        if cap == 0 { return MessagePage(rows: [], next: nil) }
+
+        var sql = """
+            SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date, m.uid,
+                   m.is_read, m.has_attachments
+            FROM messages m
+            JOIN folders f ON f.live_generation_id = m.generation_id
+            WHERE f.id = ?
+            """
+        var arguments: StatementArguments = [folder.rawValue]
+        if let cursor {
+            let t = cursor.internalDate.timeIntervalSince1970
+            let uid = Int64(cursor.uid.rawValue)
+            sql += " AND (m.internal_date < ? OR (m.internal_date = ? AND m.uid < ?))"
+            arguments += [t, t, uid]
+        }
+        sql += " ORDER BY m.internal_date DESC, m.uid DESC LIMIT ?"
+        arguments += [cap + 1]
+        let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
+        let hasMore = rows.count > cap
+        let slice = hasMore ? Array(rows.prefix(cap)) : rows
+        let mapped = slice.map { MailStore.messageRow(from: $0, preview: $0["preview"]) }
+        var next: MessagePageCursor?
+        if hasMore, let last = slice.last {
+            let uid: Int64 = last["uid"]
+            next = MessagePageCursor(
+                internalDate: Date(timeIntervalSince1970: last["internal_date"]),
+                uid: IMAPUID(rawValue: UInt32(uid))
+            )
+        }
+        return MessagePage(rows: mapped, next: next)
+    }
+
+    static func messageRow(from row: Row, preview: String) -> MessageRow {
+        MessageRow(
+            id: MessageID(rawValue: row["id"]),
+            from: row["from_display"],
+            subject: row["subject"],
+            preview: preview,
+            date: Date(timeIntervalSince1970: row["internal_date"]),
+            isRead: row["is_read"],
+            hasAttachments: row["has_attachments"]
+        )
+    }
+
+    static func fetchDetail(_ db: Database, id: MessageID) throws -> MessageDetail {
+        guard let row = try Row.fetchOne(db, sql: "SELECT * FROM messages WHERE id = ?", arguments: [id.rawValue]) else {
+            throw MailStoreError.messageNotFound
+        }
+        let from: [MailAddress] = try StoreJSON.decode([MailAddress].self, from: row["from_json"])
+        let to: [MailAddress] = try StoreJSON.decode([MailAddress].self, from: row["to_json"])
+        let cc: [MailAddress] = try StoreJSON.decode([MailAddress].self, from: row["cc_json"])
+        let replyTo: [MailAddress] = try StoreJSON.decode([MailAddress].self, from: row["reply_to_json"])
+        let references: [String] = try StoreJSON.decode([String].self, from: row["references_json"])
+        let attachments = try StoreJSON.decode([AttachmentInfoDTO].self, from: row["attachments_json"]).map { $0.makeInfo() }
+        let headerDate: Double? = row["header_date"]
+        let rfcID: String? = row["rfc_message_id"]
+        let inReplyTo: String? = row["in_reply_to"]
+        let bodyText: String? = row["body_text"]
+        let html: String? = row["sanitized_html"]
+        let envelope = Envelope(
+            subject: row["subject"],
+            from: from,
+            to: to,
+            cc: cc,
+            replyTo: replyTo,
+            internalDate: Date(timeIntervalSince1970: row["internal_date"]),
+            headerDate: headerDate.map { Date(timeIntervalSince1970: $0) },
+            rfcMessageID: rfcID,
+            inReplyTo: inReplyTo,
+            references: references
+        )
+        let quarantined: Bool = row["is_quarantined"]
+        return MessageDetail(
+            id: id,
+            envelope: envelope,
+            bodyText: bodyText,
+            sanitizedHTML: html,
+            attachments: attachments,
+            isQuarantined: quarantined
+        )
+    }
+
+    static func upsertMessage(_ db: Database, _ message: IncomingMessage) throws {
+        let genID = try requireGenerationID(db, message.generation)
+        let env = message.envelope
+        let fromJSON = try StoreJSON.encode(env.from)
+        let toJSON = try StoreJSON.encode(env.to)
+        let ccJSON = try StoreJSON.encode(env.cc)
+        let replyJSON = try StoreJSON.encode(env.replyTo)
+        let refsJSON = try StoreJSON.encode(env.references)
+        let extraJSON = try StoreJSON.encode(message.flags.extra)
+        let attJSON = try StoreJSON.encode(message.attachments.map(AttachmentInfoDTO.init))
+        // Pending local `\Seen` wins over inbound unseen until STORE is acknowledged.
+        let pendingSeen = try Int.fetchOne(
+            db,
+            sql: """
+                SELECT EXISTS(
+                    SELECT 1 FROM seen_queue
+                    WHERE folder_id = ? AND uid_validity = ? AND uid = ?
+                )
+                """,
+            arguments: [
+                message.generation.folder.rawValue,
+                Int64(message.generation.uidValidity),
+                Int64(message.uid.rawValue),
+            ]
+        ) == 1
+        let isRead = message.flags.isRead || pendingSeen
+        try db.execute(
+            sql: """
+                INSERT INTO messages (
+                    generation_id, uid, subject, from_json, to_json, cc_json, reply_to_json,
+                    from_text, to_text, from_display, internal_date, header_date,
+                    rfc_message_id, in_reply_to, references_json,
+                    is_read, is_flagged, is_answered, is_draft, is_deleted, extra_flags_json,
+                    has_attachments, body_text, sanitized_html, preview,
+                    is_truncated, is_quarantined, parse_defect, attachments_json, decoded_bytes
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
+                )
+                ON CONFLICT(generation_id, uid) DO UPDATE SET
+                    subject = excluded.subject,
+                    from_json = excluded.from_json,
+                    to_json = excluded.to_json,
+                    cc_json = excluded.cc_json,
+                    reply_to_json = excluded.reply_to_json,
+                    from_text = excluded.from_text,
+                    to_text = excluded.to_text,
+                    from_display = excluded.from_display,
+                    internal_date = excluded.internal_date,
+                    header_date = excluded.header_date,
+                    rfc_message_id = excluded.rfc_message_id,
+                    in_reply_to = excluded.in_reply_to,
+                    references_json = excluded.references_json,
+                    is_read = excluded.is_read,
+                    is_flagged = excluded.is_flagged,
+                    is_answered = excluded.is_answered,
+                    is_draft = excluded.is_draft,
+                    is_deleted = excluded.is_deleted,
+                    extra_flags_json = excluded.extra_flags_json,
+                    has_attachments = excluded.has_attachments,
+                    body_text = excluded.body_text,
+                    sanitized_html = excluded.sanitized_html,
+                    preview = excluded.preview,
+                    is_truncated = excluded.is_truncated,
+                    is_quarantined = excluded.is_quarantined,
+                    parse_defect = excluded.parse_defect,
+                    attachments_json = excluded.attachments_json,
+                    decoded_bytes = excluded.decoded_bytes
+                """,
+            arguments: [
+                genID,
+                Int64(message.uid.rawValue),
+                env.subject,
+                fromJSON, toJSON, ccJSON, replyJSON,
+                AddressFormat.ftsText(env.from),
+                AddressFormat.ftsText(env.to) + " " + AddressFormat.ftsText(env.cc),
+                AddressFormat.display(env.from),
+                env.internalDate.timeIntervalSince1970,
+                env.headerDate.map { $0.timeIntervalSince1970 },
+                env.rfcMessageID,
+                env.inReplyTo,
+                refsJSON,
+                isRead,
+                message.flags.isFlagged,
+                message.flags.isAnswered,
+                message.flags.isDraft,
+                message.flags.isDeleted,
+                extraJSON,
+                !message.attachments.isEmpty,
+                message.bodyText,
+                message.sanitizedHTML,
+                Preview.make(from: message.bodyText),
+                message.isTruncated,
+                message.isQuarantined,
+                message.parseDefect,
+                attJSON,
+                message.decodedBytes,
+            ]
+        )
+        if message.isQuarantined, let defect = message.parseDefect, !defect.isEmpty {
+            let folderRow = try requireFolder(db, message.generation.folder)
+            let accountID: String = folderRow["account_id"]
+            try insertError(
+                db,
+                StoreLogEntry(
+                    kind: .parse,
+                    account: AccountID(rawValue: accountID),
+                    folder: message.generation.folder,
+                    generation: message.generation,
+                    uid: message.uid,
+                    message: defect
+                )
+            )
+        }
+    }
+}
