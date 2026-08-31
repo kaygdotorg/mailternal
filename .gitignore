@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+App/Mailternal.xcodeproj/
+App/build/
+DerivedData/
+*.xcuserstate
+.DS_Store
