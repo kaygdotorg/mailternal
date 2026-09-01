@@ -113,6 +113,7 @@ enum Schema {
 
         // External-content FTS: delete while old content rows still exist
         // (spec: sync.md FTS). Insert/update after the content row is written.
+        // Flag-only UPDATEs must not churn FTS (AFTER UPDATE OF content columns + WHEN).
         try db.execute(sql: """
             CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
               INSERT INTO messages_fts(rowid, subject, from_text, to_text, body_text)
@@ -122,7 +123,13 @@ enum Schema {
               INSERT INTO messages_fts(messages_fts, rowid, subject, from_text, to_text, body_text)
               VALUES ('delete', old.id, old.subject, old.from_text, old.to_text, old.body_text);
             END;
-            CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages BEGIN
+            CREATE TRIGGER messages_fts_au
+            AFTER UPDATE OF subject, from_text, to_text, body_text ON messages
+            WHEN old.subject IS NOT new.subject
+              OR old.from_text IS NOT new.from_text
+              OR old.to_text IS NOT new.to_text
+              OR old.body_text IS NOT new.body_text
+            BEGIN
               INSERT INTO messages_fts(messages_fts, rowid, subject, from_text, to_text, body_text)
               VALUES ('delete', old.id, old.subject, old.from_text, old.to_text, old.body_text);
               INSERT INTO messages_fts(rowid, subject, from_text, to_text, body_text)

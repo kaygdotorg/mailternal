@@ -25,6 +25,9 @@ import Testing
         #expect(triggers.contains("messages_fts_ai"))
         #expect(triggers.contains("messages_fts_ad"))
         #expect(triggers.contains("messages_fts_au"))
+        let au = (try await store.triggerSQL("messages_fts_au")) ?? ""
+        #expect(au.contains("UPDATE OF subject, from_text, to_text, body_text"))
+        #expect(au.uppercased().contains("WHEN"))
 
         let sql = try await store.ftsCreateSQL() ?? ""
         #expect(sql.contains("unicode61"))
