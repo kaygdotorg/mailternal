@@ -41,10 +41,10 @@ final class MailternalUITests: XCTestCase {
         XCTAssertTrue(unread.waitForExistence(timeout: 10), "Inbox should contain an unread marker")
         unread.click()
         XCTAssertTrue(element(UIIdentifier.messageViewer).waitForExistence(timeout: 8))
-        let from = app.staticTexts["From"]
+        let subject = element(UIIdentifier.messageSubject)
         let quarantine = element(UIIdentifier.quarantineBanner)
         XCTAssertTrue(
-            from.waitForExistence(timeout: 8) || quarantine.waitForExistence(timeout: 8),
+            subject.waitForExistence(timeout: 8) || quarantine.waitForExistence(timeout: 8),
             "viewer should show envelope or quarantine content"
         )
         XCTAssertTrue(
@@ -85,12 +85,131 @@ final class MailternalUITests: XCTestCase {
         XCTAssertTrue(settingsWindow.textFields[UIIdentifier.setupHost].waitForExistence(timeout: 5))
     }
 
-    func testWindowedModeBannerVisibleWhenMockReportsWindowed() {
+    func testMessageListHasNoSearchChromeWhileSearchStaysReachable() {
         signInToMock()
-        XCTAssertTrue(
-            element(UIIdentifier.windowedBanner).waitForExistence(timeout: 10),
-            "windowed-mode banner should appear after mock account seed"
+        let table = messageTable()
+        XCTAssertTrue(table.tableRows.firstMatch.waitForExistence(timeout: 10))
+
+        // The middle pane's windowed-mode banner is gone: nothing over the list
+        // discloses search coverage while the panel is closed, and nothing
+        // reserves height above the first row.
+        XCTAssertFalse(
+            element(UIIdentifier.searchCoverage).exists,
+            "no search chrome should stand over the message list"
         )
+        XCTAssertEqual(
+            app.staticTexts
+                .matching(NSPredicate(format: "label BEGINSWITH %@", "Search covers mail since"))
+                .count,
+            0,
+            "coverage disclosure must not be list chrome"
+        )
+
+        // Measured against the window, not the pane, so this is a depth below
+        // the physical window top.
+        let restDepth = MailWindowDissolvePolicy.messageList.restDepth(safeAreaTop: 0)
+        let depth = table.tableRows.firstMatch.frame.minY - mainWindow.frame.minY
+        XCTAssertGreaterThanOrEqual(
+            depth,
+            restDepth - 1,
+            "first row should rest at the ramp's end, not inside it"
+        )
+        XCTAssertLessThan(
+            depth,
+            restDepth + 24,
+            "no banner or spacer should reserve height above the first row"
+        )
+
+        // The feature stays reachable through its own command, and windowed
+        // mode is disclosed there instead.
+        activateMainWindow()
+        app.typeKey("k", modifierFlags: .command)
+        XCTAssertTrue(
+            element(UIIdentifier.searchField).waitForExistence(timeout: 8),
+            "cmd-K should still open search"
+        )
+        XCTAssertTrue(
+            element(UIIdentifier.searchCoverage).waitForExistence(timeout: 5),
+            "windowed-mode coverage should be disclosed in the search panel"
+        )
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(
+            waitUntil(timeout: 5) { !self.element(UIIdentifier.searchPanel).exists },
+            "Escape should close search again"
+        )
+    }
+
+    func testSidebarSlashHierarchyCollapsesAndExpands() {
+        signInToMock()
+        let parent = element(UIIdentifier.sidebarFolder("Engineering"))
+        let child = element(UIIdentifier.sidebarFolder("Engineering/Reports"))
+        let leaf = element(UIIdentifier.sidebarFolder("Engineering/Reports/Weekly"))
+
+        XCTAssertTrue(parent.waitForExistence(timeout: 10), "slash hierarchy parent")
+        XCTAssertTrue(child.waitForExistence(timeout: 10), "slash hierarchy child")
+        XCTAssertTrue(leaf.waitForExistence(timeout: 10), "slash hierarchy leaf")
+        XCTAssertTrue(parent.label.localizedCaseInsensitiveContains("syncing"), "syncing state is spoken")
+
+        let disclosure = parent.disclosureTriangles.firstMatch
+        XCTAssertTrue(disclosure.waitForExistence(timeout: 5), "parent has a native disclosure affordance")
+        XCTAssertEqual(leaf.disclosureTriangles.count, 0, "leaf must not expose a disclosure affordance")
+        XCTAssertTrue(leaf.label.localizedCaseInsensitiveContains("sync halted"), "halted state is spoken")
+
+        disclosure.click()
+        XCTAssertTrue(
+            waitUntil(timeout: 5) { !child.exists && !leaf.exists },
+            "collapsing the parent hides its descendants"
+        )
+
+        parent.disclosureTriangles.firstMatch.click()
+        XCTAssertTrue(child.waitForExistence(timeout: 5), "expanding restores the child")
+        XCTAssertTrue(leaf.waitForExistence(timeout: 5), "expanding restores the grandchild")
+    }
+
+    func testSidebarDotHierarchyAndAdjacentRoot() {
+        signInToMock()
+        let parent = element(UIIdentifier.sidebarFolder("Research"))
+        let child = element(UIIdentifier.sidebarFolder("Research.Notes"))
+        let adjacent = element(UIIdentifier.sidebarFolder("Adjacent"))
+        let adjacentLeaf = element(UIIdentifier.sidebarFolder("AdjacentLeaf"))
+
+        XCTAssertTrue(parent.waitForExistence(timeout: 10), "dot hierarchy parent")
+        XCTAssertTrue(child.waitForExistence(timeout: 10), "dot hierarchy child")
+        XCTAssertTrue(adjacent.waitForExistence(timeout: 10), "adjacent-name root")
+        XCTAssertTrue(adjacentLeaf.waitForExistence(timeout: 10), "adjacent-name folder")
+
+        let disclosure = parent.disclosureTriangles.firstMatch
+        XCTAssertTrue(disclosure.waitForExistence(timeout: 5), "dot parent has a native disclosure affordance")
+        XCTAssertEqual(child.disclosureTriangles.count, 0, "dot leaf must not expose a disclosure affordance")
+        XCTAssertEqual(adjacent.disclosureTriangles.count, 0, "false-parent candidate must remain a root")
+
+        disclosure.click()
+        XCTAssertTrue(
+            waitUntil(timeout: 5) { !child.exists },
+            "dot hierarchy collapses like slash hierarchy"
+        )
+        parent.disclosureTriangles.firstMatch.click()
+        XCTAssertTrue(child.waitForExistence(timeout: 5), "dot hierarchy expands again")
+        XCTAssertTrue(adjacentLeaf.exists, "false-parent folder stays visible independently")
+    }
+
+    func testNestedFolderGetInfoShowsNameAndPath() {
+        signInToMock()
+        let folder = element(UIIdentifier.sidebarFolder("Engineering/Reports/Weekly"))
+        XCTAssertTrue(folder.waitForExistence(timeout: 10), "nested folder for Get Info")
+
+        folder.rightClick()
+        let getInfo = app.menuItems["Get Info…"]
+        XCTAssertTrue(getInfo.waitForExistence(timeout: 5), "nested-folder context menu")
+        getInfo.click()
+
+        XCTAssertTrue(app.staticTexts["Weekly"].waitForExistence(timeout: 5), "Get Info exposes folder name")
+        XCTAssertTrue(
+            app.staticTexts["Engineering/Reports/Weekly"].waitForExistence(timeout: 5),
+            "Get Info exposes full folder path"
+        )
+        let halted = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", "Halted")).firstMatch
+        XCTAssertTrue(halted.waitForExistence(timeout: 5), "Get Info exposes halted sync metadata")
     }
 
     func testQuarantinedMessageShowsBanner() {
@@ -102,6 +221,66 @@ final class MailternalUITests: XCTestCase {
             element(UIIdentifier.quarantineBanner).waitForExistence(timeout: 10),
             "first Inbox message is quarantined in the mock seed"
         )
+    }
+
+    func testReaderSubjectClearsTheFadeAndDetailsDisclosureExpands() {
+        signInToMock()
+        let table = messageTable()
+        XCTAssertTrue(table.tableRows.firstMatch.waitForExistence(timeout: 10))
+        // Row 0 of the mock Inbox is the quarantined seed; row 1 is a normal
+        // message with a full envelope.
+        let row = table.tableRows.element(boundBy: 1)
+        XCTAssertTrue(row.waitForExistence(timeout: 10), "second Inbox row")
+        row.click()
+
+        let subject = element(UIIdentifier.messageSubject)
+        XCTAssertTrue(subject.waitForExistence(timeout: 8), "reader should show a subject region")
+
+        // Measured against the window, so this is a depth below the physical
+        // window top: the subject rests past the viewer's dissolve, never in
+        // its ramp.
+        let topInset = MessageViewerLayoutPolicy.readerTopInset(safeAreaTop: 0)
+        let depth = subject.frame.minY - mainWindow.frame.minY
+        XCTAssertGreaterThanOrEqual(
+            depth,
+            topInset - 1,
+            "subject must start below the top dissolve, not inside it"
+        )
+
+        // Details is a real disclosure and starts collapsed: stored technical
+        // headers never compete with reading.
+        XCTAssertTrue(
+            element(UIIdentifier.messageDetails).waitForExistence(timeout: 5),
+            "envelope should expose a details disclosure"
+        )
+        XCTAssertFalse(headerRow("Message-ID").exists, "collapsed details hide stored headers")
+
+        let disclosure = element(UIIdentifier.messageViewer).disclosureTriangles.firstMatch
+        XCTAssertTrue(disclosure.waitForExistence(timeout: 5), "details must be a disclosure control")
+        disclosure.click()
+        XCTAssertTrue(
+            headerRow("Message-ID").waitForExistence(timeout: 5),
+            "expanding details reveals the headers the store actually parsed"
+        )
+        XCTAssertFalse(
+            headerRow("Bcc").exists,
+            "no Bcc is parsed, so no row may claim one"
+        )
+
+        disclosure.click()
+        XCTAssertTrue(
+            waitUntil(timeout: 5) { !self.headerRow("Message-ID").exists },
+            "collapsing details hides them again"
+        )
+    }
+
+    /// Detail rows are label/value pairs, so a header is addressed by the cell
+    /// whose label starts with its name — and only inside the reader.
+    private func headerRow(_ label: String) -> XCUIElement {
+        element(UIIdentifier.messageViewer)
+            .descendants(matching: .any)
+            .matching(NSPredicate(format: "label BEGINSWITH %@", label))
+            .firstMatch
     }
 
     private var mainWindow: XCUIElement {

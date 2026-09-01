@@ -4,54 +4,80 @@ import MailternalInterfaces
 
 struct MessageListPane: View {
     @Bindable var model: AppModel
+    @State private var titleShowsAccount = false
+    @State private var titleHeight: CGFloat = 0
+
+    private var listDissolvePolicy: MailWindowDissolvePolicy {
+        .messageList.withTopOrigin(titleHeight / 2)
+    }
+
+    private var listTitle: String {
+        titleShowsAccount
+            ? model.listTitleAccountName
+            : (model.selectedFolder?.name ?? "Messages")
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if case .windowed(let since) = model.syncStatus.mode {
-                WindowedModeBanner(since: since)
-            }
+        ZStack(alignment: .top) {
             MessageTableRepresentable(
                 rows: model.listRows,
                 selectedID: model.selectedMessageID,
                 epoch: model.listEpoch,
+                lineCount: model.appearance.messageListLines,
+                accent: model.appearance.accent,
+                topRestDepth: listDissolvePolicy.restDepth(safeAreaTop: 0),
                 onSelect: { model.selectMessage($0) },
                 onPrefetch: { model.loadMoreIfNeeded(near: $0) },
-                onCopySubject: { model.copySelectedSubject() }
+                onCopySubject: { messageID in model.copySubject(for: messageID) },
+                onCopyDeepLink: { messageID in
+                    Task { await model.copyDeepLink(for: messageID) }
+                },
+                onArchive: { model.archive($0) },
+                onMarkRead: { model.markRead($0) }
             )
-            .overlay {
-                if model.isLoadingList, model.listRows.isEmpty {
-                    ProgressView()
-                        .controlSize(.small)
-                } else if model.folders.isEmpty == false, model.listRows.isEmpty, model.selectedFolderID != nil, !model.isPaging {
-                    EmptyMailboxState(title: "No Messages", detail: "This folder is empty.")
+            .mailWindowDissolve(listDissolvePolicy)
+
+            Button {
+                withAnimation(MailMotion.disclosure) {
+                    titleShowsAccount.toggle()
                 }
+            } label: {
+                Text(listTitle)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .id(listTitle)
+                    .transition(.opacity)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.regularMaterial)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier(UIIdentifier.messageListTitle)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { titleHeight = $0 }
+        }
+        .overlay {
+            if model.isLoadingList, model.listRows.isEmpty {
+                ProgressView()
+                    .controlSize(.small)
+            } else if model.folders.isEmpty == false, model.listRows.isEmpty, model.selectedFolderID != nil, !model.isPaging {
+                EmptyMailboxState(title: "No Messages", detail: "This folder is empty.")
             }
         }
-        .navigationSplitViewColumnWidth(min: 280, ideal: 360, max: 560)
-    }
-}
-
-struct WindowedModeBanner: View {
-    let since: Date
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "clock.arrow.circlepath")
-                .foregroundStyle(.secondary)
-            Text("Search covers mail since \(MailDateFormat.syncedThrough(since))")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(.quaternary.opacity(0.6))
-        .overlay(alignment: .bottom) {
-            Divider()
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier(UIIdentifier.windowedBanner)
+        // No chrome sits above this column, so its rows own the whole height:
+        // they travel to the window's physical top edge and dissolve at it.
+        // The measured title height moves that origin below the title while
+        // keeping the title itself outside the scrolling mask.
+        .ignoresSafeArea(.container, edges: .top)
+        .navigationSplitViewColumnWidth(min: 280, ideal: 360, max: .infinity)
     }
 }
 
@@ -59,14 +85,20 @@ struct MessageTableRepresentable: NSViewRepresentable {
     var rows: [MessageRow]
     var selectedID: MessageID?
     var epoch: UInt64
+    var lineCount: Int
+    var accent: AccentSource
+    var topRestDepth: CGFloat
     var onSelect: (MessageID?) -> Void
     var onPrefetch: (Int) -> Void
-    var onCopySubject: () -> Void
+    var onCopySubject: (MessageID) -> Void
+    var onCopyDeepLink: (MessageID) -> Void
+    var onArchive: (MessageID) -> Void
+    var onMarkRead: (MessageID) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> MessageTableContainer {
-        let container = MessageTableContainer()
+        let container = MessageTableContainer(topRestDepth: topRestDepth)
         context.coordinator.bind(container: container, parent: self)
         return container
     }
@@ -76,15 +108,19 @@ struct MessageTableRepresentable: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
         var parent: MessageTableRepresentable?
+        private var lineCount = MessageListLayout.defaultLineCount
+        weak var container: MessageTableContainer?
         weak var tableView: NSTableView?
         private var epoch: UInt64 = 0
         private var rowIDs: [MessageID] = []
 
         func bind(container: MessageTableContainer, parent: MessageTableRepresentable) {
             self.parent = parent
+            self.container = container
             tableView = container.tableView
+            container.updateAccent(parent.accent)
             container.tableView.delegate = self
             container.tableView.dataSource = self
             container.onVisibleRow = { [weak self] row in
@@ -95,9 +131,17 @@ struct MessageTableRepresentable: NSViewRepresentable {
 
         func update(container: MessageTableContainer, parent: MessageTableRepresentable) {
             self.parent = parent
+            container.updateTopRestDepth(parent.topRestDepth)
             let table = container.tableView
+            // SwiftUI observes AccentSource; resolve it at this AppKit bridge
+            // and refresh rows only when the canonical color actually changes.
+            let accentChanged = container.updateAccent(parent.accent)
             let oldCount = rowIDs.count
             let newIDs = parent.rows.map(\.id)
+            let newLineCount = MessageListLayout.normalizedLineCount(parent.lineCount)
+            let lineCountChanged = newLineCount != lineCount
+            lineCount = newLineCount
+
             if parent.epoch != epoch {
                 epoch = parent.epoch
                 rowIDs = newIDs
@@ -112,16 +156,32 @@ struct MessageTableRepresentable: NSViewRepresentable {
             } else if newIDs != rowIDs {
                 rowIDs = newIDs
                 table.reloadData()
-            } else {
-                let visible = table.rows(in: table.visibleRect)
-                if visible.length > 0 {
-                    table.reloadData(
-                        forRowIndexes: IndexSet(integersIn: visible.location..<(visible.location + visible.length)),
-                        columnIndexes: IndexSet(integer: 0)
-                    )
+            } else if accentChanged {
+                reloadVisibleRows(in: table)
+            }
+
+            if lineCountChanged {
+                let origin = table.enclosingScrollView?.contentView.bounds.origin
+                if table.numberOfRows > 0 {
+                    table.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<table.numberOfRows))
+                }
+                reloadVisibleRows(in: table)
+                if let origin, let scrollView = table.enclosingScrollView {
+                    scrollView.contentView.setBoundsOrigin(origin)
+                    scrollView.reflectScrolledClipView(scrollView.contentView)
                 }
             }
             syncSelection(in: table)
+        }
+
+        private func reloadVisibleRows(in table: NSTableView) {
+            let visible = table.rows(in: table.visibleRect)
+            if visible.length > 0 {
+                table.reloadData(
+                    forRowIndexes: IndexSet(integersIn: visible.location..<(visible.location + visible.length)),
+                    columnIndexes: IndexSet(integer: 0)
+                )
+            }
         }
 
         func numberOfRows(in tableView: NSTableView) -> Int {
@@ -132,18 +192,47 @@ struct MessageTableRepresentable: NSViewRepresentable {
             parent?.onPrefetch(row)
             let cell = tableView.makeView(withIdentifier: MessageCellView.identifier, owner: self) as? MessageCellView
                 ?? MessageCellView()
+            cell.updateAccentColor(container?.accentColor)
             if let rowModel = parent?.rows[safe: row] {
-                cell.apply(rowModel)
+                cell.apply(rowModel, lineCount: lineCount)
             }
             return cell
         }
 
         func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-            tableView.makeView(withIdentifier: MessageRowChrome.identifier, owner: self) as? MessageRowChrome
+            let rowView = tableView.makeView(withIdentifier: MessageRowChrome.identifier, owner: self) as? MessageRowChrome
                 ?? MessageRowChrome()
+            rowView.updateAccentColor(container?.accentColor)
+            return rowView
         }
 
-        func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 72 }
+        func tableView(
+            _ tableView: NSTableView,
+            rowActionsForRow row: Int,
+            edge: NSTableView.RowActionEdge
+        ) -> [NSTableViewRowAction] {
+            guard let messageID = parent?.rows[safe: row]?.id else { return [] }
+            switch edge {
+            case .trailing:
+                return [
+                    NSTableViewRowAction(style: .destructive, title: "Archive") { [weak self] _, _ in
+                        self?.parent?.onArchive(messageID)
+                    }
+                ]
+            case .leading:
+                return [
+                    NSTableViewRowAction(style: .regular, title: "Mark as Read") { [weak self] _, _ in
+                        self?.parent?.onMarkRead(messageID)
+                    }
+                ]
+            @unknown default:
+                return []
+            }
+        }
+
+        func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+            MessageListLayout.rowHeight(for: lineCount)
+        }
 
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard let tableView else { return }
@@ -157,10 +246,13 @@ struct MessageTableRepresentable: NSViewRepresentable {
             }
         }
 
+        private var lastScrolledSelectionID: MessageID?
+
         private func syncSelection(in tableView: NSTableView) {
             guard let selectedID = parent?.selectedID,
                   let index = parent?.rows.firstIndex(where: { $0.id == selectedID })
             else {
+                lastScrolledSelectionID = nil
                 if tableView.selectedRow != -1 {
                     tableView.deselectAll(nil)
                 }
@@ -169,29 +261,71 @@ struct MessageTableRepresentable: NSViewRepresentable {
             if tableView.selectedRow != index {
                 tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
             }
+            // A new selection (click, deep link, restoration) is brought into
+            // view exactly once; index shifts from backfill prepends and
+            // reloads must not yank an established scroll position.
+            if lastScrolledSelectionID != selectedID {
+                lastScrolledSelectionID = selectedID
+                tableView.scrollRowToVisible(index)
+            }
         }
 
         private func makeMenu() -> NSMenu {
             let menu = NSMenu()
-            let copy = NSMenuItem(title: "Copy Subject", action: #selector(copySubject(_:)), keyEquivalent: "")
-            copy.target = self
-            menu.addItem(copy)
+            menu.delegate = self
             return menu
         }
 
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            menu.removeAllItems()
+            guard clickedMessageID != nil else { return }
+
+            let copySubject = NSMenuItem(
+                title: "Copy Subject",
+                action: #selector(copySubject(_:)),
+                keyEquivalent: ""
+            )
+            copySubject.target = self
+            menu.addItem(copySubject)
+
+            let copyLink = NSMenuItem(
+                title: "Copy Deep Link",
+                action: #selector(copyDeepLink(_:)),
+                keyEquivalent: ""
+            )
+            copyLink.target = self
+            menu.addItem(copyLink)
+        }
+
+        private var clickedMessageID: MessageID? {
+            guard let tableView,
+                  tableView.clickedRow >= 0,
+                  let row = parent?.rows[safe: tableView.clickedRow] else { return nil }
+            return row.id
+        }
+
         @objc private func copySubject(_ sender: Any?) {
-            parent?.onCopySubject()
+            guard let messageID = clickedMessageID else { return }
+            parent?.onCopySubject(messageID)
+        }
+
+        @objc private func copyDeepLink(_ sender: Any?) {
+            guard let messageID = clickedMessageID else { return }
+            parent?.onCopyDeepLink(messageID)
         }
     }
 }
+
 
 @MainActor
 final class MessageTableContainer: NSView {
     let scrollView = NSScrollView()
     let tableView = NSTableView()
+    private(set) var accentColor: NSColor?
     var onVisibleRow: ((Int) -> Void)?
 
-    override init(frame frameRect: NSRect) {
+    init(topRestDepth: CGFloat = MailWindowDissolvePolicy.messageList.restDepth(safeAreaTop: 0)) {
+        let frameRect = NSRect(origin: .zero, size: .zero)
         super.init(frame: frameRect)
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("message"))
         column.resizingMask = .autoresizingMask
@@ -203,7 +337,7 @@ final class MessageTableContainer: NSView {
         tableView.backgroundColor = .clear
         tableView.style = .plain
         tableView.setAccessibilityIdentifier(UIIdentifier.messageTable)
-        tableView.rowHeight = 72
+        tableView.rowHeight = MessageListLayout.rowHeight(for: MessageListLayout.defaultLineCount)
         tableView.intercellSpacing = .zero
         tableView.usesAlternatingRowBackgroundColors = false
         tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
@@ -213,7 +347,21 @@ final class MessageTableContainer: NSView {
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
+        // The pane's frame runs to the physical window top, so rows travel up
+        // beneath the fixed title and dissolve in the mask's ramp on the way.
+        // The scroll CONTENT stops at the ramp's end, so the first row comes
+        // to rest below it and stays readable. `contentInsets` does that
+        // without moving the view: the clip view keeps its full-bleed frame,
+        // so no row geometry and no bottom edge moves. The automatic insets
+        // would derive the same band from a safe area this pane has already
+        // cleared, and overwrite it with zero. `scrollerInsets` follows the
+        // content, because the scroller belongs beside the rows, not under the
+        // title.
+        let topRest = max(topRestDepth, 0)
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = NSEdgeInsets(top: topRest, left: 0, bottom: 0, right: 0)
+        scrollView.scrollerInsets = NSEdgeInsets(top: topRest, left: 0, bottom: 0, right: 0)
+        scrollView.suppressSystemScrollEdgeEffect()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         let clip = scrollView.contentView
         clip.postsBoundsChangedNotifications = true
@@ -231,6 +379,11 @@ final class MessageTableContainer: NSView {
             object: clip
         )
     }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        scrollView.suppressSystemScrollEdgeEffect()
+    }
+
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
@@ -247,6 +400,28 @@ final class MessageTableContainer: NSView {
             onVisibleRow?(visible.location + visible.length - 1)
         }
     }
+
+    func updateTopRestDepth(_ depth: CGFloat) {
+        let topRest = max(depth, 0)
+        guard abs(scrollView.contentInsets.top - topRest) > .ulpOfOne else { return }
+        scrollView.contentInsets = NSEdgeInsets(top: topRest, left: 0, bottom: 0, right: 0)
+        scrollView.scrollerInsets = NSEdgeInsets(top: topRest, left: 0, bottom: 0, right: 0)
+    }
+    @discardableResult
+    func updateAccent(_ source: AccentSource) -> Bool {
+        let color = source.nsColor
+        guard accentColor?.isEqual(color) != true else { return false }
+        accentColor = color
+        let visible = tableView.rows(in: tableView.visibleRect)
+        guard visible.length > 0 else { return true }
+        for row in visible.location..<(visible.location + visible.length) {
+            (tableView.rowView(atRow: row, makeIfNecessary: false) as? MessageRowChrome)?
+                .updateAccentColor(color)
+            (tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? MessageCellView)?
+                .updateAccentColor(color)
+        }
+        return true
+    }
 }
 
 @MainActor
@@ -254,11 +429,13 @@ final class MessageRowChrome: NSTableRowView {
     static let identifier = NSUserInterfaceItemIdentifier("MessageRowChrome")
     private let selectionLayer = CALayer()
     private let hoverLayer = CALayer()
+    private var accentColor: NSColor?
     private var tracking: NSTrackingArea?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        focusRingType = .none
         identifier = Self.identifier
         hoverLayer.cornerRadius = AppShapeScale.row
         hoverLayer.cornerCurve = .continuous
@@ -328,14 +505,19 @@ final class MessageRowChrome: NSTableRowView {
     override func drawSelection(in dirtyRect: NSRect) {}
     override func drawBackground(in dirtyRect: NSRect) {}
 
+    func updateAccentColor(_ color: NSColor?) {
+        accentColor = color
+        refreshChrome()
+    }
+
     private func refreshChrome() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            selectionLayer.backgroundColor = isSelected
-                ? NSColor.selectedContentBackgroundColor.cgColor
-                : nil
+            let accent = accentColor?.usingColorSpace(.sRGB)?.cgColor
+            selectionLayer.backgroundColor = isSelected ? accent : nil
             hoverLayer.opacity = isSelected ? 0 : hoverLayer.opacity
         }
     }
+
 }
 
 @MainActor
@@ -347,10 +529,15 @@ final class MessageCellView: NSTableCellView {
     private let previewLabel = NSTextField(labelWithString: "")
     private let dateLabel = NSTextField(labelWithString: "")
     private let paperclip = NSImageView()
+    private var accentColor: NSColor?
+    private var isUnread = false
+    private var subjectTopFromConstraint: NSLayoutConstraint!
+    private var subjectTopRowConstraint: NSLayoutConstraint!
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         identifier = Self.identifier
+        focusRingType = .none
         unreadDot.wantsLayer = true
         unreadDot.layer?.cornerRadius = 4
         unreadDot.translatesAutoresizingMaskIntoConstraints = false
@@ -361,7 +548,10 @@ final class MessageCellView: NSTableCellView {
         paperclip.translatesAutoresizingMaskIntoConstraints = false
         fromLabel.lineBreakMode = .byTruncatingTail
         subjectLabel.lineBreakMode = .byTruncatingTail
-        previewLabel.lineBreakMode = .byTruncatingTail
+        previewLabel.usesSingleLineMode = false
+        previewLabel.cell?.wraps = true
+        previewLabel.cell?.isScrollable = false
+        previewLabel.lineBreakMode = .byWordWrapping
         dateLabel.lineBreakMode = .byClipping
         previewLabel.textColor = .secondaryLabelColor
         dateLabel.textColor = .secondaryLabelColor
@@ -376,6 +566,8 @@ final class MessageCellView: NSTableCellView {
         addSubview(previewLabel)
         addSubview(dateLabel)
         addSubview(paperclip)
+        subjectTopFromConstraint = subjectLabel.topAnchor.constraint(equalTo: fromLabel.bottomAnchor, constant: 2)
+        subjectTopRowConstraint = subjectLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10)
         NSLayoutConstraint.activate([
             unreadDot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             unreadDot.centerYAnchor.constraint(equalTo: fromLabel.centerYAnchor),
@@ -387,7 +579,7 @@ final class MessageCellView: NSTableCellView {
             dateLabel.centerYAnchor.constraint(equalTo: fromLabel.centerYAnchor),
             fromLabel.trailingAnchor.constraint(lessThanOrEqualTo: dateLabel.leadingAnchor, constant: -8),
             subjectLabel.leadingAnchor.constraint(equalTo: fromLabel.leadingAnchor),
-            subjectLabel.topAnchor.constraint(equalTo: fromLabel.bottomAnchor, constant: 2),
+            subjectTopFromConstraint,
             paperclip.trailingAnchor.constraint(equalTo: dateLabel.trailingAnchor),
             paperclip.centerYAnchor.constraint(equalTo: subjectLabel.centerYAnchor),
             paperclip.widthAnchor.constraint(equalToConstant: 12),
@@ -399,9 +591,23 @@ final class MessageCellView: NSTableCellView {
     }
 
     @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
-    func apply(_ row: MessageRow) {
+    func apply(_ row: MessageRow, lineCount: Int) {
+        isUnread = !row.isRead
+        let visibility = MessageListLayout.fieldVisibility(for: lineCount)
+        fromLabel.isHidden = !visibility.sender
+        dateLabel.isHidden = !visibility.date
+        previewLabel.isHidden = !visibility.preview
+        previewLabel.maximumNumberOfLines = MessageListLayout.previewLineCount(for: lineCount)
+        previewLabel.lineBreakMode = visibility.preview ? .byWordWrapping : .byTruncatingTail
+        NSLayoutConstraint.deactivate([subjectTopFromConstraint, subjectTopRowConstraint])
+        NSLayoutConstraint.activate([
+            visibility.sender ? subjectTopFromConstraint : subjectTopRowConstraint
+        ])
+
         fromLabel.stringValue = row.from
         fromLabel.font = .systemFont(ofSize: MessageTypography.bodyPointSize, weight: row.isRead ? .regular : .semibold)
         subjectLabel.stringValue = row.subject
@@ -412,7 +618,7 @@ final class MessageCellView: NSTableCellView {
         dateLabel.stringValue = MailDateFormat.listRow(row.date)
         dateLabel.font = .systemFont(ofSize: 11, weight: row.isRead ? .regular : .medium)
         paperclip.isHidden = !row.hasAttachments
-        unreadDot.layer?.backgroundColor = row.isRead ? NSColor.clear.cgColor : NSColor.controlAccentColor.cgColor
+        refreshUnreadDot()
         unreadDot.toolTip = row.isRead ? nil : "Unread"
         unreadDot.setAccessibilityElement(true)
         unreadDot.setAccessibilityIdentifier(UIIdentifier.unreadDot)
@@ -421,6 +627,23 @@ final class MessageCellView: NSTableCellView {
         setAccessibilityLabel("\(row.from), \(row.subject), \(MailDateFormat.listRow(row.date))")
         setAccessibilityRole(.staticText)
     }
+    func updateAccentColor(_ color: NSColor?) {
+        accentColor = color
+        refreshUnreadDot()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshUnreadDot()
+    }
+
+    private func refreshUnreadDot() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let accent = accentColor?.usingColorSpace(.sRGB)?.cgColor
+            unreadDot.layer?.backgroundColor = isUnread ? accent : NSColor.clear.cgColor
+        }
+    }
+
 }
 
 private extension Array {

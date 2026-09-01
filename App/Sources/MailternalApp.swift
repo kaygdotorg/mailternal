@@ -121,6 +121,14 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
         showMainWindow()
         return true
     }
+    /// The sole platform entry point for deep links. AppModel owns parsing and
+    /// queues the typed destination until account and folders are ready.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let model else { return }
+        for url in urls {
+            model.openURL(url)
+        }
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false

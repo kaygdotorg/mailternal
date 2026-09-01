@@ -24,7 +24,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
 struct SettingsSourceList: View {
     @Binding var selection: SettingsSection?
-    let accentColor: Color
+    let appearance: AppearanceSettings
 
     var body: some View {
         List(SettingsSection.allCases, selection: $selection) { section in
@@ -33,7 +33,9 @@ struct SettingsSourceList: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
-        .tint(accentColor)
+        .focusEffectDisabled(true)
+        .tint(appearance.accent.color)
+        .environment(appearance.accent)
         .padding(.top, 46)
     }
 }
@@ -42,7 +44,6 @@ struct SettingsDetailView: View {
     let section: SettingsSection
     @Bindable var model: AppModel
     let appearance: AppearanceSettings
-    let accentColor: Color
 
     var body: some View {
         Group {
@@ -53,7 +54,8 @@ struct SettingsDetailView: View {
                 AppearanceSettingsForm(appearance: appearance)
             }
         }
-        .tint(accentColor)
+        .tint(appearance.accent.color)
+        .environment(appearance.accent)
         .padding(.top, 20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -203,6 +205,7 @@ struct AccountSetupForm: View {
         }
         let config = AccountConfig(
             id: AccountID(rawValue: "account-1"),
+            accountLinkID: .random(),
             displayName: displayName.isEmpty ? email : displayName,
             emailAddress: email,
             username: username,
@@ -222,52 +225,91 @@ struct AppearanceSettingsForm: View {
 
     var body: some View {
         Form {
-            Section("Theme") {
-                Picker("Appearance", selection: $appearance.mode) {
+            Section {
+                Picker(selection: $appearance.mode) {
                     ForEach(AppearanceMode.allCases) { mode in
                         Text(mode.label).tag(mode)
                     }
+                } label: {
+                    Text("Theme")
+                    Text("System follows the macOS light or dark setting.")
                 }
-            }
-            Section("Window") {
-                Picker("Backdrop", selection: $appearance.backdropKind) {
-                    ForEach(WindowBackdropKind.allCases) { kind in
-                        Text(kind.label).tag(kind)
+                Picker(selection: $appearance.emailReadingMode) {
+                    ForEach(EmailReadingMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
                     }
+                } label: {
+                    Text("Email Reading")
+                    Text("Original keeps each message's colors; Dark keeps the reading canvas dark.")
                 }
-                Slider(value: $appearance.backgroundOpacity, in: 0.4...1, step: 0.01) {
+                .accessibilityIdentifier(UIIdentifier.emailReadingMode)
+            }
+            Section("Messages") {
+                Picker(selection: $appearance.messageListLines) {
+                    ForEach(Array(MessageListLayout.lineRange), id: \.self) { lines in
+                        Text("\(lines) \(lines == 1 ? "line" : "lines")").tag(lines)
+                    }
+                } label: {
+                    Text("Row lines")
+                    Text("One line shows the subject; two adds the sender and date; more adds preview text.")
+                }
+                .accessibilityIdentifier(UIIdentifier.messageListLines)
+            }
+            Section {
+                LabeledContent {
+                    HStack {
+                        Slider(
+                            value: $appearance.backgroundOpacity,
+                            in: AppearanceSettings.backgroundOpacityRange,
+                            step: 0.01
+                        )
+                        .onChange(of: appearance.backgroundOpacity) { _, _ in
+                            appearance.persistOpacity()
+                        }
+                        // Proportional text, in a fixed trailing slot: the
+                        // readout keeps its place without monospaced digits.
+                        Text(AppearanceSettings.formattedOpacityPercentage(appearance.backgroundOpacity))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 44, alignment: .trailing)
+                    }
+                } label: {
                     Text("Opacity")
-                } minimumValueLabel: {
-                    Text("40%")
-                } maximumValueLabel: {
-                    Text("100%")
+                    Text("How solid the window is. Lower lets more of the desktop show through; 100% is fully solid.")
                 }
-                .disabled(appearance.backdropKind == .opaque)
-                .onChange(of: appearance.backgroundOpacity) { _, _ in
-                    appearance.persistOpacity()
+                Toggle(isOn: $appearance.usesLiquidGlass) {
+                    Text("Liquid Glass")
+                    Text("Refracts the desktop behind the window instead of softly blurring it. No visible effect at 100% opacity.")
                 }
-                Text("Opaque is the default. Blur uses NSVisualEffectView. Liquid Glass is optional. Reduce Transparency and fullscreen always force opaque.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Window")
+            } footer: {
+                Text("The window stays solid in fullscreen, and while Reduce Transparency is on.")
             }
             Section("Accent") {
-                Toggle("Use a custom accent", isOn: Binding(
-                    get: { appearance.accentOverride != nil },
+                Toggle(isOn: Binding(
+                    get: { appearance.accent.accentOverride != nil },
                     set: { enabled in
                         if enabled {
-                            appearance.accentOverride = AccentColorValue(nsColor: .controlAccentColor)
+                            appearance.accent.accentOverride = AccentColorValue(nsColor: appearance.accent.nsColor)
                         } else {
-                            appearance.accentOverride = nil
+                            appearance.accent.accentOverride = nil
                         }
                     }
-                ))
-                if appearance.accentOverride != nil {
+                )) {
+                    Text("Use a custom accent")
+                    Text(
+                        appearance.accent.accentOverride == nil
+                            ? "Controls and selection use the macOS accent color."
+                            : "Controls and selection use the color below."
+                    )
+                }
+                if appearance.accent.accentOverride != nil {
                     ColorPicker(
-                        "Accent Color",
+                        "Color",
                         selection: Binding(
-                            get: { Color(nsColor: appearance.effectiveAccentColor) },
+                            get: { appearance.accent.color },
                             set: { color in
-                                appearance.accentOverride = AccentColorValue(nsColor: NSColor(color))
+                                appearance.accent.accentOverride = AccentColorValue(nsColor: NSColor(color))
                             }
                         ),
                         supportsOpacity: false
@@ -288,16 +330,14 @@ final class SettingsSplitController: NSSplitViewController {
     private var didSetDivider = false
 
     init(model: AppModel, appearance: AppearanceSettings, selection: Binding<SettingsSection?>) {
-        let accent = Color(nsColor: appearance.effectiveAccentColor)
         sidebarHosting = NSHostingController(
-            rootView: SettingsSourceList(selection: selection, accentColor: accent)
+            rootView: SettingsSourceList(selection: selection, appearance: appearance)
         )
         detailHosting = NSHostingController(
             rootView: SettingsDetailView(
                 section: selection.wrappedValue ?? .account,
                 model: model,
-                appearance: appearance,
-                accentColor: accent
+                appearance: appearance
             )
         )
         sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarHosting)
@@ -321,13 +361,11 @@ final class SettingsSplitController: NSSplitViewController {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func update(model: AppModel, appearance: AppearanceSettings, selection: Binding<SettingsSection?>) {
-        let accent = Color(nsColor: appearance.effectiveAccentColor)
-        sidebarHosting.rootView = SettingsSourceList(selection: selection, accentColor: accent)
+        sidebarHosting.rootView = SettingsSourceList(selection: selection, appearance: appearance)
         detailHosting.rootView = SettingsDetailView(
             section: selection.wrappedValue ?? .account,
             model: model,
-            appearance: appearance,
-            accentColor: accent
+            appearance: appearance
         )
         configureWindow()
     }

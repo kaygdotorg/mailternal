@@ -41,11 +41,15 @@ struct SearchPanel: View {
                     errorMessage: errorMessage,
                     maximumHeight: maximumHeight,
                     contrast: contrast,
+                    coverage: coverageDisclosure,
                     onMove: moveSelection,
                     onActivate: activateSelection,
                     onOpen: { row in
                         model.openSearchResult(row)
                         model.toasts.isSuppressed = false
+                    },
+                    onCopyDeepLink: { messageID in
+                        Task { await model.copyDeepLink(for: messageID) }
                     },
                     onClear: { query = "" },
                     onDismiss: dismiss,
@@ -72,6 +76,15 @@ struct SearchPanel: View {
                 runSearch(newValue)
             }
         }
+    }
+
+    /// Windowed mode is a degraded state the app has to keep disclosing. The
+    /// statement belongs where the user is actually searching, so it rides the
+    /// search panel instead of standing as permanent chrome over the message
+    /// list.
+    private var coverageDisclosure: String? {
+        guard case .windowed(let since) = model.syncStatus.mode else { return nil }
+        return "Search covers mail since \(MailDateFormat.syncedThrough(since))"
     }
 
     private func dismiss() {
@@ -147,19 +160,29 @@ private struct SearchPanelSurface: View {
     let errorMessage: String?
     let maximumHeight: CGFloat
     let contrast: ColorSchemeContrast
+    let coverage: String?
     let onMove: (Int) -> Void
     let onActivate: () -> Void
     let onOpen: (MessageRow) -> Void
+    let onCopyDeepLink: (MessageID) -> Void
     let onClear: () -> Void
     let onDismiss: () -> Void
     let onRetry: () -> Void
-    @Environment(\.mailternalAccentColor) private var accentColor
+    @Environment(AccentSource.self) private var accent
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             field
                 .padding(.horizontal, 18)
                 .padding(.vertical, 15)
+            if let coverage {
+                Text(coverage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 12)
+                    .accessibilityIdentifier(UIIdentifier.searchCoverage)
+            }
             content
         }
         .frame(maxHeight: maximumHeight, alignment: .top)
@@ -279,12 +302,17 @@ private struct SearchPanelSurface: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(
                                 selectedIndex == index
-                                    ? accentColor.opacity(contrast == .increased ? 0.24 : 0.12)
+                                    ? accent.color.opacity(contrast == .increased ? 0.24 : 0.12)
                                     : Color.clear,
                                 in: RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
                             )
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("Copy Deep Link") {
+                                onCopyDeepLink(row.id)
+                            }
+                        }
                     }
                 }
                 .padding(.horizontal, 12)

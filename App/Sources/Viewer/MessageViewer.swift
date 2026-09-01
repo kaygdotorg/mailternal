@@ -9,6 +9,13 @@ struct MessageViewer: View {
     @State private var findIndex: Int?
     @State private var findBackwards = false
     @State private var findTick: UInt64 = 0
+    /// Titlebar depth measured where the pane still has a safe area, i.e.
+    /// outside the scrolling surface's own `ignoresSafeArea`.
+    @State private var safeAreaTop: CGFloat = 0
+    /// Height the subject and envelope regions spend, so the isolated HTML
+    /// surface can take the rest of the pane instead of a fixed stub.
+    @State private var readerChromeHeight: CGFloat = 0
+    @State private var isDetailsExpanded = false
 
     private var findHaystack: String {
         MessageFind.haystack(
@@ -45,6 +52,13 @@ struct MessageViewer: View {
                 .zIndex(1)
             }
         }
+        // Read here, not on the scrolling surface: the reader deliberately
+        // ignores the container safe area so its dissolve can start at the
+        // physical window top, which leaves this the only place the titlebar
+        // depth is still measurable.
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.safeAreaInsets.top
+        } action: { safeAreaTop = $0 }
         .animation(MailMotion.disclosure, value: model.isFindPresented)
         .focusScope(viewerFocus)
         .accessibilityIdentifier(UIIdentifier.messageViewer)
@@ -57,6 +71,7 @@ struct MessageViewer: View {
             restartFind()
         }
         .onChange(of: model.detail?.id) { _, _ in
+            isDetailsExpanded = false
             restartFind()
         }
         .onChange(of: model.isShowingRawSource) { _, _ in
@@ -70,23 +85,7 @@ struct MessageViewer: View {
     @ViewBuilder
     private var content: some View {
         if let detail = model.detail {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    EnvelopeHeader(envelope: detail.envelope, attachments: detail.attachments)
-                    if detail.isQuarantined {
-                        QuarantineBanner(
-                            showingRaw: model.isShowingRawSource,
-                            loadRaw: { Task { await model.loadRawSource() } }
-                        )
-                    }
-                    bodyBlock(detail)
-                }
-                .frame(maxWidth: MessageTypography.readingMeasure, alignment: .leading)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(MessageTypography.transcriptInset)
-                .padding(.bottom, 40)
-            }
-            .background(Color(nsColor: .windowBackgroundColor).opacity(0.001))
+            reader(detail)
         } else if model.isLoadingDetail {
             ProgressView()
                 .controlSize(.small)
@@ -99,8 +98,61 @@ struct MessageViewer: View {
         }
     }
 
+    /// One scroll owner, three full-width regions: subject, envelope, body.
+    private func reader(_ detail: MessageDetail) -> some View {
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    MessageSubjectRegion(
+                        subject: detail.envelope.subject,
+                        topInset: MessageViewerLayoutPolicy.readerTopInset(safeAreaTop: safeAreaTop),
+                        isShowingRawSource: model.isShowingRawSource,
+                        showRawSource: { Task { await model.loadRawSource() } },
+                        showFormatted: { model.isShowingRawSource = false },
+                        copySubject: { model.copySelectedSubject() }
+                    )
+                    MessageEnvelopeRegion(
+                        envelope: detail.envelope,
+                        attachments: detail.attachments,
+                        isDetailsExpanded: $isDetailsExpanded
+                    )
+                }
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height
+                } action: { readerChromeHeight = $0 }
+                bodyRegion(detail)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(MessageReaderSurface.page)
+        .background {
+            ScrollEdgeEffectSuppressor()
+        }
+        .ignoresSafeArea(.container, edges: .top)
+        .mailWindowDissolve(.viewer)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func bodyRegion(_ detail: MessageDetail) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if detail.isQuarantined {
+                QuarantineBanner(
+                    showingRaw: model.isShowingRawSource,
+                    loadRaw: { Task { await model.loadRawSource() } }
+                )
+            }
+            bodyContent(detail)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
+        .padding(.top, MessageViewerLayoutPolicy.bodyTopPadding)
+        .padding(.bottom, MessageViewerLayoutPolicy.bottomPadding)
+        .background(MessageReaderSurface.page)
+        .accessibilityIdentifier(UIIdentifier.messageBody)
+    }
+
     @ViewBuilder
-    private func bodyBlock(_ detail: MessageDetail) -> some View {
+    private func bodyContent(_ detail: MessageDetail) -> some View {
         if model.isShowingRawSource, let raw = model.rawSource {
             RawSourceView(
                 text: raw,
@@ -113,27 +165,7 @@ struct MessageViewer: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
         } else if let html = detail.sanitizedHTML, !html.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                MessageHTMLView(
-                    html: html,
-                    partProvider: model.partProvider(for: detail.id),
-                    onExternalLink: { url in
-                        NSWorkspace.shared.open(url)
-                    },
-                    allowRemoteImages: model.allowRemoteImages,
-                    findQuery: activeFindQuery,
-                    findTick: findTick,
-                    findBackwards: findBackwards
-                )
-                .frame(minHeight: 280)
-                Button(model.allowRemoteImages ? "Remote Images On" : "Load Remote Images") {
-                    model.allowRemoteImages = true
-                }
-                .buttonStyle(.plain)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .disabled(model.allowRemoteImages)
-            }
+            htmlBody(detail, html: html)
         } else if let text = detail.bodyText, !text.isEmpty {
             PlainTextBody(
                 text: text,
@@ -141,11 +173,49 @@ struct MessageViewer: View {
                 selectedMatchIndex: findSnapshot.index,
                 findTick: findTick
             )
+            // The pane stays full width; only the plain-text measure narrows.
+            .frame(maxWidth: MessageTypography.plainTextMeasure, alignment: .leading)
         } else {
             Text("This message has no text.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private func htmlBody(_ detail: MessageDetail, html: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !model.allowRemoteImages {
+                RemoteImageNotice { model.allowRemoteImages = true }
+            }
+            MessageHTMLView(
+                html: html,
+                partProvider: model.partProvider(for: detail.id),
+                onExternalLink: { url in
+                    NSWorkspace.shared.open(url)
+                },
+                allowRemoteImages: model.allowRemoteImages,
+                emailReadingMode: model.appearance.emailReadingMode,
+                findQuery: activeFindQuery,
+                findTick: findTick,
+                findBackwards: findBackwards
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        }
+        // JavaScript is off inside the isolated web view (network isolation),
+        // so nothing can report the document height and the web view keeps its
+        // own scroller. Sizing this region to exactly what the subject and
+        // envelope leave free keeps the outer scroll from stacking on top of
+        // that inner one, and keeps the inner one from being a small window in
+        // a tall empty pane.
+        .containerRelativeFrame(.vertical) { height, _ in
+            MessageViewerLayoutPolicy.htmlHeight(
+                containerHeight: height,
+                reservedHeight: readerChromeHeight
+                    + MessageViewerLayoutPolicy.bodyTopPadding
+                    + MessageViewerLayoutPolicy.bottomPadding
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func restartFind() {
@@ -167,60 +237,270 @@ struct MessageViewer: View {
     }
 }
 
-struct EnvelopeHeader: View {
-    let envelope: Envelope
-    let attachments: [AttachmentInfo]
+/// Reading anchor: the strongest contrast in the reader, wrapping without
+/// limit, resting below the window's dissolve rather than inside its ramp.
+struct MessageSubjectRegion: View {
+    let subject: String
+    let topInset: CGFloat
+    let isShowingRawSource: Bool
+    let showRawSource: () -> Void
+    let showFormatted: () -> Void
+    let copySubject: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(envelope.subject)
-                .font(.title2)
+        let display = MessageHeaderPolicy.subject(subject)
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(display.text)
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(display.isPlaceholder ? Color.secondary : Color.primary)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
-            LabeledContent("From") {
-                Text(format(envelope.from))
-                    .textSelection(.enabled)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityIdentifier(UIIdentifier.messageSubject)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            actions
+        }
+        .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
+        .padding(.top, topInset)
+        .padding(.bottom, MessageViewerLayoutPolicy.subjectBottomPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(MessageReaderSurface.subject)
+        .overlay(alignment: .bottom) { ReaderRegionDivider() }
+    }
+
+    private var actions: some View {
+        Menu {
+            if isShowingRawSource {
+                Button("Show Formatted Message", action: showFormatted)
+            } else {
+                Button("View Raw Source", action: showRawSource)
             }
-            if !envelope.to.isEmpty {
-                LabeledContent("To") {
-                    Text(format(envelope.to))
-                        .textSelection(.enabled)
-                }
-            }
-            if !envelope.cc.isEmpty {
-                LabeledContent("Cc") {
-                    Text(format(envelope.cc))
-                        .textSelection(.enabled)
-                }
-            }
-            LabeledContent("Date") {
-                Text(MailDateFormat.envelope(envelope.internalDate))
+            Button("Copy Subject", action: copySubject)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.borderless)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel("Message actions")
+    }
+}
+
+/// Envelope: who sent it, who received it, when, what came attached — and a
+/// disclosure for every remaining header the store actually parsed.
+struct MessageEnvelopeRegion: View {
+    let envelope: Envelope
+    let attachments: [AttachmentInfo]
+    @Binding var isDetailsExpanded: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            senderRow
+            if !recipientGroups.isEmpty {
+                recipients
+                    .padding(.top, MessageViewerLayoutPolicy.envelopeRowSpacing)
             }
             if !attachments.isEmpty {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: "paperclip")
-                        .foregroundStyle(.secondary)
-                    Text(attachments.map { $0.filename ?? $0.id }.joined(separator: ", "))
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
+                attachmentRows
+                    .padding(.top, MessageViewerLayoutPolicy.attachmentSpacing)
             }
+            details
+                .padding(.top, MessageViewerLayoutPolicy.envelopeRowSpacing)
         }
         .font(.subheadline)
-        .labeledContentStyle(.automatic)
-        .padding(.bottom, 4)
-        .overlay(alignment: .bottom) {
-            Divider()
+        .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
+        .padding(.top, MessageViewerLayoutPolicy.envelopeTopPadding)
+        .padding(.bottom, MessageViewerLayoutPolicy.envelopeBottomPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(MessageReaderSurface.envelope)
+        .overlay(alignment: .bottom) { ReaderRegionDivider() }
+    }
+
+    /// Sender and date share a line until the line no longer fits — at a narrow
+    /// pane or a large text size the date drops below instead of squeezing the
+    /// identity.
+    private var senderRow: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 16) {
+                senderIdentity
+                Spacer(minLength: 16)
+                dateText
+            }
+            VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.envelopePairSpacing) {
+                senderIdentity
+                dateText
+            }
         }
     }
 
-    private func format(_ addresses: [MailAddress]) -> String {
-        addresses.map { address in
-            if let name = address.displayName, !name.isEmpty {
-                return "\(name) <\(address.address)>"
+    @ViewBuilder
+    private var senderIdentity: some View {
+        if envelope.from.isEmpty {
+            Text("Unknown sender")
+                .font(.headline)
+                .foregroundStyle(.secondary)
+        } else if envelope.from.count == 1, let sender = envelope.from.first {
+            // Name and address are separate runs, both in the primary text
+            // role: an address a recipient may need to check is never dimmed
+            // into a caption.
+            VStack(alignment: .leading, spacing: 2) {
+                Text(MessageHeaderPolicy.name(of: sender))
+                    .font(.headline)
+                if MessageHeaderPolicy.name(of: sender) != sender.address {
+                    Text(sender.address)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
-            return address.address
-        }.joined(separator: ", ")
+            .textSelection(.enabled)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("From, \(MessageHeaderPolicy.full(sender))")
+        } else {
+            Text(MessageHeaderPolicy.list(envelope.from))
+                .font(.headline)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+
+    private var dateText: some View {
+        Text(MailDateFormat.envelope(envelope.internalDate))
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+    }
+
+    /// A recipient group the message actually carries. Absent groups never
+    /// reach the grid, so the reader stays silent about what it does not know.
+    private struct RecipientGroup: Identifiable {
+        let id: String
+        let summary: String
+        let spoken: String
+    }
+
+    private var recipientGroups: [RecipientGroup] {
+        let groups = [
+            (label: "To", addresses: envelope.to),
+            (label: "Cc", addresses: envelope.cc),
+        ]
+        return groups.compactMap { group in
+            guard let summary = MessageHeaderPolicy.summary(group.addresses),
+                  let spoken = MessageHeaderPolicy.spokenSummary(group.addresses)
+            else { return nil }
+            return RecipientGroup(id: group.label, summary: summary, spoken: spoken)
+        }
+    }
+
+    /// Label and value stay separate grid cells so the columns align at every
+    /// text size; the value carries the spoken form, because "+2" is a visual
+    /// abbreviation rather than something to read aloud.
+    private var recipients: some View {
+        Grid(
+            alignment: .leadingFirstTextBaseline,
+            horizontalSpacing: 10,
+            verticalSpacing: MessageViewerLayoutPolicy.envelopePairSpacing
+        ) {
+            ForEach(recipientGroups) { group in
+                GridRow {
+                    Text(group.id)
+                        .foregroundStyle(.secondary)
+                        .gridColumnAlignment(.leading)
+                    Text(group.summary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                        .accessibilityLabel(group.spoken)
+                }
+            }
+        }
+    }
+
+    private var attachmentRows: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(attachments) { attachment in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "paperclip")
+                        .foregroundStyle(.secondary)
+                    Text(MessageHeaderPolicy.attachmentName(attachment))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                    if let size = MessageHeaderPolicy.attachmentSize(attachment) {
+                        Text(size)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Attachment, \(MessageHeaderPolicy.attachmentName(attachment))")
+            }
+        }
+    }
+
+    /// A real disclosure control: tab reaches it, Space and Return toggle it,
+    /// and VoiceOver speaks its expanded state. It holds every stored header
+    /// with a value — raw MIME stays behind the separate raw-source action.
+    private var details: some View {
+        DisclosureGroup(isExpanded: $isDetailsExpanded) {
+            Grid(
+                alignment: .leadingFirstTextBaseline,
+                horizontalSpacing: 10,
+                verticalSpacing: MessageViewerLayoutPolicy.envelopePairSpacing
+            ) {
+                ForEach(MessageHeaderPolicy.detailRows(for: envelope)) { row in
+                    GridRow {
+                        Text(row.label)
+                            .foregroundStyle(.secondary)
+                            .gridColumnAlignment(.leading)
+                        Text(row.value)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            // The label names the control; keeping the accessibility label here
+            // leaves the expanded rows as their own elements.
+            Text("Details")
+                .font(.subheadline)
+                .accessibilityLabel("Message details")
+        }
+        .accessibilityIdentifier(UIIdentifier.messageDetails)
+    }
+}
+
+/// The 1pt boundary between reader regions. Increased contrast asks for a
+/// separator that survives a strengthened palette, so the role changes rather
+/// than the geometry.
+private struct ReaderRegionDivider: View {
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        Rectangle()
+            .fill(MessageReaderSurface.divider(increasedContrast: contrast == .increased))
+            .frame(height: 1)
+    }
+}
+
+/// Blocked remote content is a body state the reader discloses before the
+/// message is read, not a permanently disabled control after it.
+private struct RemoteImageNotice: View {
+    let load: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "photo")
+                .foregroundStyle(.secondary)
+            Text("Remote images are blocked in this message.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Load Images", action: load)
+                .buttonStyle(.link)
+            Spacer(minLength: 0)
+        }
+        .font(.callout)
     }
 }
 
@@ -243,6 +523,8 @@ struct PlainTextBody: View {
     }
 }
 
+/// A parse failure is a message state, not a floating card: it sits at the top
+/// of the body region on the same opaque page as the text it replaces.
 struct QuarantineBanner: View {
     let showingRaw: Bool
     let loadRaw: () -> Void
@@ -265,8 +547,8 @@ struct QuarantineBanner: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(12)
-        .background(.quaternary, in: RoundedRectangle(cornerRadius: AppShapeScale.compact, style: .continuous))
+        .padding(.bottom, 14)
+        .overlay(alignment: .bottom) { ReaderRegionDivider() }
         .accessibilityIdentifier(UIIdentifier.quarantineBanner)
     }
 }
@@ -333,8 +615,9 @@ struct HighlightedMessageText: NSViewRepresentable {
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSTextView, context: Context) -> CGSize? {
-        let width = proposal.width ?? MessageTypography.readingMeasure
-        nsView.textContainer?.containerSize = NSSize(width: max(width, 1), height: .greatestFiniteMagnitude)
+        let width = proposal.width ?? nsView.bounds.width
+        guard width.isFinite, width > 0 else { return nil }
+        nsView.textContainer?.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
         nsView.frame.size.width = width
         applyText(to: nsView)
         guard let container = nsView.textContainer else {

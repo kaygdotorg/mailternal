@@ -5,33 +5,45 @@ import MailternalInterfaces
 
 struct FolderSidebar: View {
     @Bindable var model: AppModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var inspectorFolder: FolderSummary?
 
     var body: some View {
+        let roots = FolderHierarchy.make(from: model.folders)
+        let specialRoots = roots.filter { $0.folder.role != .none }
+        let customRoots = roots.filter { $0.folder.role == .none }
+
         List(selection: Binding(
             get: { model.selectedFolderID },
             set: { model.selectFolder($0) }
         )) {
-            if !model.specialFolders.isEmpty {
+            if !specialRoots.isEmpty {
                 Section("Mailboxes") {
-                    ForEach(model.specialFolders) { folder in
-                        FolderRow(folder: folder, selected: folder.id == model.selectedFolderID)
-                            .tag(folder.id)
-                            .contextMenu { folderMenu(folder) }
+                    ForEach(specialRoots) { node in
+                        folderNode(node)
                     }
                 }
             }
-            if !model.customFolders.isEmpty {
+            if !customRoots.isEmpty {
                 Section("Folders") {
-                    ForEach(model.customFolders) { folder in
-                        FolderRow(folder: folder, selected: folder.id == model.selectedFolderID)
-                            .tag(folder.id)
-                            .contextMenu { folderMenu(folder) }
+                    ForEach(customRoots) { node in
+                        folderNode(node)
                     }
                 }
             }
         }
         .listStyle(.sidebar)
+        // The column's own content rests at the titlebar safe area, which is
+        // exactly where this pane's ramp starts. The margin moves the first
+        // section down to the ramp's end, so rows dissolve on their way up to
+        // the traffic lights instead of resting half-erased under them.
+        .contentMargins(.top, MailWindowDissolvePolicy.sidebar.topReach, for: .scrollContent)
+        .background {
+            ScrollEdgeEffectSuppressor()
+        }
+        .mailWindowDissolve(.sidebar)
+        .popover(item: $inspectorFolder, arrowEdge: .trailing) { folder in
+            FolderInspector(folder: folder)
+        }
         .accessibilityIdentifier(UIIdentifier.sidebar)
         .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
         .overlay {
@@ -61,6 +73,22 @@ struct FolderSidebar: View {
         }
     }
 
+    private func folderNode(_ node: FolderHierarchyNode) -> some View {
+        FolderTreeNodeView(
+            node: node,
+            selectedID: model.selectedFolderID,
+            inspectorFolder: $inspectorFolder,
+            onRefresh: {
+                Task { await model.refresh() }
+            },
+            onCopyDeepLink: model.isAccountActive
+                ? { folder in
+                    Task { await model.copyDeepLink(for: folder.id) }
+                }
+                : nil
+        )
+    }
+
     private var accountLabel: String? {
         switch model.accountState {
         case .none: nil
@@ -70,124 +98,156 @@ struct FolderSidebar: View {
         case .connectionFailed: "Offline"
         }
     }
+}
 
-    @ViewBuilder
-    private func folderMenu(_ folder: FolderSummary) -> some View {
-        Button("Refresh") {
-            Task { await model.refresh() }
+private struct FolderTreeNodeView: View {
+    let node: FolderHierarchyNode
+    let selectedID: FolderID?
+    @Binding var inspectorFolder: FolderSummary?
+    let onRefresh: () -> Void
+    let onCopyDeepLink: ((FolderSummary) -> Void)?
+    @State private var isExpanded = true
+
+    var body: some View {
+        if node.children.isEmpty {
+            decoratedRow
+        } else {
+            DisclosureGroup(isExpanded: $isExpanded) {
+                ForEach(node.children) { child in
+                    FolderTreeNodeView(
+                        node: child,
+                        selectedID: selectedID,
+                        inspectorFolder: $inspectorFolder,
+                        onRefresh: onRefresh,
+                        onCopyDeepLink: onCopyDeepLink
+                    )
+                }
+            } label: {
+                decoratedRow
+            }
         }
-        Button("Copy Folder Name") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(folder.path, forType: .string)
-        }
-        Divider()
-        Text("\(folder.unreadCount) unread of \(folder.totalCount)")
+    }
+
+    private var decoratedRow: some View {
+        FolderRow(folder: node.folder, selected: node.folder.id == selectedID)
+            .tag(node.folder.id)
+            .contextMenu {
+                Button("Get Info…") {
+                    inspectorFolder = node.folder
+                }
+                Button("Refresh", action: onRefresh)
+                Button("Copy Folder Name") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(node.folder.name, forType: .string)
+                }
+                if let onCopyDeepLink {
+                    Button("Copy Deep Link") {
+                        onCopyDeepLink(node.folder)
+                    }
+                }
+            }
     }
 }
 
 struct FolderRow: View {
     let folder: FolderSummary
     let selected: Bool
-    @State private var disclosed = true
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
+    @Environment(AccentSource.self) private var accent
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Image(systemName: folder.role.systemImage)
-                    .frame(width: 16)
-                    .foregroundStyle(.secondary)
-                Text(folder.name)
-                    .lineLimit(1)
-                Spacer(minLength: 4)
-                backfillAccessory
-                if folder.unreadCount > 0 {
-                    Text(folder.unreadCount > 99 ? "99+" : "\(folder.unreadCount)")
-                        .font(.caption2.weight(.semibold))
-                        .monospacedDigit()
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1)
-                        .foregroundStyle(badgeForeground)
-                        .background(Color.accentColor, in: Capsule())
-                        .accessibilityLabel("\(folder.unreadCount) unread")
-                }
-            }
-            if disclosed {
-                statusLine
-                    .transition(.opacity)
+        HStack(spacing: 8) {
+            Image(systemName: folder.role.systemImage)
+                .frame(width: 16)
+                .foregroundStyle(.secondary)
+            Text(folder.name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            backfillAccessory
+            if folder.unreadCount > 0 {
+                Text(folder.unreadCount > 99 ? "99+" : "\(folder.unreadCount)")
+                    .font(.caption2.weight(.semibold))
+                    .monospacedDigit()
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .foregroundStyle(badgeForeground)
+                    .background(accent.color, in: Capsule())
+                    .accessibilityLabel("\(folder.unreadCount) unread")
             }
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
-            withAnimation(reduceMotion ? MailMotion.disclosure : MailMotion.disclosure) {
-                disclosed.toggle()
-            }
-        }
+        .focusEffectDisabled(true)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(selected ? "Selected" : "")
+        // Every folder row is addressed by path in the UI tests, so the
+        // identifier belongs on the row itself, hierarchy or not.
         .accessibilityIdentifier(UIIdentifier.sidebarFolder(folder.path))
     }
 
     @ViewBuilder
     private var backfillAccessory: some View {
-        switch folder.backfill {
-        case .idle, .complete:
-            EmptyView()
-        case .syncing(let progress):
-            if let progress {
-                ProgressView(value: progress)
-                    .controlSize(.small)
-                    .frame(width: 36)
-                    .accessibilityLabel("Backfill \(Int((progress * 100).rounded())) percent")
-            } else {
-                ProgressView()
-                    .controlSize(.small)
-                    .accessibilityLabel("Backfill in progress")
-            }
-        case .halted:
-            Image(systemName: "pause.circle")
-                .foregroundStyle(.secondary)
-                .help("Backfill halted")
-        }
-    }
-
-    @ViewBuilder
-    private var statusLine: some View {
-        switch folder.backfill {
-        case .halted(let date):
-            Text("Synced through \(MailDateFormat.syncedThrough(date))")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        case .syncing(let progress):
-            Text(progress.map { "Backfilling \(Int(($0 * 100).rounded()))%" } ?? "Backfilling…")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        case .idle:
-            Text("Waiting to sync")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        case .complete:
-            EmptyView()
+        if case .syncing = folder.backfill {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityLabel("Syncing")
         }
     }
 
     private var badgeForeground: Color {
-        OutgoingForegroundPolicy.prefersBlackText(on: NSColor.controlAccentColor) ? .black : .white
+        OutgoingForegroundPolicy.prefersBlackText(on: accent.nsColor) ? .black : .white
     }
 
     private var accessibilityLabel: String {
         var parts = [folder.name]
         if folder.unreadCount > 0 { parts.append("\(folder.unreadCount) unread") }
         switch folder.backfill {
-        case .halted(let date):
-            parts.append("synced through \(MailDateFormat.syncedThrough(date))")
+        case .halted:
+            parts.append("sync halted")
         case .syncing:
             parts.append("syncing")
         default:
             break
         }
         return parts.joined(separator: ", ")
+    }
+}
+
+private struct FolderInspector: View {
+    let folder: FolderSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(folder.name)
+                .font(.headline)
+                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 7) {
+                LabeledContent("Name", value: folder.name)
+                LabeledContent("Path", value: folder.path)
+                LabeledContent("Role", value: folder.role.rawValue.capitalized)
+                LabeledContent("Messages", value: "\(folder.totalCount)")
+                LabeledContent("Unread", value: "\(folder.unreadCount)")
+                LabeledContent("Sync", value: syncDescription)
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 260, alignment: .leading)
+        .textSelection(.enabled)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(folder.name) folder information")
+    }
+
+    private var syncDescription: String {
+        switch folder.backfill {
+        case .idle:
+            "Waiting to sync"
+        case .complete:
+            "Complete"
+        case .syncing(let progress):
+            progress.map { "Syncing \(Int(($0 * 100).rounded()))%" } ?? "Syncing…"
+        case .halted(let date):
+            "Halted; synced through \(MailDateFormat.syncedThrough(date))"
+        }
     }
 }
 

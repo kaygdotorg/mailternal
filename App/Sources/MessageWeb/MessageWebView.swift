@@ -36,6 +36,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     /// Identity last loaded or queued. Skip `loadHTMLString` when unchanged.
     private var lastHTMLIdentity: DisplayedHTMLIdentity?
     private var lastProvider: PartProvider?
+    private var emailReadingMode: EmailReadingMode = .original
     private var fence: NetworkFenceState = .compiling
     private var pendingRender = false
 
@@ -72,7 +73,9 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsLinkPreview = false
-        webView.underPageBackgroundColor = .clear
+        // macOS WKWebView is opaque by default (isOpaque is get-only here);
+        // the mode-driven canvas is enforced via underPageBackgroundColor + CSS.
+        webView.underPageBackgroundColor = Self.canvasColor(for: .original)
         webView.autoresizingMask = [.width, .height]
         webView.frame = bounds
         errorLabel.autoresizingMask = [.width, .height]
@@ -99,18 +102,23 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     /// fetched until ``setRemoteImagesAllowed(_:)`` is `true`.
     ///
     /// SwiftUI `updateNSView` may call this on every observation tick. Identical
-    /// `(html hash, remoteAllowed)` is a no-op: no `loadHTMLString`, so scroll
-    /// and in-flight `mailternal-part://` fetches are preserved. Provider is
-    /// still swapped. Remote-consent changes go through
+    /// `(html hash, remoteAllowed, reading mode)` is a no-op: no
+    /// `loadHTMLString`, so scroll and in-flight `mailternal-part://` fetches are
+    /// preserved. Provider is still swapped. Remote-consent changes go through
     /// ``setRemoteImagesAllowed(_:)``, not a fresh render.
     public func render(
         html: String,
-        partProvider: @escaping @Sendable (String) async throws -> (data: Data, mimeType: String)
+        partProvider: @escaping @Sendable (String) async throws -> (data: Data, mimeType: String),
+        emailReadingMode: EmailReadingMode = .original
     ) {
         lastProvider = partProvider
         handler.update(provider: partProvider, remoteAllowed: remoteImagesAllowed)
+        let modeChanged = self.emailReadingMode != emailReadingMode
+        self.emailReadingMode = emailReadingMode
+        webView.underPageBackgroundColor = Self.canvasColor(for: emailReadingMode)
         let next = HTMLRenderIdempotence.identity(html: html, remoteAllowed: remoteImagesAllowed)
-        if HTMLRenderIdempotence.action(displayed: lastHTMLIdentity, next: next) == .skip {
+        if HTMLRenderIdempotence.action(displayed: lastHTMLIdentity, next: next) == .skip,
+           !modeChanged {
             return
         }
         lastHTML = html
@@ -167,7 +175,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             pendingRender = false
             errorLabel.isHidden = true
             webView.isHidden = false
-            webView.loadHTMLString(Self.wrap(lastHTML), baseURL: nil)
+            webView.loadHTMLString(Self.wrap(lastHTML, emailReadingMode: emailReadingMode), baseURL: nil)
         case .refuseHTML:
             pendingRender = false
             presentFenceFailure()
@@ -332,37 +340,65 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         return scheme == "about" || scheme == "applewebdata"
     }
 
-    /// Reader chrome. Semantic colors only; author colors in the HTML are not remapped.
-    /// The 490 pt measure is the viewer's frame; this CSS supplies the 20 pt inset
-    /// and body typography from `docs/spec/design.md`.
-    private static let readerCSS = """
-    html { color-scheme: light dark; background: transparent; }
-    body {
-      margin: 0; padding: 0 20px;
-      font: -apple-system-body;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
-      font-size: 13px; line-height: 18px;
-      color: -apple-system-label; background: transparent;
-      word-wrap: break-word; overflow-wrap: break-word;
-    }
-    p { margin: 0 0 10px 0; }
-    a { color: -apple-system-link; }
-    h1 { font: -apple-system-title2; margin: 0 0 10px 0; }
-    h2 { font: -apple-system-title3; margin: 0 0 10px 0; }
-    h3, h4 { font: -apple-system-headline; margin: 0 0 10px 0; }
-    blockquote {
-      margin: 0 0 10px 0; padding: 0 0 0 12px;
-      border-left: 2px solid -apple-system-separator;
-      color: -apple-system-secondary-label;
-    }
-    pre, code, kbd, samp { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
-    pre { white-space: pre-wrap; }
-    img, svg { max-width: 100%; height: auto; }
-    table { border-collapse: collapse; max-width: 100%; }
-    """
+    /// Reader chrome. Author colors in the HTML are not remapped, but the
+    /// reading canvas is always opaque so authored light or dark text has a
+    /// stable surface beneath it.
+    /// Matches the dark `NSColor.textBackgroundColor` used by
+    /// `MessageReaderSurface.page`.
+    private static let darkCanvasHex = "#1e1e1e"
 
-    private static func wrap(_ html: String) -> String {
-        let styleTag = "<meta charset=\"utf-8\"><style>\(readerCSS)</style>"
+    private static func canvasColor(for mode: EmailReadingMode) -> NSColor {
+        switch mode {
+        case .original:
+            .white
+        case .dark:
+            NSColor(calibratedWhite: 0.117647, alpha: 1)
+        }
+    }
+
+    private static func readerCSS(for mode: EmailReadingMode) -> String {
+        let colorScheme: String
+        let canvas: String
+        switch mode {
+        case .original:
+            colorScheme = "light"
+            canvas = "#ffffff"
+        case .dark:
+            colorScheme = "dark"
+            canvas = darkCanvasHex
+        }
+        return """
+        /* The canvas lives on html and stays opaque so mail that declares no
+           colors is readable; author body/background declarations must win,
+           so only color-scheme is forced. */
+        html { color-scheme: \(colorScheme) !important; background: \(canvas); }
+        body {
+          margin: 0; padding: 0 20px;
+          font: -apple-system-body;
+          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+          font-size: 13px; line-height: 18px;
+          color: -apple-system-label; background: \(canvas);
+          word-wrap: break-word; overflow-wrap: break-word;
+        }
+        p { margin: 0 0 10px 0; }
+        a { color: -apple-system-link; }
+        h1 { font: -apple-system-title2; margin: 0 0 10px 0; }
+        h2 { font: -apple-system-title3; margin: 0 0 10px 0; }
+        h3, h4 { font: -apple-system-headline; margin: 0 0 10px 0; }
+        blockquote {
+          margin: 0 0 10px 0; padding: 0 0 0 12px;
+          border-left: 2px solid -apple-system-separator;
+          color: -apple-system-secondary-label;
+        }
+        pre, code, kbd, samp { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+        pre { white-space: pre-wrap; }
+        img, svg { max-width: 100%; height: auto; }
+        table { border-collapse: collapse; max-width: 100%; }
+        """
+    }
+
+    private static func wrap(_ html: String, emailReadingMode: EmailReadingMode) -> String {
+        let styleTag = "<meta charset=\"utf-8\"><style>\(readerCSS(for: emailReadingMode))</style>"
         if let head = html.range(of: "<head", options: .caseInsensitive) {
             var cursor = head.upperBound
             var quote: Character?

@@ -1,0 +1,126 @@
+import Foundation
+import MailternalInterfaces
+
+/// What the reader may honestly say about a message envelope.
+///
+/// `Envelope` stores From, Reply-To, To, Cc, both dates, and the threading
+/// headers — and nothing else. There is no Bcc and there are no authentication
+/// results, so the reader's disclosure is called "Details" rather than "Full
+/// Headers", and a field the store never parsed simply has no row. Raw routing
+/// data stays in the separate raw-source pathway.
+enum MessageHeaderPolicy {
+    static let noSubjectPlaceholder = "(No Subject)"
+
+    struct DetailRow: Identifiable, Equatable {
+        let label: String
+        let value: String
+
+        var id: String { label }
+    }
+
+    /// Subject as shown. An empty subject is a real state, so it gets a marked
+    /// placeholder instead of a blank line in the strongest contrast role.
+    static func subject(_ raw: String) -> (text: String, isPlaceholder: Bool) {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (noSubjectPlaceholder, true)
+            : (raw, false)
+    }
+
+    /// Display name when the message carries one, otherwise the address itself.
+    static func name(of address: MailAddress) -> String {
+        guard let name = address.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty
+        else { return address.address }
+        return name
+    }
+
+    /// Name and address together. A reader is where a recipient checks whether
+    /// the two agree, so the address is never dropped for a display name.
+    static func full(_ address: MailAddress) -> String {
+        let displayName = name(of: address)
+        return displayName == address.address
+            ? address.address
+            : "\(displayName) <\(address.address)>"
+    }
+
+    static func list(_ addresses: [MailAddress]) -> String {
+        addresses.map(full).joined(separator: ", ")
+    }
+
+    /// Compact recipient line: the first recipient plus a count of the rest.
+    /// `nil` for an empty group — an absent group gets no row at all rather
+    /// than an invented "undisclosed recipients".
+    static func summary(_ addresses: [MailAddress]) -> String? {
+        guard let first = addresses.first else { return nil }
+        let rest = addresses.count - 1
+        return rest > 0 ? "\(name(of: first)) +\(rest)" : name(of: first)
+    }
+
+    /// The same summary as speech: "+3" is a visual abbreviation, not a label.
+    static func spokenSummary(_ addresses: [MailAddress]) -> String? {
+        guard let first = addresses.first else { return nil }
+        let rest = addresses.count - 1
+        return rest > 0 ? "\(name(of: first)) and \(rest) more" : name(of: first)
+    }
+
+    /// Every stored envelope field that carries a real value, in reading order.
+    static func detailRows(for envelope: Envelope) -> [DetailRow] {
+        var rows: [DetailRow] = []
+        if !envelope.from.isEmpty {
+            rows.append(DetailRow(label: "From", value: list(envelope.from)))
+        }
+        // A Reply-To that repeats From is noise, not a header the reader needs.
+        if !envelope.replyTo.isEmpty, envelope.replyTo != envelope.from {
+            rows.append(DetailRow(label: "Reply-To", value: list(envelope.replyTo)))
+        }
+        if !envelope.to.isEmpty {
+            rows.append(DetailRow(label: "To", value: list(envelope.to)))
+        }
+        if !envelope.cc.isEmpty {
+            rows.append(DetailRow(label: "Cc", value: list(envelope.cc)))
+        }
+        rows += dateRows(for: envelope)
+        if let messageID = trimmed(envelope.rfcMessageID) {
+            rows.append(DetailRow(label: "Message-ID", value: messageID))
+        }
+        if let inReplyTo = trimmed(envelope.inReplyTo) {
+            rows.append(DetailRow(label: "In-Reply-To", value: inReplyTo))
+        }
+        let references = envelope.references.compactMap(trimmed)
+        if !references.isEmpty {
+            rows.append(DetailRow(label: "References", value: references.joined(separator: "\n")))
+        }
+        return rows
+    }
+
+    /// When the message was written and when the server took delivery are two
+    /// different facts; they collapse into one row only when they agree.
+    private static func dateRows(for envelope: Envelope) -> [DetailRow] {
+        guard let headerDate = envelope.headerDate,
+              abs(headerDate.timeIntervalSince(envelope.internalDate)) >= 1
+        else {
+            return [DetailRow(label: "Date", value: MailDateFormat.envelope(envelope.internalDate))]
+        }
+        return [
+            DetailRow(label: "Sent", value: MailDateFormat.envelope(headerDate)),
+            DetailRow(label: "Received", value: MailDateFormat.envelope(envelope.internalDate)),
+        ]
+    }
+
+    /// Attachment name as shown. The IMAP part specifier is the honest fallback
+    /// when a part carries no filename.
+    static func attachmentName(_ attachment: AttachmentInfo) -> String {
+        trimmed(attachment.filename) ?? attachment.id
+    }
+
+    static func attachmentSize(_ attachment: AttachmentInfo) -> String? {
+        guard let size = attachment.sizeEstimate, size > 0 else { return nil }
+        return Int64(size).formatted(.byteCount(style: .file))
+    }
+
+    private static func trimmed(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty
+        else { return nil }
+        return value
+    }
+}
