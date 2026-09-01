@@ -40,12 +40,15 @@ targets:
       configs:
         Debug:
           ENABLE_TESTABILITY: true
+          ENABLE_APP_SANDBOX: false
+          CODE_SIGN_ENTITLEMENTS: ""
   MailternalAppTests:
     type: bundle.unit-test
     platform: macOS
     sources:
       - path: AppTests
       - path: Sources/Support/UILogic.swift
+      - path: Sources/Support/PartFetchRouting.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal.apptests

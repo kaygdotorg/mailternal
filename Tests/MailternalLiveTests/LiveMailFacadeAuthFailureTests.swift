@@ -37,7 +37,6 @@ func restorePersistedAccountMapsTerminalAuthToAuthFailed() async throws {
         container: container,
         keychain: keychain,
         enableNotifications: false,
-        clientFactory: AuthRejectingFactory()
     )
     defer {
         try? keychain.deletePassword(for: account)
@@ -57,38 +56,4 @@ func restorePersistedAccountMapsTerminalAuthToAuthFailed() async throws {
     await facade.shutdown()
 }
 
-final class AuthRejectingFactory: IMAPClientFactory, @unchecked Sendable {
-    func makeClient(endpoint: IMAPEndpoint, username: String, password: String) -> any IMAPClient {
-        AuthRejectingClient()
-    }
-}
-
-final class AuthRejectingClient: IMAPClient, @unchecked Sendable {
-    private let stream: AsyncStream<IMAPMailboxEvent>
-
-    init() {
-        stream = AsyncStream { $0.finish() }
-    }
-
-    nonisolated var events: AsyncStream<IMAPMailboxEvent> { stream }
-
-    func capabilities() async -> IMAPCapabilities { .none }
-    func selectedMailbox() async -> IMAPSelectedMailbox? { nil }
-    func connect() async throws { throw IMAPError.auth("Invalid credentials") }
-    func close() async {}
-    func listFolders() async throws -> IMAPFolderDiscovery {
-        throw IMAPError.auth("Invalid credentials")
-    }
-    func select(_ mailbox: String, qresync: IMAPQResyncSelect?) async throws -> IMAPSelectedMailbox {
-        throw IMAPError.auth("Invalid credentials")
-    }
-    func enableQResync() async throws { throw IMAPError.auth("Invalid credentials") }
-    func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
-        throw IMAPError.auth("Invalid credentials")
-    }
-    func storeSeen(uids: IMAPUIDSet) async throws { throw IMAPError.auth("Invalid credentials") }
-    func beginIdle() async throws -> IMAPIdle { throw IMAPError.auth("Invalid credentials") }
-    func endIdle() async throws { throw IMAPError.auth("Invalid credentials") }
-    func renewIdle() async throws -> IMAPIdle { throw IMAPError.auth("Invalid credentials") }
-}
 #endif

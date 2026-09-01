@@ -74,6 +74,10 @@ enum Allowlist: Sendable {
         "time": ["datetime"],
         "body": ["background", "link", "vlink", "alink", "text"],
         "svg": ["viewbox", "xmlns:xlink", "preserveaspectratio", "version"],
+        // fill/stroke/stop-color keys are listed so SVG paint attributes survive the
+        // key allowlist. VALUES are never kept verbatim: rewriteAttributes routes
+        // every paintAttributes key through CSSSanitizer.sanitizedPaint (url()/
+        // non-color rejected). See isPaintAttribute.
         "path": ["d", "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "transform", "opacity", "fill-opacity", "stroke-opacity"],
         "rect": ["x", "y", "rx", "ry", "fill", "stroke", "stroke-width", "transform", "opacity"],
         "circle": ["cx", "cy", "r", "fill", "stroke", "stroke-width", "transform", "opacity"],

@@ -41,7 +41,6 @@ final class LiveMailFacade: MailFacade {
     private var engineTasks: [Task<Void, Never>] = []
     private var foldersTask: Task<Void, Never>?
     private var didRestore = false
-    private let clientFactory: (any IMAPClientFactory)?
     private var qaMonitorTask: Task<Void, Never>?
     private let qaStartedAt = Date()
     private var qaFirstPageLogged = false
@@ -53,6 +52,7 @@ final class LiveMailFacade: MailFacade {
     private var qaPeakFootprint: Int64 = 0
     private var qaAllFoldersCompleteLogged = false
     private var qaLastSizeLog = Date.distantPast
+    private let clientFactory: (any IMAPClientFactory)?
 
     init(
         container: MailternalContainer = .default,
@@ -164,13 +164,17 @@ final class LiveMailFacade: MailFacade {
             try keychain.deletePassword(for: id)
             try? await store.deleteAccount(id)
         }
-        container.wipeAttachmentFiles()
+        // Drop UI-visible account state on the MainActor first so a multi-gig
+        // cache wipe cannot freeze an "active" account. Then await the
+        // off-main wipe so callers still finish after files are gone.
+        let attachments = container
         config = nil
         visibleFolderID = nil
         setState(.none)
         foldersContinuation.yield([])
         syncContinuation.yield(SyncStatus(mode: .fullHistory, isOnline: false))
         notifications.setBadge(0)
+        await attachments.wipeAttachmentFiles()
     }
 
     func page(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) async throws -> MessagePage {

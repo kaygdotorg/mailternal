@@ -1,4 +1,7 @@
 import Foundation
+import os
+
+private let containerLog = Logger(subsystem: "org.kayg.mailternal", category: "Container")
 
 /// On-disk layout for the live store (and therefore the sync engine).
 ///
@@ -38,13 +41,37 @@ struct MailternalContainer: Sendable {
         try FileManager.default.createDirectory(at: attachmentsDirectory, withIntermediateDirectories: true)
     }
 
-    func wipeAttachmentFiles() {
+    /// Deletes every file in `attachments/`.
+    ///
+    /// FileManager work runs on a detached utility task so a multi-gigabyte
+    /// cache cannot freeze the MainActor. The directory itself is kept.
+    /// Per-file failures are logged and do not throw.
+    nonisolated func wipeAttachmentFiles() async {
+        let directory = attachmentsDirectory
+        let failures = await Task.detached(priority: .utility) {
+            Self.removeContents(of: directory)
+        }.value
+        for failure in failures {
+            containerLog.error("attachment wipe failed: \(failure, privacy: .public)")
+        }
+    }
+
+    nonisolated private static func removeContents(of directory: URL) -> [String] {
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(at: attachmentsDirectory, includingPropertiesForKeys: nil) else {
-            return
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return []
         }
+        var failures: [String] = []
         for file in files {
-            try? fm.removeItem(at: file)
+            do {
+                try fm.removeItem(at: file)
+            } catch {
+                failures.append("\(file.lastPathComponent): \(error.localizedDescription)")
+            }
         }
+        return failures
     }
 }

@@ -347,6 +347,9 @@ func svgFillEvasionRejected() {
         #"<svg><circle fill="\75\72\6c(https://evil.example/x.png)" r="4"/></svg>"#,
         #"<svg><circle fill="URL(https://evil.example/x.png)" r="4"/></svg>"#,
         #"<svg><g fill="url('https://evil.example/x.png')"><rect width="1" height="1"/></g></svg>"#,
+        #"<svg><rect fill="url(#localGradient)" width="10" height="10"/></svg>"#,
+        #"<svg><rect fill="url(//evil.example/proto.png)" width="10" height="10"/></svg>"#,
+        #"<svg><rect fill="url(https://evil.example/x.png)" stroke="url(https://evil.example/s.png)" width="10" height="10"/></svg>"#,
     ]
     for html in samples {
         let result = HTMLSanitizer.sanitize(html)
