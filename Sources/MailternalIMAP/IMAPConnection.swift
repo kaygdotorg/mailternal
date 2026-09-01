@@ -74,9 +74,15 @@ enum IMAPTLS {
         }
         var configuration = TLSConfiguration.makeClientConfiguration()
         configuration.certificateVerification = .fullVerification
-        // System trust roots (the default). Never `.none` / empty pins.
+        if let extras = try IMAPTrust.additionalCertificates() {
+            // SecTrust (`trustRoots = .default` + additionalTrustRoots) rejects
+            // the QA self-signed leaf (no CA:TRUE). Forcing `.certificates`
+            // selects BoringSSL. Merge system anchors so extras extend,
+            // rather than replace, production roots.
+            configuration.trustRoots = .certificates(IMAPTrust.extendedTrustRoots(extras))
+        }
         let context = try NIOSSLContext(configuration: configuration)
-        return try NIOSSLClientHandler(context: context, serverHostname: host)
+        return try NIOSSLClientHandler(context: context, serverHostname: IMAPTrust.sniHostname(for: host))
     }
 
     static func upgrade(channel: Channel, hostname: String) async throws {
