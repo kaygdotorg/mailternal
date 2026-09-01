@@ -107,17 +107,34 @@ func decodeBase64(
     specifier: String?,
     cap: Int?
 ) throws -> (Data, truncated: Bool) {
-    let bytes: [UInt8] = data.withUnsafeBytes { raw in
-        Array(raw.bindMemory(to: UInt8.self))
+    let r = try decodeBase64Streaming(data, state: state, specifier: specifier, cap: cap)
+    return (r.data, truncated: r.truncated)
+}
+
+/// Cap-aware streaming base64 decode.
+///
+/// Walks `data` in place (no `Data` → `Array` copy). Output is reserved to
+/// `min(cap, 3/4 input)` and production stops as soon as `cap` is reached.
+/// `inputBytesConsumed` is the number of source octets examined — on a
+/// truncated decode this is ~`cap * 4/3`, not the full body. Cancellation is
+/// checked at least every ``MIMELimits/cancellationCheckpoint`` decoded bytes.
+func decodeBase64Streaming(
+    _ data: Data,
+    state: ParseState,
+    specifier: String?,
+    cap: Int?
+) throws -> (data: Data, truncated: Bool, inputBytesConsumed: Int) {
+    try data.withUnsafeBytes { raw in
+        let p = raw.bindMemory(to: UInt8.self)
+        let r = try decodeBase64Buffer(
+            p,
+            recordDefects: true,
+            specifier: specifier,
+            state: state,
+            cap: cap
+        )
+        return (Data(r.out), r.truncated, r.consumed)
     }
-    var broken = false
-    let decoded = decodeBase64Bytes(bytes, recordDefects: true, specifier: specifier, state: state, broken: &broken)
-    if let cap, decoded.count > cap {
-        try state.accountDecoded(cap)
-        return (Data(decoded.prefix(cap)), true)
-    }
-    try state.accountDecoded(decoded.count)
-    return (Data(decoded), false)
 }
 
 /// Shared by CTE base64 and RFC 2047 B encoding.
@@ -128,45 +145,17 @@ func decodeBase64Bytes(
     state: ParseState?,
     broken: inout Bool
 ) -> [UInt8] {
-    var out: [UInt8] = []
-    out.reserveCapacity(input.count * 3 / 4 + 4)
-    var acc: UInt32 = 0
-    var n = 0
-    var sawInvalid = false
-
-    func flushQuad() {
-        guard n > 0 else { return }
-        acc <<= UInt32(6 * (4 - n))
-        if n >= 2 { out.append(UInt8((acc >> 16) & 0xFF)) }
-        if n >= 3 { out.append(UInt8((acc >> 8) & 0xFF)) }
-        if n >= 4 { out.append(UInt8(acc & 0xFF)) }
-        acc = 0
-        n = 0
+    let result = input.withUnsafeBufferPointer { buf in
+        (try? decodeBase64Buffer(
+            buf,
+            recordDefects: recordDefects,
+            specifier: specifier,
+            state: state,
+            cap: nil
+        )) ?? (out: [], truncated: false, consumed: 0, broken: false)
     }
-
-    for b in input {
-        if b == 61 { // pad — finish
-            flushQuad()
-            break
-        }
-        if b == 32 || b == 9 || b == 10 || b == 13 { continue }
-        let v = base64Value(b)
-        if v < 0 {
-            if recordDefects && !sawInvalid {
-                state?.record(.brokenBase64, specifier: specifier, "invalid base64 alphabet")
-                sawInvalid = true
-                broken = true
-            }
-            continue
-        }
-        acc = (acc << 6) | UInt32(v)
-        n += 1
-        if n == 4 { flushQuad() }
-    }
-
-    if n > 0 { flushQuad() }
-    if recordDefects && sawInvalid { broken = true }
-    return out
+    if result.broken { broken = true }
+    return result.out
 }
 
 func decodeBase64Bytes(
@@ -177,6 +166,105 @@ func decodeBase64Bytes(
 ) -> [UInt8] {
     var broken = false
     return decodeBase64Bytes(input, recordDefects: recordDefects, specifier: specifier, state: state, broken: &broken)
+}
+
+/// Streaming base64 over a borrowed buffer. Stops at `cap` decoded bytes.
+private func decodeBase64Buffer(
+    _ p: UnsafeBufferPointer<UInt8>,
+    recordDefects: Bool,
+    specifier: String?,
+    state: ParseState?,
+    cap: Int?
+) throws -> (out: [UInt8], truncated: Bool, consumed: Int, broken: Bool) {
+    var out = [UInt8]()
+    let expected = p.count * 3 / 4
+    let reserve: Int
+    if let cap {
+        reserve = min(max(cap, 0), expected)
+    } else {
+        reserve = expected
+    }
+    out.reserveCapacity(reserve)
+    var truncated = false
+    var sawInvalid = false
+    var acc: UInt32 = 0
+    var n = 0
+    var producedSinceCheck = 0
+    var i = 0
+
+    func emit(_ b: UInt8) -> Bool {
+        if let cap, out.count >= cap {
+            truncated = true
+            return false
+        }
+        out.append(b)
+        producedSinceCheck += 1
+        return true
+    }
+
+    func flushQuad() -> Bool {
+        guard n > 0 else { return true }
+        acc <<= UInt32(6 * (4 - n))
+        if n >= 2 {
+            if !emit(UInt8((acc >> 16) & 0xFF)) {
+                acc = 0
+                n = 0
+                return false
+            }
+        }
+        if n >= 3 {
+            if !emit(UInt8((acc >> 8) & 0xFF)) {
+                acc = 0
+                n = 0
+                return false
+            }
+        }
+        if n >= 4 {
+            if !emit(UInt8(acc & 0xFF)) {
+                acc = 0
+                n = 0
+                return false
+            }
+        }
+        acc = 0
+        n = 0
+        return true
+    }
+
+    while i < p.count {
+        if truncated { break }
+        if producedSinceCheck >= MIMELimits.cancellationCheckpoint {
+            try state?.accountDecoded(producedSinceCheck)
+            producedSinceCheck = 0
+        }
+        let b = p[i]
+        i += 1
+        if b == 61 { // pad — finish the current sextets and stop
+            _ = flushQuad()
+            break
+        }
+        if b == 32 || b == 9 || b == 10 || b == 13 { continue }
+        let v = base64Value(b)
+        if v < 0 {
+            if recordDefects && !sawInvalid {
+                state?.record(.brokenBase64, specifier: specifier, "invalid base64 alphabet")
+                sawInvalid = true
+            }
+            continue
+        }
+        acc = (acc << 6) | UInt32(v)
+        n += 1
+        if n == 4 {
+            if !flushQuad() { break }
+        }
+    }
+    if !truncated && n > 0 {
+        _ = flushQuad()
+    }
+    if producedSinceCheck > 0 {
+        try state?.accountDecoded(producedSinceCheck)
+    }
+    return (out, truncated, i, sawInvalid)
 }
 
 private func base64Value(_ b: UInt8) -> Int {
