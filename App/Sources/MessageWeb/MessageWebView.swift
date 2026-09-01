@@ -33,6 +33,8 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     private let userContentController: WKUserContentController
     private var remoteImagesAllowed = false
     private var lastHTML = ""
+    /// Identity last loaded or queued. Skip `loadHTMLString` when unchanged.
+    private var lastHTMLIdentity: DisplayedHTMLIdentity?
     private var lastProvider: PartProvider?
     private var fence: NetworkFenceState = .compiling
     private var pendingRender = false
@@ -95,25 +97,62 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     /// reference (`cid:…` or an absolute `http(s)` URL) for each
     /// `mailternal-part://` token the page requests. Remote tokens are not
     /// fetched until ``setRemoteImagesAllowed(_:)`` is `true`.
+    ///
+    /// SwiftUI `updateNSView` may call this on every observation tick. Identical
+    /// `(html hash, remoteAllowed)` is a no-op: no `loadHTMLString`, so scroll
+    /// and in-flight `mailternal-part://` fetches are preserved. Provider is
+    /// still swapped. Remote-consent changes go through
+    /// ``setRemoteImagesAllowed(_:)``, not a fresh render.
     public func render(
         html: String,
         partProvider: @escaping @Sendable (String) async throws -> (data: Data, mimeType: String)
     ) {
-        lastHTML = html
         lastProvider = partProvider
         handler.update(provider: partProvider, remoteAllowed: remoteImagesAllowed)
+        let next = HTMLRenderIdempotence.identity(html: html, remoteAllowed: remoteImagesAllowed)
+        if HTMLRenderIdempotence.action(displayed: lastHTMLIdentity, next: next) == .skip {
+            return
+        }
+        lastHTML = html
+        lastHTMLIdentity = next
         requestLoad()
     }
 
     /// Re-render so consented remote tokens become fetchable through the scheme
     /// handler. The categorical network content-rule block stays active.
+    /// Does not go through ``render(html:partProvider:)``.
     public func setRemoteImagesAllowed(_ allowed: Bool) {
         guard allowed != remoteImagesAllowed else { return }
         remoteImagesAllowed = allowed
         handler.setRemoteAllowed(allowed)
-        if lastProvider != nil {
-            requestLoad()
+        guard lastProvider != nil else { return }
+        let next = HTMLRenderIdempotence.identity(html: lastHTML, remoteAllowed: allowed)
+        if HTMLRenderIdempotence.action(displayed: lastHTMLIdentity, next: next) == .skip {
+            return
         }
+        lastHTMLIdentity = next
+        requestLoad()
+    }
+
+    /// In-page find via `WKWebView.find`. JavaScript stays off.
+    /// Empty `query` clears the highlight. Always case-insensitive and wrapping.
+    @discardableResult
+    public func findInPage(_ query: String, backwards: Bool = false) async -> Bool {
+        lastFindQuery = query
+        lastFindBackwards = backwards
+        return await performFind()
+    }
+
+    private var lastFindQuery = ""
+    private var lastFindBackwards = false
+
+    private func performFind() async -> Bool {
+        let configuration = WKFindConfiguration()
+        configuration.backwards = lastFindBackwards
+        configuration.caseSensitive = false
+        configuration.wraps = true
+        let result = await webView.find(lastFindQuery, configuration: configuration)
+        return result.matchFound
     }
 
     private func requestLoad() {
@@ -272,6 +311,11 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     }
 
     public func webViewDidClose(_ webView: WKWebView) {}
+
+    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard !lastFindQuery.isEmpty else { return }
+        Task { _ = await performFind() }
+    }
 
     private func isInternalDocumentLoad(_ action: WKNavigationAction, url: URL) -> Bool {
         guard action.navigationType == .other else { return false }

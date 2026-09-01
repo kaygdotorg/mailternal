@@ -103,6 +103,9 @@ final class AppModel {
                 }
             }
             if case .none = accountState {
+                #if DEBUG
+                if QALaunch.parse() != nil { return }
+                #endif
                 SettingsWindowController.shared.show(model: self, appearance: appearance)
             }
         }
@@ -279,7 +282,11 @@ final class AppModel {
     func partProvider(for message: MessageID) -> @Sendable (String) async throws -> (data: Data, mimeType: String) {
         let box = MailFacadePartFetch(facade: facade)
         return { reference in
-            try await box.fetch(message: message, part: reference)
+            try await PartFetchRouting.dispatch(
+                reference: reference,
+                imap: { part in try await box.fetch(message: message, part: part) },
+                remote: { url in try await RemoteImageFetch.load(url) }
+            )
         }
     }
 

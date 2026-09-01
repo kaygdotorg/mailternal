@@ -6,15 +6,20 @@ import MailternalSanitizer
 typealias PartProvider = @Sendable (String) async throws -> (data: Data, mimeType: String)
 
 /// Serves `mailternal-part://` tokens. Remote tokens get a placeholder until consent.
+///
+/// Each `start` owns one unstructured `Task` in ``SchemeTaskRegistry``. `stop`
+/// cancels that task; success, failure, and cancel all remove the entry so the
+/// map cannot leak and a recycled `ObjectIdentifier` cannot inherit a stale
+/// stopped flag.
 final class PartSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     private struct State {
         var provider: PartProvider?
         var remoteAllowed = false
-        var stopped: Set<ObjectIdentifier> = []
     }
 
     private let lock = NSLock()
     private var state = State()
+    private let registry = SchemeTaskRegistry()
 
     func update(provider: PartProvider?, remoteAllowed: Bool) {
         lock.lock()
@@ -41,15 +46,19 @@ final class PartSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable
             return
         }
 
-        Task {
-            if self.isStopped(id) { return }
+        let slot = HandleSlot()
+        let task = Task {
+            defer {
+                if let handle = slot.handle { self.registry.remove(handle) }
+            }
+            if Task.isCancelled { return }
             do {
                 let (data, mime) = try await self.resolve(
                     url,
                     provider: provider,
                     remoteAllowed: remoteAllowed
                 )
-                if self.isStopped(id) { return }
+                if Task.isCancelled { return }
                 let response = URLResponse(
                     url: url,
                     mimeType: mime,
@@ -59,23 +68,18 @@ final class PartSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable
                 urlSchemeTask.didReceive(response)
                 urlSchemeTask.didReceive(data)
                 urlSchemeTask.didFinish()
+            } catch is CancellationError {
+                return
             } catch {
-                if self.isStopped(id) { return }
+                if Task.isCancelled { return }
                 urlSchemeTask.didFailWithError(error)
             }
         }
+        slot.handle = registry.register(id, task: task)
     }
 
     func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
-        lock.lock()
-        state.stopped.insert(ObjectIdentifier(urlSchemeTask))
-        lock.unlock()
-    }
-
-    private func isStopped(_ id: ObjectIdentifier) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return state.stopped.contains(id)
+        registry.stop(ObjectIdentifier(urlSchemeTask))
     }
 
     private func resolve(
@@ -83,27 +87,28 @@ final class PartSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable
         provider: PartProvider?,
         remoteAllowed: Bool
     ) async throws -> (Data, String) {
+        try Task.checkCancellation()
         guard let reference = PartURL.decode(url) else {
             throw URLError(.badURL)
         }
         if reference.isRemote, !remoteAllowed {
             return (Self.placeholderPNG, "image/png")
         }
-        return try await PartFetchRouting.dispatch(
-            reference: reference.providerKey,
-            imap: { key in
-                guard let provider else {
-                    throw URLError(.resourceUnavailable)
-                }
-                return try await provider(key)
-            },
-            remote: { url in try await RemoteImageFetch.load(url) }
-        )
+        guard let provider else {
+            throw URLError(.resourceUnavailable)
+        }
+        let part = try await provider(reference.providerKey)
+        try Task.checkCancellation()
+        return (part.data, part.mimeType)
     }
 
     /// 1x1 transparent PNG used as the blocked-remote placeholder.
     private static let placeholderPNG = Data(base64Encoded:
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
     )!
+}
+
+private final class HandleSlot: @unchecked Sendable {
+    var handle: SchemeTaskHandle?
 }
 #endif

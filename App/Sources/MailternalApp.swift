@@ -21,6 +21,12 @@ struct MailternalApp: App {
             return MockMailFacade()
         }
         do {
+            #if DEBUG
+            if let qa = try QALaunch.makeFacade() {
+                QALaunch.log("live facade container=\(QALaunch.parse()?.containerRoot.path ?? "")")
+                return qa
+            }
+            #endif
             return try LiveMailFacade()
         } catch {
             fatalError("Could not open the Mailternal store: \(error)")
@@ -80,7 +86,16 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        if QALaunch.parse() != nil {
+            // SSH/headless: no WindowServer. Don't activate a UI session.
+            NSApp.setActivationPolicy(.prohibited)
+        } else {
+            NSApp.setActivationPolicy(.regular)
+        }
+        #else
         NSApp.setActivationPolicy(.regular)
+        #endif
         if let model = Self.pendingModel, let appearance = Self.pendingAppearance {
             self.model = model
             self.appearance = appearance
@@ -88,6 +103,17 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        if QALaunch.parse() != nil {
+            // SwiftUI `.task` on MainSplitRoot may never fire without a rendered
+            // window. Drive restore/engine from the delegate instead.
+            QALaunch.log(
+                "headless launch pid=\(ProcessInfo.processInfo.processIdentifier) footprint=\(QALaunch.footprintBytes())"
+            )
+            model?.start()
+            return
+        }
+        #endif
         showMainWindow()
     }
 
