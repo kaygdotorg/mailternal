@@ -36,6 +36,7 @@ let package = Package(
         ]),
         .target(name: "MailternalSync", dependencies: [
             "MailternalInterfaces", "MailternalIMAP", "MailternalMIME", "MailternalStore",
+            "MailternalSanitizer",
         ]),
         .testTarget(name: "MailternalIMAPTests", dependencies: [
             "MailternalIMAP",
@@ -47,6 +48,38 @@ let package = Package(
                     resources: [.copy("Corpus")]),
         .testTarget(name: "MailternalStoreTests", dependencies: ["MailternalStore"]),
         .testTarget(name: "MailternalSanitizerTests", dependencies: ["MailternalSanitizer"]),
-        .testTarget(name: "MailternalSyncTests", dependencies: ["MailternalSync"]),
+        .testTarget(name: "MailternalSyncTests", dependencies: [
+            "MailternalSync", "MailternalStore", "MailternalIMAP", "MailternalInterfaces",
+        ]),
     ]
 )
+
+#if os(macOS)
+package.targets.append(contentsOf: [
+    .target(
+        name: "MailternalLive",
+        dependencies: [
+            "MailternalInterfaces",
+            "MailternalIMAP",
+            "MailternalStore",
+            "MailternalSync",
+        ],
+        path: "App/Sources",
+        sources: [
+            "Live/LiveMailFacade.swift",
+            "Live/MailternalContainer.swift",
+            "Live/LiveNotifications.swift",
+            "Live/QAIMAPTrust.swift",
+            "Support/KeychainStore.swift",
+        ]
+    ),
+    .testTarget(
+        name: "MailternalLiveTests",
+        dependencies: [
+            "MailternalLive",
+            "MailternalInterfaces",
+            "MailternalIMAP",
+        ]
+    ),
+])
+#endif

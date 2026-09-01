@@ -73,31 +73,38 @@ final class AppModel {
         streamsStarted = true
         Task { [weak self] in
             guard let self else { return }
-            for await state in facade.accountStateStream {
-                applyAccountState(state)
+            if let live = facade as? LiveMailFacade {
+                await live.restorePersistedAccount()
             }
-        }
-        Task { [weak self] in
-            guard let self else { return }
-            for await folders in facade.foldersStream {
-                self.folders = folders
-                if selectedFolderID == nil, let inbox = folders.first(where: { $0.role == .inbox }) {
-                    selectFolder(inbox.id)
-                } else if let selectedFolderID, folders.contains(where: { $0.id == selectedFolderID }) {
-                    // keep
-                } else if let first = folders.first {
-                    selectFolder(first.id)
+            applyAccountState(facade.accountState)
+            Task { [weak self] in
+                guard let self else { return }
+                for await state in facade.accountStateStream {
+                    applyAccountState(state)
                 }
             }
-        }
-        Task { [weak self] in
-            guard let self else { return }
-            for await status in facade.syncStatusStream {
-                syncStatus = status
+            Task { [weak self] in
+                guard let self else { return }
+                for await folders in facade.foldersStream {
+                    self.folders = folders
+                    if selectedFolderID == nil, let inbox = folders.first(where: { $0.role == .inbox }) {
+                        selectFolder(inbox.id)
+                    } else if let selectedFolderID, folders.contains(where: { $0.id == selectedFolderID }) {
+                        // keep
+                    } else if let first = folders.first {
+                        selectFolder(first.id)
+                    }
+                }
             }
-        }
-        if case .none = accountState {
-            SettingsWindowController.shared.show(model: self, appearance: appearance)
+            Task { [weak self] in
+                guard let self else { return }
+                for await status in facade.syncStatusStream {
+                    syncStatus = status
+                }
+            }
+            if case .none = accountState {
+                SettingsWindowController.shared.show(model: self, appearance: appearance)
+            }
         }
     }
 
@@ -129,6 +136,7 @@ final class AppModel {
     func selectFolder(_ id: FolderID?) {
         guard selectedFolderID != id else { return }
         selectedFolderID = id
+        (facade as? LiveMailFacade)?.reportVisibleFolder(id)
         selectedMessageID = nil
         detail = nil
         rawSource = nil

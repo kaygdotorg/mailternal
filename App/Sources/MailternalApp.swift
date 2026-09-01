@@ -10,10 +10,21 @@ struct MailternalApp: App {
 
     init() {
         let appearance = AppearanceSettings()
-        let model = AppModel(facade: MockMailFacade(), appearance: appearance)
+        let model = AppModel(facade: Self.makeFacade(), appearance: appearance)
         _appearance = State(initialValue: appearance)
         _model = State(initialValue: model)
         MailternalAppDelegate.bootstrap(model: model, appearance: appearance)
+    }
+
+    private static func makeFacade() -> any MailFacade {
+        if ProcessInfo.processInfo.arguments.contains("-mock") {
+            return MockMailFacade()
+        }
+        do {
+            return try LiveMailFacade()
+        } catch {
+            fatalError("Could not open the Mailternal store: \(error)")
+        }
     }
 
     var body: some Scene {
@@ -87,6 +98,17 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let live = model?.facade as? LiveMailFacade else {
+            return .terminateNow
+        }
+        Task {
+            await live.shutdown()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func showMainWindow() {
