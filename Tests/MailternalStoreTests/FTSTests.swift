@@ -88,3 +88,19 @@ import Testing
         #expect(try await store.search("   ", limit: 10).isEmpty)
     }
 }
+
+@Test func searchQueryPlanUsesFTSIndex() async throws {
+    try await withStore { store, _ in
+        let (_, _, generation) = try await seedInbox(store)
+        _ = try await store.upsertMessages([
+            makeMessage(generation: generation, uid: 1, subject: "alpha", body: "needle token"),
+        ])
+        let plan = try await store.explainSearchQueryPlan("needle", limit: 10)
+        let upper = plan.uppercased()
+        #expect(upper.contains("MESSAGES_FTS"), "\(plan)")
+        let scannedMessages = upper.split(separator: "\n").contains { line in
+            line.contains("SCAN MESSAGES") && !line.contains("FTS") && !line.contains("USING INDEX") && !line.contains("VIRTUAL")
+        }
+        #expect(!scannedMessages, "\(plan)")
+    }
+}

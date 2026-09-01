@@ -141,6 +141,17 @@ extension MailStore {
         }
     }
 
+    /// `EXPLAIN QUERY PLAN` for the pagination SELECT. Locks the keyset index.
+    public func explainPageQueryPlan(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int
+    ) async throws -> String {
+        try await read { db in
+            try MailStore.explainPage(db, folder: folder, after: cursor, limit: limit)
+        }
+    }
+
     /// ValueObservation of the visible page window (spec: sync.md Storage).
     public func observePage(
         in folder: FolderID,
@@ -248,8 +259,9 @@ extension MailStore {
             SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date, m.uid,
                    m.is_read, m.has_attachments
             FROM messages m
-            JOIN folders f ON f.live_generation_id = m.generation_id
-            WHERE f.id = ?
+            WHERE m.generation_id = (
+                SELECT live_generation_id FROM folders WHERE id = ? AND retired = 0
+            )
             """
         var arguments: StatementArguments = [folder.rawValue]
         if let cursor {
@@ -273,6 +285,37 @@ extension MailStore {
             )
         }
         return MessagePage(rows: mapped, next: next)
+    }
+
+    static func explainPage(
+        _ db: Database,
+        folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int
+    ) throws -> String {
+        let cap = max(limit, 0)
+        var sql = """
+            SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date, m.uid,
+                   m.is_read, m.has_attachments
+            FROM messages m
+            WHERE m.generation_id = (
+                SELECT live_generation_id FROM folders WHERE id = ? AND retired = 0
+            )
+            """
+        var arguments: StatementArguments = [folder.rawValue]
+        if let cursor {
+            let t = cursor.internalDate.timeIntervalSince1970
+            let uid = Int64(cursor.uid.rawValue)
+            sql += " AND (m.internal_date < ? OR (m.internal_date = ? AND m.uid < ?))"
+            arguments += [t, t, uid]
+        }
+        sql += " ORDER BY m.internal_date DESC, m.uid DESC LIMIT ?"
+        arguments += [cap + 1]
+        let rows = try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
+        return rows.map { row -> String in
+            if let detail: String = row["detail"] { return detail }
+            return row.map { String(describing: $0.1) }.joined(separator: " | ")
+        }.joined(separator: "\n")
     }
 
     static func messageRow(from row: Row, preview: String) -> MessageRow {
