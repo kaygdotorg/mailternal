@@ -22,6 +22,7 @@ let package = Package(
         .target(name: "MailternalIMAP", dependencies: [
             "MailternalInterfaces",
             .product(name: "NIO", package: "swift-nio"),
+            .product(name: "NIOTLS", package: "swift-nio"),
             .product(name: "NIOSSL", package: "swift-nio-ssl"),
             .product(name: "NIOIMAP", package: "swift-nio-imap"),
         ]),
