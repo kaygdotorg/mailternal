@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+	<dict>
+		<key>name</key>
+		<string>iCloud</string>
+		<key>host</key>
+		<string>imap.mail.me.com</string>
+		<key>port</key>
+		<integer>993</integer>
+		<key>security</key>
+		<string>implicitTLS</string>
+		<key>usernameHint</key>
+		<string>Your Apple Account email</string>
+		<key>guidance</key>
+		<string>Create an app-specific password at appleid.apple.com. Two-factor authentication is required; the account password will not work.</string>
+		<key>smtpHost</key>
+		<string>smtp.mail.me.com</string>
+		<key>smtpPort</key>
+		<integer>587</integer>
+		<key>smtpSecurity</key>
+		<string>startTLS</string>
+	</dict>
+	<dict>
+		<key>name</key>
+		<string>Fastmail</string>
+		<key>host</key>
+		<string>imap.fastmail.com</string>
+		<key>port</key>
+		<integer>993</integer>
+		<key>security</key>
+		<string>implicitTLS</string>
+		<key>usernameHint</key>
+		<string>Your Fastmail email address</string>
+		<key>guidance</key>
+		<string>Create an app-specific password in Fastmail → Privacy &amp; Security → Integrations. The account password will not work with IMAP.</string>
+		<key>smtpHost</key>
+		<string>smtp.fastmail.com</string>
+		<key>smtpPort</key>
+		<integer>587</integer>
+		<key>smtpSecurity</key>
+		<string>startTLS</string>
+	</dict>
+</array>
+</plist>
