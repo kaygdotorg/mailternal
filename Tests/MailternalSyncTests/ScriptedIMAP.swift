@@ -39,6 +39,12 @@ final class ScriptedWorld: @unchecked Sendable {
     private var flagFallbackEntered = false
     private var flagFallbackReturned = false
     private var flagFallbackWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Pauses the fallback STORE phase so stop() can be tested while the
+    /// archive write gate is held.
+    var pauseArchiveStore = false
+    private var archiveStoreReleased = false
+    private var archiveStoreEntered = false
+    private var archiveStoreWaiters: [CheckedContinuation<Void, Never>] = []
     init(
         capabilities: IMAPCapabilities,
         folders: [IMAPMailbox],
@@ -314,6 +320,58 @@ final class ScriptedWorld: @unchecked Sendable {
             waiter.resume()
         }
     }
+    func archiveStorePauseIfNeeded() async throws {
+        let alreadyReleased = captureArchiveStorePause()
+        guard alreadyReleased != nil else { return }
+        if alreadyReleased == true { return }
+        try await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if registerArchiveStoreWaiter(continuation) {
+                    continuation.resume()
+                }
+            }
+        }, onCancel: {
+            releaseArchiveStore()
+        })
+        try Task.checkCancellation()
+    }
+
+    private func captureArchiveStorePause() -> Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard pauseArchiveStore else { return nil }
+        archiveStoreEntered = true
+        return archiveStoreReleased
+    }
+
+    private func registerArchiveStoreWaiter(
+        _ continuation: CheckedContinuation<Void, Never>
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if archiveStoreReleased || Task.isCancelled {
+            return true
+        }
+        archiveStoreWaiters.append(continuation)
+        return false
+    }
+
+    func archiveStoreDidEnter() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return archiveStoreEntered
+    }
+
+    func releaseArchiveStore() {
+        lock.lock()
+        archiveStoreReleased = true
+        let waiters = archiveStoreWaiters
+        archiveStoreWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
 
 
 
@@ -435,6 +493,12 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func capabilities() async -> IMAPCapabilities { world.snapshotCapabilities() }
+    func connect() async throws {
+        if let connectError { throw connectError }
+        if let error = world.connectFailure() { throw error }
+        connected = true
+        closed = false
+    }
     func selectedMailbox() async -> IMAPSelectedMailbox? {
         guard let selectedPath else { return nil }
         return makeSelected(world.mailbox(selectedPath), name: selectedPath)
@@ -444,16 +508,11 @@ actor ScriptedIMAPClient: IMAPClient {
 
     func wasClosed() -> Bool { closed }
 
-    func connect() async throws {
-        if let connectError { throw connectError }
-        if let error = world.connectFailure() { throw error }
-        connected = true
-        closed = false
-    }
-
     func close() async {
-        // Closing a client must not strand a fetch paused by the test gate.
+        // Closing a client must not strand a fetch or archive phase paused by
+        // the test gates.
         world.releaseFlagFallback()
+        world.releaseArchiveStore()
         connected = false
         closed = true
         idleContinuation?.finish()
@@ -559,6 +618,7 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func storeDeleted(uids: IMAPUIDSet) async throws {
+        try await world.archiveStorePauseIfNeeded()
         if let error = world.mutationError("STORE") { throw error }
         guard let selectedPath else { return }
         world.applyStoreDeleted(path: selectedPath, uids: uids)

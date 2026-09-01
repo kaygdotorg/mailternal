@@ -64,10 +64,39 @@ extension MailStore {
         }
     }
 
-    /// Tagged `OK`: dequeue an archive operation.
+    /// Tagged `OK`: dequeue an archive operation and clear any row that
+    /// arrived from a concurrent FETCH while this operation was pending.
     public func deleteArchiveOp(_ op: ArchiveOp) async throws {
         try await write { db in
+            let present = try Int.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM archive_queue WHERE id = ?)",
+                arguments: [op.id]
+            ) == 1
+            guard present else { return }
             try db.execute(sql: "DELETE FROM archive_queue WHERE id = ?", arguments: [op.id])
+            try db.execute(
+                sql: """
+                    DELETE FROM messages
+                    WHERE uid = ?
+                      AND generation_id IN (
+                        SELECT id FROM generations
+                        WHERE folder_id = ? AND uid_validity = ?
+                      )
+                    """,
+                arguments: [Int64(op.uid.rawValue), op.folder.rawValue, Int64(op.uidValidity)]
+            )
+        }
+    }
+
+    /// Persists that the fallback COPY completed. The remaining STORE and
+    /// EXPUNGE phases are safe to retry after a process restart.
+    public func markArchiveCopied(_ op: ArchiveOp) async throws {
+        try await write { db in
+            try db.execute(
+                sql: "UPDATE archive_queue SET copied = 1 WHERE id = ?",
+                arguments: [op.id]
+            )
         }
     }
 
@@ -87,8 +116,10 @@ extension MailStore {
     ) throws {
         try db.execute(
             sql: """
-                INSERT INTO archive_queue (account_id, folder_id, uid_validity, uid, enqueued_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO archive_queue (
+                    account_id, folder_id, uid_validity, uid, enqueued_at, copied
+                )
+                VALUES (?, ?, ?, ?, ?, 0)
                 ON CONFLICT(account_id, folder_id, uid_validity, uid) DO NOTHING
                 """,
             arguments: [
@@ -115,6 +146,37 @@ extension MailStore {
     }
 
     static func dropStaleArchive(_ db: Database, folder: FolderID) throws {
+        let rows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT account_id, uid_validity, uid
+                FROM archive_queue
+                WHERE folder_id = ?
+                  AND uid_validity != COALESCE(
+                    (SELECT g.uid_validity
+                     FROM folders f
+                     JOIN generations g ON g.id = f.live_generation_id
+                     WHERE f.id = ?),
+                    -1
+                  )
+                """,
+            arguments: [folder.rawValue, folder.rawValue]
+        )
+        for row in rows {
+            let account: String = row["account_id"]
+            let uidValidity: Int64 = row["uid_validity"]
+            let uid: Int64 = row["uid"]
+            try MailStore.insertError(
+                db,
+                StoreLogEntry(
+                    kind: .archive,
+                    account: AccountID(rawValue: account),
+                    folder: folder,
+                    uid: IMAPUID(rawValue: UInt32(uid)),
+                    message: "stale UIDVALIDITY \(uidValidity)"
+                )
+            )
+        }
         try db.execute(
             sql: """
                 DELETE FROM archive_queue
@@ -139,7 +201,9 @@ extension MailStore {
             account: AccountID(rawValue: row["account_id"]),
             folder: FolderID(rawValue: row["folder_id"]),
             uidValidity: UInt32(uidValidity),
-            uid: IMAPUID(rawValue: UInt32(uid))
+            uid: IMAPUID(rawValue: UInt32(uid)),
+            copied: row["copied"]
         )
     }
+
 }

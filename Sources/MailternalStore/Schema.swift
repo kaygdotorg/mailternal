@@ -49,6 +49,11 @@ enum Schema {
             }
             try db.execute(sql: "CREATE INDEX archive_queue_send_idx ON archive_queue(enqueued_at, id)")
         }
+        migrator.registerMigration("v5_archive_copied") { db in
+            try db.alter(table: "archive_queue") { t in
+                t.add(column: "copied", .boolean).notNull().defaults(to: false)
+            }
+        }
         return migrator
     }
 

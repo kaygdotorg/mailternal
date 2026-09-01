@@ -370,6 +370,24 @@ extension MailStore {
 
     static func upsertMessage(_ db: Database, _ message: IncomingMessage) throws {
         let genID = try requireGenerationID(db, message.generation)
+        // A FETCH captured before enqueueArchive must not resurrect the
+        // optimistically hidden message. The queue entry is checked in the same
+        // writer transaction as this upsert, so either ordering is safe.
+        let pendingArchive = try Int.fetchOne(
+            db,
+            sql: """
+                SELECT EXISTS(
+                    SELECT 1 FROM archive_queue
+                    WHERE folder_id = ? AND uid_validity = ? AND uid = ?
+                )
+                """,
+            arguments: [
+                message.generation.folder.rawValue,
+                Int64(message.generation.uidValidity),
+                Int64(message.uid.rawValue),
+            ]
+        ) == 1
+        if pendingArchive { return }
         let env = message.envelope
         let fromJSON = try StoreJSON.encode(env.from)
         let toJSON = try StoreJSON.encode(env.to)
