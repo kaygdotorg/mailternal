@@ -1647,6 +1647,13 @@ public actor SyncEngine {
                         uids: uids
                     )
                 }
+                // The MOVE/EXPUNGE just removed this UID from the source
+                // mailbox: it is an expunge we performed ourselves. Bump the
+                // folder's expunge revision so an ingest window whose FETCH
+                // was captured before this removal cannot commit stale rows
+                // that would resurrect the archived message locally
+                // (invariant documented on `expungeRevision`).
+                expungeRevision[op.folder, default: 0] &+= 1
                 try await store.deleteArchiveOp(op)
             } catch SyncChannelError.staleMailbox {
                 try await store.dropStaleArchive(folder: op.folder)
