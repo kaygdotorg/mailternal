@@ -48,7 +48,7 @@ struct LiveIMAPClient: IMAPClient {
 }
 
 package struct LiveIMAPClientFactory: IMAPClientFactory {
-    func makeClient(endpoint: IMAPEndpoint, username: String, password: String) -> any IMAPClient {
+    package func makeClient(endpoint: IMAPEndpoint, username: String, password: String) -> any IMAPClient {
         LiveIMAPClient(session: IMAPSession(endpoint: endpoint, username: username, password: password))
     }
 }

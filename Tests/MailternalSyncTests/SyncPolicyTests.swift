@@ -103,3 +103,15 @@ import Testing
     let ordered = SyncPolicy.sortFolders([other, archive, inbox])
     #expect(ordered.map(\.role) == [.inbox, .archive, .none])
 }
+
+@Test func flagSweepWindowsAreBoundedAscendingChunks() {
+    #expect(SyncPolicy.flagSweepWindows(uidNext: 1).isEmpty)
+    #expect(SyncPolicy.flagSweepWindows(uidNext: 0).isEmpty)
+    #expect(SyncPolicy.flagSweepWindows(uidNext: 6, windowSize: 2) == [1...2, 3...4, 5...5])
+    #expect(SyncPolicy.flagSweepWindows(uidNext: 5, windowSize: 10) == [1...4])
+    #expect(
+        SyncPolicy.flagSweepWindows(uidNext: 100_001, windowSize: 50_000)
+            == [1...50_000, 50_001...100_000]
+    )
+    #expect(SyncPolicy.flagSweepWindowSize == 5000)
+}

@@ -899,3 +899,182 @@ import Testing
         await second.stop()
     }
 }
+
+@Test func engineSurfacesTerminalAuthFailureAndStopsRetrying() async throws {
+    try await withSyncStore { store, dir in
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": ScriptedMailbox(path: "INBOX")]
+        )
+        world.setConnectError(IMAPError.auth("Invalid credentials"))
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: FixedDisk(freeBytes: 50 * 1024 * 1024 * 1024, volumeBytes: 100 * 1024 * 1024 * 1024),
+            clock: { Date() },
+            settings: testSettings(dir: dir)
+        )
+        let seen = EventCountLog()
+        let stream = await engine.failures
+        let collector = Task {
+            for await failure in stream {
+                if case .authentication = failure { seen.append(1) }
+            }
+        }
+        await engine.start()
+        try await waitUntil(timeout: .seconds(2)) { seen.snapshot().contains(1) }
+        try await Task.sleep(for: .milliseconds(400))
+        #expect(world.snapshotConnectAttempts() == 1)
+        await engine.stop()
+        collector.cancel()
+    }
+}
+
+@Test func seenDrainDropsStoreWhenSelectUIDValidityDiffers() async throws {
+    try await withSyncStore { store, dir in
+        var box = ScriptedMailbox(path: "INBOX", uidValidity: 3, uidNext: 2, highestModSeq: 4)
+        box.messages[1] = makePlainMessage(uid: 1, subject: "orig")
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date() },
+            settings: testSettings(dir: dir)
+        )
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            try await store.fetchFolders(account: sampleConfig().id)
+                .contains { $0.role == .inbox && $0.backfill == .complete && $0.totalCount == 1 }
+        }
+        world.updateMailbox("INBOX") { live in
+            live.uidValidity = 99
+            live.uidNext = 2
+            live.messages = [
+                1: makePlainMessage(uid: 1, subject: "replacement", flags: []),
+            ]
+        }
+        let folders = try await store.fetchFolders(account: sampleConfig().id)
+        let inbox = try #require(folders.first { $0.role == .inbox })
+        try await store.enqueueSeen(
+            account: sampleConfig().id,
+            folder: inbox.id,
+            uidValidity: 3,
+            uid: IMAPUID(rawValue: 1)
+        )
+        try await waitUntil(timeout: .seconds(3)) {
+            try await store.snapshotSeenQueue().isEmpty
+        }
+        #expect(world.seenUIDs().isEmpty)
+        await engine.stop()
+    }
+}
+
+@Test func ingestWindowDiscardsWhenGenerationChangesMidFetch() async throws {
+    try await withSyncStore { store, dir in
+        var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 5, highestModSeq: 2)
+        for n in 1...4 {
+            let uid = UInt32(n)
+            box.messages[uid] = makePlainMessage(uid: uid, subject: "g1-\(uid)", body: "body-\(uid)")
+        }
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        world.fetchNanos = 400_000_000
+        world.stallFetchesAfter = 0
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date() },
+            settings: testSettings(dir: dir, window: 2)
+        )
+        await engine.start()
+        try await waitUntil(timeout: .seconds(2)) { world.snapshotFetchCount() >= 1 }
+        let folders = try await store.fetchFolders(account: sampleConfig().id)
+        let inbox = try #require(folders.first { $0.role == .inbox })
+        let captured = try #require(await store.liveGeneration(for: inbox.id))
+        #expect(captured.uidValidity == 1)
+        let capturedState = try await store.fetchSyncState(for: captured)
+        _ = try await store.createReplacementGeneration(
+            folder: inbox.id,
+            uidValidity: 99,
+            baselineUID: capturedState?.baselineUID
+        )
+        try await store.activateReplacementGeneration(folder: inbox.id)
+        try await Task.sleep(for: .milliseconds(600))
+        await engine.stop()
+
+        let old = MailboxGeneration(folder: inbox.id, uidValidity: 1)
+        let oldUIDs = try await store.uids(in: old).map(\.rawValue)
+        #expect(!oldUIDs.contains(3))
+        #expect(!oldUIDs.contains(4))
+        let oldState = try await store.fetchSyncState(for: old)
+        #expect(oldState?.lowWaterUID == nil)
+        let live = try #require(await store.liveGeneration(for: inbox.id))
+        #expect(live.uidValidity == 99)
+        #expect(try await store.uids(in: live).isEmpty)
+    }
+}
+
+@Test func basicPathReconcileExpungesInBoundedWindows() async throws {
+    try await withSyncStore { store, dir in
+        var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 6, highestModSeq: 2)
+        for n in 1...5 {
+            let uid = UInt32(n)
+            box.messages[uid] = makePlainMessage(uid: uid, subject: "keep-\(uid)")
+        }
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date() },
+            settings: testSettings(dir: dir, window: 2, flagSweep: 2)
+        )
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            try await store.fetchFolders(account: sampleConfig().id)
+                .contains { $0.role == .inbox && $0.backfill == .complete && $0.totalCount == 5 }
+        }
+        world.updateMailbox("INBOX") { live in
+            live.messages.removeValue(forKey: 2)
+            live.messages.removeValue(forKey: 5)
+        }
+        world.resetFlagFetchRanges()
+        await engine.refreshNow()
+        try await waitUntil(timeout: .seconds(5)) {
+            try await store.fetchFolders(account: sampleConfig().id)
+                .contains { $0.role == .inbox && $0.totalCount == 3 }
+        }
+        let folders = try await store.fetchFolders(account: sampleConfig().id)
+        let inbox = try #require(folders.first { $0.role == .inbox })
+        let generation = try #require(await store.liveGeneration(for: inbox.id))
+        #expect(try await store.uids(in: generation).map(\.rawValue) == [1, 3, 4])
+        let sweeps = world.snapshotFlagFetchRanges()
+        #expect(sweeps.contains { $0 == [1...2] })
+        #expect(sweeps.contains { $0 == [3...4] })
+        #expect(sweeps.contains { $0 == [5...5] })
+        #expect(!sweeps.contains { $0 == [1...5] })
+        await engine.stop()
+    }
+}
