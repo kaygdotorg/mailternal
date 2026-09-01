@@ -93,17 +93,23 @@ struct AccountSetupForm: View {
 
             Section("Account") {
                 TextField("Display Name", text: $displayName)
+                    .accessibilityIdentifier(UIIdentifier.setupDisplayName)
                 TextField("Email Address", text: $email)
                     .textContentType(.username)
+                    .accessibilityIdentifier(UIIdentifier.setupEmail)
                 TextField("Username", text: $username)
                     .textContentType(.username)
+                    .accessibilityIdentifier(UIIdentifier.setupUsername)
                 SecureField("Password", text: $password)
                     .textContentType(.password)
+                    .accessibilityIdentifier(UIIdentifier.setupPassword)
             }
 
             Section("IMAP") {
                 TextField("Host", text: $host)
+                    .accessibilityIdentifier(UIIdentifier.setupHost)
                 TextField("Port", text: $port)
+                    .accessibilityIdentifier(UIIdentifier.setupPort)
                 Picker("Security", selection: Binding(
                     get: { security.rawValue },
                     set: { security = IMAPEndpoint.Security(rawValue: $0) ?? .implicitTLS }
@@ -394,6 +400,7 @@ final class SettingsWindowController: NSWindowController {
             )
             window.contentViewController = split
             window.title = ""
+            window.setAccessibilityIdentifier(UIIdentifier.settingsWindow)
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.toolbarStyle = .unified

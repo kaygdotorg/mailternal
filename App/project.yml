@@ -37,3 +37,58 @@ targets:
         INFOPLIST_KEY_NSHumanReadableCopyright: "AGPLv3"
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
         INFOPLIST_KEY_NSUserNotificationsUsageDescription: "Mailternal notifies you when new mail arrives."
+      configs:
+        Debug:
+          ENABLE_TESTABILITY: true
+  MailternalAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: AppTests
+      - path: Sources/Support/UILogic.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal.apptests
+        GENERATE_INFOPLIST_FILE: true
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        BUNDLE_LOADER: ""
+        TEST_HOST: ""
+  MailternalUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: UITests
+      - path: Sources/Support/UILogic.swift
+    dependencies:
+      - target: Mailternal
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal.uitests
+        TEST_TARGET_NAME: Mailternal
+        GENERATE_INFOPLIST_FILE: true
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+schemes:
+  Mailternal:
+    shared: true
+    build:
+      targets:
+        Mailternal: all
+        MailternalAppTests: [test]
+        MailternalUITests: [test]
+    run:
+      config: Debug
+      commandLineArguments:
+        "-mock": true
+    test:
+      config: Debug
+      commandLineArguments:
+        "-mock": true
+      targets:
+        - MailternalAppTests
+        - MailternalUITests

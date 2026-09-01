@@ -150,7 +150,7 @@ final class AppModel {
         guard let id else { return }
         observeTask = Task { [weak self] in
             guard let self else { return }
-            for await page in facade.observePage(in: id, after: nil, limit: Self.pageSize) {
+            for await page in facade.observePage(in: id, after: nil, limit: MessageListPrefetch.pageSize) {
                 guard !Task.isCancelled, selectedFolderID == id else { return }
                 applyFirstPage(page)
                 isLoadingList = false
@@ -162,8 +162,12 @@ final class AppModel {
     }
 
     func loadMoreIfNeeded(near row: Int) {
-        guard !isPaging, listCursor != nil, let folder = selectedFolderID else { return }
-        guard row >= listRows.count - Self.prefetchMargin else { return }
+        guard MessageListPrefetch.shouldLoadMore(
+            near: row,
+            loadedCount: listRows.count,
+            hasMore: listCursor != nil,
+            isPaging: isPaging
+        ), let folder = selectedFolderID else { return }
         isPaging = true
         pageTask?.cancel()
         let cursor = listCursor
@@ -171,7 +175,7 @@ final class AppModel {
             guard let self else { return }
             defer { isPaging = false }
             do {
-                let page = try await facade.page(in: folder, after: cursor, limit: Self.pageSize)
+                let page = try await facade.page(in: folder, after: cursor, limit: MessageListPrefetch.pageSize)
                 guard !Task.isCancelled, selectedFolderID == folder else { return }
                 appendPage(page)
             } catch {
@@ -318,8 +322,6 @@ final class AppModel {
         return selectedFolderID
     }
 
-    private static let pageSize = 80
-    private static let prefetchMargin = 24
 }
 
 private struct MailFacadePartFetch: @unchecked Sendable {

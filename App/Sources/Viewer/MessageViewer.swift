@@ -27,6 +27,7 @@ struct MessageViewer: View {
         }
         .animation(MailMotion.disclosure, value: model.isFindPresented)
         .focusScope(viewerFocus)
+        .accessibilityIdentifier(UIIdentifier.messageViewer)
         .onExitCommand {
             if model.isFindPresented {
                 model.isFindPresented = false
@@ -224,6 +225,7 @@ struct QuarantineBanner: View {
         }
         .padding(12)
         .background(.quaternary, in: RoundedRectangle(cornerRadius: AppShapeScale.compact, style: .continuous))
+        .accessibilityIdentifier(UIIdentifier.quarantineBanner)
     }
 }
 

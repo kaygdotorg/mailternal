@@ -96,8 +96,7 @@ struct SearchPanel: View {
 
     private func runSearch(_ text: String) {
         searchTask?.cancel()
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
+        guard let trimmed = SearchQueryPolicy.normalizedQuery(text) else {
             results = []
             selectedIndex = nil
             isSearching = false
@@ -107,7 +106,7 @@ struct SearchPanel: View {
         isSearching = true
         errorMessage = nil
         searchTask = Task {
-            try? await Task.sleep(for: .milliseconds(120))
+            try? await Task.sleep(for: SearchQueryPolicy.debounce)
             guard !Task.isCancelled else { return }
             do {
                 let hits = try await model.facade.search(trimmed, limit: 40)
@@ -164,6 +163,7 @@ private struct SearchPanelSurface: View {
             content
         }
         .frame(maxHeight: maximumHeight, alignment: .top)
+        .accessibilityIdentifier(UIIdentifier.searchPanel)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: AppShapeScale.card, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: AppShapeScale.card, style: .continuous)
@@ -189,6 +189,7 @@ private struct SearchPanelSurface: View {
                 .foregroundStyle(.secondary)
             TextField("Search all messages", text: $query)
                 .textFieldStyle(.plain)
+                .accessibilityIdentifier(UIIdentifier.searchField)
                 .font(.system(size: 17, weight: .regular, design: .rounded))
                 .focused(fieldFocused)
                 .onSubmit(onActivate)
