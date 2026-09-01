@@ -151,8 +151,12 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         configuration.backwards = lastFindBackwards
         configuration.caseSensitive = false
         configuration.wraps = true
-        let result = await webView.find(lastFindQuery, configuration: configuration)
-        return result.matchFound
+        do {
+            let result = try await webView.find(lastFindQuery, configuration: configuration)
+            return result.matchFound
+        } catch {
+            return false
+        }
     }
 
     private func requestLoad() {
@@ -312,7 +316,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
 
     public func webViewDidClose(_ webView: WKWebView) {}
 
-    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
         guard !lastFindQuery.isEmpty else { return }
         Task { _ = await performFind() }
     }

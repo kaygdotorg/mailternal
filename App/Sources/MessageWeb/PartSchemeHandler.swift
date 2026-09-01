@@ -10,7 +10,8 @@ typealias PartProvider = @Sendable (String) async throws -> (data: Data, mimeTyp
 /// Each `start` owns one unstructured `Task` in ``SchemeTaskRegistry``. `stop`
 /// cancels that task; success, failure, and cancel all remove the entry so the
 /// map cannot leak and a recycled `ObjectIdentifier` cannot inherit a stale
-/// stopped flag.
+/// stopped flag. The handler is self-contained: it only calls the injected
+/// `partProvider`.
 final class PartSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable {
     private struct State {
         var provider: PartProvider?
@@ -47,7 +48,7 @@ final class PartSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable
         }
 
         let slot = HandleSlot()
-        let task = Task {
+        let task = Task<Void, Never> {
             defer {
                 if let handle = slot.handle { self.registry.remove(handle) }
             }
