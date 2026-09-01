@@ -1,0 +1,11 @@
+From: a@b.com
+Subject: flowed
+Date: Wed, 01 Jan 2020 00:00:00 +0000
+Content-Type: text/plain; charset=utf-8; format=flowed
+
+
+This is a long line that was 
+wrapped with DelSp.
+
+-- 
+signature

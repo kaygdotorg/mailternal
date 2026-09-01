@@ -1,0 +1,7 @@
+From: a@b.com
+Subject: broken b64
+Date: Wed, 01 Jan 2020 00:00:00 +0000
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: base64
+
+SGVsbG8g@@V29ybGQ=

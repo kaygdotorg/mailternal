@@ -1,0 +1,22 @@
+From: outer@example.com
+Subject: Outer
+Date: Wed, 01 Jan 2020 00:00:00 +0000
+Message-ID: <outer@host>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix"
+
+--mix
+Content-Type: text/plain; charset=utf-8
+
+outer
+--mix
+Content-Type: message/rfc822
+
+From: inner@example.com
+Subject: Inner
+Date: Thu, 02 Jan 2020 00:00:00 +0000
+Message-ID: <inner@host>
+Content-Type: text/plain; charset=utf-8
+
+inner
+--mix--
