@@ -6,7 +6,11 @@ enum QAIMAPTrust {
     static func installIfRequested() {
         let env = ProcessInfo.processInfo.environment
         guard env["MAILTERNAL_QA"] == "1" || QALaunch.parse() != nil else { return }
-        try? install()
+        do {
+            try install()
+        } catch {
+            QALaunch.log("QA cert install failed: \(error)")
+        }
     }
 
     /// Throws if the QA cert cannot be loaded. Used by the smoke test.
@@ -19,5 +23,6 @@ enum QAIMAPTrust {
             throw LiveMailError("QA certificate at \(path) is empty.")
         }
         IMAPSession.installAdditionalTrustRoots(pem: [data])
+        QALaunch.log("installed QA trust root path=\(path) bytes=\(data.count)")
     }
 }

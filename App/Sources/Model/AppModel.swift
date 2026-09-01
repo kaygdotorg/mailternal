@@ -337,15 +337,12 @@ private struct MailFacadePartFetch: @unchecked Sendable {
     func fetch(message: MessageID, part: String) async throws -> (data: Data, mimeType: String) {
         let url = try await facade.fetchAttachment(message, part: part)
         let data = try Data(contentsOf: url)
-        let mime: String
-        switch url.pathExtension.lowercased() {
-        case "png": mime = "image/png"
-        case "jpg", "jpeg": mime = "image/jpeg"
-        case "gif": mime = "image/gif"
-        case "webp": mime = "image/webp"
-        case "pdf": mime = "application/pdf"
-        default: mime = "application/octet-stream"
-        }
+        // Hash cache files have no extension; MIME comes from attachment metadata.
+        let attachments = (try? await facade.detail(message))?.attachments ?? []
+        let mime = AttachmentMIME.declared(
+            for: part,
+            attachments: attachments.map { ($0.id, $0.mimeType, $0.contentID) }
+        ) ?? "application/octet-stream"
         return (data, mime)
     }
 }

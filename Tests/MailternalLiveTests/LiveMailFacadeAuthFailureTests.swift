@@ -10,6 +10,10 @@ import Testing
 @Test
 @MainActor
 func restorePersistedAccountMapsTerminalAuthToAuthFailed() async throws {
+    // Live test: needs the QA Dovecot on 127.0.0.1:1993 and its trust roots
+    // (installed by QAIMAPTrust when MAILTERNAL_QA=1). Without them the IP-literal
+    // fail-closed TLS rule correctly refuses the connection.
+    guard ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" else { return }
     let fm = FileManager.default
     let root = fm.temporaryDirectory.appendingPathComponent(
         "mailternal-live-auth-\(UUID().uuidString)",
