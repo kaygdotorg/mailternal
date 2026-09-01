@@ -170,6 +170,71 @@ extension MailStore {
         }
     }
 
+    /// IMAP locator for an on-demand BODY.PEEK / RFC822 fetch.
+    ///
+    /// Returns `nil` when the row is gone (expunged or retired-generation cleanup).
+    public func messageRef(
+        _ id: MessageID
+    ) async throws -> (folder: FolderID, generation: MailboxGeneration, uid: IMAPUID)? {
+        try await read { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT g.folder_id, g.uid_validity, m.uid
+                    FROM messages m
+                    JOIN generations g ON g.id = m.generation_id
+                    WHERE m.id = ?
+                    """,
+                arguments: [id.rawValue]
+            ) else { return nil }
+            let folderID: Int64 = row["folder_id"]
+            let uidValidity: Int64 = row["uid_validity"]
+            let uid: Int64 = row["uid"]
+            let folder = FolderID(rawValue: folderID)
+            return (
+                folder,
+                MailboxGeneration(folder: folder, uidValidity: UInt32(uidValidity)),
+                IMAPUID(rawValue: UInt32(uid))
+            )
+        }
+    }
+
+    /// UIDs stored for `generation`, optional inclusive range, ascending.
+    ///
+    /// Used by CONDSTORE/basic expunge reconciliation. A missing generation
+    /// yields an empty array rather than an error.
+    public func uids(
+        in generation: MailboxGeneration,
+        range: ClosedRange<UInt32>? = nil
+    ) async throws -> [IMAPUID] {
+        try await read { db in
+            guard let genID = try MailStore.generationID(db, generation) else { return [] }
+            let values: [Int64]
+            if let range {
+                values = try Int64.fetchAll(
+                    db,
+                    sql: """
+                        SELECT uid FROM messages
+                        WHERE generation_id = ? AND uid >= ? AND uid <= ?
+                        ORDER BY uid ASC
+                        """,
+                    arguments: [genID, Int64(range.lowerBound), Int64(range.upperBound)]
+                )
+            } else {
+                values = try Int64.fetchAll(
+                    db,
+                    sql: """
+                        SELECT uid FROM messages
+                        WHERE generation_id = ?
+                        ORDER BY uid ASC
+                        """,
+                    arguments: [genID]
+                )
+            }
+            return values.map { IMAPUID(rawValue: UInt32($0)) }
+        }
+    }
+
     static func fetchPage(
         _ db: Database,
         folder: FolderID,
