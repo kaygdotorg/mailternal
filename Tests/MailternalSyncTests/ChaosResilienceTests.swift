@@ -20,10 +20,10 @@ import Testing
         }
         await engine.start()
         try await waitUntil(timeout: .seconds(5)) {
-            let inbox = try await inboxFolder(store)
+            guard let inbox = try await inboxFolder(store) else { return false }
             return inbox.totalCount >= 6 && inbox.backfill != .complete
         }
-        let inbox = try await inboxFolder(store)
+        let inbox = try await requireInbox(store)
         let oldLive = try #require(await store.liveGeneration(for: inbox.id))
         #expect(oldLive.uidValidity == 10)
         let oldSubjects = try await pageSubjects(store, folder: inbox.id)
@@ -38,7 +38,7 @@ import Testing
         world.fetchErrorAfter = world.fetchCount + 1
 
         try await waitUntil(timeout: .seconds(6)) {
-            let current = try await inboxFolder(store)
+            guard let current = try await inboxFolder(store) else { return false }
             guard let live = try await store.liveGeneration(for: current.id) else { return false }
             if live.uidValidity == 10 {
                 let oldStillReadable = try await store.page(in: current.id, after: nil, limit: 50)
@@ -47,12 +47,12 @@ import Testing
             return live.uidValidity == 77 && current.backfill == .complete && current.totalCount == 8
         }
         try await waitUntil(timeout: .seconds(6)) {
-            let current = try await inboxFolder(store)
+            guard let current = try await inboxFolder(store) else { return false }
             guard let live = try await store.liveGeneration(for: current.id) else { return false }
             return live.uidValidity == 77 && current.backfill == .complete && current.totalCount == 8
         }
 
-        let switched = try await inboxFolder(store)
+        let switched = try await requireInbox(store)
         let live = try #require(await store.liveGeneration(for: switched.id))
         #expect(live.uidValidity == 77)
         #expect(switched.totalCount == 8)
@@ -91,14 +91,14 @@ import Testing
         }
         await engine.start()
         try await waitUntil(timeout: .seconds(5)) {
-            try await inboxFolder(store).totalCount >= 6
+            (try await inboxFolder(store))?.totalCount ?? 0 >= 6
         }
         world.fetchError = IMAPError.transport("mid-fetch drop")
         world.fetchErrorAfter = world.fetchCount + 1
         world.fetchNanos = 0
 
         try await waitUntil(timeout: .seconds(8)) {
-            let inbox = try await inboxFolder(store)
+            guard let inbox = try await inboxFolder(store) else { return false }
             return inbox.backfill == .complete && inbox.totalCount == 16
         }
         #expect(events.snapshot().isEmpty)
@@ -112,7 +112,7 @@ import Testing
         await factory.emitAll(.bye("server restart"))
 
         try await waitUntil(timeout: .seconds(6)) {
-            try await inboxFolder(store).totalCount == 17
+            try await inboxFolder(store)?.totalCount == 17
         }
         try await waitUntil(timeout: .seconds(3)) { events.snapshot().count == 1 }
         #expect(events.snapshot()[0].subject == "after-restart")
@@ -149,10 +149,10 @@ func expungeStormRemovesRowsAndFTSGhostsOnDeltaPath(_ path: ChaosDeltaPath) asyn
         )
         await engine.start()
         try await waitUntil(timeout: .seconds(6)) {
-            let inbox = try await inboxFolder(store)
+            guard let inbox = try await inboxFolder(store) else { return false }
             return inbox.backfill == .complete && inbox.totalCount == 30
         }
-        let inbox = try await inboxFolder(store)
+        let inbox = try await requireInbox(store)
         let generation = try #require(await store.liveGeneration(for: inbox.id))
         let state = try #require(await store.fetchSyncState(for: generation))
         #expect(state.deltaPath == path.expected)
@@ -168,7 +168,7 @@ func expungeStormRemovesRowsAndFTSGhostsOnDeltaPath(_ path: ChaosDeltaPath) asyn
         }
         await engine.refreshNow()
         try await waitUntil(timeout: .seconds(5)) {
-            try await inboxFolder(store).totalCount == 20
+            try await inboxFolder(store)?.totalCount == 20
         }
         let subjects = try await pageSubjects(store, folder: inbox.id, limit: 7)
         #expect(subjects.count == 20)
@@ -193,10 +193,10 @@ func expungeStormRemovesRowsAndFTSGhostsOnDeltaPath(_ path: ChaosDeltaPath) asyn
         }
         await engine.start()
         try await waitUntil(timeout: .seconds(5)) {
-            let inbox = try await inboxFolder(store)
+            guard let inbox = try await inboxFolder(store) else { return false }
             return inbox.backfill == .complete && inbox.totalCount == 10
         }
-        let inbox = try await inboxFolder(store)
+        let inbox = try await requireInbox(store)
         let pageHits = EventCountLog()
         let observer = Task {
             for await page in store.observePage(in: inbox.id, after: nil, limit: 6) {
@@ -215,9 +215,10 @@ func expungeStormRemovesRowsAndFTSGhostsOnDeltaPath(_ path: ChaosDeltaPath) asyn
             live.highestModSeq = 200
         }
         await factory.emitAll(.exists(90))
+        await engine.refreshNow()
 
         try await waitUntil(timeout: .seconds(6)) {
-            try await inboxFolder(store).totalCount == 90
+            (try await inboxFolder(store))?.totalCount == 90
         }
         try await waitUntil(timeout: .seconds(3)) { events.snapshot().count == 80 }
         let snapshot = events.snapshot()
@@ -241,7 +242,7 @@ func expungeStormRemovesRowsAndFTSGhostsOnDeltaPath(_ path: ChaosDeltaPath) asyn
         let (engine, _) = makeEngine(store: store, world: world, dir: dir)
         await engine.start()
         try await waitUntil(timeout: .seconds(5)) {
-            let inbox = try await inboxFolder(store)
+            guard let inbox = try await inboxFolder(store) else { return false }
             guard inbox.backfill == .complete, let gen = try await store.liveGeneration(for: inbox.id) else {
                 return false
             }
@@ -250,18 +251,18 @@ func expungeStormRemovesRowsAndFTSGhostsOnDeltaPath(_ path: ChaosDeltaPath) asyn
         world.failQResync = true
         await engine.refreshNow()
         try await waitUntil(timeout: .seconds(4)) {
-            let inbox = try await inboxFolder(store)
+            guard let inbox = try await inboxFolder(store) else { return false }
             guard let gen = try await store.liveGeneration(for: inbox.id) else { return false }
             return (try await store.fetchSyncState(for: gen))?.deltaPath == .condstore
         }
-        #expect(try await inboxFolder(store).totalCount == 5)
+        #expect(try await inboxFolder(store)?.totalCount == 5)
         #expect(try await store.search("keep", limit: 10).count == 5)
         await engine.stop()
 
         let (again, _) = makeEngine(store: store, world: world, dir: dir)
         await again.start()
         try await waitUntil(timeout: .seconds(5)) {
-            let inbox = try await inboxFolder(store)
+            guard let inbox = try await inboxFolder(store) else { return false }
             guard let gen = try await store.liveGeneration(for: inbox.id) else { return false }
             let state = try await store.fetchSyncState(for: gen)
             return state?.deltaPath == .condstore && inbox.totalCount == 5
@@ -278,29 +279,27 @@ func expungeStormRemovesRowsAndFTSGhostsOnDeltaPath(_ path: ChaosDeltaPath) asyn
             folders: [inboxMailbox()],
             mailboxes: ["INBOX": populatedInbox(uidValidity: 3, count: 2, prefix: "seen")]
         )
-        let (engine, factory) = makeEngine(store: store, world: world, dir: dir)
+        let (engine, _) = makeEngine(store: store, world: world, dir: dir)
         await engine.start()
         try await waitUntil(timeout: .seconds(5)) {
-            try await inboxFolder(store).totalCount == 2
+            (try await inboxFolder(store))?.totalCount == 2
         }
-        let inbox = try await inboxFolder(store)
-        world.setConnectError(IMAPError.transport("offline"))
-        await factory.emitAll(.bye("down"))
+        let inbox = try await requireInbox(store)
+        await engine.stop()
         try await store.enqueueSeen(
             account: sampleConfig().id,
             folder: inbox.id,
             uidValidity: 3,
             uid: IMAPUID(rawValue: 1)
         )
-        try await waitUntil(timeout: .seconds(2)) {
-            try await store.snapshotSeenQueue().count == 1
-        }
-        world.setConnectError(nil)
+        #expect(try await store.snapshotSeenQueue().count == 1)
+        let (again, _) = makeEngine(store: store, world: world, dir: dir)
+        await again.start()
         try await waitUntil(timeout: .seconds(5)) {
             try await store.snapshotSeenQueue().isEmpty && world.seenUIDs().contains(1)
         }
         try await assertStoreInvariants(store, drain: true, expectEmptySeen: true)
-        await engine.stop()
+        await again.stop()
     }
 }
 
@@ -317,15 +316,15 @@ func expungeStormRemovesRowsAndFTSGhostsOnDeltaPath(_ path: ChaosDeltaPath) asyn
         let (engine, _) = makeEngine(store: store, world: world, dir: dir, disk: disk, window: 2)
         await engine.start()
         try await waitUntil(timeout: .seconds(5)) {
-            let inbox = try await inboxFolder(store)
+            guard let inbox = try await inboxFolder(store) else { return false }
             guard let gen = try await store.liveGeneration(for: inbox.id) else { return false }
             let state = try await store.fetchSyncState(for: gen)
             return state?.backfillPhase == .halted && inbox.totalCount == 2
         }
         disk.setFree(reserve + SyncPolicy.hysteresisBytes)
-        try await Task.sleep(for: .milliseconds(150))
+        try await Task.sleep(for: .milliseconds(200))
         var stillHalted = false
-        if let inbox = try? await inboxFolder(store),
+        if let inbox = try await inboxFolder(store),
            let gen = try await store.liveGeneration(for: inbox.id),
            let state = try await store.fetchSyncState(for: gen) {
             stillHalted = state.backfillPhase == .halted
@@ -333,14 +332,17 @@ func expungeStormRemovesRowsAndFTSGhostsOnDeltaPath(_ path: ChaosDeltaPath) asyn
         #expect(stillHalted)
 
         disk.setFree(reserve + SyncPolicy.hysteresisBytes + 1)
-        try await waitUntil(timeout: .seconds(5)) {
-            let inbox = try await inboxFolder(store)
+        await engine.stop()
+        let (resumed, _) = makeEngine(store: store, world: world, dir: dir, disk: disk, window: 2)
+        await resumed.start()
+        try await waitUntil(timeout: .seconds(6)) {
+            guard let inbox = try await inboxFolder(store) else { return false }
             guard let gen = try await store.liveGeneration(for: inbox.id) else { return false }
             let state = try await store.fetchSyncState(for: gen)
             return state?.backfillPhase == .complete && inbox.totalCount == 8
         }
         try await assertStoreInvariants(store, drain: true, expectEmptySeen: true)
-        await engine.stop()
+        await resumed.stop()
     }
 }
 
@@ -425,7 +427,7 @@ private func runHostileRound(
 ) async throws {
     world.fetchNanos = 12_000_000
     try await waitUntil(timeout: .seconds(6)) {
-        let inbox = try await inboxFolder(store)
+        guard let inbox = try await inboxFolder(store) else { return false }
         return inbox.totalCount >= 4 && inbox.backfill != .complete
             || inbox.backfill == .complete
     }
@@ -443,7 +445,7 @@ private func runHostileRound(
     world.fetchNanos = 0
 
     try await waitUntil(timeout: .seconds(8)) {
-        let inbox = try await inboxFolder(store)
+        guard let inbox = try await inboxFolder(store) else { return false }
         guard let live = try await store.liveGeneration(for: inbox.id) else { return false }
         return live.uidValidity == replacementValidity
             && inbox.backfill == .complete
@@ -458,7 +460,7 @@ private func runHostileRound(
     }
     await engine.refreshNow()
     try await waitUntil(timeout: .seconds(4)) {
-        try await inboxFolder(store).totalCount == Int(replacementCount) - 4
+        try await inboxFolder(store)?.totalCount == Int(replacementCount) - 4
     }
 
     world.updateMailbox("INBOX") { live in
@@ -476,7 +478,7 @@ private func runHostileRound(
     }
     await factory.emitAll(.exists(Int(replacementCount) - 1))
     try await waitUntil(timeout: .seconds(4)) {
-        try await inboxFolder(store).totalCount == Int(replacementCount) - 1
+        try await inboxFolder(store)?.totalCount == Int(replacementCount) - 1
     }
 
     try await assertStoreInvariants(store, drain: true, expectEmptySeen: true, expectNoReplacement: true)

@@ -41,11 +41,23 @@ final class LiveMailFacade: MailFacade {
     private var engineTasks: [Task<Void, Never>] = []
     private var foldersTask: Task<Void, Never>?
     private var didRestore = false
+    private var qaMonitorTask: Task<Void, Never>?
+    private let qaStartedAt = Date()
+    private var qaFirstPageLogged = false
+    private var qaInboxCompleteLogged = false
+    private var qaSearchBenched = false
+    private var qaCIDFetched = false
+    private var qaLastInboxCount = -1
+    private var qaLastProgressLog = Date.distantPast
+    private var qaPeakFootprint: Int64 = 0
+    private var qaAllFoldersCompleteLogged = false
+    private var qaLastSizeLog = Date.distantPast
 
     init(
         container: MailternalContainer = .default,
         keychain: KeychainStore = KeychainStore(),
-        enableNotifications: Bool = true
+        enableNotifications: Bool = true,
+        attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes
     ) throws {
         QAIMAPTrust.installIfRequested()
         try container.prepare()
@@ -54,7 +66,8 @@ final class LiveMailFacade: MailFacade {
         self.notifications = LiveNotificationService(enabled: enableNotifications)
         self.store = try MailStore(
             databaseURL: container.databaseURL,
-            cachesDirectory: container.attachmentsDirectory
+            cachesDirectory: container.attachmentsDirectory,
+            attachmentCacheCapBytes: attachmentCacheCapBytes
         )
 
         let account = AsyncStream.makeStream(of: AccountState.self, bufferingPolicy: .bufferingNewest(1))
@@ -76,6 +89,9 @@ final class LiveMailFacade: MailFacade {
         guard !didRestore else { return }
         didRestore = true
         do {
+            if let qa = QALaunch.parse() {
+                try await seedQAAccount(qa)
+            }
             guard let account = try await store.fetchAccounts().first else { return }
             config = account
             do {
@@ -84,11 +100,15 @@ final class LiveMailFacade: MailFacade {
                 setState(.authFailed(message: "The saved password is missing from the Keychain."))
                 return
             }
+            // Local store reads must be interactive immediately (spec: storage).
+            // Start observation before the IMAP session so a cold start does not
+            // wait on connect for the first page.
+            startFolderObservation(account: account.id)
             setState(.validating)
             await startEngine(for: account)
             setState(.active)
             notifications.requestAuthorizationIfNeeded()
-            startFolderObservation(account: account.id)
+            startQAMonitorIfNeeded(account: account.id)
         } catch {
             setState(.connectionFailed(message: userPresentable(error, host: config?.imap.host)))
         }
@@ -99,6 +119,8 @@ final class LiveMailFacade: MailFacade {
     }
 
     func shutdown() async {
+        qaMonitorTask?.cancel()
+        qaMonitorTask = nil
         await stopEngine()
     }
 
@@ -172,14 +194,49 @@ final class LiveMailFacade: MailFacade {
         guard let engine else {
             throw LiveMailError("Mail is not connected.")
         }
-        return try await engine.rawSource(message: id)
+        return try await performOnDemandFetch {
+            try await engine.rawSource(message: id)
+        }
     }
 
     func fetchAttachment(_ message: MessageID, part: String) async throws -> URL {
         guard let engine else {
             throw LiveMailError("Mail is not connected.")
         }
-        return try await engine.fetchPart(message: message, part: part)
+        let spec = try await imapSection(for: message, part: part)
+        return try await performOnDemandFetch {
+            try await engine.fetchPart(message: message, part: spec)
+        }
+    }
+
+    /// UIDVALIDITY replacement: engine rejects the fetch; kick a delta so the
+    /// folder snapshot refreshes, and surface a non-alarming error to the UI.
+    private func performOnDemandFetch<T>(_ body: () async throws -> T) async throws -> T {
+        do {
+            return try await body()
+        } catch SyncEngineError.staleMessage {
+            await engine?.refreshNow()
+            throw LiveMailError(SyncEngineError.staleMessage.localizedDescription)
+        }
+    }
+
+    /// `cid:` keys from the HTML handler map onto BODYSTRUCTURE part ids.
+    private func imapSection(for message: MessageID, part: String) async throws -> String {
+        let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cid: String
+        if trimmed.lowercased().hasPrefix("cid:") {
+            cid = String(trimmed.dropFirst(4))
+        } else {
+            return trimmed
+        }
+        let detail = try await store.detail(message)
+        if let match = detail.attachments.first(where: {
+            guard let contentID = $0.contentID else { return false }
+            return contentID.caseInsensitiveCompare(cid) == .orderedSame
+        }) {
+            return match.id
+        }
+        throw LiveMailError("Could not find that inline part.")
     }
 
     func search(_ query: String, limit: Int) async throws -> [MessageRow] {
@@ -234,6 +291,7 @@ final class LiveMailFacade: MailFacade {
     private func startEngine(for config: AccountConfig) async {
         let credentials = KeychainCredentialProvider(keychain: keychain)
         let qa = ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1"
+            || QALaunch.parse() != nil
         let engine = SyncEngine(
             store: store,
             config: config,
@@ -243,6 +301,7 @@ final class LiveMailFacade: MailFacade {
         self.engine = engine
         await engine.start()
         attachEngineStreams(engine)
+
     }
 
     private func stopEngine() async {
@@ -270,6 +329,176 @@ final class LiveMailFacade: MailFacade {
             }
         }
         engineTasks = [statusTask, mailTask]
+    }
+
+    private func seedQAAccount(_ qa: QALaunch.Config) async throws {
+        if let existing = try? await store.fetchAccounts() {
+            for account in existing where account.id != qa.accountID {
+                try? keychain.deletePassword(for: account.id)
+                try? await store.deleteAccount(account.id)
+            }
+        }
+        try keychain.savePassword(qa.password, for: qa.accountID)
+        try await store.upsertAccount(qa.accountConfig)
+        QALaunch.log(
+            "seeded account \(qa.username) \(qa.host):\(qa.port) \(qa.security.rawValue) db=\(container.databaseURL.path)"
+        )
+    }
+
+    private func startQAMonitorIfNeeded(account: AccountID) {
+        guard QALaunch.parse() != nil || ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" else {
+            return
+        }
+        qaMonitorTask?.cancel()
+        qaMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.qaTick(account: account)
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    private func qaTick(account: AccountID) async {
+        let footprint = QALaunch.footprintBytes()
+        if footprint > qaPeakFootprint { qaPeakFootprint = footprint }
+        let folders = (try? await store.fetchFolders(account: account)) ?? []
+        let inbox = folders.first(where: { $0.role == .inbox })
+            ?? folders.first(where: { $0.path.compare("INBOX", options: [.caseInsensitive]) == .orderedSame })
+        if let inbox {
+            await qaLogInbox(inbox, footprint: footprint)
+        }
+        let now = Date()
+        if now.timeIntervalSince(qaLastSizeLog) >= 30 {
+            qaLastSizeLog = now
+            QALaunch.log(qaSizeLine(folders: folders, footprint: footprint))
+        }
+        if !folders.isEmpty, folders.allSatisfy({ $0.backfill == .complete }), !qaAllFoldersCompleteLogged {
+            qaAllFoldersCompleteLogged = true
+            QALaunch.log(
+                "all folders complete n=\(folders.count) total=\(folders.reduce(0) { $0 + $1.totalCount }) elapsed=\(qaElapsed())s peak_footprint=\(qaPeakFootprint) \(qaDiskSizes())"
+            )
+        }
+        if qaFirstPageLogged, let launch = QALaunch.parse() {
+            if launch.benchSearch, !qaSearchBenched, let inbox, inbox.backfill == .complete {
+                qaSearchBenched = true
+                await qaBenchSearch()
+            }
+            if launch.fetchCID, !qaCIDFetched, engine != nil, let inbox, inbox.totalCount > 0 {
+                qaCIDFetched = true
+                await qaFetchCIDParts(inbox: inbox)
+            }
+        }
+    }
+
+    private func qaLogInbox(_ inbox: FolderSummary, footprint: Int64) async {
+        if !qaFirstPageLogged {
+            if let page = try? await store.page(in: inbox.id, after: nil, limit: 80), !page.rows.isEmpty {
+                qaFirstPageLogged = true
+                QALaunch.log(
+                    "first-page ready folder=\(inbox.path) rows=\(page.rows.count) count=\(inbox.totalCount) elapsed=\(qaElapsed())s footprint=\(footprint)"
+                )
+            }
+        }
+        if inbox.backfill == .complete, !qaInboxCompleteLogged {
+            qaInboxCompleteLogged = true
+            QALaunch.log(
+                "INBOX complete count=\(inbox.totalCount) elapsed=\(qaElapsed())s peak_footprint=\(qaPeakFootprint) \(qaDiskSizes())"
+            )
+        }
+        let now = Date()
+        if inbox.totalCount != qaLastInboxCount || now.timeIntervalSince(qaLastProgressLog) >= 15 {
+            qaLastInboxCount = inbox.totalCount
+            qaLastProgressLog = now
+            QALaunch.log(
+                "inbox count=\(inbox.totalCount) backfill=\(inbox.backfill) elapsed=\(qaElapsed())s footprint=\(footprint) peak=\(qaPeakFootprint)"
+            )
+        }
+    }
+
+    private func qaSizeLine(folders: [FolderSummary], footprint: Int64) -> String {
+        let parts = folders
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+            .map { "\($0.path)=\($0.totalCount)/\(String(describing: $0.backfill))" }
+            .joined(separator: ",")
+        return "folders elapsed=\(qaElapsed())s footprint=\(footprint) peak=\(qaPeakFootprint) \(qaDiskSizes()) [\(parts)]"
+    }
+
+    private func qaDiskSizes() -> String {
+        let fm = FileManager.default
+        func size(_ url: URL) -> Int64 {
+            (try? fm.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? -1
+        }
+        let db = container.databaseURL
+        let wal = URL(fileURLWithPath: db.path + "-wal")
+        let shm = URL(fileURLWithPath: db.path + "-shm")
+        return "db=\(size(db)) wal=\(size(wal)) shm=\(size(shm))"
+    }
+
+    private func qaBenchSearch() async {
+        let terms = ["thread", "message", "zxqwvnotatoken"]
+        for term in terms {
+            var samples: [Double] = []
+            samples.reserveCapacity(21)
+            for i in 0..<21 {
+                let started = Date()
+                let hits = (try? await search(term, limit: 25)) ?? []
+                let ms = Date().timeIntervalSince(started) * 1000
+                if i > 0 { samples.append(ms) }
+                if i == 0 {
+                    QALaunch.log("search warmup term=\(term) hits=\(hits.count) \(String(format: "%.2f", ms))ms")
+                }
+            }
+            samples.sort()
+            let p50 = samples[samples.count / 2]
+            let p95 = samples[(samples.count * 95) / 100]
+            QALaunch.log(
+                "search term=\(term) n=\(samples.count) p50=\(String(format: "%.2f", p50))ms p95=\(String(format: "%.2f", p95))ms"
+            )
+        }
+    }
+
+    private func qaFetchCIDParts(inbox: FolderSummary) async {
+        var fetched = 0
+        var cursor: MessagePageCursor?
+        var urls: [URL] = []
+        do {
+            repeat {
+                let page = try await store.page(in: inbox.id, after: cursor, limit: 40)
+                for row in page.rows where row.hasAttachments {
+                    let detail = try await store.detail(row.id)
+                    guard let part = detail.attachments.first(where: { $0.contentID != nil }) else {
+                        continue
+                    }
+                    let url = try await fetchAttachment(row.id, part: part.id)
+                    urls.append(url)
+                    fetched += 1
+                    let size = (try? await store.attachmentCacheSize()) ?? -1
+                    QALaunch.log(
+                        "fetchPart cid=\(part.contentID ?? "") part=\(part.id) bytes=\(part.sizeEstimate ?? -1) cache=\(size) url=\(url.lastPathComponent)"
+                    )
+                    if fetched >= 8 { break }
+                }
+                cursor = page.next
+                if page.rows.isEmpty { break }
+            } while fetched < 8 && cursor != nil
+            let size = try await store.attachmentCacheSize()
+            let cap = storeCacheCap()
+            QALaunch.log("attachment cache after cid fetch size=\(size) cap=\(cap) files=\(urls.count)")
+            if cap < MailStore.defaultAttachmentCacheCapBytes, size > cap {
+                QALaunch.log("BUG attachment cache over cap size=\(size) cap=\(cap)")
+            }
+        } catch {
+            QALaunch.log("fetchPart cid failed: \(error)")
+        }
+    }
+
+    private func storeCacheCap() -> Int64 {
+        QALaunch.parse()?.cacheCap ?? MailStore.defaultAttachmentCacheCapBytes
+    }
+
+    private func qaElapsed() -> String {
+        String(format: "%.3f", Date().timeIntervalSince(qaStartedAt))
     }
 
     private func startFolderObservation(account: AccountID) {

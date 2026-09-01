@@ -5,7 +5,7 @@ import MailternalIMAP
 enum QAIMAPTrust {
     static func installIfRequested() {
         let env = ProcessInfo.processInfo.environment
-        guard env["MAILTERNAL_QA"] == "1" else { return }
+        guard env["MAILTERNAL_QA"] == "1" || QALaunch.parse() != nil else { return }
         try? install()
     }
 

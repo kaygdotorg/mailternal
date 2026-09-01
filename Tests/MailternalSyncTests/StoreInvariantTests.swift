@@ -21,7 +21,7 @@ import Testing
         let (engine, _) = makeEngine(store: store, world: world, dir: dir)
         await engine.start()
         try await waitUntil(timeout: .seconds(5)) {
-            let inbox = try await inboxFolder(store)
+            guard let inbox = try await inboxFolder(store) else { return false }
             return inbox.totalCount == 4 && inbox.backfill == .complete
         }
         await engine.stop()
@@ -31,7 +31,7 @@ import Testing
         #expect(clean.messageCount == 4)
         #expect(clean.ftsCount == 4)
 
-        let inbox = try await inboxFolder(store)
+        let inbox = try await requireInbox(store)
         let generation = try #require(await store.liveGeneration(for: inbox.id))
         var state = try #require(await store.fetchSyncState(for: generation))
         state.lowWaterUID = IMAPUID(rawValue: 99)

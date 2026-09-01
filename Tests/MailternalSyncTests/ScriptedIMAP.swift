@@ -590,11 +590,12 @@ struct InvariantFailure: Error, CustomStringConvertible {
     var description: String { issues.joined(separator: "; ") }
 }
 
-func inboxFolder(_ store: MailStore) async throws -> FolderSummary {
-    let folders = try await store.fetchFolders(account: sampleConfig().id)
-    guard let inbox = folders.first(where: { $0.role == .inbox }) else {
-        throw WaitTimeout()
-    }
+func inboxFolder(_ store: MailStore) async throws -> FolderSummary? {
+    try await store.fetchFolders(account: sampleConfig().id).first(where: { $0.role == .inbox })
+}
+
+func requireInbox(_ store: MailStore) async throws -> FolderSummary {
+    guard let inbox = try await inboxFolder(store) else { throw WaitTimeout() }
     return inbox
 }
 
