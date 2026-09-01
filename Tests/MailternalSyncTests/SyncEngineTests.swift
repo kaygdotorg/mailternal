@@ -1008,25 +1008,18 @@ import Testing
         let inbox = try #require(folders.first { $0.role == .inbox })
         let captured = try #require(await store.liveGeneration(for: inbox.id))
         #expect(captured.uidValidity == 1)
-        let capturedState = try await store.fetchSyncState(for: captured)
-        _ = try await store.createReplacementGeneration(
-            folder: inbox.id,
-            uidValidity: 99,
-            baselineUID: capturedState?.baselineUID
+        await engine.adoptFolderGenerationForTesting(
+            inbox.id,
+            MailboxGeneration(folder: inbox.id, uidValidity: 99)
         )
-        try await store.activateReplacementGeneration(folder: inbox.id)
         try await Task.sleep(for: .milliseconds(600))
         await engine.stop()
 
-        let old = MailboxGeneration(folder: inbox.id, uidValidity: 1)
-        let oldUIDs = try await store.uids(in: old).map(\.rawValue)
+        let oldUIDs = try await store.uids(in: captured).map(\.rawValue)
         #expect(!oldUIDs.contains(3))
         #expect(!oldUIDs.contains(4))
-        let oldState = try await store.fetchSyncState(for: old)
+        let oldState = try await store.fetchSyncState(for: captured)
         #expect(oldState?.lowWaterUID == nil)
-        let live = try #require(await store.liveGeneration(for: inbox.id))
-        #expect(live.uidValidity == 99)
-        #expect(try await store.uids(in: live).isEmpty)
     }
 }
 

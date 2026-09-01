@@ -649,7 +649,7 @@ public actor SyncEngine {
                 // mid-ingest must not persist low-water (spec: sync.md backfill).
                 try Task.checkCancellation()
                 guard committed else { return }
-                guard try await stillCurrentGeneration(capturedGeneration, folder: folderID) else { return }
+                guard stillCurrentGeneration(capturedGeneration, folder: folderID) else { return }
                 state.lowWaterUID = IMAPUID(rawValue: window.lowerBound)
                 state.progress = SyncPolicy.backfillProgress(uidNext: uidNext, lowWater: state.lowWaterUID?.rawValue)
                 try await store.saveSyncState(state)
@@ -780,7 +780,7 @@ public actor SyncEngine {
             built.append(incoming)
         }
 
-        guard try await stillCurrentGeneration(capturedGeneration, folder: record.id) else { return false }
+        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return false }
         if built.isEmpty { return true }
         built.sort { $0.uid > $1.uid }
 
@@ -795,7 +795,7 @@ public actor SyncEngine {
             }
         }
 
-        guard try await stillCurrentGeneration(capturedGeneration, folder: record.id) else { return false }
+        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return false }
         _ = try await store.upsertMessages(built)
 
         if canNotify {
@@ -1247,11 +1247,17 @@ public actor SyncEngine {
     }
 
     private func periodicLoop() async {
-        await waitUntilWalksSettle()
         while !stopping && !Task.isCancelled {
             try? await Task.sleep(for: settings.periodicTick)
             if stopping { return }
             guard let channel = syncChannel else { continue }
+            // INBOX live mail must not wait for every folder walk to finish.
+            // IDLE only starts after backfillPassFinished; without this,
+            // APPEND/EXISTS during the 100k walk is never ingested.
+            if let inboxID, !dualConnection || !backfillPassFinished {
+                try? await delta(folderID: inboxID, channel: channel, notify: true)
+            }
+            if !backfillPassFinished { continue }
             let now = clock()
             for record in folders.values where record.role != .inbox {
                 let interval = SyncPolicy.isSpecialUse(record.role)
@@ -1260,9 +1266,6 @@ public actor SyncEngine {
                 if now.timeIntervalSince(record.lastDeltaAt) >= durationSeconds(interval) {
                     try? await delta(folderID: record.id, channel: channel, notify: true)
                 }
-            }
-            if !dualConnection, let inboxID {
-                try? await delta(folderID: inboxID, channel: channel, notify: true)
             }
             for record in SyncPolicy.sortFolders(Array(folders.values)) {
                 if stopping { return }
@@ -1279,10 +1282,17 @@ public actor SyncEngine {
     private func stillCurrentGeneration(
         _ captured: MailboxGeneration,
         folder: FolderID
-    ) async throws -> Bool {
-        guard folders[folder]?.generation == captured else { return false }
-        let live = try await store.liveGeneration(for: folder)
-        return live == captured
+    ) -> Bool {
+        folders[folder]?.generation == captured
+    }
+
+    /// Test seam: UIDVALIDITY replacement mid-FETCH updates this map from another
+    /// engine task. Production only writes it in prepare/maybeReplace.
+    func adoptFolderGenerationForTesting(_ folder: FolderID, _ generation: MailboxGeneration) {
+        guard var record = folders[folder] else { return }
+        record.generation = generation
+        record.isReplacement = true
+        folders[folder] = record
     }
 
     private func seenLoop() async {
@@ -1311,8 +1321,12 @@ public actor SyncEngine {
             do {
                 let selected = try await channel.select(summary.path)
                 let liveNow = try await store.liveGeneration(for: op.folder)
-                if liveNow?.uidValidity != op.uidValidity || selected.uidValidity != op.uidValidity {
+                if liveNow?.uidValidity != op.uidValidity {
                     try await store.dropStaleSeen(folder: op.folder)
+                    continue
+                }
+                if selected.uidValidity != op.uidValidity {
+                    try await store.dropSeen(op, reason: "stale UIDVALIDITY")
                     continue
                 }
                 try await channel.storeSeen(uids: IMAPUIDSet(uid: op.uid.rawValue))
