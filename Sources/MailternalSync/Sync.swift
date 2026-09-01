@@ -25,7 +25,7 @@ public struct NewMailEvent: Sendable {
     }
 }
 
-enum SyncEngineError: Error, Sendable, Equatable {
+public enum SyncEngineError: Error, Sendable, Equatable {
     case stopped
     case messageNotFound
     case partMissing
@@ -33,6 +33,22 @@ enum SyncEngineError: Error, Sendable, Equatable {
     /// `fetchPart` was given something other than a numeric IMAP section
     /// (`1`, `1.2`, `1.2.HEADER`, `1.2.TEXT`).
     case invalidPartSpecifier
+    /// On-demand fetch targeted a prior mailbox generation (UIDVALIDITY changed).
+    /// No IMAP body fetch and no cache write were performed.
+    case staleMessage
+}
+
+extension SyncEngineError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .stopped: return "Sync is not running."
+        case .messageNotFound: return "That message is no longer in the local store."
+        case .partMissing: return "That part is not on the message."
+        case .folderNotFound: return "That folder is no longer in the local store."
+        case .invalidPartSpecifier: return "That part specifier is not a legal IMAP section."
+        case .staleMessage: return "This message is no longer current."
+        }
+    }
 }
 
 enum IMAPSectionSpecifier {

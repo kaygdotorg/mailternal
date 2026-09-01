@@ -319,6 +319,83 @@ import Testing
     }
 }
 
+@Test func fetchPartRejectsStaleGenerationWithoutWritingCache() async throws {
+    try await withSyncStore { store, dir in
+        var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 2, highestModSeq: 1)
+        box.messages[1] = makePlainMessage(uid: 1, subject: "src", body: "BODYTEXT")
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: FixedDisk(freeBytes: 50 * 1024 * 1024 * 1024, volumeBytes: 100 * 1024 * 1024 * 1024),
+            clock: { Date() },
+            settings: testSettings(dir: dir)
+        )
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            try await store.fetchFolders(account: sampleConfig().id)
+                .contains { $0.role == .inbox && $0.backfill == .complete && $0.totalCount == 1 }
+        }
+        let folders = try await store.fetchFolders(account: sampleConfig().id)
+        let inbox = try #require(folders.first { $0.role == .inbox })
+        let page = try await store.page(in: inbox.id, after: nil, limit: 1)
+        let id = try #require(page.rows.first?.id)
+        let ref = try #require(await store.messageRef(id))
+        #expect(ref.generation.uidValidity == 1)
+
+        let caches = dir.appendingPathComponent("Caches", isDirectory: true)
+        func cacheListing() -> [String] {
+            let fm = FileManager.default
+            guard let enumerator = fm.enumerator(atPath: caches.path) else { return [] }
+            return (enumerator.allObjects as? [String] ?? []).sorted()
+        }
+        let before = cacheListing()
+        let fetchesBefore = world.snapshotFetchCount()
+        let cacheSizeBefore = try await store.attachmentCacheSize()
+
+        // UIDVALIDITY changes on the server between messageRef and the on-demand
+        // SELECT. Same UID now names a different message — must not FETCH or cache it.
+        world.updateMailbox("INBOX") { live in
+            live.uidValidity = 99
+            live.uidNext = 2
+            live.highestModSeq = 1
+            live.messages = [
+                1: makePlainMessage(uid: 1, subject: "gen2", body: "REPLACEMENT-SHOULD-NOT-FETCH"),
+            ]
+        }
+
+        await #expect(throws: SyncEngineError.staleMessage) {
+            _ = try await engine.fetchPart(message: id, part: "1")
+        }
+        await #expect(throws: SyncEngineError.staleMessage) {
+            _ = try await engine.rawSource(message: id)
+        }
+        #expect(cacheListing() == before)
+        #expect(try await store.attachmentCacheSize() == cacheSizeBefore)
+        #expect(world.snapshotFetchCount() == fetchesBefore)
+        #expect(try await store.search("REPLACEMENT-SHOULD-NOT-FETCH", limit: 5).isEmpty)
+        let detail = try await store.detail(id)
+        #expect(detail.envelope.subject == "src")
+
+        await engine.refreshNow()
+        try await waitUntil(timeout: .seconds(5)) {
+            guard let live = try await store.liveGeneration(for: inbox.id) else { return false }
+            return live.uidValidity == 99
+        }
+        await #expect(throws: SyncEngineError.staleMessage) {
+            _ = try await engine.fetchPart(message: id, part: "1")
+        }
+        #expect(cacheListing() == before)
+        await engine.stop()
+    }
+}
+
 @Test func engineIngestsOfflineMailOnReconnectWithoutRefetchingHistory() async throws {
     try await withSyncStore { store, dir in
         var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 4, highestModSeq: 4)

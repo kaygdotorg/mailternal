@@ -140,17 +140,9 @@ public actor SyncEngine {
         guard IMAPSectionSpecifier.isLegal(part) else {
             throw SyncEngineError.invalidPartSpecifier
         }
-        try ensureRunning()
-        guard let ref = try await store.messageRef(message) else {
-            throw SyncEngineError.messageNotFound
-        }
-        guard let summary = try await store.fetchFolderSummary(ref.folder) else {
-            throw SyncEngineError.folderNotFound
-        }
-        guard let channel = syncChannel else { throw SyncEngineError.stopped }
-        _ = try await channel.select(summary.path)
-        let fetched = try await channel.fetch(
-            .peek(uids: IMAPUIDSet(uid: ref.uid.rawValue), section: .part(part))
+        let located = try await locateLiveMessage(message)
+        let fetched = try await located.channel.fetch(
+            .peek(uids: IMAPUIDSet(uid: located.uid), section: .part(part))
         )
         guard let data = fetched.first?.parts.first(where: {
             $0.specifier == part || $0.specifier.uppercased() == part.uppercased()
@@ -162,21 +154,38 @@ public actor SyncEngine {
     }
 
     public func rawSource(message: MessageID) async throws -> String {
+        let located = try await locateLiveMessage(message)
+        let section = IMAPPeekSection(specifier: "", binary: false, origin: 0, length: SyncPolicy.rawSourceCap)
+        let fetched = try await located.channel.fetch(
+            IMAPFetchRequest(uids: IMAPUIDSet(uid: located.uid), uid: true, peek: [section])
+        )
+        let data = fetched.first?.parts.first?.data ?? Data()
+        return MessageAssembler.escapeRaw(data)
+    }
+
+    /// Rejects on-demand fetches tagged with a prior mailbox generation
+    /// (spec: sync.md UIDVALIDITY). `messageRef` may return a retiring row;
+    /// live generation + post-SELECT UIDVALIDITY must both match.
+    private func locateLiveMessage(
+        _ message: MessageID
+    ) async throws -> (uid: UInt32, channel: SyncChannel) {
         try ensureRunning()
         guard let ref = try await store.messageRef(message) else {
             throw SyncEngineError.messageNotFound
+        }
+        let live = try await store.liveGeneration(for: ref.folder)
+        guard live == ref.generation else {
+            throw SyncEngineError.staleMessage
         }
         guard let summary = try await store.fetchFolderSummary(ref.folder) else {
             throw SyncEngineError.folderNotFound
         }
         guard let channel = syncChannel else { throw SyncEngineError.stopped }
-        _ = try await channel.select(summary.path)
-        let section = IMAPPeekSection(specifier: "", binary: false, origin: 0, length: SyncPolicy.rawSourceCap)
-        let fetched = try await channel.fetch(
-            IMAPFetchRequest(uids: IMAPUIDSet(uid: ref.uid.rawValue), uid: true, peek: [section])
-        )
-        let data = fetched.first?.parts.first?.data ?? Data()
-        return MessageAssembler.escapeRaw(data)
+        let selected = try await channel.select(summary.path)
+        guard selected.uidValidity == ref.generation.uidValidity else {
+            throw SyncEngineError.staleMessage
+        }
+        return (ref.uid.rawValue, channel)
     }
 
     private func addStatus(_ id: UUID, _ continuation: AsyncStream<SyncStatus>.Continuation) {
