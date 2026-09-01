@@ -89,11 +89,16 @@ final class PartSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable
         if reference.isRemote, !remoteAllowed {
             return (Self.placeholderPNG, "image/png")
         }
-        guard let provider else {
-            throw URLError(.resourceUnavailable)
-        }
-        let part = try await provider(reference.providerKey)
-        return (part.data, part.mimeType)
+        return try await PartFetchRouting.dispatch(
+            reference: reference.providerKey,
+            imap: { key in
+                guard let provider else {
+                    throw URLError(.resourceUnavailable)
+                }
+                return try await provider(key)
+            },
+            remote: { url in try await RemoteImageFetch.load(url) }
+        )
     }
 
     /// 1x1 transparent PNG used as the blocked-remote placeholder.

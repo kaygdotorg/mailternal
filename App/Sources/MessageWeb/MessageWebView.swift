@@ -1,7 +1,14 @@
 #if os(macOS)
 import AppKit
+import os
 import WebKit
 import MailternalSanitizer
+
+/// Failure to install the categorical `WKContentRuleList` network fence.
+public struct MessageWebIsolationError: Error, LocalizedError, Sendable {
+    public let reason: String
+    public var errorDescription: String? { reason }
+}
 
 /// Isolated HTML message surface (spec: `docs/spec/sync.md` HTML isolation).
 ///
@@ -11,19 +18,29 @@ import MailternalSanitizer
 /// ``onExternalLink`` and never loaded in-view. Revealing remote images does
 /// not lift the content-rule block — consented tokens become fetchable
 /// through the scheme handler only.
+///
+/// If the content-rule list fails to compile, HTML is never loaded (fail closed).
 @MainActor
 public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     /// Invoked for user-activated links (http(s), mailto, …). Never loaded in-view.
     public var onExternalLink: ((URL) -> Void)?
+    /// Invoked if the categorical network fence cannot be installed.
+    public var onError: ((any Error) -> Void)?
 
     private let webView: WKWebView
+    private let errorLabel: NSTextField
     private let handler: PartSchemeHandler
     private let userContentController: WKUserContentController
     private var remoteImagesAllowed = false
     private var lastHTML = ""
     private var lastProvider: PartProvider?
-    private var blockListReady = false
+    private var fence: NetworkFenceState = .compiling
     private var pendingRender = false
+
+    private static let isolationLog = Logger(
+        subsystem: "org.kayg.mailternal",
+        category: "HTMLIsolation"
+    )
 
     public override init(frame: NSRect) {
         let handler = PartSchemeHandler()
@@ -39,9 +56,15 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         configuration.allowsAirPlayForMediaPlayback = false
         configuration.setURLSchemeHandler(handler, forURLScheme: PartURL.scheme)
         let webView = WKWebView(frame: .zero, configuration: configuration)
+        let errorLabel = NSTextField(wrappingLabelWithString: "")
+        errorLabel.isSelectable = true
+        errorLabel.alignment = .center
+        errorLabel.textColor = .secondaryLabelColor
+        errorLabel.isHidden = true
         self.handler = handler
         self.userContentController = userContentController
         self.webView = webView
+        self.errorLabel = errorLabel
         super.init(frame: frame)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -50,7 +73,10 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         webView.underPageBackgroundColor = .clear
         webView.autoresizingMask = [.width, .height]
         webView.frame = bounds
+        errorLabel.autoresizingMask = [.width, .height]
+        errorLabel.frame = bounds.insetBy(dx: 24, dy: 24)
         addSubview(webView)
+        addSubview(errorLabel)
         installNetworkBlockList()
     }
 
@@ -62,6 +88,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     public override func layout() {
         super.layout()
         webView.frame = bounds
+        errorLabel.frame = bounds.insetBy(dx: 24, dy: 24)
     }
 
     /// Display already-sanitized HTML. `partProvider` is called with the original
@@ -90,12 +117,29 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     }
 
     private func requestLoad() {
-        guard blockListReady else {
+        switch HTMLIsolationFence.decision(for: fence) {
+        case .waitForFence:
             pendingRender = true
-            return
+        case .loadHTML:
+            pendingRender = false
+            errorLabel.isHidden = true
+            webView.isHidden = false
+            webView.loadHTMLString(Self.wrap(lastHTML), baseURL: nil)
+        case .refuseHTML:
+            pendingRender = false
+            presentFenceFailure()
         }
-        pendingRender = false
-        webView.loadHTMLString(Self.wrap(lastHTML), baseURL: nil)
+    }
+
+    private func presentFenceFailure() {
+        webView.stopLoading()
+        webView.isHidden = true
+        if let blank = URL(string: "about:blank") {
+            webView.load(URLRequest(url: blank))
+        }
+        errorLabel.stringValue =
+            "This message cannot be displayed because the network isolation layer failed to install."
+        errorLabel.isHidden = false
     }
 
     private func installNetworkBlockList() {
@@ -103,13 +147,22 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         WKContentRuleListStore.default().compileContentRuleList(
             forIdentifier: "mailternal.block-all.v1",
             encodedContentRuleList: json
-        ) { [weak self] list, _ in
+        ) { [weak self] list, error in
+            let compileReason = error.map { $0.localizedDescription }
             Task { @MainActor in
                 guard let self else { return }
+                self.fence = HTMLIsolationFence.state(compiledList: list != nil)
                 if let list {
                     self.userContentController.add(list)
+                } else {
+                    let reason = compileReason
+                        ?? "WKContentRuleList compile returned nil"
+                    let failure = MessageWebIsolationError(reason: reason)
+                    Self.isolationLog.error(
+                        "Content-rule compile failed; refusing to load HTML. \(reason, privacy: .public)"
+                    )
+                    self.onError?(failure)
                 }
-                self.blockListReady = true
                 if self.pendingRender {
                     self.requestLoad()
                 }
