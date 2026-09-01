@@ -32,6 +32,7 @@ struct FolderSidebar: View {
             }
         }
         .listStyle(.sidebar)
+        .accessibilityIdentifier(UIIdentifier.sidebar)
         .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
         .overlay {
             if model.folders.isEmpty {
@@ -125,6 +126,7 @@ struct FolderRow: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityLabel)
+        .accessibilityIdentifier(UIIdentifier.sidebarFolder(folder.path))
     }
 
     @ViewBuilder

@@ -51,6 +51,7 @@ struct WindowedModeBanner: View {
             Divider()
         }
         .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(UIIdentifier.windowedBanner)
     }
 }
 
@@ -201,6 +202,7 @@ final class MessageTableContainer: NSView {
         tableView.selectionHighlightStyle = .none
         tableView.backgroundColor = .clear
         tableView.style = .plain
+        tableView.setAccessibilityIdentifier(UIIdentifier.messageTable)
         tableView.rowHeight = 72
         tableView.intercellSpacing = .zero
         tableView.usesAlternatingRowBackgroundColors = false
@@ -412,6 +414,10 @@ final class MessageCellView: NSTableCellView {
         paperclip.isHidden = !row.hasAttachments
         unreadDot.layer?.backgroundColor = row.isRead ? NSColor.clear.cgColor : NSColor.controlAccentColor.cgColor
         unreadDot.toolTip = row.isRead ? nil : "Unread"
+        unreadDot.setAccessibilityElement(true)
+        unreadDot.setAccessibilityIdentifier(UIIdentifier.unreadDot)
+        unreadDot.setAccessibilityLabel("Unread")
+        unreadDot.setAccessibilityHidden(row.isRead)
         setAccessibilityLabel("\(row.from), \(row.subject), \(MailDateFormat.listRow(row.date))")
         setAccessibilityRole(.staticText)
     }

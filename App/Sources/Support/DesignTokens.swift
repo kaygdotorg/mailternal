@@ -71,34 +71,6 @@ enum OutgoingForegroundPolicy {
     }
 }
 
-enum MailDateFormat {
-    private static let time: Date.FormatStyle = .dateTime.hour().minute()
-    private static let absolute: Date.FormatStyle = .dateTime.month(.abbreviated).day().year()
-    private static let weekday: Date.FormatStyle = .dateTime.weekday(.wide)
-
-    static func listRow(_ date: Date, now: Date = .now, calendar: Calendar = .current) -> String {
-        if calendar.isDate(date, inSameDayAs: now) {
-            return date.formatted(.relative(presentation: .named, unitsStyle: .narrow))
-        }
-        if calendar.isDateInYesterday(date) {
-            return "Yesterday"
-        }
-        if let weekAgo = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now)),
-           date >= weekAgo {
-            return date.formatted(weekday)
-        }
-        return date.formatted(absolute)
-    }
-
-    static func envelope(_ date: Date) -> String {
-        date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().year().hour().minute())
-    }
-
-    static func syncedThrough(_ date: Date) -> String {
-        date.formatted(.dateTime.month(.abbreviated).day().year())
-    }
-}
-
 extension FolderRole {
     var systemImage: String {
         switch self {

@@ -182,6 +182,7 @@ struct ToastLayer: View {
             .frame(maxWidth: .infinity, alignment: .top)
             .padding(.top, 10)
             .opacity(presenter.isSuppressed ? 0 : 1)
+            .accessibilityIdentifier(UIIdentifier.toastStack)
             .allowsHitTesting(!presenter.isSuppressed && !rendered.isEmpty)
         }
     }
@@ -267,5 +268,6 @@ private struct ToastCard: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(entry.severity.spokenWord). \(entry.title)")
         .accessibilityValue(entry.detail ?? "")
+        .accessibilityIdentifier(UIIdentifier.toast)
     }
 }

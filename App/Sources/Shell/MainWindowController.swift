@@ -128,6 +128,7 @@ enum MainWindowStartupConfiguration {
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.identifier = NSUserInterfaceItemIdentifier(frameAutosaveName)
+        window.setAccessibilityIdentifier(UIIdentifier.mainWindow)
         window.contentMinSize = minimumContentSize
         window.setFrameAutosaveName(frameAutosaveName)
         if !window.setFrameUsingName(frameAutosaveName) || !hasValidRestoredFrame(window) {
