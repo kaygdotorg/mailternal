@@ -2,8 +2,14 @@ import Foundation
 import GRDB
 
 extension MailStore {
-    /// Full-text search over live-generation messages. Preview is an FTS snippet
-    /// (spec: sync.md FTS). Empty or invalid queries yield no rows.
+    /// Full-text search over live-generation messages, newest first. Preview is
+    /// an FTS snippet (spec: sync.md FTS). Empty or invalid queries yield no rows.
+    ///
+    /// Message ids are date-ordered (see `upsertMessages`), so the FTS rowid is
+    /// too: `ORDER BY messages_fts.rowid DESC LIMIT n` walks matches in index
+    /// order and stops at n — no bm25 scoring or sorter over every match
+    /// (QA on a 100k store: ~180ms p50 with `ORDER BY rank` → sub-ms).
+    /// snippet() runs only for emitted rows because no sorter is involved.
     ///
     /// Known 0.0.1 limitation: `unicode61` does not segment CJK, so CJK search is
     /// substring-poor until a later ICU-backed tokenizer.
@@ -21,9 +27,9 @@ extension MailStore {
                 JOIN messages m ON m.id = messages_fts.rowid
                 JOIN generations g ON g.id = m.generation_id AND g.state = 'live'
                 JOIN folders f ON f.id = g.folder_id AND f.retired = 0
-                WHERE messages_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
+                WHERE messages_fts MATCH ?1
+                ORDER BY messages_fts.rowid DESC
+                LIMIT ?2
                 """
             let rows = try Row.fetchAll(db, sql: sql, arguments: [pattern, cap])
             return rows.map { row in
@@ -55,7 +61,7 @@ extension MailStore {
                 JOIN generations g ON g.id = m.generation_id AND g.state = 'live'
                 JOIN folders f ON f.id = g.folder_id AND f.retired = 0
                 WHERE messages_fts MATCH ?
-                ORDER BY rank
+                ORDER BY messages_fts.rowid DESC
                 LIMIT ?
                 """
             let rows = try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: [pattern, cap])
