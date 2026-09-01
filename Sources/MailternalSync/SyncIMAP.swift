@@ -53,6 +53,12 @@ package struct LiveIMAPClientFactory: IMAPClientFactory {
     }
 }
 
+/// Thrown by mailbox-scoped channel commands when the selected mailbox's
+/// UIDVALIDITY no longer matches the caller's pinned generation.
+enum SyncChannelError: Error, Sendable, Equatable {
+    case staleMailbox
+}
+
 /// Serializes every command on one IMAP connection. Ending IDLE is automatic
 /// before a non-idle command so a multiplexed fallback stays correct.
 ///
@@ -114,6 +120,51 @@ actor SyncChannel {
             let selected = try await self.client.select(path, qresync: qresync)
             self.selectedPath = path
             return selected
+        }
+    }
+
+    /// Atomic select-verify-fetch. Guards against the shared-channel race where
+    /// another task (seen drain, delta, part fetch) re-SELECTs a different
+    /// mailbox between a caller's SELECT and its dependent UID command — which
+    /// would silently run the command against the wrong mailbox (spec:
+    /// sync.md, generation isolation). Re-selects `path` when the channel's
+    /// selection was stolen; verifies UIDVALIDITY when the caller pins one.
+    func fetch(
+        in path: String,
+        expectedUIDValidity: UInt32? = nil,
+        _ request: IMAPFetchRequest
+    ) async throws -> [IMAPFetchedMessage] {
+        try await withCommand {
+            try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
+            return try await self.client.fetch(request)
+        }
+    }
+
+    /// Atomic select-verify-store for the seen queue: the op's UIDVALIDITY is
+    /// re-verified against the *server's* selected mailbox immediately before
+    /// STORE, inside one exclusive channel operation.
+    func storeSeen(
+        in path: String,
+        expectedUIDValidity: UInt32?,
+        uids: IMAPUIDSet
+    ) async throws {
+        try await withCommand {
+            try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
+            try await self.client.storeSeen(uids: uids)
+        }
+    }
+
+    private func ensureSelectedUnlocked(_ path: String, expectedUIDValidity: UInt32?) async throws {
+        try await leaveIdleUnlocked()
+        let selected: IMAPSelectedMailbox
+        if selectedPath == path, let current = await client.selectedMailbox() {
+            selected = current
+        } else {
+            selected = try await client.select(path, qresync: nil)
+            selectedPath = path
+        }
+        if let expected = expectedUIDValidity, selected.uidValidity != expected {
+            throw SyncChannelError.staleMailbox
         }
     }
 

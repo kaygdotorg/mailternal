@@ -173,9 +173,16 @@ public actor SyncEngine {
             throw SyncEngineError.invalidPartSpecifier
         }
         let located = try await locateLiveMessage(message)
-        let fetched = try await located.channel.fetch(
-            .peek(uids: IMAPUIDSet(uid: located.uid), section: .part(part))
-        )
+        let fetched: [IMAPFetchedMessage]
+        do {
+            fetched = try await located.channel.fetch(
+                in: located.path,
+                expectedUIDValidity: located.uidValidity,
+                .peek(uids: IMAPUIDSet(uid: located.uid), section: .part(part))
+            )
+        } catch SyncChannelError.staleMailbox {
+            throw SyncEngineError.staleMessage
+        }
         guard let data = fetched.first?.parts.first(where: {
             $0.specifier == part || $0.specifier.uppercased() == part.uppercased()
         })?.data, !data.isEmpty else {
@@ -188,19 +195,28 @@ public actor SyncEngine {
     public func rawSource(message: MessageID) async throws -> String {
         let located = try await locateLiveMessage(message)
         let section = IMAPPeekSection(specifier: "", binary: false, origin: 0, length: SyncPolicy.rawSourceCap)
-        let fetched = try await located.channel.fetch(
-            IMAPFetchRequest(uids: IMAPUIDSet(uid: located.uid), uid: true, peek: [section])
-        )
+        let fetched: [IMAPFetchedMessage]
+        do {
+            fetched = try await located.channel.fetch(
+                in: located.path,
+                expectedUIDValidity: located.uidValidity,
+                IMAPFetchRequest(uids: IMAPUIDSet(uid: located.uid), uid: true, peek: [section])
+            )
+        } catch SyncChannelError.staleMailbox {
+            throw SyncEngineError.staleMessage
+        }
         let data = fetched.first?.parts.first?.data ?? Data()
         return MessageAssembler.escapeRaw(data)
     }
 
     /// Rejects on-demand fetches tagged with a prior mailbox generation
     /// (spec: sync.md UIDVALIDITY). `messageRef` may return a retiring row;
-    /// live generation + post-SELECT UIDVALIDITY must both match.
+    /// the UIDVALIDITY pin is enforced atomically with the UID command by the
+    /// channel (`fetch(in:expectedUIDValidity:)`), so a selection stolen
+    /// between locate and fetch cannot hit the wrong mailbox or generation.
     private func locateLiveMessage(
         _ message: MessageID
-    ) async throws -> (uid: UInt32, channel: SyncChannel) {
+    ) async throws -> (uid: UInt32, path: String, uidValidity: UInt32, channel: SyncChannel) {
         try ensureRunning()
         guard let ref = try await store.messageRef(message) else {
             throw SyncEngineError.messageNotFound
@@ -213,11 +229,7 @@ public actor SyncEngine {
             throw SyncEngineError.folderNotFound
         }
         guard let channel = syncChannel else { throw SyncEngineError.stopped }
-        let selected = try await channel.select(summary.path)
-        guard selected.uidValidity == ref.generation.uidValidity else {
-            throw SyncEngineError.staleMessage
-        }
-        return (ref.uid.rawValue, channel)
+        return (ref.uid.rawValue, summary.path, ref.generation.uidValidity, channel)
     }
 
     private func addStatus(_ id: UUID, _ continuation: AsyncStream<SyncStatus>.Continuation) {
@@ -676,17 +688,25 @@ public actor SyncEngine {
         let uidSet = IMAPUIDSet(window)
         let meta: [IMAPFetchedMessage]
         do {
-            meta = try await channel.fetch(IMAPFetchRequest(
-                uids: uidSet,
-                envelope: true,
-                bodyStructure: true,
-                flags: true,
-                internalDate: true,
-                uid: true,
-                peek: Self.speculativePeeks
-            ))
+            meta = try await channel.fetch(
+                in: record.path,
+                expectedUIDValidity: capturedGeneration.uidValidity,
+                IMAPFetchRequest(
+                    uids: uidSet,
+                    envelope: true,
+                    bodyStructure: true,
+                    flags: true,
+                    internalDate: true,
+                    uid: true,
+                    peek: Self.speculativePeeks
+                )
+            )
         } catch is CancellationError {
             throw CancellationError()
+        } catch SyncChannelError.staleMailbox {
+            // UIDVALIDITY moved; the next delta pass opens a replacement
+            // generation. Window not committed.
+            return false
         } catch {
             await logSync("window fetch \(record.path)", detail: String(describing: error), folder: record.id)
             if SyncPolicy.isTransport(error) { throw error }
@@ -740,11 +760,15 @@ public actor SyncEngine {
                     let chunk = Array(sortedUIDs[index..<end])
                     index = end
                     do {
-                        let fetched = try await channel.fetch(IMAPFetchRequest(
-                            uids: SyncPolicy.uidSet(uids: chunk),
-                            uid: true,
-                            peek: specifiers.map { IMAPPeekSection.part($0) }
-                        ))
+                        let fetched = try await channel.fetch(
+                            in: record.path,
+                            expectedUIDValidity: capturedGeneration.uidValidity,
+                            IMAPFetchRequest(
+                                uids: SyncPolicy.uidSet(uids: chunk),
+                                uid: true,
+                                peek: specifiers.map { IMAPPeekSection.part($0) }
+                            )
+                        )
                         for message in fetched {
                             guard let uid = message.uid else { continue }
                             var parts = bodies[uid] ?? []
@@ -851,12 +875,14 @@ public actor SyncEngine {
         channel: SyncChannel,
         reason: String
     ) async throws {
-        let flags: [IMAPFetchedMessage]
-        do {
-            flags = try await channel.fetch(.flags(uids: IMAPUIDSet(window)))
-        } catch {
-            return
-        }
+        // Quarantine rows are what make cursor advance legal for a failed
+        // window (spec: every UID committed as message or quarantine). A
+        // failure here must propagate so the cursor never skips the window.
+        let flags = try await channel.fetch(
+            in: record.path,
+            expectedUIDValidity: record.generation.uidValidity,
+            .flags(uids: IMAPUIDSet(window))
+        )
         let now = clock()
         let incoming = flags.compactMap { fetched -> IncomingMessage? in
             guard let uid = fetched.uid else { return nil }
@@ -1008,10 +1034,14 @@ public actor SyncEngine {
                 )
             }
             if let mod = record.highestModseq, await folderHasMessages(record) {
-                let flags = try await channel.fetch(.flagsChangedSince(
-                    uids: SyncPolicy.knownUIDSet(uidNext: selected.uidNext ?? record.lastUidNext),
-                    modSeq: mod
-                ))
+                let flags = try await channel.fetch(
+                    in: record.path,
+                    expectedUIDValidity: record.generation.uidValidity,
+                    .flagsChangedSince(
+                        uids: SyncPolicy.knownUIDSet(uidNext: selected.uidNext ?? record.lastUidNext),
+                        modSeq: mod
+                    )
+                )
                 try await applyFlagFetch(flags, record: record)
             }
         case .condstore:
@@ -1021,10 +1051,14 @@ public actor SyncEngine {
             }
             try await maybeReplace(selected: selected, record: &record)
             if let mod = record.highestModseq, await folderHasMessages(record) {
-                let flags = try await channel.fetch(.flagsChangedSince(
-                    uids: SyncPolicy.knownUIDSet(uidNext: selected.uidNext ?? record.lastUidNext),
-                    modSeq: mod
-                ))
+                let flags = try await channel.fetch(
+                    in: record.path,
+                    expectedUIDValidity: record.generation.uidValidity,
+                    .flagsChangedSince(
+                        uids: SyncPolicy.knownUIDSet(uidNext: selected.uidNext ?? record.lastUidNext),
+                        modSeq: mod
+                    )
+                )
                 try await applyFlagFetch(flags, record: record)
             }
             try await reconcileExpunges(record: record, selected: selected, channel: channel)
@@ -1095,7 +1129,13 @@ public actor SyncEngine {
             try Task.checkCancellation()
             let stored = try await store.uids(in: record.generation, range: range)
             if stored.isEmpty { continue }
-            let fetched = try await channel.fetch(.flags(uids: IMAPUIDSet(range)))
+            // Atomic in-mailbox fetch: a stolen selection here would make the
+            // server set miss every stored UID and mass-delete live rows.
+            let fetched = try await channel.fetch(
+                in: record.path,
+                expectedUIDValidity: record.generation.uidValidity,
+                .flags(uids: IMAPUIDSet(range))
+            )
             let server = Set(fetched.compactMap(\.uid))
             let gone = stored.filter { !server.contains($0.rawValue) }
             if !gone.isEmpty {
@@ -1319,18 +1359,23 @@ public actor SyncEngine {
                 continue
             }
             do {
-                let selected = try await channel.select(summary.path)
                 let liveNow = try await store.liveGeneration(for: op.folder)
                 if liveNow?.uidValidity != op.uidValidity {
                     try await store.dropStaleSeen(folder: op.folder)
                     continue
                 }
-                if selected.uidValidity != op.uidValidity {
-                    try await store.dropSeen(op, reason: "stale UIDVALIDITY")
-                    continue
-                }
-                try await channel.storeSeen(uids: IMAPUIDSet(uid: op.uid.rawValue))
+                // Atomic select-verify-store: the server's selected UIDVALIDITY
+                // is checked against the op inside one exclusive channel
+                // operation, so a replacement activated during any await here
+                // cannot mark an unrelated message in the new generation.
+                try await channel.storeSeen(
+                    in: summary.path,
+                    expectedUIDValidity: op.uidValidity,
+                    uids: IMAPUIDSet(uid: op.uid.rawValue)
+                )
                 try await store.dequeueSeen(op)
+            } catch SyncChannelError.staleMailbox {
+                try await store.dropSeen(op, reason: "stale UIDVALIDITY")
             } catch let error as IMAPError {
                 if error.isTaggedNO || error.isTaggedBAD {
                     try await store.dropSeen(op, reason: error.description)
