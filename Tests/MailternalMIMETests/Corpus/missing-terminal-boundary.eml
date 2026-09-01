@@ -1,0 +1,14 @@
+From: a@b.com
+Subject: Missing close
+Date: Wed, 01 Jan 2020 00:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="edge"
+
+--edge
+Content-Type: text/plain; charset=utf-8
+
+first part
+--edge
+Content-Type: text/plain; charset=utf-8
+
+second part

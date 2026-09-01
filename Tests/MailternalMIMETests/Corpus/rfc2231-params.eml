@@ -1,0 +1,10 @@
+From: a@b.com
+Subject: file
+Date: Wed, 01 Jan 2020 00:00:00 +0000
+Content-Type: application/pdf; name*0*=utf-8''%E6%97%A5; name*1*=%E6%9C%AC
+Content-Disposition: attachment;
+ filename*0*=UTF-8''%E6%97%A5%E6%9C%AC;
+ filename*1*=%E8%AA%9E%2E%70%64%66
+Content-Transfer-Encoding: base64
+
+JVBERg==
