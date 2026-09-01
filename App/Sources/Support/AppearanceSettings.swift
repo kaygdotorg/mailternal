@@ -149,7 +149,9 @@ final class AppearanceSettings {
     }
 
     func applyAppKitAppearance() {
-        NSApp.appearance = mode.nsAppearance
+        // NSApp is nil until NSApplication is created; .shared creates it on demand,
+        // so this is safe during early init and headless launches.
+        NSApplication.shared.appearance = mode.nsAppearance
     }
 
     private static let defaultBackgroundOpacity = 0.85
