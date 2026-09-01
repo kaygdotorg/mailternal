@@ -241,6 +241,22 @@ public struct StoreLogEntry: Hashable, Sendable, Identifiable {
     }
 }
 
+// MARK: - Folder identity (LIST reconcile)
+
+/// A folder as reported by one LIST pass (spec: sync.md mailbox discovery).
+///
+/// Match by `objectID` when the server provides one; otherwise by `path`.
+/// Pass the keys from the current LIST to `MailStore.reconcileFolders`.
+public struct FolderKey: Hashable, Sendable {
+    public var path: String
+    public var objectID: String?
+
+    public init(path: String, objectID: String? = nil) {
+        self.path = path
+        self.objectID = objectID.flatMap { $0.isEmpty ? nil : $0 }
+    }
+}
+
 // MARK: - Folder counts
 
 /// Per-folder aggregate counts. Observed independently of any page window.
@@ -259,6 +275,48 @@ public struct FolderCounts: Hashable, Sendable {
 public enum FTSIntegrityResult: Hashable, Sendable {
     case ok
     case rebuilt
+}
+
+/// Structural store checks used by sync chaos tests (spec: sync.md storage).
+///
+/// A clean report means: every message belongs to a live / replacement /
+/// retiring generation, FTS row count matches the message table, no backfill
+/// cursor sits past the generation's UIDNEXT estimate, and each folder has at
+/// most one live and one replacement generation.
+public struct StoreInvariantReport: Hashable, Sendable {
+    public var messageCount: Int
+    public var ftsCount: Int
+    public var orphanMessageCount: Int
+    public var cursorBeyondUidNextCount: Int
+    public var liveGenerations: Int
+    public var replacementGenerations: Int
+    public var retiringGenerations: Int
+    public var seenQueueCount: Int
+    public var issues: [String]
+
+    public var isClean: Bool { issues.isEmpty }
+
+    public init(
+        messageCount: Int,
+        ftsCount: Int,
+        orphanMessageCount: Int,
+        cursorBeyondUidNextCount: Int,
+        liveGenerations: Int,
+        replacementGenerations: Int,
+        retiringGenerations: Int,
+        seenQueueCount: Int,
+        issues: [String]
+    ) {
+        self.messageCount = messageCount
+        self.ftsCount = ftsCount
+        self.orphanMessageCount = orphanMessageCount
+        self.cursorBeyondUidNextCount = cursorBeyondUidNextCount
+        self.liveGenerations = liveGenerations
+        self.replacementGenerations = replacementGenerations
+        self.retiringGenerations = retiringGenerations
+        self.seenQueueCount = seenQueueCount
+        self.issues = issues
+    }
 }
 
 // MARK: - Attachment pins

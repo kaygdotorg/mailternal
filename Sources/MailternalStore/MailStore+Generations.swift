@@ -11,7 +11,7 @@ extension MailStore {
         baselineUID: IMAPUID?
     ) async throws -> MailboxGeneration {
         try await write { db in
-            _ = try MailStore.requireFolder(db, folder)
+            _ = try MailStore.requireActiveFolder(db, folder)
             if let existing = try Row.fetchOne(
                 db,
                 sql: "SELECT id, uid_validity FROM generations WHERE folder_id = ? AND state = ?",
@@ -21,6 +21,21 @@ extension MailStore {
                 if existingUV != Int64(uidValidity) {
                     throw MailStoreError.uidValidityMismatch
                 }
+                return MailboxGeneration(folder: folder, uidValidity: uidValidity)
+            }
+            if let existingID = try Int64.fetchOne(
+                db,
+                sql: "SELECT id FROM generations WHERE folder_id = ? AND uid_validity = ?",
+                arguments: [folder.rawValue, Int64(uidValidity)]
+            ) {
+                try db.execute(
+                    sql: "UPDATE generations SET state = ? WHERE id = ?",
+                    arguments: [GenerationState.live.rawValue, existingID]
+                )
+                try db.execute(
+                    sql: "UPDATE folders SET live_generation_id = ? WHERE id = ?",
+                    arguments: [existingID, folder.rawValue]
+                )
                 return MailboxGeneration(folder: folder, uidValidity: uidValidity)
             }
             try MailStore.insertGeneration(
@@ -43,7 +58,7 @@ extension MailStore {
         baselineUID: IMAPUID?
     ) async throws -> MailboxGeneration {
         try await write { db in
-            _ = try MailStore.requireFolder(db, folder)
+            _ = try MailStore.requireActiveFolder(db, folder)
             if let existing = try Row.fetchOne(
                 db,
                 sql: "SELECT id, uid_validity FROM generations WHERE folder_id = ? AND state = ?",
@@ -78,7 +93,7 @@ extension MailStore {
     /// stale seen-queue ops for the prior UIDVALIDITY dropped.
     public func activateReplacementGeneration(folder: FolderID) async throws {
         try await write { db in
-            let folderRow = try MailStore.requireFolder(db, folder)
+            let folderRow = try MailStore.requireActiveFolder(db, folder)
             guard let replacementID = try Int64.fetchOne(
                 db,
                 sql: "SELECT id FROM generations WHERE folder_id = ? AND state = ?",

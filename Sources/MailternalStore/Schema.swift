@@ -33,12 +33,19 @@ enum Schema {
             t.column("object_id", .text)
             // No FK: circular with generations.live pointer.
             t.column("live_generation_id", .integer)
-            t.uniqueKey(["account_id", "path"])
+            // Retired folders stay until generation cleanup; path uniqueness
+            // applies only to live rows so a path-only recreate can insert.
+            t.column("retired", .boolean).notNull().defaults(to: false)
         }
         try db.execute(sql: """
             CREATE UNIQUE INDEX folders_object_id_uidx
             ON folders(account_id, object_id)
             WHERE object_id IS NOT NULL
+            """)
+        try db.execute(sql: """
+            CREATE UNIQUE INDEX folders_account_path_uidx
+            ON folders(account_id, path)
+            WHERE retired = 0
             """)
         try db.execute(sql: "CREATE INDEX folders_account_idx ON folders(account_id)")
 

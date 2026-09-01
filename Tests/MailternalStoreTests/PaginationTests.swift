@@ -35,6 +35,41 @@ import Testing
     }
 }
 
+@Test func pageQueryPlanUsesKeysetIndexNotTableScan() async throws {
+    try await withStore { store, _ in
+        let (_, folder, generation) = try await seedInbox(store)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        for origin in stride(from: 1, through: 2_400, by: 400) {
+            let chunk = (origin..<origin + 400).map { uid in
+                makeMessage(
+                    generation: generation,
+                    uid: UInt32(uid),
+                    subject: "m\(uid)",
+                    date: base.addingTimeInterval(Double(uid)),
+                    body: "body \(uid)"
+                )
+            }
+            _ = try await store.upsertMessages(chunk)
+        }
+
+        func assertKeyset(_ plan: String) {
+            let upper = plan.uppercased()
+            #expect(plan.contains("messages_page_idx"), "\(plan)")
+            #expect(!upper.contains("USE TEMP B-TREE FOR ORDER BY"), "\(plan)")
+            let scannedWithoutIndex = upper.split(separator: "\n").contains { line in
+                line.contains("SCAN") && line.contains("MESSAGES") && !line.contains("USING INDEX")
+            }
+            #expect(!scannedWithoutIndex, "\(plan)")
+        }
+
+        let first = try await store.explainPageQueryPlan(in: folder, after: nil, limit: 80)
+        assertKeyset(first)
+        let page = try await store.page(in: folder, after: nil, limit: 80)
+        let next = try await store.explainPageQueryPlan(in: folder, after: page.next, limit: 80)
+        assertKeyset(next)
+    }
+}
+
 @Test func pageProjectionsExcludeBodies() async throws {
     try await withStore { store, _ in
         let (_, folder, generation) = try await seedInbox(store)

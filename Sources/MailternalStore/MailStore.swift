@@ -170,6 +170,24 @@ extension MailStore {
         }
     }
 
+    /// Retires folders for `account` that are absent from this LIST pass.
+    ///
+    /// A stored folder is kept when a `seen` key matches it by `objectID` (when
+    /// the folder has one) or else by `path`. Already-retired rows are ignored.
+    /// Returns the folders newly marked retired so sync can cancel their work.
+    ///
+    /// Retire moves every generation to `retiring` and clears the live pointer;
+    /// call `cleanupRetiredGenerations` to drop messages and FTS rows. Do not
+    /// invoke this on a failed LIST — an empty `seen` set retires every folder.
+    public func reconcileFolders(
+        account: AccountID,
+        seen: [FolderKey]
+    ) async throws -> [FolderID] {
+        try await write { db in
+            try MailStore.reconcileFolders(db, account: account, seen: seen)
+        }
+    }
+
     public func fetchFolders(account: AccountID) async throws -> [FolderSummary] {
         try await read { db in
             try MailStore.fetchFolders(db, account: account)
@@ -210,7 +228,7 @@ extension MailStore {
                 arguments: [account.rawValue, objectID]
             ) {
                 try db.execute(
-                    sql: "UPDATE folders SET path = ?, name = ?, role = ? WHERE id = ?",
+                    sql: "UPDATE folders SET path = ?, name = ?, role = ?, retired = 0 WHERE id = ?",
                     arguments: [path, name, role.rawValue, existing]
                 )
                 return FolderID(rawValue: existing)
@@ -218,23 +236,81 @@ extension MailStore {
         }
         if let existing = try Int64.fetchOne(
             db,
-            sql: "SELECT id FROM folders WHERE account_id = ? AND path = ?",
+            sql: "SELECT id FROM folders WHERE account_id = ? AND path = ? AND retired = 0",
             arguments: [account.rawValue, path]
         ) {
             try db.execute(
-                sql: "UPDATE folders SET name = ?, role = ?, object_id = COALESCE(?, object_id) WHERE id = ?",
+                sql: """
+                    UPDATE folders SET name = ?, role = ?, object_id = COALESCE(?, object_id), retired = 0
+                    WHERE id = ?
+                    """,
                 arguments: [name, role.rawValue, objectID, existing]
             )
             return FolderID(rawValue: existing)
         }
         try db.execute(
             sql: """
-                INSERT INTO folders (account_id, path, name, role, object_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO folders (account_id, path, name, role, object_id, retired)
+                VALUES (?, ?, ?, ?, ?, 0)
                 """,
             arguments: [account.rawValue, path, name, role.rawValue, objectID]
         )
         return FolderID(rawValue: db.lastInsertedRowID)
+    }
+
+    static func reconcileFolders(
+        _ db: Database,
+        account: AccountID,
+        seen: [FolderKey]
+    ) throws -> [FolderID] {
+        let seenObjectIDs = Set(seen.compactMap(\.objectID))
+        let seenPaths = Set(seen.map(\.path))
+        let rows = try Row.fetchAll(
+            db,
+            sql: "SELECT id, path, object_id FROM folders WHERE account_id = ? AND retired = 0",
+            arguments: [account.rawValue]
+        )
+        var retired: [FolderID] = []
+        for row in rows {
+            let id: Int64 = row["id"]
+            let path: String = row["path"]
+            let objectID: String? = row["object_id"]
+            let matched: Bool
+            if let objectID, !objectID.isEmpty, seenObjectIDs.contains(objectID) {
+                matched = true
+            } else {
+                matched = seenPaths.contains(path)
+            }
+            if !matched {
+                let folder = FolderID(rawValue: id)
+                try retireFolder(db, folder)
+                retired.append(folder)
+            }
+        }
+        return retired
+    }
+
+    static func retireFolder(_ db: Database, _ folder: FolderID) throws {
+        try db.execute(
+            sql: "UPDATE folders SET retired = 1, live_generation_id = NULL WHERE id = ?",
+            arguments: [folder.rawValue]
+        )
+        try db.execute(
+            sql: """
+                UPDATE generations SET state = ?
+                WHERE folder_id = ? AND state IN (?, ?)
+                """,
+            arguments: [
+                GenerationState.retiring.rawValue,
+                folder.rawValue,
+                GenerationState.live.rawValue,
+                GenerationState.replacement.rawValue,
+            ]
+        )
+        try db.execute(
+            sql: "DELETE FROM seen_queue WHERE folder_id = ?",
+            arguments: [folder.rawValue]
+        )
     }
 
     static func fetchFolders(_ db: Database, account: AccountID) throws -> [FolderSummary] {
@@ -245,7 +321,7 @@ extension MailStore {
                    s.backfill_phase, s.progress, s.halted_through
             FROM folders f
             LEFT JOIN sync_state s ON s.generation_id = f.live_generation_id
-            WHERE f.account_id = ?
+            WHERE f.account_id = ? AND f.retired = 0
             ORDER BY \(RoleOrder.sqlCase("f.role")), f.path COLLATE NOCASE
             """
         let rows = try Row.fetchAll(db, sql: sql, arguments: [account.rawValue])
@@ -260,7 +336,7 @@ extension MailStore {
                    s.backfill_phase, s.progress, s.halted_through
             FROM folders f
             LEFT JOIN sync_state s ON s.generation_id = f.live_generation_id
-            WHERE f.id = ?
+            WHERE f.id = ? AND f.retired = 0
             """
         guard let row = try Row.fetchOne(db, sql: sql, arguments: [folder.rawValue]) else {
             return nil
@@ -306,6 +382,15 @@ extension MailStore {
 
     static func requireFolder(_ db: Database, _ folder: FolderID) throws -> Row {
         guard let row = try Row.fetchOne(db, sql: "SELECT * FROM folders WHERE id = ?", arguments: [folder.rawValue]) else {
+            throw MailStoreError.folderNotFound
+        }
+        return row
+    }
+
+    static func requireActiveFolder(_ db: Database, _ folder: FolderID) throws -> Row {
+        let row = try requireFolder(db, folder)
+        let retired: Bool = row["retired"]
+        if retired {
             throw MailStoreError.folderNotFound
         }
         return row
@@ -375,5 +460,118 @@ extension MailStore {
         try await read { db in
             try String.fetchOne(db, sql: "PRAGMA journal_mode") ?? ""
         }
+    }
+
+    /// Structural invariants for sync chaos / leftover detection (spec: sync.md).
+    public func checkInvariants() async throws -> StoreInvariantReport {
+        try await read { db in
+            try MailStore.collectInvariants(db)
+        }
+    }
+
+    static func collectInvariants(_ db: Database) throws -> StoreInvariantReport {
+        let messageCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messages") ?? 0
+        let ftsCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messages_fts") ?? 0
+        let orphanMessageCount = try Int.fetchOne(
+            db,
+            sql: """
+                SELECT COUNT(*) FROM messages m
+                LEFT JOIN generations g ON g.id = m.generation_id
+                WHERE g.id IS NULL
+                   OR g.state NOT IN ('live', 'replacement', 'retiring')
+                """
+        ) ?? 0
+        let cursorBeyondUidNextCount = try Int.fetchOne(
+            db,
+            sql: """
+                SELECT COUNT(*) FROM sync_state s
+                JOIN generations g ON g.id = s.generation_id
+                WHERE s.low_water_uid IS NOT NULL
+                  AND (
+                    (s.baseline_uid IS NOT NULL AND s.low_water_uid > s.baseline_uid + 1)
+                    OR s.low_water_uid > COALESCE(
+                        (SELECT MAX(m.uid) FROM messages m WHERE m.generation_id = s.generation_id),
+                        0
+                    ) + 1
+                  )
+                """
+        ) ?? 0
+        let liveGenerations = try Int.fetchOne(
+            db, sql: "SELECT COUNT(*) FROM generations WHERE state = 'live'"
+        ) ?? 0
+        let replacementGenerations = try Int.fetchOne(
+            db, sql: "SELECT COUNT(*) FROM generations WHERE state = 'replacement'"
+        ) ?? 0
+        let retiringGenerations = try Int.fetchOne(
+            db, sql: "SELECT COUNT(*) FROM generations WHERE state = 'retiring'"
+        ) ?? 0
+        let seenQueueCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM seen_queue") ?? 0
+        let multiLive = try Int.fetchOne(
+            db,
+            sql: """
+                SELECT COUNT(*) FROM (
+                    SELECT folder_id FROM generations
+                    WHERE state = 'live'
+                    GROUP BY folder_id
+                    HAVING COUNT(*) > 1
+                )
+                """
+        ) ?? 0
+        let multiReplacement = try Int.fetchOne(
+            db,
+            sql: """
+                SELECT COUNT(*) FROM (
+                    SELECT folder_id FROM generations
+                    WHERE state = 'replacement'
+                    GROUP BY folder_id
+                    HAVING COUNT(*) > 1
+                )
+                """
+        ) ?? 0
+        let missingFTS = try Int.fetchOne(
+            db,
+            sql: """
+                SELECT COUNT(*) FROM messages m
+                WHERE NOT EXISTS (SELECT 1 FROM messages_fts f WHERE f.rowid = m.id)
+                """
+        ) ?? 0
+        let extraFTS = try Int.fetchOne(
+            db,
+            sql: """
+                SELECT COUNT(*) FROM messages_fts f
+                WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = f.rowid)
+                """
+        ) ?? 0
+
+        var issues: [String] = []
+        if orphanMessageCount > 0 {
+            issues.append("orphan messages: \(orphanMessageCount)")
+        }
+        if messageCount != ftsCount || missingFTS > 0 || extraFTS > 0 {
+            issues.append(
+                "FTS mismatch messages=\(messageCount) fts=\(ftsCount) missing=\(missingFTS) extra=\(extraFTS)"
+            )
+        }
+        if cursorBeyondUidNextCount > 0 {
+            issues.append("cursors beyond UIDNEXT: \(cursorBeyondUidNextCount)")
+        }
+        if multiLive > 0 {
+            issues.append("folders with multiple live generations: \(multiLive)")
+        }
+        if multiReplacement > 0 {
+            issues.append("folders with multiple replacement generations: \(multiReplacement)")
+        }
+
+        return StoreInvariantReport(
+            messageCount: messageCount,
+            ftsCount: ftsCount,
+            orphanMessageCount: orphanMessageCount,
+            cursorBeyondUidNextCount: cursorBeyondUidNextCount,
+            liveGenerations: liveGenerations,
+            replacementGenerations: replacementGenerations,
+            retiringGenerations: retiringGenerations,
+            seenQueueCount: seenQueueCount,
+            issues: issues
+        )
     }
 }
