@@ -13,6 +13,7 @@ import Testing
             "messages_fts",
             "sync_state",
             "seen_queue",
+            "archive_queue",
             "error_log",
             "attachment_cache",
             "grdb_migrations",
@@ -46,6 +47,37 @@ import Testing
         // (Opening twice in one process is covered by migrator no-op on current schema.)
         let folders = try await store.fetchFolders(account: AccountID(rawValue: "missing"))
         #expect(folders.isEmpty)
+    }
+}
+
+@Test func folderSeparatorColumnIsNullableAndPersistsDiscoveryMetadata() async throws {
+    try await withStore { store, _ in
+        let columns = try await store.read { db in
+            try db.columns(in: "folders").map(\.name)
+        }
+        #expect(columns.contains("separator"))
+
+        let account = sampleAccount()
+        try await store.upsertAccount(account)
+        let legacy = try await store.upsertFolder(
+            account: account.id,
+            path: "Legacy",
+            name: "Legacy",
+            separator: nil,
+            role: .none,
+            objectID: nil
+        )
+        #expect(try await store.fetchFolderSummary(legacy)?.separator == nil)
+
+        let discovered = try await store.upsertFolder(
+            account: account.id,
+            path: "Root^Child",
+            name: "Child",
+            separator: "^",
+            role: .none,
+            objectID: "custom-delimiter"
+        )
+        #expect(try await store.fetchFolderSummary(discovered)?.separator == "^")
     }
 }
 

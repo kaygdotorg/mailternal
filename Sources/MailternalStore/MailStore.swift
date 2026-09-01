@@ -181,9 +181,9 @@ extension MailStore {
             try db.execute(
                 sql: """
                     INSERT INTO accounts (
-                        id, display_name, email_address, username,
+                        id, account_link_id, display_name, email_address, username,
                         imap_host, imap_port, imap_security
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         display_name = excluded.display_name,
                         email_address = excluded.email_address,
@@ -194,6 +194,7 @@ extension MailStore {
                     """,
                 arguments: [
                     config.id.rawValue,
+                    config.accountLinkID.uuidString,
                     config.displayName,
                     config.emailAddress,
                     config.username,
@@ -232,11 +233,14 @@ extension MailStore {
     }
 
     static func account(from row: Row) throws -> AccountConfig {
-        guard let security = IMAPEndpoint.Security(rawValue: row["imap_security"]) else {
+        guard let security = IMAPEndpoint.Security(rawValue: row["imap_security"]),
+              let accountLinkRaw: String = row["account_link_id"],
+              let accountLinkID = AccountLinkID(uuidString: accountLinkRaw) else {
             throw MailStoreError.accountNotFound
         }
         return AccountConfig(
             id: AccountID(rawValue: row["id"]),
+            accountLinkID: accountLinkID,
             displayName: row["display_name"],
             emailAddress: row["email_address"],
             username: row["username"],
@@ -258,11 +262,20 @@ extension MailStore {
         account: AccountID,
         path: String,
         name: String,
+        separator: Character?,
         role: FolderRole,
         objectID: String?
     ) async throws -> FolderID {
         try await write { db in
-            try MailStore.upsertFolder(db, account: account, path: path, name: name, role: role, objectID: objectID)
+            try MailStore.upsertFolder(
+                db,
+                account: account,
+                path: path,
+                name: name,
+                separator: separator,
+                role: role,
+                objectID: objectID
+            )
         }
     }
 
@@ -314,9 +327,11 @@ extension MailStore {
         account: AccountID,
         path: String,
         name: String,
+        separator: Character?,
         role: FolderRole,
         objectID: String?
     ) throws -> FolderID {
+        let separatorValue = separator.map(String.init)
         if let objectID {
             if let existing = try Int64.fetchOne(
                 db,
@@ -324,8 +339,8 @@ extension MailStore {
                 arguments: [account.rawValue, objectID]
             ) {
                 try db.execute(
-                    sql: "UPDATE folders SET path = ?, name = ?, role = ?, retired = 0 WHERE id = ?",
-                    arguments: [path, name, role.rawValue, existing]
+                    sql: "UPDATE folders SET path = ?, name = ?, separator = ?, role = ?, retired = 0 WHERE id = ?",
+                    arguments: [path, name, separatorValue, role.rawValue, existing]
                 )
                 return FolderID(rawValue: existing)
             }
@@ -337,19 +352,19 @@ extension MailStore {
         ) {
             try db.execute(
                 sql: """
-                    UPDATE folders SET name = ?, role = ?, object_id = COALESCE(?, object_id), retired = 0
+                    UPDATE folders SET name = ?, separator = ?, role = ?, object_id = COALESCE(?, object_id), retired = 0
                     WHERE id = ?
                     """,
-                arguments: [name, role.rawValue, objectID, existing]
+                arguments: [name, separatorValue, role.rawValue, objectID, existing]
             )
             return FolderID(rawValue: existing)
         }
         try db.execute(
             sql: """
-                INSERT INTO folders (account_id, path, name, role, object_id, retired)
-                VALUES (?, ?, ?, ?, ?, 0)
+                INSERT INTO folders (account_id, path, name, separator, role, object_id, retired)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
                 """,
-            arguments: [account.rawValue, path, name, role.rawValue, objectID]
+            arguments: [account.rawValue, path, name, separatorValue, role.rawValue, objectID]
         )
         return FolderID(rawValue: db.lastInsertedRowID)
     }
@@ -407,11 +422,15 @@ extension MailStore {
             sql: "DELETE FROM seen_queue WHERE folder_id = ?",
             arguments: [folder.rawValue]
         )
+        try db.execute(
+            sql: "DELETE FROM archive_queue WHERE folder_id = ?",
+            arguments: [folder.rawValue]
+        )
     }
 
     static func fetchFolders(_ db: Database, account: AccountID) throws -> [FolderSummary] {
         let sql = """
-            SELECT f.id, f.name, f.path, f.role,
+            SELECT f.id, f.name, f.path, f.separator, f.role,
                    (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id) AS total,
                    (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id AND m.is_read = 0) AS unread,
                    s.backfill_phase, s.progress, s.halted_through
@@ -426,7 +445,7 @@ extension MailStore {
 
     static func fetchFolderSummary(_ db: Database, folder: FolderID) throws -> FolderSummary? {
         let sql = """
-            SELECT f.id, f.name, f.path, f.role,
+            SELECT f.id, f.name, f.path, f.separator, f.role,
                    (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id) AS total,
                    (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id AND m.is_read = 0) AS unread,
                    s.backfill_phase, s.progress, s.halted_through
@@ -461,10 +480,16 @@ extension MailStore {
         let phase: String? = row["backfill_phase"]
         let progress: Double? = row["progress"]
         let halted: Double? = row["halted_through"]
+        let rawSeparator: String? = row["separator"]
+        let separator = rawSeparator.flatMap { raw -> Character? in
+            guard raw.count == 1 else { return nil }
+            return raw.first
+        }
         return FolderSummary(
             id: FolderID(rawValue: row["id"]),
             name: row["name"],
             path: row["path"],
+            separator: separator,
             role: role,
             unreadCount: row["unread"],
             totalCount: row["total"],

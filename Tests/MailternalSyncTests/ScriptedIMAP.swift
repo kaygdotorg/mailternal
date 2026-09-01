@@ -12,8 +12,13 @@ final class ScriptedWorld: @unchecked Sendable {
     var failQResync = false
     var failSelect: Error?
     var storeSeenError: Error?
-    var storedSeen: [UInt32] = []
     var isGmail = false
+    var moveError: Error?
+    var copyError: Error?
+    var storeDeletedError: Error?
+    var expungeError: Error?
+    var storedSeen: [UInt32] = []
+    var archiveCommands: [String] = []
     var fetchNanos: UInt64 = 0
     /// Sleep `fetchNanos` only on fetches after this count. `nil` sleeps every fetch.
     var stallFetchesAfter: Int?
@@ -23,8 +28,17 @@ final class ScriptedWorld: @unchecked Sendable {
     var fetchErrorAfter: Int?
     var fetchCount = 0
     var selectCount = 0
+    /// UID ranges requested by envelope/bodystructure metadata fetches.
+    /// Follow-up body peeks and bounded flag sweeps are intentionally omitted.
+    var metadataFetchRanges: [[ClosedRange<UInt32>]] = []
     var flagFetchRanges: [[ClosedRange<UInt32>]] = []
-
+    /// Pauses the quarantine FLAGS fallback after capturing its server response.
+    /// This lets tests deterministically interleave an EXPUNGE delta.
+    var pauseFlagFallback = false
+    private var flagFallbackReleased = false
+    private var flagFallbackEntered = false
+    private var flagFallbackReturned = false
+    private var flagFallbackWaiters: [CheckedContinuation<Void, Never>] = []
     init(
         capabilities: IMAPCapabilities,
         folders: [IMAPMailbox],
@@ -80,6 +94,82 @@ final class ScriptedWorld: @unchecked Sendable {
         return storedSeen
     }
 
+    func archiveCommandSnapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return archiveCommands
+    }
+
+    func mutationError(_ command: String) -> Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        switch command {
+        case "MOVE": return moveError
+        case "COPY": return copyError
+        case "STORE": return storeDeletedError
+        case "EXPUNGE": return expungeError
+        default: return nil
+        }
+    }
+
+    func applyArchiveMove(path: String, destination: String, uids: IMAPUIDSet) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var source = mailboxes[path] else { return }
+        var target = mailboxes[destination] ?? ScriptedMailbox(path: destination)
+        for uid in Array(source.messages.keys) where SyncPolicy.contains(uids, uid: uid) {
+            guard let message = source.messages.removeValue(forKey: uid) else { continue }
+            target.messages[uid] = message
+            archiveCommands.append("MOVE \(path) \(destination) \(uid)")
+        }
+        target.uidNext = max(target.uidNext, target.messages.keys.max().map { $0 &+ 1 } ?? target.uidNext)
+        mailboxes[path] = source
+        mailboxes[destination] = target
+    }
+
+    func applyArchiveCopy(path: String, destination: String, uids: IMAPUIDSet) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let source = mailboxes[path] else { return }
+        var target = mailboxes[destination] ?? ScriptedMailbox(path: destination)
+        for uid in Array(source.messages.keys) where SyncPolicy.contains(uids, uid: uid) {
+            guard let message = source.messages[uid] else { continue }
+            target.messages[uid] = message
+            archiveCommands.append("COPY \(path) \(destination) \(uid)")
+        }
+        target.uidNext = max(target.uidNext, target.messages.keys.max().map { $0 &+ 1 } ?? target.uidNext)
+        mailboxes[destination] = target
+    }
+
+    func applyStoreDeleted(path: String, uids: IMAPUIDSet) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var source = mailboxes[path] else { return }
+        for uid in Array(source.messages.keys) where SyncPolicy.contains(uids, uid: uid) {
+            guard var message = source.messages[uid] else { continue }
+            if !message.flags.contains(where: { $0.lowercased().contains("deleted") }) {
+                message.flags.append("\\Deleted")
+            }
+            source.messages[uid] = message
+            archiveCommands.append("STORE \(path) \(uid)")
+        }
+        mailboxes[path] = source
+    }
+
+    func applyExpunge(path: String, uids: IMAPUIDSet) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var source = mailboxes[path] else { return }
+        for uid in Array(source.messages.keys) where SyncPolicy.contains(uids, uid: uid) {
+            guard let message = source.messages[uid],
+                  message.flags.contains(where: { $0.lowercased().contains("deleted") })
+            else { continue }
+            source.messages.removeValue(forKey: uid)
+            archiveCommands.append("EXPUNGE \(path) \(uid)")
+        }
+        mailboxes[path] = source
+    }
+
     func updateMailbox(_ path: String, _ body: (inout ScriptedMailbox) -> Void) {
         lock.lock()
         defer { lock.unlock() }
@@ -122,9 +212,115 @@ final class ScriptedWorld: @unchecked Sendable {
     func noteFetch(_ request: IMAPFetchRequest) {
         lock.lock()
         defer { lock.unlock() }
+        if request.envelope || request.bodyStructure {
+            metadataFetchRanges.append(request.uids.ranges)
+        }
         if request.flags && !request.envelope && !request.bodyStructure && request.peek.isEmpty {
             flagFetchRanges.append(request.uids.ranges)
         }
+    }
+
+    func flagFallbackSnapshotIfPaused(
+        _ request: IMAPFetchRequest,
+        path: String
+    ) async throws -> ScriptedMailbox? {
+        guard request.flags,
+              !request.envelope,
+              !request.bodyStructure,
+              request.peek.isEmpty
+        else {
+            return nil
+        }
+        guard let captured = captureFlagFallback(path: path) else {
+            return nil
+        }
+        if captured.alreadyReleased {
+            noteFlagFallbackReturned()
+            return captured.snapshot
+        }
+        try await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if registerFlagFallbackWaiter(continuation) {
+                    continuation.resume()
+                }
+            }
+        }, onCancel: {
+            cancelFlagFallbackWaiters()
+        })
+        try Task.checkCancellation()
+        noteFlagFallbackReturned()
+        return captured.snapshot
+    }
+
+    private func captureFlagFallback(
+        path: String
+    ) -> (snapshot: ScriptedMailbox, alreadyReleased: Bool)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard pauseFlagFallback else { return nil }
+        let snapshot = mailboxes[path] ?? ScriptedMailbox(path: path)
+        flagFallbackEntered = true
+        return (snapshot, flagFallbackReleased)
+    }
+
+    private func registerFlagFallbackWaiter(
+        _ continuation: CheckedContinuation<Void, Never>
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if flagFallbackReleased || Task.isCancelled {
+            return true
+        }
+        flagFallbackWaiters.append(continuation)
+        return false
+    }
+
+    private func cancelFlagFallbackWaiters() {
+        lock.lock()
+        flagFallbackReleased = true
+        let waiters = flagFallbackWaiters
+        flagFallbackWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func noteFlagFallbackReturned() {
+        lock.lock()
+        flagFallbackReturned = true
+        lock.unlock()
+    }
+
+    func flagFallbackDidEnter() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flagFallbackEntered
+    }
+
+    func flagFallbackDidReturn() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flagFallbackReturned
+    }
+
+    func releaseFlagFallback() {
+        lock.lock()
+        flagFallbackReleased = true
+        let waiters = flagFallbackWaiters
+        flagFallbackWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+
+
+    func snapshotMetadataFetchRanges() -> [[ClosedRange<UInt32>]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return metadataFetchRanges
     }
 
     func snapshotFlagFetchRanges() -> [[ClosedRange<UInt32>]] {
@@ -182,11 +378,17 @@ final class ScriptedWorld: @unchecked Sendable {
         selectCount += 1
         lock.unlock()
     }
+
+}
+
+enum ScriptedFetchError: Error {
+    case metadata
 }
 
 struct ScriptedMessage: Sendable {
     var uid: UInt32
     var flags: [String]
+
     var internalDate: Date
     var envelope: IMAPEnvelope
     var structure: IMAPBodyStructure
@@ -250,13 +452,14 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func close() async {
+        // Closing a client must not strand a fetch paused by the test gate.
+        world.releaseFlagFallback()
         connected = false
         closed = true
         idleContinuation?.finish()
         idleContinuation = nil
         eventContinuation.finish()
     }
-
     func listFolders() async throws -> IMAPFolderDiscovery {
         let discovery = world.discovery()
         return IMAPFolderDiscovery(folders: discovery.folders, isGmail: discovery.isGmail)
@@ -269,7 +472,8 @@ actor ScriptedIMAPClient: IMAPClient {
             throw IMAPError.taggedBAD(tag: "t", message: "QRESYNC failed", code: nil)
         }
         selectedPath = mailbox
-        return makeSelected(world.mailbox(mailbox), name: mailbox)
+        let box = world.mailbox(mailbox)
+        return makeSelected(box, name: mailbox)
     }
 
     func enableQResync() async throws {
@@ -281,12 +485,18 @@ actor ScriptedIMAPClient: IMAPClient {
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
         if let error = world.beginFetch() { throw error }
         world.noteFetch(request)
+        let pausedFlagSnapshot: ScriptedMailbox?
+        if let selectedPath {
+            pausedFlagSnapshot = try await world.flagFallbackSnapshotIfPaused(request, path: selectedPath)
+        } else {
+            pausedFlagSnapshot = nil
+        }
         let delay = world.fetchSleepNanos()
         if delay > 0 {
             try await Task.sleep(nanoseconds: delay)
         }
         guard let selectedPath else { return [] }
-        let box = world.mailbox(selectedPath)
+        let box = pausedFlagSnapshot ?? world.mailbox(selectedPath)
         var results: [IMAPFetchedMessage] = []
         for (uid, message) in box.messages.sorted(by: { $0.key < $1.key }) {
             if !SyncPolicy.contains(request.uids, uid: uid) { continue }
@@ -334,6 +544,30 @@ actor ScriptedIMAPClient: IMAPClient {
         if let error = world.seenError() { throw error }
         guard let selectedPath else { return }
         world.applyStoreSeen(path: selectedPath, uids: uids)
+    }
+ 
+    func move(uids: IMAPUIDSet, to mailbox: String) async throws {
+        if let error = world.mutationError("MOVE") { throw error }
+        guard let selectedPath else { return }
+        world.applyArchiveMove(path: selectedPath, destination: mailbox, uids: uids)
+    }
+
+    func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
+        if let error = world.mutationError("COPY") { throw error }
+        guard let selectedPath else { return }
+        world.applyArchiveCopy(path: selectedPath, destination: mailbox, uids: uids)
+    }
+
+    func storeDeleted(uids: IMAPUIDSet) async throws {
+        if let error = world.mutationError("STORE") { throw error }
+        guard let selectedPath else { return }
+        world.applyStoreDeleted(path: selectedPath, uids: uids)
+    }
+
+    func expunge(uids: IMAPUIDSet) async throws {
+        if let error = world.mutationError("EXPUNGE") { throw error }
+        guard let selectedPath else { return }
+        world.applyExpunge(path: selectedPath, uids: uids)
     }
 
     func beginIdle() async throws -> IMAPIdle {
@@ -509,6 +743,23 @@ func condstoreCaps() -> IMAPCapabilities {
         "IMAP4REV1", "IDLE", "CONDSTORE", "ENABLE", "STARTTLS", "AUTH=PLAIN",
     ])
 }
+enum EqualExistsRacePath: String, CaseIterable, Sendable {
+    case basic
+    case condstore
+    case qresync
+
+    var capabilities: IMAPCapabilities {
+        switch self {
+        case .basic:
+            basicCaps()
+        case .condstore:
+            condstoreCaps()
+        case .qresync:
+            qresyncCaps()
+        }
+    }
+}
+
 
 func inboxMailbox() -> IMAPMailbox {
     IMAPMailbox(path: "INBOX", name: "INBOX", separator: "/", role: .inbox, mailboxID: nil, attributes: [])
@@ -530,8 +781,6 @@ func testSettings(
         specialUseDelta: .seconds(3600),
         otherFolderDelta: .seconds(3600),
         seenPoll: seenPoll,
-        setupSampleSize: 1000,
-        windowedDays: 30,
         diskURL: dir,
         periodicTick: periodicTick,
         cleanupTick: cleanupTick,
@@ -675,6 +924,9 @@ func withSyncStore(_ body: (MailStore, URL) async throws -> Void) async throws {
 func sampleConfig() -> AccountConfig {
     AccountConfig(
         id: AccountID(rawValue: "qa"),
+        accountLinkID: AccountLinkID(
+            uuidString: "00000000-0000-4000-8000-000000000022"
+        )!,
         displayName: "QA",
         emailAddress: "qa@mailternal.test",
         username: "qa@mailternal.test",

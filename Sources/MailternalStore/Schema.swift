@@ -9,6 +9,46 @@ enum Schema {
         migrator.registerMigration("v1_initial") { db in
             try createV1(db)
         }
+        migrator.registerMigration("v2_folder_separator") { db in
+            try db.alter(table: "folders") { t in
+                t.add(column: "separator", .text)
+            }
+        }
+        migrator.registerMigration("v3_account_link_id") { db in
+            try db.alter(table: "accounts") { t in
+                t.add(column: "account_link_id", .text)
+            }
+
+            let accountIDs = try String.fetchAll(db, sql: "SELECT id FROM accounts ORDER BY id")
+            var used = Set<String>()
+            for accountID in accountIDs {
+                var linkID = UUID().uuidString.lowercased()
+                while used.contains(linkID) {
+                    linkID = UUID().uuidString.lowercased()
+                }
+                used.insert(linkID)
+                try db.execute(
+                    sql: "UPDATE accounts SET account_link_id = ? WHERE id = ?",
+                    arguments: [linkID, accountID]
+                )
+            }
+            try db.execute(
+                sql: "CREATE UNIQUE INDEX accounts_account_link_id_uidx ON accounts(account_link_id)"
+            )
+        }
+        migrator.registerMigration("v4_archive_queue") { db in
+            try db.create(table: "archive_queue") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("account_id", .text).notNull()
+                t.column("folder_id", .integer).notNull()
+                    .references("folders", onDelete: .cascade)
+                t.column("uid_validity", .integer).notNull()
+                t.column("uid", .integer).notNull()
+                t.column("enqueued_at", .double).notNull()
+                t.uniqueKey(["account_id", "folder_id", "uid_validity", "uid"])
+            }
+            try db.execute(sql: "CREATE INDEX archive_queue_send_idx ON archive_queue(enqueued_at, id)")
+        }
         return migrator
     }
 

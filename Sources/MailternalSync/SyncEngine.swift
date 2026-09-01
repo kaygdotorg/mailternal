@@ -29,10 +29,6 @@ public actor SyncEngine {
     private var inboxID: FolderID?
     private var currentStatus = SyncStatus(mode: .fullHistory, isOnline: false)
     private var windowedSince: Date?
-    private var setupDecided = false
-    private var sampleTextBytes: Int64 = 0
-    private var sampleCount = 0
-    private var inboxExists = 0
     private var notified: Set<NotificationKey> = []
     private var statusWaiters: [UUID: AsyncStream<SyncStatus>.Continuation] = [:]
     private var mailWaiters: [UUID: AsyncStream<NewMailEvent>.Continuation] = [:]
@@ -40,6 +36,11 @@ public actor SyncEngine {
     private var lastFailure: SyncFailure?
     private var reconnectAttempt = 0
     private var refreshPulse: Int = 0
+    /// Bumped when a delta observes expunges so an in-flight backfill window
+    /// cannot commit a FETCH captured before that deletion.
+    private var expungeRevision: [FolderID: UInt64] = [:]
+    private var activeQuarantineOperations = 0
+    private var quarantineDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private var qresyncEnabled = false
 
     /// HEADER for threading fields; `1` covers the common single-part body.
@@ -52,8 +53,8 @@ public actor SyncEngine {
     private static let followUpPeekChunk = 32
 
     /// - Parameter qaAmpleDisk: QA/testing only. When `true`, disk policy sees a
-    ///   spacious synthetic volume so a nearly-full host (reserve = max(5 GiB,
-    ///   10% of volume)) cannot halt INBOX backfill. Production callers omit this.
+    ///   spacious synthetic volume so a nearly-full host cannot halt INBOX
+    ///   backfill. Production callers omit this.
     public init(
         store: MailStore,
         config: AccountConfig,
@@ -113,9 +114,11 @@ public actor SyncEngine {
         stopping = false
         runTask = Task { await self.runLoop() }
     }
-
     public func stop() async {
         stopping = true
+        // Let a quarantine operation finish its revision check and repair
+        // before closing the command channel or cancelling the session group.
+        await waitForQuarantineDrain()
         // Close first so in-flight send() waiters resume, then cancel the run loop.
         await teardown()
         runTask?.cancel()
@@ -296,6 +299,27 @@ public actor SyncEngine {
         if stopping || runTask == nil { throw SyncEngineError.stopped }
     }
 
+    private func beginQuarantineOperation() {
+        activeQuarantineOperations += 1
+    }
+
+    private func endQuarantineOperation() {
+        activeQuarantineOperations -= 1
+        guard activeQuarantineOperations == 0 else { return }
+        let waiters = quarantineDrainWaiters
+        quarantineDrainWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func waitForQuarantineDrain() async {
+        guard activeQuarantineOperations > 0 else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            quarantineDrainWaiters.append(continuation)
+        }
+    }
+
     private func runLoop() async {
         while !stopping && !Task.isCancelled {
             do {
@@ -303,6 +327,9 @@ public actor SyncEngine {
             } catch is CancellationError {
                 break
             } catch {
+                if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
+                    break
+                }
                 if let failure = Self.classifyTerminal(error) {
                     emitFailure(failure)
                     stopping = true
@@ -355,6 +382,7 @@ public actor SyncEngine {
         try await enablePreferredExtensions(channel: sync)
         try await discover(channel: sync)
         try await deltaAll(channel: sync, notify: true)
+        try await repairLegacyIncompleteBackfills()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask { await self.backfillAll() }
@@ -363,7 +391,8 @@ public actor SyncEngine {
             group.addTask { await self.seenLoop() }
             group.addTask { await self.cleanupLoop() }
             group.addTask { await self.watchBye() }
-            while !self.stopping && !self.sessionBroken && !Task.isCancelled {
+            while (!self.stopping || self.activeQuarantineOperations > 0)
+                    && !self.sessionBroken && !Task.isCancelled {
                 try await Task.sleep(for: .milliseconds(200))
             }
             group.cancelAll()
@@ -436,6 +465,7 @@ public actor SyncEngine {
                 account: config.id,
                 path: mailbox.path,
                 name: mailbox.name,
+                separator: mailbox.separator,
                 role: mailbox.role,
                 objectID: mailbox.mailboxID
             )
@@ -522,7 +552,6 @@ public actor SyncEngine {
         let storedUIDs = try await store.uids(in: generation, range: nil)
         let maxStored = storedUIDs.last?.rawValue ?? 0
         let uidNext = selected.uidNext ?? 1
-        if mailbox.role == .inbox { inboxExists = selected.exists }
 
         // Empty store → current UIDNEXT so the first delta does not fetch
         // history (backfill owns that, without notify). After any stored UID,
@@ -540,6 +569,7 @@ public actor SyncEngine {
             highestModseq: state.highestModseq,
             lastUidNext: lastUidNext,
             lastDeltaAt: Date(timeIntervalSince1970: 0),
+            serverMessageCount: selected.exists,
             isReplacement: isReplacement
         )
     }
@@ -553,6 +583,46 @@ public actor SyncEngine {
         if !stopping && !Task.isCancelled {
             backfillPassFinished = true
         }
+    }
+    /// Older builds advanced the durable cursor across messages rejected by
+    /// the setup-time cutoff. A completed generation with fewer local rows than
+    /// the post-delta server count is therefore incomplete. Reset its cursor
+    /// once so the normal idempotent upsert walk fills every gap.
+    private func repairLegacyIncompleteBackfills() async throws {
+        for record in folders.values where !record.isReplacement {
+            guard record.serverMessageCount > 0,
+                  let summary = try await store.fetchFolderSummary(record.id),
+                  summary.totalCount < record.serverMessageCount,
+                  var state = try await store.fetchSyncState(for: record.generation),
+                  state.backfillPhase == .complete
+            else {
+                continue
+            }
+            state.backfillPhase = .walking
+            state.lowWaterUID = nil
+            state.progress = 0
+            state.haltedThrough = nil
+            try await store.saveSyncState(state)
+            try await store.recordError(StoreLogEntry(
+                kind: .sync,
+                account: config.id,
+                folder: record.id,
+                generation: record.generation,
+                message: "repairing incomplete completed backfill",
+                detail: "local=\(summary.totalCount) server=\(record.serverMessageCount) path=\(record.path)"
+            ))
+        }
+    }
+    private func clearWindowedModeIfResolved() async {
+        guard windowedSince != nil else { return }
+        for record in folders.values {
+            if let state = try? await store.fetchSyncState(for: record.generation),
+               state.backfillPhase == .halted {
+                return
+            }
+        }
+        windowedSince = nil
+        publishStatus(mode: .fullHistory)
     }
 
     /// Backfill, then atomically switch a replacement generation only once it is complete.
@@ -582,7 +652,19 @@ public actor SyncEngine {
                     state.backfillPhase = .walking
                     state.haltedThrough = nil
                     try await store.saveSyncState(state)
+                    await clearWindowedModeIfResolved()
                 } else {
+                    let since = state.haltedThrough ?? clock()
+                    if state.haltedThrough == nil {
+                        state.haltedThrough = since
+                        try await store.saveSyncState(state)
+                    }
+                    if windowedSince == nil {
+                        windowedSince = since
+                    }
+                    if let windowedSince {
+                        publishStatus(mode: .windowed(since: windowedSince))
+                    }
                     return
                 }
             }
@@ -637,39 +719,47 @@ public actor SyncEngine {
                     return
                 }
 
+                let windowSize = SyncPolicy.backfillWindowSize(
+                    configured: settings.backfillWindowSize,
+                    lowWater: state.lowWaterUID?.rawValue
+                )
                 guard let window = SyncPolicy.nextWindow(
                     uidNext: uidNext,
-                    windowSize: settings.backfillWindowSize,
+                    windowSize: windowSize,
                     lowWater: state.lowWaterUID?.rawValue
                 ) else {
                     state.backfillPhase = .complete
                     state.progress = 1
                     try await store.saveSyncState(state)
+                    await clearWindowedModeIfResolved()
                     return
                 }
-
                 let capturedGeneration = record.generation
                 let committed = try await ingestWindow(
                     record: record,
                     window: window,
                     channel: channel,
                     notify: false,
-                    accumulateSample: record.role == .inbox && !setupDecided
+                    expectedExpungeRevision: expungeRevision[folderID] ?? 0
                 )
 
                 // Cursor advances only after a committed window. Cancellation
                 // mid-ingest must not persist low-water (spec: sync.md backfill).
                 try Task.checkCancellation()
-                guard committed else { return }
+                if !committed {
+                    return
+                }
                 guard stillCurrentGeneration(capturedGeneration, folder: folderID) else { return }
                 state.lowWaterUID = IMAPUID(rawValue: window.lowerBound)
                 state.progress = SyncPolicy.backfillProgress(uidNext: uidNext, lowWater: state.lowWaterUID?.rawValue)
                 try await store.saveSyncState(state)
-                await maybeDecideSetup()
             }
         } catch is CancellationError {
             return
         } catch {
+            if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
+                return
+            }
             await logSync("backfill \(record.path)", detail: String(describing: error), folder: folderID)
             if SyncPolicy.isTransport(error) {
                 sessionBroken = true
@@ -682,7 +772,7 @@ public actor SyncEngine {
         window: ClosedRange<UInt32>,
         channel: SyncChannel,
         notify: Bool,
-        accumulateSample: Bool
+        expectedExpungeRevision: UInt64? = nil
     ) async throws -> Bool {
         let capturedGeneration = record.generation
         let uidSet = IMAPUIDSet(window)
@@ -708,20 +798,21 @@ public actor SyncEngine {
             // generation. Window not committed.
             return false
         } catch {
+            if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
+                return false
+            }
             await logSync("window fetch \(record.path)", detail: String(describing: error), folder: record.id)
             if SyncPolicy.isTransport(error) { throw error }
-            try await quarantineUnknown(record: record, window: window, channel: channel, reason: String(describing: error))
-            return true
+            let committed = try await quarantineUnknown(
+                record: record,
+                window: window,
+                channel: channel,
+                reason: String(describing: error),
+                expectedExpungeRevision: expectedExpungeRevision
+            )
+            return committed
         }
 
-        if accumulateSample {
-            for message in meta {
-                if let structure = message.bodyStructure {
-                    sampleTextBytes += MessageAssembler.textPartOctets(structure)
-                    sampleCount += 1
-                }
-            }
-        }
 
         var bodies: [UInt32: [IMAPPeekedPart]] = [:]
         var missingByUID: [UInt32: [String]] = [:]
@@ -778,6 +869,9 @@ public actor SyncEngine {
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch {
+                        if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
+                            return false
+                        }
                         await logSync("body peek \(record.path)", detail: String(describing: error), folder: record.id)
                         if SyncPolicy.isTransport(error) { throw error }
                     }
@@ -787,7 +881,6 @@ public actor SyncEngine {
 
         let generation = record.generation
         let now = clock()
-        let cutoff = windowedSince
         var built: [IncomingMessage] = []
         built.reserveCapacity(meta.count)
         for fetched in meta {
@@ -798,9 +891,6 @@ public actor SyncEngine {
                 bodyParts: bodies[uid] ?? fetched.parts,
                 now: now
             )
-            if let cutoff, incoming.envelope.internalDate < cutoff {
-                continue
-            }
             built.append(incoming)
         }
 
@@ -819,8 +909,27 @@ public actor SyncEngine {
             }
         }
 
+        if let expectedExpungeRevision,
+           expectedExpungeRevision != expungeRevision[record.id, default: 0] {
+            return false
+        }
         guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return false }
         _ = try await store.upsertMessages(built)
+
+        // An expunge can arrive while the upsert is suspended. Reconcile
+        // again after the write so the stale FETCH cannot resurrect rows that
+        // the concurrent delta already removed.
+        if let expectedExpungeRevision,
+           expectedExpungeRevision != expungeRevision[record.id, default: 0] {
+            let latest = try await channel.select(record.path)
+            try await reconcileExpunges(
+                record: record,
+                selected: latest,
+                channel: channel,
+                revisionAlreadyAdvanced: true
+            )
+            return true
+        }
 
         if canNotify {
             for message in pendingNotify {
@@ -844,7 +953,8 @@ public actor SyncEngine {
         from lo: UInt32,
         to hi: UInt32,
         channel: SyncChannel,
-        notify: Bool
+        notify: Bool,
+        expectedExpungeRevision: UInt64? = nil
     ) async throws {
         var lowWater: UInt32? = nil
         let uidNext = hi < UInt32.max ? hi &+ 1 : hi
@@ -860,7 +970,7 @@ public actor SyncEngine {
                     window: start...window.upperBound,
                     channel: channel,
                     notify: notify,
-                    accumulateSample: false
+                    expectedExpungeRevision: expectedExpungeRevision
                 )
                 if !committed { return }
             }
@@ -873,8 +983,9 @@ public actor SyncEngine {
         record: FolderRecord,
         window: ClosedRange<UInt32>,
         channel: SyncChannel,
-        reason: String
-    ) async throws {
+        reason: String,
+        expectedExpungeRevision: UInt64? = nil
+    ) async throws -> Bool {
         // Quarantine rows are what make cursor advance legal for a failed
         // window (spec: every UID committed as message or quarantine). A
         // failure here must propagate so the cursor never skips the window.
@@ -894,30 +1005,34 @@ public actor SyncEngine {
                 now: now
             )
         }
-        if !incoming.isEmpty {
-            _ = try await store.upsertMessages(incoming)
+
+        if let expectedExpungeRevision,
+           expectedExpungeRevision != expungeRevision[record.id, default: 0] {
+            // The fallback FLAGS reply may have crossed an EXPUNGE delta.
+            // Do not write its stale UID set or advance the cursor.
+            return false
         }
+        guard !incoming.isEmpty else { return true }
+
+        // Once the write begins, stop waits for the post-write revision check
+        // and expunge repair instead of cancelling it halfway through.
+        beginQuarantineOperation()
+        defer { endQuarantineOperation() }
+        _ = try await store.upsertMessages(incoming)
+        if let expectedExpungeRevision,
+           expectedExpungeRevision != expungeRevision[record.id, default: 0] {
+            let latest = try await channel.select(record.path)
+            try await reconcileExpunges(
+                record: record,
+                selected: latest,
+                channel: channel,
+                revisionAlreadyAdvanced: true
+            )
+            return false
+        }
+        return true
     }
 
-    private func maybeDecideSetup() async {
-        guard !setupDecided, sampleCount > 0 else { return }
-        let target = min(settings.setupSampleSize, max(inboxExists, 1))
-        guard sampleCount >= target else { return }
-        setupDecided = true
-        let snap = disk.snapshot(for: settings.diskURL)
-        let reserve = SyncPolicy.reserveBytes(volumeBytes: snap.volumeBytes)
-        let text = SyncPolicy.extrapolatedTextBytes(
-            sampleTextBytes: sampleTextBytes,
-            sampleCount: sampleCount,
-            messageCount: max(inboxExists, sampleCount)
-        )
-        let projected = SyncPolicy.projectedStoreBytes(textPartBytes: text)
-        if SyncPolicy.shouldEnterWindowed(freeBytes: snap.freeBytes, projectedBytes: projected, reserveBytes: reserve) {
-            let since = clock().addingTimeInterval(TimeInterval(-settings.windowedDays * 24 * 3600))
-            windowedSince = since
-            publishStatus(mode: .windowed(since: since))
-        }
-    }
 
     private func activateReplacement(folderID: FolderID) async {
         guard var record = folders[folderID] else { return }
@@ -926,6 +1041,7 @@ public actor SyncEngine {
             record.isReplacement = false
             folders[folderID] = record
             try await store.dropStaleSeen(folder: folderID)
+            try await store.dropStaleArchive(folder: folderID)
         } catch {
             await logSync("activate replacement", detail: String(describing: error), folder: folderID)
         }
@@ -1009,6 +1125,7 @@ public actor SyncEngine {
 
     private func runDelta(record: inout FolderRecord, channel: SyncChannel, notify: Bool) async throws {
         let selected: IMAPSelectedMailbox
+        let vanished: [UInt32]
         switch record.deltaPath {
         case .qresync:
             let qresync: IMAPQResyncSelect?
@@ -1022,51 +1139,110 @@ public actor SyncEngine {
                 qresync = nil
             }
             selected = try await channel.select(record.path, qresync: qresync)
+            vanished = selected.vanishedEarlier + selected.vanished
+        case .condstore, .basic:
+            selected = try await channel.select(record.path)
+            vanished = []
+        }
+
+        let observedExpunge = selected.exists < record.serverMessageCount || !vanished.isEmpty
+        let uidNextChanged = selected.uidNext.map { $0 != record.lastUidNext } ?? false
+        // Invalidate an in-flight FETCH before any path-specific await. UIDNEXT
+        // identifies the selected mailbox even when a removed UID was never
+        // written locally, so this also covers an expunge+append with unchanged
+        // EXISTS. Append-only changes conservatively invalidate the FETCH too.
+        let revisionAlreadyAdvanced = observedExpunge || uidNextChanged
+        if revisionAlreadyAdvanced {
+            expungeRevision[record.id, default: 0] &+= 1
+        }
+
+        switch record.deltaPath {
+        case .qresync:
             if selected.noModSeq {
                 try await persistDowngrade(&record, reason: .noModSeq, channel: channel)
             }
+            let generationChanged = selected.uidValidity != record.generation.uidValidity
             try await maybeReplace(selected: selected, record: &record)
-            let vanished = selected.vanishedEarlier + selected.vanished
-            if !vanished.isEmpty {
-                _ = try await store.deleteUIDs(
-                    generation: record.generation,
-                    uids: vanished.map { IMAPUID(rawValue: $0) }
-                )
-            }
-            if let mod = record.highestModseq, await folderHasMessages(record) {
-                let flags = try await channel.fetch(
-                    in: record.path,
-                    expectedUIDValidity: record.generation.uidValidity,
-                    .flagsChangedSince(
-                        uids: SyncPolicy.knownUIDSet(uidNext: selected.uidNext ?? record.lastUidNext),
-                        modSeq: mod
+            // Publish a replacement before any following await so an in-flight
+            // backfill cannot continue committing rows into the retired generation.
+            folders[record.id] = record
+            // VANISHED, expunge reconciliation, and flag FETCHes belong to the
+            // generation selected above. A UIDVALIDITY change has already moved
+            // `record` to a fresh generation, so those old-generation results
+            // must not be applied to it.
+            if !generationChanged {
+                if !vanished.isEmpty {
+                    _ = try await store.deleteUIDs(
+                        generation: record.generation,
+                        uids: vanished.map { IMAPUID(rawValue: $0) }
                     )
-                )
-                try await applyFlagFetch(flags, record: record)
+                }
+                // A QRESYNC SELECT can race an in-flight EXPUNGE burst delivered
+                // on the IDLE socket. If EXISTS moved backwards or QRESYNC
+                // carried a VANISHED set, sweep stored UIDs as the lossless
+                // fallback. This never runs on an ordinary refresh.
+                if observedExpunge {
+                    try await reconcileExpunges(
+                        record: record,
+                        selected: selected,
+                        channel: channel,
+                        revisionAlreadyAdvanced: revisionAlreadyAdvanced
+                    )
+                }
+                if let mod = record.highestModseq, await folderHasMessages(record) {
+                    let flags = try await channel.fetch(
+                        in: record.path,
+                        expectedUIDValidity: record.generation.uidValidity,
+                        .flagsChangedSince(
+                            uids: SyncPolicy.knownUIDSet(uidNext: selected.uidNext ?? record.lastUidNext),
+                            modSeq: mod
+                        )
+                    )
+                    try await applyFlagFetch(flags, record: record)
+                }
             }
         case .condstore:
-            selected = try await channel.select(record.path)
             if selected.noModSeq {
                 try await persistDowngrade(&record, reason: .noModSeq, channel: channel)
             }
+            let generationChanged = selected.uidValidity != record.generation.uidValidity
             try await maybeReplace(selected: selected, record: &record)
-            if let mod = record.highestModseq, await folderHasMessages(record) {
-                let flags = try await channel.fetch(
-                    in: record.path,
-                    expectedUIDValidity: record.generation.uidValidity,
-                    .flagsChangedSince(
-                        uids: SyncPolicy.knownUIDSet(uidNext: selected.uidNext ?? record.lastUidNext),
-                        modSeq: mod
-                    )
+            folders[record.id] = record
+            if !generationChanged {
+                try await reconcileExpunges(
+                    record: record,
+                    selected: selected,
+                    channel: channel,
+                    revisionAlreadyAdvanced: revisionAlreadyAdvanced
                 )
-                try await applyFlagFetch(flags, record: record)
+                if let mod = record.highestModseq, await folderHasMessages(record) {
+                    let flags = try await channel.fetch(
+                        in: record.path,
+                        expectedUIDValidity: record.generation.uidValidity,
+                        .flagsChangedSince(
+                            uids: SyncPolicy.knownUIDSet(uidNext: selected.uidNext ?? record.lastUidNext),
+                            modSeq: mod
+                        )
+                    )
+                    try await applyFlagFetch(flags, record: record)
+                }
             }
-            try await reconcileExpunges(record: record, selected: selected, channel: channel)
         case .basic:
-            selected = try await channel.select(record.path)
+            let generationChanged = selected.uidValidity != record.generation.uidValidity
             try await maybeReplace(selected: selected, record: &record)
-            try await reconcileExpunges(record: record, selected: selected, channel: channel)
+            folders[record.id] = record
+            if !generationChanged {
+                try await reconcileExpunges(
+                    record: record,
+                    selected: selected,
+                    channel: channel,
+                    revisionAlreadyAdvanced: revisionAlreadyAdvanced
+                )
+            }
         }
+        // Repair decisions compare the local count with the latest EXISTS,
+        // not the count captured during discovery.
+        record.serverMessageCount = selected.exists
 
         let uidNext = selected.uidNext ?? record.lastUidNext
         if uidNext > record.lastUidNext {
@@ -1078,7 +1254,8 @@ public actor SyncEngine {
                     from: lo,
                     to: hi,
                     channel: channel,
-                    notify: notify && !record.isReplacement
+                    notify: notify && !record.isReplacement,
+                    expectedExpungeRevision: expungeRevision[record.id] ?? 0
                 )
             }
         }
@@ -1115,12 +1292,18 @@ public actor SyncEngine {
     private func reconcileExpunges(
         record: FolderRecord,
         selected: IMAPSelectedMailbox,
-        channel: SyncChannel
+        channel: SyncChannel,
+        revisionAlreadyAdvanced: Bool = false
     ) async throws {
+        var revisionAdvanced = revisionAlreadyAdvanced
         let uidNext = selected.uidNext ?? record.lastUidNext
         guard uidNext > 1 else {
             let stored = try await store.uids(in: record.generation, range: nil)
             if !stored.isEmpty {
+                if !revisionAdvanced {
+                    expungeRevision[record.id, default: 0] &+= 1
+                    revisionAdvanced = true
+                }
                 _ = try await store.deleteUIDs(generation: record.generation, uids: stored)
             }
             return
@@ -1139,6 +1322,10 @@ public actor SyncEngine {
             let server = Set(fetched.compactMap(\.uid))
             let gone = stored.filter { !server.contains($0.rawValue) }
             if !gone.isEmpty {
+                if !revisionAdvanced {
+                    expungeRevision[record.id, default: 0] &+= 1
+                    revisionAdvanced = true
+                }
                 _ = try await store.deleteUIDs(generation: record.generation, uids: gone)
             }
             try await applyFlagFetch(fetched, record: record)
@@ -1339,6 +1526,7 @@ public actor SyncEngine {
         while !stopping && !Task.isCancelled {
             if let channel = syncChannel {
                 try? await drainSeen(channel: channel)
+                try? await drainArchive(channel: channel)
             }
             try? await Task.sleep(for: settings.seenPoll)
         }
@@ -1352,6 +1540,7 @@ public actor SyncEngine {
             let live = try await store.liveGeneration(for: op.folder)
             if live?.uidValidity != op.uidValidity {
                 try await store.dropStaleSeen(folder: op.folder)
+                try await store.dropStaleArchive(folder: op.folder)
                 continue
             }
             guard let summary = try await store.fetchFolderSummary(op.folder) else {
@@ -1362,6 +1551,7 @@ public actor SyncEngine {
                 let liveNow = try await store.liveGeneration(for: op.folder)
                 if liveNow?.uidValidity != op.uidValidity {
                     try await store.dropStaleSeen(folder: op.folder)
+                    try await store.dropStaleArchive(folder: op.folder)
                     continue
                 }
                 // Atomic select-verify-store: the server's selected UIDVALIDITY
@@ -1386,9 +1576,67 @@ public actor SyncEngine {
         }
     }
 
+ 
+    private func drainArchive(channel: SyncChannel) async throws {
+        let ops = try await store.snapshotArchiveQueue(limit: 32)
+        for op in ops {
+            if stopping { return }
+            try Task.checkCancellation()
+            let live = try await store.liveGeneration(for: op.folder)
+            if live?.uidValidity != op.uidValidity {
+                try await store.dropStaleArchive(folder: op.folder)
+                continue
+            }
+            guard let source = try await store.fetchFolderSummary(op.folder) else {
+                try await discardArchive(op, reason: "folder missing")
+                continue
+            }
+            guard let target = folders.values.first(where: { $0.role == .archive }) else {
+                try await discardArchive(op, reason: "no Archive folder")
+                continue
+            }
+            do {
+                let liveNow = try await store.liveGeneration(for: op.folder)
+                if liveNow?.uidValidity != op.uidValidity {
+                    try await store.dropStaleArchive(folder: op.folder)
+                    continue
+                }
+                try await channel.archive(
+                    in: source.path,
+                    expectedUIDValidity: op.uidValidity,
+                    uids: IMAPUIDSet(uid: op.uid.rawValue),
+                    destination: target.path,
+                    useMove: (await channel.capabilities()).move
+                )
+                try await store.deleteArchiveOp(op)
+            } catch SyncChannelError.staleMailbox {
+                try await store.dropStaleArchive(folder: op.folder)
+                try await store.deleteArchiveOp(op)
+            } catch let error as IMAPError {
+                if error.isTaggedNO || error.isTaggedBAD {
+                    try await discardArchive(op, reason: error.description)
+                } else {
+                    throw error
+                }
+            }
+        }
+    }
+
+    private func discardArchive(_ op: ArchiveOp, reason: String) async throws {
+        try await store.deleteArchiveOp(op)
+        try await store.recordError(StoreLogEntry(
+            kind: .archive,
+            account: op.account,
+            folder: op.folder,
+            generation: MailboxGeneration(folder: op.folder, uidValidity: op.uidValidity),
+            uid: op.uid,
+            message: reason
+        ))
+    }
     private func cleanupLoop() async {
         while !stopping && !Task.isCancelled {
             do {
+
                 var deleted: Int
                 repeat {
                     deleted = try await store.cleanupRetiredGenerations(batchSize: 200)

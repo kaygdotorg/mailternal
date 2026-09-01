@@ -4,7 +4,8 @@ import NIO
 import NIOIMAP
 
 /// IMAP session actor: TLS/auth/capabilities, LIST discovery, PEEK fetch,
-/// UID STORE `\Seen`, IDLE, and QRESYNC/CONDSTORE/basic delta primitives.
+/// UID STORE `\Seen`, archive MOVE/COPY/STORE/EXPUNGE, IDLE, and
+/// QRESYNC/CONDSTORE/basic delta primitives.
 ///
 /// Wave-2's sync engine owns policy (which path, when to IDLE, backoff). This
 /// type is the wire. A non-peek body fetch cannot be expressed — ``IMAPFetchRequest``
@@ -323,6 +324,59 @@ extension IMAPSession {
                 messages: set,
                 modifiers: [],
                 data: .flags(.add(silent: true, list: [.seen]))
+              )
+        else { return }
+        let tagged = try await send(command)
+        try throwIfFailed(tagged)
+    }
+ 
+    /// `UID MOVE <uids> <mailbox>`. Only tagged `OK` is success.
+    public func move(uids: IMAPUIDSet, to mailbox: String) async throws {
+        try ensureAuthenticated()
+        guard let set = IMAPCommandFactory.uidSet(uids),
+              let command = Command.uidMove(
+                messages: set,
+                mailbox: MailboxName(ByteBuffer(string: mailbox))
+              )
+        else { return }
+        let tagged = try await send(command)
+        try throwIfFailed(tagged)
+    }
+
+    /// `UID COPY <uids> <mailbox>`. Only tagged `OK` is success.
+    public func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
+        try ensureAuthenticated()
+        guard let set = IMAPCommandFactory.uidSet(uids),
+              let command = Command.uidCopy(
+                messages: set,
+                mailbox: MailboxName(ByteBuffer(string: mailbox))
+              )
+        else { return }
+        let tagged = try await send(command)
+        try throwIfFailed(tagged)
+    }
+
+    /// `UID STORE <uids> +FLAGS.SILENT (\Deleted)`. Only tagged `OK` is success.
+    public func storeDeleted(uids: IMAPUIDSet) async throws {
+        try ensureAuthenticated()
+        guard let set = IMAPCommandFactory.uidSet(uids),
+              let command = Command.uidStore(
+                messages: set,
+                modifiers: [],
+                data: .flags(.add(silent: true, list: [.deleted]))
+              )
+        else { return }
+        let tagged = try await send(command)
+        try throwIfFailed(tagged)
+    }
+
+    /// `UID EXPUNGE <uids>`. Only tagged `OK` is success.
+    public func expunge(uids: IMAPUIDSet) async throws {
+        try ensureAuthenticated()
+        guard let set = IMAPCommandFactory.uidSet(uids),
+              let command = Command.uidExpunge(
+                messages: set,
+                mailbox: MailboxName(ByteBuffer(string: ""))
               )
         else { return }
         let tagged = try await send(command)

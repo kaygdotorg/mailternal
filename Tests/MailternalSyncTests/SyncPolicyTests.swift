@@ -68,17 +68,62 @@ import Testing
     #expect(SyncPolicy.knownUIDSet(uidNext: 100_001).ranges == [1...100_000])
 }
 
-@Test func diskPolicyReserveWindowedHaltAndResume() {
-    #expect(SyncPolicy.reserveBytes(volumeBytes: 10 * 1024 * 1024 * 1024) == 5 * 1024 * 1024 * 1024)
-    #expect(SyncPolicy.reserveBytes(volumeBytes: 100 * 1024 * 1024 * 1024) == 10 * 1024 * 1024 * 1024)
-    #expect(SyncPolicy.projectedStoreBytes(textPartBytes: 1000) == 1600)
-    #expect(SyncPolicy.extrapolatedTextBytes(sampleTextBytes: 1000, sampleCount: 10, messageCount: 100) == 10_000)
+@Test func diskPolicyCapsReserveAndResumesWithHeadroom() {
+    let gib: Int64 = 1024 * 1024 * 1024
+    #expect(SyncPolicy.reserveBytes(volumeBytes: 0) == 5 * gib)
+    #expect(SyncPolicy.reserveBytes(volumeBytes: 100 * gib) == 5 * gib)
+    #expect(SyncPolicy.reserveBytes(volumeBytes: 250 * gib) == 5 * gib)
+    #expect(SyncPolicy.reserveBytes(volumeBytes: 500 * gib) == 10 * gib)
+    #expect(SyncPolicy.reserveBytes(volumeBytes: 1_000 * gib) == 20 * gib)
+    #expect(SyncPolicy.reserveBytes(volumeBytes: 4_000 * gib) == 20 * gib)
+
+    let measuredVolume: Int64 = 994_662_584_320
+    let measuredFree: Int64 = 93_413_866_750
+    let measuredReserve = SyncPolicy.reserveBytes(volumeBytes: measuredVolume)
+    #expect(measuredReserve == measuredVolume / 50)
+    #expect(!SyncPolicy.shouldHalt(freeBytes: measuredFree, reserveBytes: measuredReserve))
+
     let reserve: Int64 = 100
-    #expect(SyncPolicy.shouldEnterWindowed(freeBytes: 150, projectedBytes: 60, reserveBytes: reserve))
-    #expect(!SyncPolicy.shouldEnterWindowed(freeBytes: 500, projectedBytes: 10, reserveBytes: reserve))
     #expect(SyncPolicy.shouldHalt(freeBytes: 90, reserveBytes: reserve))
     #expect(!SyncPolicy.shouldResume(freeBytes: 101, reserveBytes: reserve))
     #expect(SyncPolicy.shouldResume(freeBytes: reserve + SyncPolicy.hysteresisBytes + 1, reserveBytes: reserve))
+}
+
+@Test func diskSnapshotPrefersImportantCapacityAndTreatsUnknownAsUnknown() {
+    let preferred = FileDiskSpace.normalizedSnapshot(
+        availableBytes: 40,
+        importantUsageBytes: 80,
+        volumeBytes: 1_000
+    )
+    #expect(preferred.freeBytes == 80)
+    #expect(preferred.volumeBytes == 1_000)
+
+    let fallback = FileDiskSpace.normalizedSnapshot(
+        availableBytes: 40,
+        importantUsageBytes: -1,
+        volumeBytes: 1_000
+    )
+    #expect(fallback.freeBytes == 40)
+
+    let unknown = FileDiskSpace.normalizedSnapshot(
+        availableBytes: nil,
+        importantUsageBytes: nil,
+        volumeBytes: 1_000
+    )
+    #expect(unknown.freeBytes > 1_000)
+    let unknownVolume = FileDiskSpace.normalizedSnapshot(
+        availableBytes: nil,
+        importantUsageBytes: nil,
+        volumeBytes: nil
+    )
+    #expect(unknownVolume.freeBytes > unknownVolume.volumeBytes)
+}
+
+
+@Test func firstBackfillCommitIsPageSized() {
+    #expect(SyncPolicy.backfillWindowSize(configured: 1_000, lowWater: nil) == 80)
+    #expect(SyncPolicy.backfillWindowSize(configured: 40, lowWater: nil) == 40)
+    #expect(SyncPolicy.backfillWindowSize(configured: 1_000, lowWater: 20_000) == 1_000)
 }
 
 @Test func inboxRanksAheadOfSpecialUseAndRemainder() {

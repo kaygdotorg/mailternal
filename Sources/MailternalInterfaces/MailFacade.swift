@@ -4,7 +4,7 @@
 import Foundation
 
 @MainActor
-public protocol MailFacade: AnyObject {
+public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     // Account lifecycle (0.0.1: exactly one IMAP account)
     var accountState: AccountState { get }
     var accountStateStream: AsyncStream<AccountState> { get }
@@ -23,9 +23,12 @@ public protocol MailFacade: AnyObject {
 
     // Detail
     func detail(_ id: MessageID) async throws -> MessageDetail
-    /// The sole 0.0.1 mutation: enqueue \Seen (spec: sync.md write queue).
+    /// User-facing account label for titles and other account context.
+    var accountDisplayName: String? { get }
+    /// One of two queued 0.0.1 mutations: enqueue \Seen (spec: sync.md write queue).
     func markRead(_ id: MessageID) async
-    /// Capped raw-source fallback for quarantined messages (BODY.PEEK[], ≤4 MiB, escaped).
+    /// Enqueues an archive move; the sync engine drains it. No-op toast-level failure is surfaced via error log.
+    func archive(_ id: MessageID) async
     func rawSource(_ id: MessageID) async throws -> String
     /// On-demand attachment/inline-part fetch → file URL in the attachment cache.
     func fetchAttachment(_ message: MessageID, part: String) async throws -> URL

@@ -574,7 +574,9 @@ import Testing
             guard let inbox = folders.first(where: { $0.role == .inbox }) else { return false }
             guard let gen = try await store.liveGeneration(for: inbox.id) else { return false }
             let state = try await store.fetchSyncState(for: gen)
-            return state?.backfillPhase == .halted && inbox.totalCount >= 2
+            guard state?.backfillPhase == .halted && inbox.totalCount >= 2 else { return false }
+            let logs = try await store.fetchErrorLog(limit: 20)
+            return logs.contains { $0.message.contains("halted") }
         }
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
@@ -620,6 +622,10 @@ import Testing
             try await group.next()
             group.cancelAll()
         }
+        let logs = try await store.fetchErrorLog(limit: 20)
+        #expect(!logs.contains {
+            $0.kind == .sync && $0.detail?.contains("Connection closed") == true
+        })
     }
 }
 
@@ -979,6 +985,158 @@ import Testing
     }
 }
 
+@Test(
+    "equal-EXISTS expunge across a paused quarantine fallback never resurrects the expunged UID",
+    arguments: EqualExistsRacePath.allCases
+)
+func staleQuarantineFallbackCannotResurrectExpungedUID(
+    path: EqualExistsRacePath
+) async throws {
+    try await withSyncStore { store, dir in
+        var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 3, highestModSeq: 2)
+        box.messages[1] = makePlainMessage(uid: 1, subject: "keep")
+        box.messages[2] = makePlainMessage(uid: 2, subject: "stale")
+        let world = ScriptedWorld(
+            capabilities: path.capabilities,
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        // The first backfill metadata FETCH fails, forcing quarantineUnknown.
+        world.fetchError = ScriptedFetchError.metadata
+        world.fetchErrorAfter = 1
+        world.pauseFlagFallback = true
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(dir: dir, window: 2)
+        )
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            world.flagFallbackDidEnter()
+        }
+
+        // FLAGS captured UID 2 before the EXPUNGE. Queue a refresh behind
+        // the in-flight command, then publish the authoritative replacement
+        // while the stale response remains paused.
+        let refreshTask = Task(priority: .high) {
+            await engine.refreshNow()
+        }
+        await Task.yield()
+        world.updateMailbox("INBOX") { live in
+            live.messages.removeValue(forKey: 2)
+            live.messages[3] = makePlainMessage(uid: 3, subject: "replacement", body: "new")
+            live.uidNext = 4
+            live.highestModSeq = 3
+        }
+        world.releaseFlagFallback()
+        await refreshTask.value
+
+        let inbox = try #require(await inboxFolder(store))
+        let generation = try #require(await store.liveGeneration(for: inbox.id))
+        try await waitUntil(timeout: .seconds(5)) {
+            guard world.flagFallbackDidReturn() else { return false }
+            return try await store.uids(in: generation) == [
+                IMAPUID(rawValue: 1),
+                IMAPUID(rawValue: 3),
+            ]
+        }
+        let stored = try await store.uids(in: generation)
+        let authoritative = world.mailbox("INBOX")
+        await engine.stop()
+
+        let page = try await store.page(in: inbox.id, after: nil, limit: 10)
+        #expect(authoritative.exists == 2)
+        #expect(authoritative.uidNext == 4)
+        #expect(authoritative.messages.keys.sorted() == [1, 3])
+        #expect(stored == [IMAPUID(rawValue: 1), IMAPUID(rawValue: 3)])
+        #expect(try await store.messageID(generation: generation, uid: IMAPUID(rawValue: 2)) == nil)
+        #expect(page.rows.count == 2)
+        // Commands serialize on one channel, so the refresh delta's SELECT
+        // queues behind the paused FLAGS reply: the quarantine window commits
+        // before the engine learns of the EXPUNGE. UID 1's metadata FETCH
+        // genuinely failed, so its quarantine commit is legal (spec: every UID
+        // in a failed window commits as message or quarantine) and nothing
+        // re-fetches an unchanged UID afterwards. The invariant under test is
+        // that the stale FLAGS reply cannot resurrect expunged UID 2 or
+        // corrupt the cursor — not that UID 1 is immediately restored.
+        #expect(Set(page.rows.map(\.subject)) == ["replacement", ""])
+        let keepID = try #require(await store.messageID(
+            generation: generation,
+            uid: IMAPUID(rawValue: 1)
+        ))
+        let replacementID = try #require(await store.messageID(
+            generation: generation,
+            uid: IMAPUID(rawValue: 3)
+        ))
+        #expect(try await store.detail(keepID).isQuarantined == true)
+        #expect(try await store.detail(replacementID).isQuarantined == false)
+        let state = try #require(await store.fetchSyncState(for: generation))
+        #expect(state.lowWaterUID == nil)
+    }
+}
+
+@Test func engineStopCancelsPausedFlagFallbackWithoutStaleQuarantine() async throws {
+    try await withSyncStore { store, dir in
+        var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 3, highestModSeq: 2)
+        box.messages[1] = makePlainMessage(uid: 1, subject: "keep")
+        box.messages[2] = makePlainMessage(uid: 2, subject: "paused")
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        // Force the first metadata FETCH into quarantineUnknown, then pause
+        // its FLAGS fallback until stop closes the scripted client.
+        world.fetchError = ScriptedFetchError.metadata
+        world.fetchErrorAfter = 1
+        world.pauseFlagFallback = true
+        let factory = ScriptedFactory(world: world)
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: factory,
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(dir: dir, window: 2)
+        )
+
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            world.flagFallbackDidEnter()
+        }
+
+        // Do not release the gate here: stop must cancel the operation and
+        // close the client, which releases the paused FLAGS continuation.
+        try await withThrowingTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await engine.stop()
+                return true
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(2))
+                throw WaitTimeout()
+            }
+            let stopped = try await group.next()!
+            group.cancelAll()
+            #expect(stopped)
+        }
+
+        #expect(await factory.closedClientCount() == 1)
+        let inbox = try #require(await inboxFolder(store))
+        let generation = try #require(await store.liveGeneration(for: inbox.id))
+        let state = try #require(await store.fetchSyncState(for: generation))
+        #expect(state.lowWaterUID == nil)
+        #expect(try await store.uids(in: generation).isEmpty)
+        #expect(try await store.page(in: inbox.id, after: nil, limit: 10).rows.isEmpty)
+        try await assertStoreInvariants(store)
+    }
+}
+
 @Test func ingestWindowDiscardsWhenGenerationChangesMidFetch() async throws {
     try await withSyncStore { store, dir in
         var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 5, highestModSeq: 2)
@@ -1068,6 +1226,182 @@ import Testing
         #expect(sweeps.contains { $0 == [3...4] })
         #expect(sweeps.contains { $0 == [5...5] })
         #expect(!sweeps.contains { $0 == [1...5] })
+        await engine.stop()
+    }
+}
+
+@Test func engineUsesAnEightyMessageFirstWindowThenConfiguredThroughput() async throws {
+    try await withSyncStore { store, dir in
+        let box = populatedInbox(uidValidity: 1, count: 2_000, highestModSeq: 2)
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date() },
+            settings: testSettings(dir: dir, window: 1_000)
+        )
+        await engine.start()
+        try await waitUntil(timeout: .seconds(8)) {
+            world.snapshotMetadataFetchRanges().count >= 2
+        }
+        let ranges = world.snapshotMetadataFetchRanges()
+        #expect(ranges[0] == [1_921...2_000])
+        #expect(ranges[1] == [921...1_920])
+        await engine.stop()
+    }
+}
+
+@Test func engineRepairsLegacyCompleteBackfillWithoutResettingHealthyGeneration() async throws {
+    try await withSyncStore { store, dir in
+        let box = populatedInbox(uidValidity: 1, count: 10, highestModSeq: 2)
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        let lowDisk = FixedDisk(freeBytes: 1, volumeBytes: 100 * 1024 * 1024 * 1024)
+        let incomplete = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: lowDisk,
+            clock: { Date() },
+            settings: testSettings(dir: dir, window: 2)
+        )
+        await incomplete.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            let folders = try await store.fetchFolders(account: sampleConfig().id)
+            guard let inbox = folders.first(where: { $0.role == .inbox }),
+                  let generation = try await store.liveGeneration(for: inbox.id),
+                  let state = try await store.fetchSyncState(for: generation)
+            else { return false }
+            return state.backfillPhase == .halted && inbox.totalCount == 2
+        }
+        await incomplete.stop()
+
+        let folders = try await store.fetchFolders(account: sampleConfig().id)
+        let inbox = try #require(folders.first { $0.role == .inbox })
+        let generation = try #require(await store.liveGeneration(for: inbox.id))
+        var legacyState = try #require(await store.fetchSyncState(for: generation))
+        legacyState.backfillPhase = .complete
+        legacyState.progress = 1
+        legacyState.haltedThrough = nil
+        try await store.saveSyncState(legacyState)
+
+        let repair = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date() },
+            settings: testSettings(dir: dir, window: 2)
+        )
+        await repair.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            try await store.fetchFolders(account: sampleConfig().id)
+                .contains { $0.role == .inbox && $0.backfill == .complete && $0.totalCount == 10 }
+        }
+        let repairLogs = try await store.fetchErrorLog()
+        #expect(repairLogs.contains { $0.message == "repairing incomplete completed backfill" })
+        let metadataAfterRepair = world.snapshotMetadataFetchRanges().count
+        await repair.stop()
+
+        // A complete generation whose local count matches the latest EXISTS
+        // must remain complete and must not trigger another history walk.
+        let healthy = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date() },
+            settings: testSettings(dir: dir, window: 2)
+        )
+        await healthy.start()
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(world.snapshotMetadataFetchRanges().count == metadataAfterRepair)
+        await healthy.stop()
+    }
+}
+
+@Test func engineReconcilesQresyncExpungeAfterRestartDeliverBurst() async throws {
+    try await withSyncStore { store, dir in
+        let box = populatedInbox(uidValidity: 1, count: 200, highestModSeq: 20)
+        let world = ScriptedWorld(
+            capabilities: qresyncCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        world.fetchNanos = 10_000_000
+        let factory = ScriptedFactory(world: world)
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: factory,
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(dir: dir, window: 2)
+        )
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            guard let inbox = try await inboxFolder(store),
+                  let generation = try await store.liveGeneration(for: inbox.id),
+                  let state = try await store.fetchSyncState(for: generation)
+            else { return false }
+            return inbox.totalCount >= 2 && state.backfillPhase != .complete
+        }
+
+        // Drop both live connections and let the engine reconnect while history
+        // remains in flight.
+        await factory.emitAll(.bye("scripted restart"))
+        try await waitUntil(timeout: .seconds(5)) {
+            world.snapshotConnectAttempts() >= 2
+        }
+
+        // New UIDs arrive while the resumed backward walk is still active.
+        world.updateMailbox("INBOX") { live in
+            for uid in UInt32(201)...UInt32(220) {
+                live.messages[uid] = makePlainMessage(uid: uid, subject: "burst-\(uid)")
+            }
+            live.uidNext = 221
+            live.highestModSeq = 40
+        }
+        await engine.refreshNow()
+        try await waitUntil(timeout: .seconds(5)) {
+            try await store.search("burst-220", limit: 5).count == 1
+        }
+
+        // Model an expunge burst whose IDLE hint races the follow-up SELECT:
+        // the selected QRESYNC response has no VANISHED list, so the delta must
+        // use the observed EXISTS decrease to reconcile stored UIDs.
+        world.updateMailbox("INBOX") { live in
+            live.messages.removeValue(forKey: 201)
+            live.messages.removeValue(forKey: 202)
+            live.messages.removeValue(forKey: 203)
+            live.highestModSeq = 43
+            live.vanished = []
+            live.vanishedEarlier = []
+        }
+        await engine.refreshNow()
+        // Convergence walks ~110 two-UID windows at fetchNanos each; under
+        // parallel-suite load 10s is marginal. Deadline is generous on purpose.
+        try await waitUntil(timeout: .seconds(30)) {
+            guard let inbox = try await inboxFolder(store) else { return false }
+            return inbox.backfill == .complete
+                && inbox.totalCount == world.mailbox("INBOX").exists
+        }
+        let converged = try await requireInbox(store)
+        #expect(converged.totalCount == 217)
         await engine.stop()
     }
 }

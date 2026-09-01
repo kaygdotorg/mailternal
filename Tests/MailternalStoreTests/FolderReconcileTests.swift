@@ -9,6 +9,7 @@ import Testing
             account: account.id,
             path: "Work",
             name: "Work",
+            separator: nil,
             role: .none,
             objectID: nil
         )
@@ -30,6 +31,7 @@ import Testing
             account: account.id,
             path: "Projects",
             name: "Projects",
+            separator: nil,
             role: .none,
             objectID: nil
         )
@@ -82,6 +84,7 @@ import Testing
             account: account.id,
             path: "Work",
             name: "Work",
+            separator: "/",
             role: .none,
             objectID: "mbox-1"
         )
@@ -98,11 +101,11 @@ import Testing
                 body: "objectidtoken unique body"
             ),
         ])
-
         let renamed = try await store.upsertFolder(
             account: account.id,
             path: "Projects",
             name: "Projects",
+            separator: ".",
             role: .none,
             objectID: "mbox-1"
         )
@@ -123,6 +126,7 @@ import Testing
         let project = try await store.fetchFolderSummary(work)
         #expect(project?.path == "Projects")
         #expect(project?.id == work)
+        #expect(project?.separator == ".")
 
         let hits = try await store.search("objectidtoken", limit: 10)
         #expect(hits.count == 1)

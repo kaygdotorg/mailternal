@@ -25,6 +25,9 @@ private enum QA {
     static func config(port: Int, security: IMAPEndpoint.Security) -> AccountConfig {
         AccountConfig(
             id: AccountID(rawValue: "qa-\(port)"),
+            accountLinkID: AccountLinkID(
+                uuidString: "00000000-0000-4000-8000-000000000021"
+            )!,
             displayName: "QA",
             emailAddress: user,
             username: user,

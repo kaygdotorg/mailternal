@@ -40,6 +40,9 @@ public struct IMAPCapabilities: Sendable, Hashable {
     public var binary: Bool
     /// `UIDPLUS` (RFC 4315).
     public var uidPlus: Bool
+    /// `MOVE` (RFC 6851).
+    public var move: Bool
+
 
     /// Empty / unknown capabilities (pre-connect).
     public static let none = IMAPCapabilities(
@@ -57,8 +60,10 @@ public struct IMAPCapabilities: Sendable, Hashable {
         loginDisabled: false,
         gmailExtensions: false,
         binary: false,
-        uidPlus: false
+        uidPlus: false,
+        move: false
     )
+
 
     /// Creates a snapshot from already-decoded flags. Prefer `IMAPCapabilities(tokens:)`.
     public init(
@@ -76,7 +81,8 @@ public struct IMAPCapabilities: Sendable, Hashable {
         loginDisabled: Bool,
         gmailExtensions: Bool,
         binary: Bool,
-        uidPlus: Bool
+        uidPlus: Bool,
+        move: Bool = false
     ) {
         self.raw = raw
         self.startTLS = startTLS
@@ -93,7 +99,9 @@ public struct IMAPCapabilities: Sendable, Hashable {
         self.gmailExtensions = gmailExtensions
         self.binary = binary
         self.uidPlus = uidPlus
+        self.move = move
     }
+
 
     /// Parses a CAPABILITY list. Tokens are matched case-insensitively.
     public init(tokens: [String]) {
@@ -113,6 +121,7 @@ public struct IMAPCapabilities: Sendable, Hashable {
         self.gmailExtensions = upper.contains("X-GM-EXT-1")
         self.binary = upper.contains("BINARY")
         self.uidPlus = upper.contains("UIDPLUS")
+        self.move = upper.contains("MOVE")
     }
 
     /// Best delta path the *server* advertises. The engine still downgrades

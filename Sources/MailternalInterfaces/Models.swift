@@ -47,13 +47,14 @@ public struct FolderSummary: Identifiable, Hashable, Sendable {
     public var id: FolderID
     public var name: String
     public var path: String
+    public var separator: Character?
     public var role: FolderRole
     public var unreadCount: Int
     public var totalCount: Int
     public var backfill: BackfillState
-    public init(id: FolderID, name: String, path: String, role: FolderRole,
+    public init(id: FolderID, name: String, path: String, separator: Character?, role: FolderRole,
                 unreadCount: Int, totalCount: Int, backfill: BackfillState) {
-        self.id = id; self.name = name; self.path = path; self.role = role
+        self.id = id; self.name = name; self.path = path; self.separator = separator; self.role = role
         self.unreadCount = unreadCount; self.totalCount = totalCount; self.backfill = backfill
     }
 }
@@ -180,14 +181,25 @@ public struct IMAPEndpoint: Hashable, Sendable, Codable {
 /// Non-secret account settings. The password lives in the Keychain, never here.
 public struct AccountConfig: Hashable, Sendable, Codable {
     public var id: AccountID
+    public var accountLinkID: AccountLinkID
     public var displayName: String
     public var emailAddress: String
     public var username: String
     public var imap: IMAPEndpoint
-    public init(id: AccountID, displayName: String, emailAddress: String,
-                username: String, imap: IMAPEndpoint) {
-        self.id = id; self.displayName = displayName; self.emailAddress = emailAddress
-        self.username = username; self.imap = imap
+    public init(
+        id: AccountID,
+        accountLinkID: AccountLinkID,
+        displayName: String,
+        emailAddress: String,
+        username: String,
+        imap: IMAPEndpoint
+    ) {
+        self.id = id
+        self.accountLinkID = accountLinkID
+        self.displayName = displayName
+        self.emailAddress = emailAddress
+        self.username = username
+        self.imap = imap
     }
 }
 

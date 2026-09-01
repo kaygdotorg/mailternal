@@ -198,6 +198,26 @@ public struct SeenOp: Hashable, Sendable, Identifiable {
         self.uid = uid
     }
 }
+ 
+// MARK: - Archive queue
+
+/// Persisted archive mutation (spec: sync.md Archive queue).
+public struct ArchiveOp: Hashable, Sendable, Identifiable {
+    public var id: Int64
+    public var account: AccountID
+    public var folder: FolderID
+    public var uidValidity: UInt32
+    public var uid: IMAPUID
+
+    public init(id: Int64, account: AccountID, folder: FolderID, uidValidity: UInt32, uid: IMAPUID) {
+        self.id = id
+        self.account = account
+        self.folder = folder
+        self.uidValidity = uidValidity
+        self.uid = uid
+    }
+}
+
 
 // MARK: - Error log
 
@@ -205,6 +225,7 @@ public enum StoreErrorKind: String, Sendable, Codable, Hashable {
     case parse
     case sync
     case seen
+    case archive
 }
 
 public struct StoreLogEntry: Hashable, Sendable, Identifiable {
