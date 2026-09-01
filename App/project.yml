@@ -16,12 +16,6 @@ targets:
     dependencies:
       - package: MailternalCore
         product: MailternalCore
-    entitlements:
-      path: Mailternal.entitlements
-      properties:
-        com.apple.security.app-sandbox: true
-        com.apple.security.network.client: true
-        com.apple.security.files.user-selected.read-write: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal
@@ -33,6 +27,7 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         ENABLE_APP_SANDBOX: true
         ENABLE_HARDENED_RUNTIME: true
+        CODE_SIGN_ENTITLEMENTS: Mailternal.entitlements
         GENERATE_INFOPLIST_FILE: true
         INFOPLIST_KEY_NSHumanReadableCopyright: "AGPLv3"
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
@@ -41,7 +36,7 @@ targets:
         Debug:
           ENABLE_TESTABILITY: true
           ENABLE_APP_SANDBOX: false
-          CODE_SIGN_ENTITLEMENTS: ""
+          CODE_SIGN_ENTITLEMENTS: Mailternal-Debug.entitlements
   MailternalAppTests:
     type: bundle.unit-test
     platform: macOS

@@ -52,20 +52,25 @@ final class LiveMailFacade: MailFacade {
     private var qaPeakFootprint: Int64 = 0
     private var qaAllFoldersCompleteLogged = false
     private var qaLastSizeLog = Date.distantPast
-    private let clientFactory: (any IMAPClientFactory)?
+    /// Test-only scripted-session seam. `IMAPClientFactory` is package-access in
+    /// MailternalSync — visible only when this file compiles inside the SwiftPM
+    /// package (MailternalLive target / MailternalLiveTests), not in the Xcode app
+    /// target. Stored type-erased; cast back under SWIFT_PACKAGE at the use site.
+    /// The shipping app always passes nil and uses the engine's live factory.
+    private let testClientFactory: (any Sendable)?
 
     init(
         container: MailternalContainer = .default,
         keychain: KeychainStore = KeychainStore(),
         enableNotifications: Bool = true,
         attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes,
-        clientFactory: (any IMAPClientFactory)? = nil
+        clientFactory: (any Sendable)? = nil
     ) throws {
         QAIMAPTrust.installIfRequested()
         try container.prepare()
         self.container = container
         self.keychain = keychain
-        self.clientFactory = clientFactory
+        self.testClientFactory = clientFactory
         self.notifications = LiveNotificationService(enabled: enableNotifications)
         self.store = try MailStore(
             databaseURL: container.databaseURL,
@@ -296,12 +301,13 @@ final class LiveMailFacade: MailFacade {
         let qa = ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1"
             || QALaunch.parse() != nil
         let engine: SyncEngine
-        if let clientFactory {
+        #if SWIFT_PACKAGE
+        if let factory = testClientFactory as? any IMAPClientFactory {
             engine = SyncEngine(
                 store: store,
                 config: config,
                 credentials: credentials,
-                clientFactory: clientFactory,
+                clientFactory: factory,
                 qaAmpleDisk: qa
             )
         } else {
@@ -312,6 +318,14 @@ final class LiveMailFacade: MailFacade {
                 qaAmpleDisk: qa
             )
         }
+        #else
+        engine = SyncEngine(
+            store: store,
+            config: config,
+            credentials: credentials,
+            qaAmpleDisk: qa
+        )
+        #endif
         self.engine = engine
         await engine.start()
         attachEngineStreams(engine)

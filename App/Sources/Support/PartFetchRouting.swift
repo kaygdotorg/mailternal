@@ -132,3 +132,51 @@ final class RemoteImageSessionDelegate: NSObject, URLSessionTaskDelegate, @unche
         completionHandler(request)
     }
 }
+
+
+/// Declared MIME for an IMAP part / `cid:` reference.
+///
+/// `SyncEngine.fetchPart` returns an extensionless content-hash URL; MIME must
+/// never be inferred from that filename. Look up `MessageDetail.attachments`
+/// by part specifier (`id`) or Content-ID instead.
+enum AttachmentMIME {
+    static func declared(
+        for reference: String,
+        attachments: [(id: String, mimeType: String, contentID: String?)]
+    ) -> String? {
+        let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let cid = cidBody(trimmed)
+
+        if let match = attachments.first(where: { $0.id.caseInsensitiveCompare(trimmed) == .orderedSame })
+            ?? attachments.first(where: { $0.id.caseInsensitiveCompare(cid) == .orderedSame }) {
+            return sanitize(match.mimeType)
+        }
+        if let match = attachments.first(where: {
+            guard let contentID = $0.contentID else { return false }
+            return cidBody(contentID).caseInsensitiveCompare(cid) == .orderedSame
+        }) {
+            return sanitize(match.mimeType)
+        }
+        return nil
+    }
+
+    static func cidBody(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.lowercased().hasPrefix("cid:") {
+            value = String(value.dropFirst(4))
+        }
+        if value.hasPrefix("<"), value.hasSuffix(">"), value.count >= 2 {
+            value = String(value.dropFirst().dropLast())
+        }
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func sanitize(_ mime: String) -> String? {
+        let token = mime.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return token.isEmpty ? nil : token
+    }
+}

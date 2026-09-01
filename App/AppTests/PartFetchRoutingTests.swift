@@ -67,4 +67,37 @@ final class PartFetchRoutingTests: XCTestCase {
         )!
         XCTAssertNil(RemoteImageFetch.declaredImageMIME(html))
     }
+
+    func testCIDPartResolvesWithStoredMimeType() {
+        let attachments: [(id: String, mimeType: String, contentID: String?)] = [
+            ("2", "image/jpeg; name=photo.jpg", "photo@mail"),
+            ("3", "application/pdf", nil),
+        ]
+        // Hash cache files have no extension — lookup must ignore the path.
+        let hashURL = URL(fileURLWithPath: "/tmp/attachments/a1b2c3d4e5f6")
+        XCTAssertTrue(hashURL.pathExtension.isEmpty)
+
+        XCTAssertEqual(
+            AttachmentMIME.declared(for: "cid:photo@mail", attachments: attachments),
+            "image/jpeg"
+        )
+        XCTAssertEqual(
+            AttachmentMIME.declared(for: "<photo@mail>", attachments: attachments),
+            "image/jpeg"
+        )
+        XCTAssertEqual(
+            AttachmentMIME.declared(for: "photo@mail", attachments: attachments),
+            "image/jpeg"
+        )
+        XCTAssertEqual(
+            AttachmentMIME.declared(for: "2", attachments: attachments),
+            "image/jpeg"
+        )
+        XCTAssertEqual(
+            AttachmentMIME.declared(for: "3", attachments: attachments),
+            "application/pdf"
+        )
+        XCTAssertNil(AttachmentMIME.declared(for: "missing", attachments: attachments))
+        XCTAssertNil(AttachmentMIME.declared(for: "", attachments: attachments))
+    }
 }

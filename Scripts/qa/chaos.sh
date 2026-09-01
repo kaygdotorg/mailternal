@@ -204,13 +204,13 @@ cmd_status() {
 
 cmd_uidvalidity() {
   local mailbox="${1:-INBOX}"
-  echo "bumping UIDVALIDITY for $mailbox"
-  compose stop
+  echo "bumping UIDVALIDITY for $mailbox (volume must be idle; brief dual stop)"
+  compose stop dovecot-full dovecot-crippled
   docker run --rm --entrypoint /bump-uidvalidity.sh \
     -v mailternal-qa-maildata:/var/mail \
     mailternal-qa-dovecot:local \
     "$mailbox"
-  compose start
+  compose start dovecot-full dovecot-crippled
   wait_banner 1143
   wait_banner 2143
   echo "UIDVALIDITY bump complete for $mailbox"
@@ -244,11 +244,10 @@ cmd_deliver() {
 }
 
 cmd_restart() {
-  echo "restarting IMAP (drops live connections)"
-  compose restart
+  echo "restarting full IMAP (drops live connections on 1143/1993; leaves 2143)"
+  compose restart dovecot-full
   wait_banner 1143
-  wait_banner 2143
-  echo "restarted"
+  echo "restarted full instance"
 }
 
 cmd_toggle() {
