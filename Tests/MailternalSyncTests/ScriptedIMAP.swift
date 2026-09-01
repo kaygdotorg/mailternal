@@ -15,6 +15,11 @@ final class ScriptedWorld: @unchecked Sendable {
     var storedSeen: [UInt32] = []
     var isGmail = false
     var fetchNanos: UInt64 = 0
+    var connectError: Error?
+    var fetchError: Error?
+    var fetchErrorAfter: Int?
+    var fetchCount = 0
+    var selectCount = 0
 
     init(
         capabilities: IMAPCapabilities,
@@ -100,6 +105,43 @@ final class ScriptedWorld: @unchecked Sendable {
         defer { lock.unlock() }
         return fetchNanos
     }
+
+    func snapshotFetchCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return fetchCount
+    }
+
+    func connectFailure() -> Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return connectError
+    }
+
+    func setConnectError(_ error: Error?) {
+        lock.lock()
+        connectError = error
+        lock.unlock()
+    }
+
+    func beginFetch() -> Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        fetchCount += 1
+        if let after = fetchErrorAfter {
+            guard fetchCount >= after, let error = fetchError else { return nil }
+            fetchErrorAfter = nil
+            fetchError = nil
+            return error
+        }
+        return fetchError
+    }
+
+    func noteSelect() {
+        lock.lock()
+        selectCount += 1
+        lock.unlock()
+    }
 }
 
 struct ScriptedMessage: Sendable {
@@ -156,13 +198,20 @@ actor ScriptedIMAPClient: IMAPClient {
         return makeSelected(world.mailbox(selectedPath), name: selectedPath)
     }
 
+    private var closed = false
+
+    func wasClosed() -> Bool { closed }
+
     func connect() async throws {
         if let connectError { throw connectError }
+        if let error = world.connectFailure() { throw error }
         connected = true
+        closed = false
     }
 
     func close() async {
         connected = false
+        closed = true
         idleContinuation?.finish()
         idleContinuation = nil
         eventContinuation.finish()
@@ -174,6 +223,7 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func select(_ mailbox: String, qresync: IMAPQResyncSelect?) async throws -> IMAPSelectedMailbox {
+        world.noteSelect()
         if let fail = world.selectFailure() { throw fail }
         if qresync != nil, world.qresyncShouldFail() {
             throw IMAPError.taggedBAD(tag: "t", message: "QRESYNC failed", code: nil)
@@ -189,6 +239,7 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
+        if let error = world.beginFetch() { throw error }
         let delay = world.fetchSleepNanos()
         if delay > 0 {
             try await Task.sleep(nanoseconds: delay)
@@ -299,6 +350,26 @@ final class ScriptedFactory: IMAPClientFactory, @unchecked Sendable {
         clients.append(client)
         return client
     }
+
+    private func snapshotClients() -> [ScriptedIMAPClient] {
+        lock.lock()
+        defer { lock.unlock() }
+        return clients
+    }
+
+    func emitAll(_ event: IMAPMailboxEvent) async {
+        for client in snapshotClients() {
+            await client.emit(event)
+        }
+    }
+
+    func closedClientCount() async -> Int {
+        var closed = 0
+        for client in snapshotClients() {
+            if await client.wasClosed() { closed += 1 }
+        }
+        return closed
+    }
 }
 
 struct StaticPassword: IMAPCredentialProvider {
@@ -311,6 +382,29 @@ struct FixedDisk: DiskSpaceProviding {
     var volumeBytes: Int64
     func snapshot(for url: URL) -> DiskSnapshot {
         DiskSnapshot(freeBytes: freeBytes, volumeBytes: volumeBytes)
+    }
+}
+
+final class MutableDisk: DiskSpaceProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var free: Int64
+    private var volume: Int64
+
+    init(freeBytes: Int64, volumeBytes: Int64) {
+        self.free = freeBytes
+        self.volume = volumeBytes
+    }
+
+    func snapshot(for url: URL) -> DiskSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return DiskSnapshot(freeBytes: free, volumeBytes: volume)
+    }
+
+    func setFree(_ freeBytes: Int64) {
+        lock.lock()
+        free = freeBytes
+        lock.unlock()
     }
 }
 
@@ -369,22 +463,157 @@ func basicCaps() -> IMAPCapabilities {
     IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE"])
 }
 
+func condstoreCaps() -> IMAPCapabilities {
+    IMAPCapabilities(tokens: [
+        "IMAP4REV1", "IDLE", "CONDSTORE", "ENABLE", "STARTTLS", "AUTH=PLAIN",
+    ])
+}
+
 func inboxMailbox() -> IMAPMailbox {
     IMAPMailbox(path: "INBOX", name: "INBOX", separator: "/", role: .inbox, mailboxID: nil, attributes: [])
 }
 
-func testSettings(dir: URL, window: UInt32 = 2) -> SyncSettings {
+func testSettings(
+    dir: URL,
+    window: UInt32 = 2,
+    seenPoll: Duration = .milliseconds(20),
+    periodicTick: Duration = .seconds(15),
+    cleanupTick: Duration = .seconds(30),
+    allowEnableQResync: Bool = true
+) -> SyncSettings {
     SyncSettings(
         backfillWindowSize: window,
         idleRenewal: .seconds(3600),
         hintDebounce: .milliseconds(1),
         specialUseDelta: .seconds(3600),
         otherFolderDelta: .seconds(3600),
-        seenPoll: .milliseconds(20),
+        seenPoll: seenPoll,
         setupSampleSize: 1000,
         windowedDays: 30,
-        diskURL: dir
+        diskURL: dir,
+        periodicTick: periodicTick,
+        cleanupTick: cleanupTick,
+        reconnect: IMAPReconnectBackoff(base: 0.05, cap: 0.4, jitterFraction: 0.1),
+        allowEnableQResync: allowEnableQResync
     )
+}
+
+func chaosSettings(dir: URL, window: UInt32 = 2, allowEnableQResync: Bool = true) -> SyncSettings {
+    testSettings(
+        dir: dir,
+        window: window,
+        seenPoll: .milliseconds(15),
+        periodicTick: .milliseconds(80),
+        cleanupTick: .milliseconds(80),
+        allowEnableQResync: allowEnableQResync
+    )
+}
+
+func populatedInbox(
+    uidValidity: UInt32,
+    count: UInt32,
+    uidNext: UInt32? = nil,
+    prefix: String = "m",
+    highestModSeq: UInt64 = 20
+) -> ScriptedMailbox {
+    var box = ScriptedMailbox(
+        path: "INBOX",
+        uidValidity: uidValidity,
+        uidNext: uidNext ?? (count + 1),
+        highestModSeq: highestModSeq
+    )
+    if count >= 1 {
+        for uid in 1...count {
+            box.messages[uid] = makePlainMessage(
+                uid: uid,
+                subject: "\(prefix)-\(uid)",
+                body: "\(prefix) body \(uid)"
+            )
+        }
+    }
+    return box
+}
+
+func ampleDisk() -> FixedDisk {
+    FixedDisk(freeBytes: 50 * 1024 * 1024 * 1024, volumeBytes: 100 * 1024 * 1024 * 1024)
+}
+
+func makeEngine(
+    store: MailStore,
+    world: ScriptedWorld,
+    dir: URL,
+    disk: any DiskSpaceProviding = ampleDisk(),
+    window: UInt32 = 2,
+    allowEnableQResync: Bool = true
+) -> (SyncEngine, ScriptedFactory) {
+    let factory = ScriptedFactory(world: world)
+    let engine = SyncEngine(
+        store: store,
+        config: sampleConfig(),
+        credentials: StaticPassword(value: "pw"),
+        clientFactory: factory,
+        disk: disk,
+        clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+        settings: chaosSettings(dir: dir, window: window, allowEnableQResync: allowEnableQResync)
+    )
+    return (engine, factory)
+}
+
+func drainRetired(_ store: MailStore) async throws {
+    var deleted = 1
+    while deleted > 0 {
+        deleted = try await store.cleanupRetiredGenerations(batchSize: 500)
+    }
+}
+
+func assertStoreInvariants(
+    _ store: MailStore,
+    drain: Bool = false,
+    expectEmptySeen: Bool = false,
+    expectNoReplacement: Bool = false
+) async throws {
+    if drain { try await drainRetired(store) }
+    let report = try await store.checkInvariants()
+    if !report.isClean {
+        throw InvariantFailure(issues: report.issues)
+    }
+    if expectEmptySeen, report.seenQueueCount != 0 {
+        throw InvariantFailure(issues: ["seen queue leftover: \(report.seenQueueCount)"])
+    }
+    if expectNoReplacement, report.replacementGenerations != 0 {
+        throw InvariantFailure(issues: ["replacement leftover: \(report.replacementGenerations)"])
+    }
+}
+
+struct InvariantFailure: Error, CustomStringConvertible {
+    var issues: [String]
+    var description: String { issues.joined(separator: "; ") }
+}
+
+func inboxFolder(_ store: MailStore) async throws -> FolderSummary {
+    let folders = try await store.fetchFolders(account: sampleConfig().id)
+    guard let inbox = folders.first(where: { $0.role == .inbox }) else {
+        throw WaitTimeout()
+    }
+    return inbox
+}
+
+func pageSubjects(_ store: MailStore, folder: FolderID, limit: Int = 200) async throws -> [String] {
+    var cursor: MessagePageCursor?
+    var subjects: [String] = []
+    var seenIDs: Set<Int64> = []
+    repeat {
+        let page = try await store.page(in: folder, after: cursor, limit: limit)
+        for row in page.rows {
+            if !seenIDs.insert(row.id.rawValue).inserted {
+                throw InvariantFailure(issues: ["duplicate page row \(row.id.rawValue)"])
+            }
+            subjects.append(row.subject)
+        }
+        cursor = page.next
+        if page.rows.isEmpty { break }
+    } while cursor != nil
+    return subjects
 }
 
 func withSyncStore(_ body: (MailStore, URL) async throws -> Void) async throws {
@@ -424,6 +653,21 @@ func waitUntil(
 }
 
 struct WaitTimeout: Error {}
+
+final class EventCountLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Int] = []
+    func append(_ value: Int) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+    func snapshot() -> [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
 
 final class EventLog: @unchecked Sendable {
     private let lock = NSLock()
