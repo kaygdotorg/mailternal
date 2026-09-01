@@ -104,3 +104,60 @@ import Testing
         #expect(!scannedMessages, "\(plan)")
     }
 }
+
+@Test func flagOnlyUpdateLeavesFTSUntouched() async throws {
+    try await withStore { store, _ in
+        let (_, _, generation) = try await seedInbox(store)
+        _ = try await store.upsertMessages([
+            makeMessage(
+                generation: generation,
+                uid: 1,
+                subject: "hello",
+                body: "flagonlytoken unique body"
+            ),
+        ])
+        let beforeIDs = try await store.ftsRowIDs()
+        let beforeSegs = try await store.ftsDataRowCount()
+        #expect(!beforeIDs.isEmpty)
+        #expect(beforeSegs > 0)
+
+        try await store.applyFlags(
+            generation: generation,
+            deltas: [
+                FlagDelta(
+                    uid: IMAPUID(rawValue: 1),
+                    flags: MessageFlags(isRead: true, isFlagged: true)
+                ),
+            ]
+        )
+        #expect(try await store.ftsRowIDs() == beforeIDs)
+        #expect(try await store.ftsDataRowCount() == beforeSegs)
+        #expect(try await store.search("flagonlytoken", limit: 5).count == 1)
+
+        // Same-content upsert still names FTS columns; the WHEN guard must skip
+        // delete+insert when values are unchanged.
+        _ = try await store.upsertMessages([
+            makeMessage(
+                generation: generation,
+                uid: 1,
+                subject: "hello",
+                body: "flagonlytoken unique body",
+                isRead: true
+            ),
+        ])
+        #expect(try await store.ftsRowIDs() == beforeIDs)
+        #expect(try await store.ftsDataRowCount() == beforeSegs)
+
+        _ = try await store.upsertMessages([
+            makeMessage(
+                generation: generation,
+                uid: 1,
+                subject: "hello",
+                body: "changedflagtoken unique body"
+            ),
+        ])
+        #expect(try await store.search("changedflagtoken", limit: 5).count == 1)
+        #expect(try await store.search("flagonlytoken", limit: 5).isEmpty)
+        #expect(try await store.ftsDataRowCount() >= beforeSegs)
+    }
+}

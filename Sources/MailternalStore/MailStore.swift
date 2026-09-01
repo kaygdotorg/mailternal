@@ -10,9 +10,16 @@ public final class MailStore: Sendable {
     /// Default attachment-cache cap: 2 GiB (spec: sync.md Attachment cache).
     public static let defaultAttachmentCacheCapBytes: Int64 = 2 * 1024 * 1024 * 1024
 
+    /// Post-commit observation coalescing (spec: sync.md Storage).
+    ///
+    /// The first ValueObservation value is delivered immediately; later commits
+    /// are buffered and flushed after this delay with the newest value only.
+    public static let defaultObservationDebounce: Duration = .milliseconds(150)
+
     let dbPool: DatabasePool
     let cachesDirectory: URL
     let attachmentCacheCapBytes: Int64
+    let observationDebounceNanoseconds: UInt64
     let pins: PinTracker
     private let observationQueue = DispatchQueue(label: "mailternal.store.observation")
 
@@ -20,7 +27,8 @@ public final class MailStore: Sendable {
     public init(
         databaseURL: URL,
         cachesDirectory: URL,
-        attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes
+        attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes,
+        observationDebounce: Duration = MailStore.defaultObservationDebounce
     ) throws {
         var config = Configuration()
         config.foreignKeysEnabled = true
@@ -36,6 +44,7 @@ public final class MailStore: Sendable {
         self.dbPool = pool
         self.cachesDirectory = cachesDirectory
         self.attachmentCacheCapBytes = max(0, attachmentCacheCapBytes)
+        self.observationDebounceNanoseconds = MailStore.nanoseconds(from: observationDebounce)
         self.pins = PinTracker()
 
         try FileManager.default.createDirectory(at: cachesDirectory, withIntermediateDirectories: true)
@@ -53,26 +62,113 @@ public final class MailStore: Sendable {
         try await dbPool.read(values)
     }
 
+    /// ValueObservation after commit, coalesced for the interactive path.
+    ///
+    /// First snapshot is immediate; subsequent notifications wait
+    /// `observationDebounce` and keep only the newest value.
     func observe<T: Sendable>(
         _ fetch: @escaping @Sendable (Database) throws -> T
     ) -> AsyncStream<T> {
         let pool = dbPool
         let queue = observationQueue
+        let delayNs = observationDebounceNanoseconds
         return AsyncStream { continuation in
+            let debouncer = ObservationDebouncer<T>(queue: queue)
             let task = Task {
                 let observation = ValueObservation.tracking(fetch)
                 do {
                     let scheduler: ValueObservationScheduler = .async(onQueue: queue)
                     for try await value in observation.values(in: pool, scheduling: scheduler) {
-                        continuation.yield(value)
+                        try Task.checkCancellation()
+                        if delayNs == 0 || debouncer.takeFirst() {
+                            continuation.yield(value)
+                        } else {
+                            debouncer.schedule(value, delayNs: delayNs) { latest in
+                                continuation.yield(latest)
+                            }
+                        }
                     }
+                    debouncer.flush { continuation.yield($0) }
                     continuation.finish()
                 } catch {
+                    debouncer.cancel()
                     continuation.finish()
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.onTermination = { _ in
+                debouncer.cancel()
+                task.cancel()
+            }
         }
+    }
+
+    static func nanoseconds(from duration: Duration) -> UInt64 {
+        let components = duration.components
+        let secondsNs = UInt64(clamping: max(components.seconds, 0)) &* 1_000_000_000
+        let attosecondsNs = UInt64(clamping: max(components.attoseconds, 0)) / 1_000_000_000
+        return secondsNs &+ attosecondsNs
+    }
+}
+
+/// Newest-value coalescing for GRDB observation (spec: sync.md Storage).
+private final class ObservationDebouncer<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private let queue: DispatchQueue
+    private var deliveredFirst = false
+    private var pending: T?
+    private var work: DispatchWorkItem?
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+    }
+
+    func takeFirst() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if deliveredFirst { return false }
+        deliveredFirst = true
+        return true
+    }
+
+    func schedule(_ value: T, delayNs: UInt64, yield: @escaping @Sendable (T) -> Void) {
+        lock.lock()
+        pending = value
+        work?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let latest = self.pending
+            self.pending = nil
+            self.work = nil
+            self.lock.unlock()
+            if let latest {
+                yield(latest)
+            }
+        }
+        work = item
+        lock.unlock()
+        let delay = DispatchTimeInterval.nanoseconds(Int(clamping: delayNs))
+        queue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    func flush(yield: (T) -> Void) {
+        lock.lock()
+        work?.cancel()
+        work = nil
+        let latest = pending
+        pending = nil
+        lock.unlock()
+        if let latest {
+            yield(latest)
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        work?.cancel()
+        work = nil
+        pending = nil
+        lock.unlock()
     }
 }
 
@@ -433,6 +529,28 @@ extension MailStore {
                 sql: "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
                 arguments: [pattern]
             ) ?? 0
+        }
+    }
+
+    func ftsRowIDs() async throws -> [Int64] {
+        try await read { db in
+            try Int64.fetchAll(db, sql: "SELECT rowid FROM messages_fts ORDER BY rowid")
+        }
+    }
+
+    func ftsDataRowCount() async throws -> Int {
+        try await read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messages_fts_data") ?? 0
+        }
+    }
+
+    func triggerSQL(_ name: String) async throws -> String? {
+        try await read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                arguments: [name]
+            )
         }
     }
 
