@@ -195,3 +195,95 @@ import Testing
         }
     }
 }
+
+@Test func closeDuringIdleDropsSocketWithoutLogout() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let idling = Task { try await imap.session.beginIdle() }
+        _ = try await imap.expectCommand(containing: "IDLE")
+        try await imap.writeServer("+ idling")
+        _ = try await idling.value
+
+        await imap.session.close()
+
+        let joined = imap.recordedClientLines.value.joined(separator: "\n").uppercased()
+        #expect(!joined.contains("LOGOUT"))
+        do {
+            _ = try await imap.session.listFolders()
+            Issue.record("commands after close should fail")
+        } catch let error as IMAPError {
+            #expect(!error.isTLS)
+        }
+    }
+}
+
+@Test func closeUnblocksInFlightFetchWithoutLeakingWaiter() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let fetching = Task {
+            try await imap.session.fetch(
+                IMAPFetchRequest(uids: IMAPUIDSet(uid: 1), envelope: true)
+            )
+        }
+        _ = try await imap.expectCommand(containing: "UID FETCH")
+        await imap.session.close()
+        do {
+            _ = try await fetching.value
+            Issue.record("in-flight fetch should fail when the session closes")
+        } catch is CancellationError {
+            // close() may cancel the send waiter
+        } catch let error as IMAPError {
+            #expect(!error.isTLS)
+        }
+    }
+}
+
+@Test func closeDuringIdleStartUnblocksContinuation() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let idling = Task { try await imap.session.beginIdle() }
+        _ = try await imap.expectCommand(containing: "IDLE")
+        // No "+" — close must resume idleStartWaiter rather than leak it.
+        await imap.session.close()
+        do {
+            _ = try await idling.value
+            Issue.record("beginIdle should fail when the session closes")
+        } catch is CancellationError {
+            // close() may cancel the idle-start waiter
+        } catch let error as IMAPError {
+            #expect(!error.isTLS)
+        }
+    }
+}
+
+@Test func parseErrorPoisonsSessionSoLaterCommandsFailFast() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let fetching = Task {
+            try await imap.session.fetch(
+                IMAPFetchRequest(uids: IMAPUIDSet(uid: 1), envelope: true)
+            )
+        }
+        _ = try await imap.expectCommand(containing: "UID FETCH")
+        do {
+            try await imap.writeServer("this is not IMAP")
+        } catch {
+            // NIOIMAP throws at writeInbound; ResponseCollector.errorCaught still runs.
+        }
+        do {
+            _ = try await fetching.value
+            Issue.record("fetch should fail when the decoder dies")
+        } catch is CancellationError {
+            // waiter may be cancelled as the reader ends
+        } catch let error as IMAPError {
+            #expect(!error.isTLS)
+        }
+        do {
+            _ = try await imap.session.listFolders()
+            Issue.record("commands after parser death should fail fast")
+        } catch is CancellationError {
+        } catch let error as IMAPError {
+            #expect(!error.isTLS)
+        }
+    }
+}

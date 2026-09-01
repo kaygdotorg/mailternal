@@ -29,6 +29,7 @@ public actor IMAPSession {
     private let password: String
     private let group: EventLoopGroup
     private let ownsGroup: Bool
+    private var didShutdownGroup = false
     private var connection: IMAPConnection?
     private var tagCounter: UInt64 = 0
     private var readerTask: Task<Void, Never>?
@@ -98,6 +99,15 @@ public actor IMAPSession {
     }
 
     deinit {
+        if let waiter = taggedWaiter {
+            waiter.continuation.resume(throwing: IMAPError.transport("Session deallocated"))
+        }
+        if let waiter = greetingWaiter {
+            waiter.resume(throwing: IMAPError.transport("Session deallocated"))
+        }
+        if let waiter = idleStartWaiter {
+            waiter.resume(throwing: IMAPError.transport("Session deallocated"))
+        }
         eventContinuation.finish()
         readerTask?.cancel()
     }
@@ -122,25 +132,29 @@ extension IMAPSession {
         authenticated = true
     }
 
-    /// LOGOUT + close the channel. Idempotent.
+    /// Close the channel. Idempotent. Drops the socket without DONE/LOGOUT so
+    /// NIOIMAP cannot fatal on a tagged command while IDLE, and stop() cannot
+    /// pin on a stuck write.
     public func close() async {
-        guard !closed else { return }
+        let alreadyClosed = closed
         closed = true
         idleActive = false
+        idleTag = nil
         idleEvents?.finish()
         idleEvents = nil
-        if let connection, connection.channel.isActive {
-            tagCounter += 1
-            let tag = "c\(tagCounter)"
-            try? await connection.send(.tagged(TaggedCommand(tag: tag, command: .logout)))
+        if !alreadyClosed {
+            failWaiters(IMAPError.transport("Connection closed"))
         }
-        failWaiters(IMAPError.transport("Connection closed"))
-        await connection?.close()
+        // Drop the socket. Do not write DONE/LOGOUT: NIOIMAP fatals on tagged
+        // commands while IDLE, and a stuck write would pin stop().
+        let conn = connection
         connection = nil
         readerTask?.cancel()
         readerTask = nil
         eventContinuation.finish()
-        if ownsGroup {
+        await conn?.close()
+        if ownsGroup, !didShutdownGroup {
+            didShutdownGroup = true
             try? await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 group.shutdownGracefully { error in
                     if let error {
@@ -331,15 +345,24 @@ extension IMAPSession {
         idleActive = true
         let tag = nextTag()
         idleTag = tag
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            idleStartWaiter = cont
-            Task {
-                do {
-                    try await self.sendRaw(.tagged(TaggedCommand(tag: tag, command: .idleStart)))
-                } catch {
-                    self.failIdleStart(error)
+        do {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    self.idleStartWaiter = cont
+                    Task {
+                        do {
+                            try await self.sendRaw(.tagged(TaggedCommand(tag: tag, command: .idleStart)))
+                        } catch {
+                            self.failIdleStart(error)
+                        }
+                    }
                 }
+            } onCancel: {
+                Task { await self.failIdleStart(CancellationError()) }
             }
+        } catch {
+            finishIdle()
+            throw error
         }
         return IMAPIdle(events: stream)
     }
@@ -468,10 +491,24 @@ extension IMAPSession {
         _ command: Command,
         collecting: ((ResponsePayload) -> Void)? = nil
     ) async throws -> TaggedResponse {
+        if closed { throw IMAPError.transport("Session is closed") }
         let tag = nextTag()
         untaggedCollector = collecting
         defer { untaggedCollector = nil }
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<TaggedResponse, Error>) in
+        return try await withTaskCancellationHandler {
+            try await self.sendAndWait(tag: tag, command: command)
+        } onCancel: {
+            Task { await self.failTagged(CancellationError()) }
+        }
+    }
+
+    /// Install the tagged waiter before the write so a fast reply cannot arrive unmatched.
+    func sendAndWait(tag: String, command: Command) async throws -> TaggedResponse {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<TaggedResponse, Error>) in
+            if let existing = taggedWaiter {
+                taggedWaiter = nil
+                existing.continuation.resume(throwing: IMAPError.transport("Overlapping IMAP command"))
+            }
             taggedWaiter = (tag, cont)
             Task {
                 do {
@@ -496,14 +533,26 @@ extension IMAPSession {
             self.greetingPayload = nil
             return value
         }
-        return try await withCheckedThrowingContinuation { cont in
-            greetingWaiter = cont
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<ResponsePayload, Error>) in
+                self.greetingWaiter = cont
+            }
+        } onCancel: {
+            Task { await self.failGreeting(CancellationError()) }
         }
     }
 
     func waitForTagged(_ tag: String) async throws -> TaggedResponse {
-        try await withCheckedThrowingContinuation { cont in
-            taggedWaiter = (tag, cont)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<TaggedResponse, Error>) in
+                if let existing = self.taggedWaiter {
+                    self.taggedWaiter = nil
+                    existing.continuation.resume(throwing: IMAPError.transport("Overlapping IMAP command"))
+                }
+                self.taggedWaiter = (tag, cont)
+            }
+        } onCancel: {
+            Task { await self.failTagged(CancellationError()) }
         }
     }
 
@@ -563,10 +612,13 @@ extension IMAPSession {
     func handleDisconnect() {
         if let error = connection?.lastHandlerError {
             failWaiters(IMAPError.parse(String(describing: error)))
-        } else {
+        } else if !closed {
             failWaiters(IMAPError.transport("Connection closed"))
         }
         finishIdle()
+        // Parser/channel death must poison the session. Otherwise the next
+        // tagged command writes into a dead NIOIMAP decoder and hangs forever.
+        closed = true
     }
 }
 
@@ -685,6 +737,13 @@ extension IMAPSession {
         if let waiter = taggedWaiter {
             taggedWaiter = nil
             waiter.continuation.resume(throwing: error)
+        }
+    }
+
+    func failGreeting(_ error: Error) {
+        if let waiter = greetingWaiter {
+            greetingWaiter = nil
+            waiter.resume(throwing: error)
         }
     }
 
