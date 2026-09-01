@@ -1,0 +1,47 @@
+name: mailternal-qa
+
+services:
+  dovecot-full:
+    build: .
+    image: mailternal-qa-dovecot:local
+    container_name: mailternal-qa-full
+    restart: unless-stopped
+    environment:
+      DOVECOT_MODE: full
+    ports:
+      - "1143:1143"
+      - "1993:1993"
+    volumes:
+      - maildata:/var/mail
+      - ./certs:/etc/dovecot/certs
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 1143"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  dovecot-crippled:
+    build: .
+    image: mailternal-qa-dovecot:local
+    container_name: mailternal-qa-crippled
+    restart: unless-stopped
+    environment:
+      DOVECOT_MODE: crippled
+    ports:
+      - "2143:2143"
+    volumes:
+      - maildata:/var/mail
+      - ./certs:/etc/dovecot/certs
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 2143"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  maildata:
+    name: mailternal-qa-maildata
