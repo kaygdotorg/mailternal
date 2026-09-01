@@ -21,6 +21,53 @@ enum CSSSanitizer {
         return text
     }
 
+    /// SVG/HTML paint attributes (`fill`, `stroke`, `stop-color`, `color`, …).
+    /// Same lexer as ``sanitize(_:)`` (so `u/**/rl` and `\75 r\6c` collapse),
+    /// then reject anything that is still request-bearing or not a color/paint
+    /// keyword. `url(https://…)` does not survive as a paint.
+    static func sanitizedPaint(_ raw: String) -> String? {
+        let css = sanitize(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !css.isEmpty else { return nil }
+        guard isURLFree(css) else { return nil }
+        guard isColorOrPaint(css) else { return nil }
+        return css
+    }
+
+    static func isURLFree(_ css: String) -> Bool {
+        let lowered = css.lowercased()
+        if lowered.contains("url(") { return false }
+        if lowered.contains("@import") { return false }
+        if lowered.contains("javascript:") { return false }
+        if lowered.contains("vbscript:") { return false }
+        if lowered.contains("data:") { return false }
+        if lowered.contains("http:") || lowered.contains("https:") { return false }
+        if lowered.contains("file:") { return false }
+        if lowered.contains("//") { return false }
+        return true
+    }
+
+    /// `none` / `transparent` / hex / rgb() / a named color. Anything else
+    /// (including leftover `url()` fragments) is dropped.
+    static func isColorOrPaint(_ css: String) -> Bool {
+        let lowered = css.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let keywords: Set<String> = [
+            "none", "transparent", "currentcolor", "inherit", "initial", "unset",
+        ]
+        if keywords.contains(lowered) { return true }
+        if lowered.hasPrefix("#") {
+            let hex = lowered.dropFirst()
+            return [3, 4, 6, 8].contains(hex.count) && hex.allSatisfy(\.isHexDigit)
+        }
+        if let paren = lowered.firstIndex(of: "(") {
+            let name = lowered[..<paren].trimmingCharacters(in: .whitespaces)
+            let funcs: Set<String> = [
+                "rgb", "rgba", "hsl", "hsla", "hwb", "lab", "lch", "oklab", "oklch", "color",
+            ]
+            return funcs.contains(String(name))
+        }
+        return lowered.allSatisfy { $0.isLetter || $0 == "-" }
+    }
+
     /// Prevent `</style>` / `<script` from breaking out of a `<style>` element.
     private static func stripStyleBreakout(_ css: String) -> String {
         var text = css

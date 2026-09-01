@@ -17,8 +17,9 @@ import SwiftSoup
 ///
 /// Stripped:
 /// event handlers (`on*`), `srcset`/`imagesrcset`, `@import` and `url()` in
-/// CSS (`style` attributes and `<style>` blocks), `javascript:` / `data:`
-/// (non-image) / `file:` / custom schemes.
+/// CSS (`style` attributes and `<style>` blocks), SVG/HTML paint attributes
+/// that are not a URL-free color (`fill`/`stroke`/`stop-color`/`color`/…),
+/// `javascript:` / `data:` (non-image) / `file:` / custom schemes.
 ///
 /// Rewritten to `mailternal-part://part/<token>`:
 /// `cid:` references and `http`/`https` image URLs. Remote images are marked
@@ -45,7 +46,10 @@ public enum HTMLSanitizer: Sendable {
         var manifest = ResourceManifest()
         do {
             _ = try sanitizeElement(document, manifest: &manifest)
-            let serialized = try document.html()
+            // SwiftSoup reuses original source bytes for unmodified-looking
+            // subtrees (SVG especially). Attribute rewrites must not serialize
+            // the pre-sanitization text, or fill="url(https://…)" survives.
+            let serialized = String(decoding: try document.htmlUTF8WithoutSourceReuse(), as: UTF8.self)
             return SanitizedHTML(html: serialized, manifest: manifest)
         } catch {
             return SanitizedHTML(
@@ -155,6 +159,14 @@ public enum HTMLSanitizer: Sendable {
                 let css = CSSSanitizer.sanitize(rawValue)
                 if !css.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     kept.append((key, css))
+                }
+                continue
+            }
+
+            if Allowlist.isPaintAttribute(key) {
+                if Allowlist.allows(attribute: key, on: tag),
+                   let paint = CSSSanitizer.sanitizedPaint(rawValue) {
+                    kept.append((key, paint))
                 }
                 continue
             }

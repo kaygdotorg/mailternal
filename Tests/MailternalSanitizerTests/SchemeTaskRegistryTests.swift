@@ -4,14 +4,18 @@ import Testing
 
 private final class SchemeTaskIdentity: NSObject {}
 
+private func hangingTask() -> Task<Void, Never> {
+    Task<Void, Never> {
+        try? await Task.sleep(for: .seconds(30))
+    }
+}
+
 @Test("stop cancels the live provider task and forgets it")
 func schemeStopCancelsLiveTask() async {
     let registry = SchemeTaskRegistry()
     let identity = SchemeTaskIdentity()
     let id = ObjectIdentifier(identity)
-    let task = Task {
-        try? await Task.sleep(for: .seconds(30))
-    }
+    let task = hangingTask()
     _ = registry.register(id, task: task)
     #expect(registry.liveCount == 1)
     #expect(registry.isLive(id))
@@ -27,14 +31,12 @@ func schemeCompletionPrunesEntry() async {
     let registry = SchemeTaskRegistry()
     let identity = SchemeTaskIdentity()
     let id = ObjectIdentifier(identity)
-    let slot = HandleSlot()
-    let task = Task {
-        defer {
-            if let handle = slot.handle { registry.remove(handle) }
-        }
+    let task = Task<Void, Never> {
+        try? await Task.sleep(for: .milliseconds(1))
     }
-    slot.handle = registry.register(id, task: task)
+    let handle = registry.register(id, task: task)
     await task.value
+    registry.remove(handle)
     #expect(registry.liveCount == 0)
     #expect(!registry.stop(id))
 }
@@ -45,19 +47,15 @@ func schemeIdentifierReuseAfterCompletionIsFresh() async {
     let identity = SchemeTaskIdentity()
     let id = ObjectIdentifier(identity)
 
-    let slot = HandleSlot()
-    let first = Task {
-        defer {
-            if let handle = slot.handle { registry.remove(handle) }
-        }
+    let first = Task<Void, Never> {
+        try? await Task.sleep(for: .milliseconds(1))
     }
-    slot.handle = registry.register(id, task: first)
+    let firstHandle = registry.register(id, task: first)
     await first.value
+    registry.remove(firstHandle)
     #expect(registry.liveCount == 0)
 
-    let second = Task {
-        try? await Task.sleep(for: .seconds(30))
-    }
+    let second = hangingTask()
     _ = registry.register(id, task: second)
     #expect(registry.liveCount == 1)
     #expect(!second.isCancelled)
@@ -73,18 +71,14 @@ func schemeIdentifierReuseAfterStopIsFresh() async {
     let identity = SchemeTaskIdentity()
     let id = ObjectIdentifier(identity)
 
-    let first = Task {
-        try? await Task.sleep(for: .seconds(30))
-    }
+    let first = hangingTask()
     _ = registry.register(id, task: first)
     registry.stop(id)
     await first.value
     #expect(first.isCancelled)
     #expect(registry.liveCount == 0)
 
-    let second = Task {
-        try? await Task.sleep(for: .seconds(30))
-    }
+    let second = hangingTask()
     _ = registry.register(id, task: second)
     #expect(registry.isLive(id))
     #expect(!second.isCancelled)
@@ -104,26 +98,18 @@ func schemeStopUnknownIsNoop() {
 func schemeReregisterCancelsPrevious() async {
     let registry = SchemeTaskRegistry()
     let id = ObjectIdentifier(SchemeTaskIdentity())
-    let slot = HandleSlot()
-    let first = Task {
-        defer {
-            if let handle = slot.handle { registry.remove(handle) }
-        }
-        try? await Task.sleep(for: .seconds(30))
-    }
-    slot.handle = registry.register(id, task: first)
-    let second = Task {
-        try? await Task.sleep(for: .seconds(30))
-    }
+    let first = hangingTask()
+    let firstHandle = registry.register(id, task: first)
+    let second = hangingTask()
     _ = registry.register(id, task: second)
     await first.value
     #expect(first.isCancelled)
     #expect(registry.liveCount == 1)
     #expect(!second.isCancelled)
+    // Cancelled task's completion must not prune the replacement generation.
+    registry.remove(firstHandle)
+    #expect(registry.liveCount == 1)
+    #expect(!second.isCancelled)
     registry.stop(id)
     await second.value
-}
-
-private final class HandleSlot: @unchecked Sendable {
-    var handle: SchemeTaskHandle?
 }

@@ -142,4 +142,18 @@ enum Allowlist: Sendable {
     static func isSrcsetFamily(_ key: String) -> Bool {
         key == "srcset" || key == "imagesrcset" || key == "imagesizes" || key == "sizes"
     }
+
+    /// Presentation attributes that accept a CSS `<paint>` / `<color>` and
+    /// therefore `url()`. Kept only after ``CSSSanitizer/sanitizedPaint(_:)``.
+    static let paintAttributes: Set<String> = [
+        "fill", "stroke", "stop-color", "flood-color", "lighting-color",
+        "color", "bgcolor",
+        "marker", "marker-start", "marker-mid", "marker-end",
+        "clip-path", "mask", "filter",
+        "solid-color", "text-decoration-color", "outline-color", "border-color",
+    ]
+
+    static func isPaintAttribute(_ key: String) -> Bool {
+        paintAttributes.contains(key)
+    }
 }

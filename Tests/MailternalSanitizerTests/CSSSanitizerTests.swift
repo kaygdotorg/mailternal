@@ -52,14 +52,17 @@ func cssUnclosedCommentFailClosed() {
 
 @Test("paint policy rejects url() and keeps colors")
 func cssPaintPolicy() {
-    #expect(CSSSanitizer.sanitizedPaint("url(https://evil.example/x.png)") == nil
-        || CSSSanitizer.sanitizedPaint("url(https://evil.example/x.png)") == "none")
-    let urlPaint = CSSSanitizer.sanitizedPaint("url(https://evil.example/x.png)")
-    #expect(urlPaint != "url(https://evil.example/x.png)")
-    #expect(urlPaint == nil || (urlPaint.map { CSSSanitizer.isURLFree($0) && CSSSanitizer.isColorOrPaint($0) } ?? true))
-    #expect(!((urlPaint ?? "").contains("evil.example")))
-    #expect(CSSSanitizer.sanitizedPaint("u/**/rl(https://evil.example/x.png)") != "u/**/rl(https://evil.example/x.png)")
-    #expect(!((CSSSanitizer.sanitizedPaint("u/**/rl(https://evil.example/x.png)") ?? "").contains("evil.example")))
+    func assertRejected(_ raw: String) {
+        let out = CSSSanitizer.sanitizedPaint(raw)
+        #expect(out == nil || out == "none", "unexpected paint for \(raw): \(String(describing: out))")
+        #expect(!((out ?? "").contains("evil.example")))
+        #expect(!((out ?? "").lowercased().contains("url(")))
+    }
+    assertRejected("url(https://evil.example/x.png)")
+    assertRejected("u/**/rl(https://evil.example/x.png)")
+    assertRejected(#"\75\72\6c(https://evil.example/x.png)"#)
+    assertRejected("URL(https://evil.example/x.png)")
+    assertRejected("url('https://evil.example/x.png')")
     #expect(CSSSanitizer.sanitizedPaint("#00ff00") == "#00ff00")
     #expect(CSSSanitizer.sanitizedPaint("red") == "red")
     #expect(CSSSanitizer.sanitizedPaint("none") == "none")
