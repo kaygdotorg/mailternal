@@ -1,0 +1,6 @@
+certs
+corpus
+__pycache__
+*.pyc
+.git
+README.md
