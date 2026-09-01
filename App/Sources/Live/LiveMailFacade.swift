@@ -41,6 +41,7 @@ final class LiveMailFacade: MailFacade {
     private var engineTasks: [Task<Void, Never>] = []
     private var foldersTask: Task<Void, Never>?
     private var didRestore = false
+    private let clientFactory: (any IMAPClientFactory)?
     private var qaMonitorTask: Task<Void, Never>?
     private let qaStartedAt = Date()
     private var qaFirstPageLogged = false
@@ -57,12 +58,14 @@ final class LiveMailFacade: MailFacade {
         container: MailternalContainer = .default,
         keychain: KeychainStore = KeychainStore(),
         enableNotifications: Bool = true,
-        attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes
+        attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes,
+        clientFactory: (any IMAPClientFactory)? = nil
     ) throws {
         QAIMAPTrust.installIfRequested()
         try container.prepare()
         self.container = container
         self.keychain = keychain
+        self.clientFactory = clientFactory
         self.notifications = LiveNotificationService(enabled: enableNotifications)
         self.store = try MailStore(
             databaseURL: container.databaseURL,
@@ -106,8 +109,6 @@ final class LiveMailFacade: MailFacade {
             startFolderObservation(account: account.id)
             setState(.validating)
             await startEngine(for: account)
-            setState(.active)
-            notifications.requestAuthorizationIfNeeded()
             startQAMonitorIfNeeded(account: account.id)
         } catch {
             setState(.connectionFailed(message: userPresentable(error, host: config?.imap.host)))
@@ -154,8 +155,6 @@ final class LiveMailFacade: MailFacade {
 
         self.config = config
         await startEngine(for: config)
-        setState(.active)
-        notifications.requestAuthorizationIfNeeded()
         startFolderObservation(account: config.id)
     }
 
@@ -292,12 +291,23 @@ final class LiveMailFacade: MailFacade {
         let credentials = KeychainCredentialProvider(keychain: keychain)
         let qa = ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1"
             || QALaunch.parse() != nil
-        let engine = SyncEngine(
-            store: store,
-            config: config,
-            credentials: credentials,
-            qaAmpleDisk: qa
-        )
+        let engine: SyncEngine
+        if let clientFactory {
+            engine = SyncEngine(
+                store: store,
+                config: config,
+                credentials: credentials,
+                clientFactory: clientFactory,
+                qaAmpleDisk: qa
+            )
+        } else {
+            engine = SyncEngine(
+                store: store,
+                config: config,
+                credentials: credentials,
+                qaAmpleDisk: qa
+            )
+        }
         self.engine = engine
         await engine.start()
         attachEngineStreams(engine)
@@ -320,6 +330,9 @@ final class LiveMailFacade: MailFacade {
             for await status in stream {
                 guard let self else { return }
                 self.syncContinuation.yield(status)
+                if status.isOnline {
+                    self.markActiveIfValidating()
+                }
             }
         }
         let mailTask = Task { [weak self] in
@@ -328,7 +341,35 @@ final class LiveMailFacade: MailFacade {
                 self?.handleNewMail(event)
             }
         }
-        engineTasks = [statusTask, mailTask]
+        let failureTask = Task { [weak self] in
+            let stream = await engine.failures
+            for await failure in stream {
+                self?.applyEngineFailure(failure)
+            }
+        }
+        engineTasks = [statusTask, mailTask, failureTask]
+    }
+
+    private func markActiveIfValidating() {
+        guard case .validating = accountState else { return }
+        setState(.active)
+        notifications.requestAuthorizationIfNeeded()
+    }
+
+    private func applyEngineFailure(_ failure: SyncFailure) {
+        switch accountState {
+        case .none:
+            return
+        default:
+            break
+        }
+        let host = config?.imap.host ?? "the mail server"
+        switch failure {
+        case .authentication:
+            setState(.authFailed(message: "The username or password was rejected."))
+        case .tls:
+            setState(.connectionFailed(message: "Could not establish a secure connection to \(host)."))
+        }
     }
 
     private func seedQAAccount(_ qa: QALaunch.Config) async throws {

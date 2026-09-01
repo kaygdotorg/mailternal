@@ -138,7 +138,7 @@ enum MessageFind: Sendable {
         }
     }
 
-    /// Body text wins; raw source when that pane is showing; otherwise tag-stripped HTML.
+    /// Matches the viewer surface: raw pane, HTML body, then plain text.
     static func haystack(
         bodyText: String?,
         html: String?,
@@ -148,13 +148,10 @@ enum MessageFind: Sendable {
         if showingRaw, let raw {
             return raw
         }
-        if let bodyText, !bodyText.isEmpty {
-            return bodyText
-        }
         if let html, !html.isEmpty {
             return visibleText(fromHTML: html)
         }
-        return ""
+        return bodyText ?? ""
     }
 
     static func visibleText(fromHTML html: String) -> String {

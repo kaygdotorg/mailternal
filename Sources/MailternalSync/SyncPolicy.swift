@@ -229,6 +229,28 @@ enum SyncPolicy: Sendable {
         return IMAPUIDSet(1...high)
     }
 
+    /// Basic-path expunge/flag reconcile window. Spec: bounded sweeps, never
+    /// one `1...(UIDNEXT-1)` FETCH over a 100k mailbox.
+    static let flagSweepWindowSize: UInt32 = 5000
+
+    static func flagSweepWindows(
+        uidNext: UInt32,
+        windowSize: UInt32 = flagSweepWindowSize
+    ) -> [ClosedRange<UInt32>] {
+        guard uidNext > 1 else { return [] }
+        let high = uidNext &- 1
+        let size = max(1, windowSize)
+        var windows: [ClosedRange<UInt32>] = []
+        var lo: UInt32 = 1
+        while true {
+            let hi = min(high, lo &+ (size &- 1))
+            windows.append(lo...hi)
+            if hi == high { break }
+            lo = hi &+ 1
+        }
+        return windows
+    }
+
     static func uidSet<S: Sequence>(uids: S) -> IMAPUIDSet where S.Element == UInt32 {
         let sorted = uids.filter { $0 >= 1 }.sorted()
         guard let first = sorted.first else { return IMAPUIDSet(ranges: []) }
@@ -328,6 +350,7 @@ struct SyncSettings: Sendable {
     /// When false, skip `ENABLE QRESYNC` so a CONDSTORE-capable server stays
     /// on the CONDSTORE path (QA: 1143 without enable).
     var allowEnableQResync: Bool
+    var flagSweepWindowSize: UInt32
 
     static let production = SyncSettings(
         backfillWindowSize: SyncPolicy.defaultWindowSize,
@@ -342,6 +365,7 @@ struct SyncSettings: Sendable {
         periodicTick: .seconds(15),
         cleanupTick: .seconds(30),
         reconnect: IMAPReconnectBackoff(),
-        allowEnableQResync: true
+        allowEnableQResync: true,
+        flagSweepWindowSize: SyncPolicy.flagSweepWindowSize
     )
 }

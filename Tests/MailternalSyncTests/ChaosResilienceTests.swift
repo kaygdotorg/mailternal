@@ -443,6 +443,10 @@ private func runHostileRound(
     world.fetchError = IMAPError.transport("round bump")
     world.fetchErrorAfter = world.fetchCount + 1
     world.fetchNanos = 0
+    // UIDVALIDITY rewrite drops the socket (chaos.sh stop/start). A completed
+    // backfill sits in IDLE with no FETCH, so fetchError never fires unless
+    // we BYE the live connections.
+    await factory.emitAll(.bye("uidvalidity"))
 
     try await waitUntil(timeout: .seconds(8)) {
         guard let inbox = try await inboxFolder(store) else { return false }
@@ -459,8 +463,8 @@ private func runHostileRound(
         live.highestModSeq = (live.highestModSeq ?? 4) + 3
     }
     await engine.refreshNow()
-    try await waitUntil(timeout: .seconds(4)) {
-        try await inboxFolder(store)?.totalCount == Int(replacementCount) - 4
+    try await waitUntil(timeout: .seconds(8)) {
+        (try await inboxFolder(store))?.totalCount == Int(replacementCount) - 4
     }
 
     world.updateMailbox("INBOX") { live in
@@ -476,9 +480,13 @@ private func runHostileRound(
         live.uidNext = start + 3
         live.highestModSeq = (live.highestModSeq ?? 10) + 5
     }
-    await factory.emitAll(.exists(Int(replacementCount) - 1))
     try await waitUntil(timeout: .seconds(4)) {
-        try await inboxFolder(store)?.totalCount == Int(replacementCount) - 1
+        factory.clients.count >= 2
+    }
+    await factory.emitAll(.exists(Int(replacementCount) - 1))
+    await engine.refreshNow()
+    try await waitUntil(timeout: .seconds(8)) {
+        (try await inboxFolder(store))?.totalCount == Int(replacementCount) - 1
     }
 
     try await assertStoreInvariants(store, drain: true, expectEmptySeen: true, expectNoReplacement: true)

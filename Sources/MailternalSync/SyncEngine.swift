@@ -36,6 +36,8 @@ public actor SyncEngine {
     private var notified: Set<NotificationKey> = []
     private var statusWaiters: [UUID: AsyncStream<SyncStatus>.Continuation] = [:]
     private var mailWaiters: [UUID: AsyncStream<NewMailEvent>.Continuation] = [:]
+    private var failureWaiters: [UUID: AsyncStream<SyncFailure>.Continuation] = [:]
+    private var lastFailure: SyncFailure?
     private var reconnectAttempt = 0
     private var refreshPulse: Int = 0
     private var qresyncEnabled = false
@@ -63,6 +65,25 @@ public actor SyncEngine {
             config: config,
             credentials: credentials,
             clientFactory: LiveIMAPClientFactory(),
+            disk: qaAmpleDisk ? AmpleDiskSpace() : FileDiskSpace(),
+            clock: { Date() },
+            settings: .production
+        )
+    }
+
+    /// Test/LiveWiring seam: inject a scripted IMAP client without exposing disk policy.
+    package init(
+        store: MailStore,
+        config: AccountConfig,
+        credentials: any IMAPCredentialProvider,
+        clientFactory: any IMAPClientFactory,
+        qaAmpleDisk: Bool = false
+    ) {
+        self.init(
+            store: store,
+            config: config,
+            credentials: credentials,
+            clientFactory: clientFactory,
             disk: qaAmpleDisk ? AmpleDiskSpace() : FileDiskSpace(),
             clock: { Date() },
             settings: .production
@@ -136,6 +157,17 @@ public actor SyncEngine {
         }
     }
 
+    /// Terminal auth / TLS failures. Transport errors are not emitted here.
+    public var failures: AsyncStream<SyncFailure> {
+        AsyncStream { continuation in
+            let id = UUID()
+            continuation.onTermination = { _ in
+                Task { await self.dropFailure(id) }
+            }
+            addFailure(id, continuation)
+        }
+    }
+
     public func fetchPart(message: MessageID, part: String) async throws -> URL {
         guard IMAPSectionSpecifier.isLegal(part) else {
             throw SyncEngineError.invalidPartSpecifier
@@ -201,6 +233,36 @@ public actor SyncEngine {
 
     private func dropMail(_ id: UUID) { mailWaiters.removeValue(forKey: id) }
 
+    private func addFailure(_ id: UUID, _ continuation: AsyncStream<SyncFailure>.Continuation) {
+        failureWaiters[id] = continuation
+        if let lastFailure {
+            continuation.yield(lastFailure)
+        }
+    }
+
+    private func dropFailure(_ id: UUID) { failureWaiters.removeValue(forKey: id) }
+
+    private func emitFailure(_ failure: SyncFailure) {
+        lastFailure = failure
+        for continuation in failureWaiters.values {
+            continuation.yield(failure)
+        }
+    }
+
+    private static func classifyTerminal(_ error: Error) -> SyncFailure? {
+        if let imap = error as? IMAPError {
+            switch imap {
+            case .auth(let message):
+                return .authentication(message: message)
+            case .tls(let message):
+                return .tls(message: message)
+            default:
+                return nil
+            }
+        }
+        return nil
+    }
+
     private func publishStatus(online: Bool? = nil, mode: SyncStatus.Mode? = nil) {
         if let online {
             currentStatus = SyncStatus(mode: mode ?? currentStatus.mode, isOnline: online)
@@ -229,7 +291,13 @@ public actor SyncEngine {
             } catch is CancellationError {
                 break
             } catch {
-                await logSync("session ended", detail: String(describing: error))
+                if let failure = Self.classifyTerminal(error) {
+                    emitFailure(failure)
+                    stopping = true
+                    await logSync("terminal failure", detail: String(describing: error))
+                } else {
+                    await logSync("session ended", detail: String(describing: error))
+                }
             }
             await teardown()
             connected = false
@@ -269,6 +337,7 @@ public actor SyncEngine {
 
         connected = true
         reconnectAttempt = 0
+        lastFailure = nil
         publishStatus(online: true)
 
         try await enablePreferredExtensions(channel: sync)
@@ -567,7 +636,8 @@ public actor SyncEngine {
                     return
                 }
 
-                try await ingestWindow(
+                let capturedGeneration = record.generation
+                let committed = try await ingestWindow(
                     record: record,
                     window: window,
                     channel: channel,
@@ -578,6 +648,8 @@ public actor SyncEngine {
                 // Cursor advances only after a committed window. Cancellation
                 // mid-ingest must not persist low-water (spec: sync.md backfill).
                 try Task.checkCancellation()
+                guard committed else { return }
+                guard try await stillCurrentGeneration(capturedGeneration, folder: folderID) else { return }
                 state.lowWaterUID = IMAPUID(rawValue: window.lowerBound)
                 state.progress = SyncPolicy.backfillProgress(uidNext: uidNext, lowWater: state.lowWaterUID?.rawValue)
                 try await store.saveSyncState(state)
@@ -599,7 +671,8 @@ public actor SyncEngine {
         channel: SyncChannel,
         notify: Bool,
         accumulateSample: Bool
-    ) async throws {
+    ) async throws -> Bool {
+        let capturedGeneration = record.generation
         let uidSet = IMAPUIDSet(window)
         let meta: [IMAPFetchedMessage]
         do {
@@ -618,7 +691,7 @@ public actor SyncEngine {
             await logSync("window fetch \(record.path)", detail: String(describing: error), folder: record.id)
             if SyncPolicy.isTransport(error) { throw error }
             try await quarantineUnknown(record: record, window: window, channel: channel, reason: String(describing: error))
-            return
+            return true
         }
 
         if accumulateSample {
@@ -707,7 +780,8 @@ public actor SyncEngine {
             built.append(incoming)
         }
 
-        if built.isEmpty { return }
+        guard try await stillCurrentGeneration(capturedGeneration, folder: record.id) else { return false }
+        if built.isEmpty { return true }
         built.sort { $0.uid > $1.uid }
 
         let canNotify = notify && record.role == .inbox && !record.isReplacement
@@ -721,6 +795,7 @@ public actor SyncEngine {
             }
         }
 
+        guard try await stillCurrentGeneration(capturedGeneration, folder: record.id) else { return false }
         _ = try await store.upsertMessages(built)
 
         if canNotify {
@@ -737,6 +812,7 @@ public actor SyncEngine {
                 }
             }
         }
+        return true
     }
 
     private func ingestNewUIDs(
@@ -755,13 +831,14 @@ public actor SyncEngine {
         ) {
             let start = max(window.lowerBound, lo)
             if start <= window.upperBound {
-                try await ingestWindow(
+                let committed = try await ingestWindow(
                     record: record,
                     window: start...window.upperBound,
                     channel: channel,
                     notify: notify,
                     accumulateSample: false
                 )
+                if !committed { return }
             }
             if window.lowerBound <= lo { break }
             lowWater = window.lowerBound
@@ -1014,16 +1091,18 @@ public actor SyncEngine {
             }
             return
         }
-        let range: ClosedRange<UInt32> = 1...(uidNext &- 1)
-        let stored = try await store.uids(in: record.generation, range: range)
-        if stored.isEmpty { return }
-        let fetched = try await channel.fetch(.flags(uids: IMAPUIDSet(range)))
-        let server = Set(fetched.compactMap(\.uid))
-        let gone = stored.filter { !server.contains($0.rawValue) }
-        if !gone.isEmpty {
-            _ = try await store.deleteUIDs(generation: record.generation, uids: gone)
+        for range in SyncPolicy.flagSweepWindows(uidNext: uidNext, windowSize: settings.flagSweepWindowSize) {
+            try Task.checkCancellation()
+            let stored = try await store.uids(in: record.generation, range: range)
+            if stored.isEmpty { continue }
+            let fetched = try await channel.fetch(.flags(uids: IMAPUIDSet(range)))
+            let server = Set(fetched.compactMap(\.uid))
+            let gone = stored.filter { !server.contains($0.rawValue) }
+            if !gone.isEmpty {
+                _ = try await store.deleteUIDs(generation: record.generation, uids: gone)
+            }
+            try await applyFlagFetch(fetched, record: record)
         }
-        try await applyFlagFetch(fetched, record: record)
     }
 
     /// IDLE on a second connection while the sync connection is mid-FETCH
@@ -1033,8 +1112,18 @@ public actor SyncEngine {
     private func idleAfterInboxBackfill(password: String) async {
         await waitUntilWalksSettle()
         if stopping || Task.isCancelled { return }
+        // Catch up INBOX before sitting in IDLE. Mail and VANISHED that arrived
+        // during backfill (or a UIDVALIDITY replacement) otherwise wait on a
+        // hint that was never observed: dual-connection periodic skips INBOX,
+        // and EXISTS emitted before beginIdle is dropped.
+        await catchUpInboxDelta()
         await openIdleChannel(password: password)
         await idleLoop()
+    }
+
+    private func catchUpInboxDelta() async {
+        guard let sync = syncChannel, let inboxID else { return }
+        try? await delta(folderID: inboxID, channel: sync, notify: true)
     }
 
     private func waitUntilWalksSettle() async {
@@ -1080,7 +1169,19 @@ public actor SyncEngine {
         guard let channel else { return }
         while !stopping && !Task.isCancelled {
             do {
-                _ = try await channel.select(record.path)
+                let selected = try await channel.select(record.path)
+                if let latest = folders[inboxID] { record = latest }
+                let uidNext = selected.uidNext ?? record.lastUidNext
+                if selected.uidValidity != record.generation.uidValidity
+                    || uidNext > record.lastUidNext
+                    || !selected.vanished.isEmpty
+                    || !selected.vanishedEarlier.isEmpty
+                {
+                    if let sync = syncChannel {
+                        try await delta(folderID: inboxID, channel: sync, notify: true)
+                        if let latest = folders[inboxID] { record = latest }
+                    }
+                }
                 let idle = try await channel.beginIdle()
                 let outcome = await waitIdle(idle)
                 try await channel.leaveIdle()
@@ -1175,6 +1276,14 @@ public actor SyncEngine {
         }
     }
 
+    private func stillCurrentGeneration(
+        _ captured: MailboxGeneration,
+        folder: FolderID
+    ) async throws -> Bool {
+        folders[folder]?.generation == captured
+            && (try await store.liveGeneration(for: folder)) == captured
+    }
+
     private func seenLoop() async {
         while !stopping && !Task.isCancelled {
             if let channel = syncChannel {
@@ -1199,7 +1308,12 @@ public actor SyncEngine {
                 continue
             }
             do {
-                _ = try await channel.select(summary.path)
+                let selected = try await channel.select(summary.path)
+                let liveNow = try await store.liveGeneration(for: op.folder)
+                if liveNow?.uidValidity != op.uidValidity || selected.uidValidity != op.uidValidity {
+                    try await store.dropStaleSeen(folder: op.folder)
+                    continue
+                }
                 try await channel.storeSeen(uids: IMAPUIDSet(uid: op.uid.rawValue))
                 try await store.dequeueSeen(op)
             } catch let error as IMAPError {

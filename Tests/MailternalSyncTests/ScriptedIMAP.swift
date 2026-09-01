@@ -15,11 +15,15 @@ final class ScriptedWorld: @unchecked Sendable {
     var storedSeen: [UInt32] = []
     var isGmail = false
     var fetchNanos: UInt64 = 0
+    /// Sleep `fetchNanos` only on fetches after this count. `nil` sleeps every fetch.
+    var stallFetchesAfter: Int?
     var connectError: Error?
+    var connectAttempts = 0
     var fetchError: Error?
     var fetchErrorAfter: Int?
     var fetchCount = 0
     var selectCount = 0
+    var flagFetchRanges: [[ClosedRange<UInt32>]] = []
 
     init(
         capabilities: IMAPCapabilities,
@@ -109,7 +113,30 @@ final class ScriptedWorld: @unchecked Sendable {
     func fetchSleepNanos() -> UInt64 {
         lock.lock()
         defer { lock.unlock() }
+        if let limit = stallFetchesAfter, fetchCount <= limit {
+            return 0
+        }
         return fetchNanos
+    }
+
+    func noteFetch(_ request: IMAPFetchRequest) {
+        lock.lock()
+        defer { lock.unlock() }
+        if request.flags && !request.envelope && !request.bodyStructure && request.peek.isEmpty {
+            flagFetchRanges.append(request.uids.ranges)
+        }
+    }
+
+    func snapshotFlagFetchRanges() -> [[ClosedRange<UInt32>]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return flagFetchRanges
+    }
+
+    func resetFlagFetchRanges() {
+        lock.lock()
+        flagFetchRanges = []
+        lock.unlock()
     }
 
     func snapshotFetchCount() -> Int {
@@ -121,7 +148,14 @@ final class ScriptedWorld: @unchecked Sendable {
     func connectFailure() -> Error? {
         lock.lock()
         defer { lock.unlock() }
+        connectAttempts += 1
         return connectError
+    }
+
+    func snapshotConnectAttempts() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return connectAttempts
     }
 
     func setConnectError(_ error: Error?) {
@@ -246,6 +280,7 @@ actor ScriptedIMAPClient: IMAPClient {
 
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
         if let error = world.beginFetch() { throw error }
+        world.noteFetch(request)
         let delay = world.fetchSleepNanos()
         if delay > 0 {
             try await Task.sleep(nanoseconds: delay)
@@ -485,7 +520,8 @@ func testSettings(
     seenPoll: Duration = .milliseconds(20),
     periodicTick: Duration = .seconds(15),
     cleanupTick: Duration = .seconds(30),
-    allowEnableQResync: Bool = true
+    allowEnableQResync: Bool = true,
+    flagSweep: UInt32 = 5000
 ) -> SyncSettings {
     SyncSettings(
         backfillWindowSize: window,
@@ -500,7 +536,8 @@ func testSettings(
         periodicTick: periodicTick,
         cleanupTick: cleanupTick,
         reconnect: IMAPReconnectBackoff(base: 0.05, cap: 0.4, jitterFraction: 0.1),
-        allowEnableQResync: allowEnableQResync
+        allowEnableQResync: allowEnableQResync,
+        flagSweepWindowSize: flagSweep
     )
 }
 
