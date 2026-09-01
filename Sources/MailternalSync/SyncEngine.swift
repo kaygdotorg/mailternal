@@ -1280,8 +1280,9 @@ public actor SyncEngine {
         _ captured: MailboxGeneration,
         folder: FolderID
     ) async throws -> Bool {
-        folders[folder]?.generation == captured
-            && (try await store.liveGeneration(for: folder)) == captured
+        guard folders[folder]?.generation == captured else { return false }
+        let live = try await store.liveGeneration(for: folder)
+        return live == captured
     }
 
     private func seenLoop() async {
