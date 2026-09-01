@@ -176,6 +176,7 @@ private func decodeBase64Buffer(
     state: ParseState?,
     cap: Int?
 ) throws -> (out: [UInt8], truncated: Bool, consumed: Int, broken: Bool) {
+    try Task.checkCancellation()
     var out = [UInt8]()
     let expected = p.count * 3 / 4
     let reserve: Int

@@ -138,7 +138,7 @@ final class UILogicTests: XCTestCase {
         XCTAssertNil(empty.selectedMatchNumber)
     }
 
-    func testFindHaystackPrefersRawThenBodyThenStrippedHTML() {
+    func testFindHaystackPrefersRawThenVisibleHTMLThenPlain() {
         XCTAssertEqual(
             MessageFind.haystack(
                 bodyText: "plain",
@@ -153,6 +153,15 @@ final class UILogicTests: XCTestCase {
                 bodyText: "plain",
                 html: "<p>html</p>",
                 raw: "RAW",
+                showingRaw: false
+            ),
+            "html"
+        )
+        XCTAssertEqual(
+            MessageFind.haystack(
+                bodyText: "plain",
+                html: nil,
+                raw: nil,
                 showingRaw: false
             ),
             "plain"

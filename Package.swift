@@ -70,6 +70,7 @@ package.targets.append(contentsOf: [
             "Live/MailternalContainer.swift",
             "Live/LiveNotifications.swift",
             "Live/QAIMAPTrust.swift",
+            "Live/QALaunch.swift",
             "Support/KeychainStore.swift",
         ]
     ),
@@ -79,6 +80,8 @@ package.targets.append(contentsOf: [
             "MailternalLive",
             "MailternalInterfaces",
             "MailternalIMAP",
+            "MailternalSync",
+            "MailternalStore",
         ]
     ),
 ])
