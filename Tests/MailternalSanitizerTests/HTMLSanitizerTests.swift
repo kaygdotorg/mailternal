@@ -82,6 +82,22 @@ func cssEscapedURL() {
     #expect(!result.html.contains("evil.example"))
 }
 
+@Test("CSS comment-split url() in a style attribute is stripped")
+func cssCommentSplitURLInHTML() {
+    let html = #"<p style="background:u/**/rl(https://evil.example/x.png)">x</p>"#
+    let result = HTMLSanitizer.sanitize(html)
+    assertNoExfiltration(result.html)
+    #expect(!result.html.contains("evil.example"))
+}
+
+@Test("CSS comment-split @import in a style block is stripped")
+func cssCommentSplitImportInHTML() {
+    let html = "<style>@im/**/port url(\"https://evil.example/x.css\"); p { color: #111; }</style>"
+    let result = HTMLSanitizer.sanitize(html)
+    assertNoExfiltration(result.html)
+    #expect(!result.html.contains("evil.example"))
+}
+
 @Test("srcset and imagesrcset are removed")
 func srcsetRemoved() {
     let html = #"<img src="https://evil.example/a.png" srcset="https://evil.example/a-2x.png 2x" imagesrcset="https://evil.example/a-3x.png 3x">"#
