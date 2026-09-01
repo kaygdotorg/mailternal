@@ -65,10 +65,15 @@ extension MailStore {
                 arguments: [folder.rawValue, GenerationState.replacement.rawValue]
             ) {
                 let existingUV: Int64 = existing["uid_validity"]
-                if existingUV != Int64(uidValidity) {
-                    throw MailStoreError.replacementAlreadyExists
+                if existingUV == Int64(uidValidity) {
+                    return MailboxGeneration(folder: folder, uidValidity: uidValidity)
                 }
-                return MailboxGeneration(folder: folder, uidValidity: uidValidity)
+                // A later UIDVALIDITY bump abandons the in-progress replacement.
+                let existingID: Int64 = existing["id"]
+                try db.execute(
+                    sql: "UPDATE generations SET state = ? WHERE id = ?",
+                    arguments: [GenerationState.retiring.rawValue, existingID]
+                )
             }
             if try Int.fetchOne(
                 db,
