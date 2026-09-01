@@ -170,24 +170,54 @@ actor SyncChannel {
         }
     }
 
-    /// Atomic select-verify archive. The source UIDVALIDITY is checked immediately
-    /// before MOVE or the COPY/STORE/EXPUNGE fallback while the channel is exclusive.
-    func archive(
+    /// Atomic select-verify MOVE. The source UIDVALIDITY is checked immediately
+    /// before the server mutation while the channel is exclusive.
+    func archiveMove(
         in path: String,
         expectedUIDValidity: UInt32?,
         uids: IMAPUIDSet,
-        destination: String,
-        useMove: Bool
+        destination: String
     ) async throws {
         try await withCommand {
             try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
-            if useMove {
-                try await self.client.move(uids: uids, to: destination)
-            } else {
-                try await self.client.copy(uids: uids, to: destination)
-                try await self.client.storeDeleted(uids: uids)
-                try await self.client.expunge(uids: uids)
-            }
+            try await self.client.move(uids: uids, to: destination)
+        }
+    }
+
+    /// Atomic select-verify COPY, the first phase of the no-MOVE fallback.
+    func archiveCopy(
+        in path: String,
+        expectedUIDValidity: UInt32?,
+        uids: IMAPUIDSet,
+        destination: String
+    ) async throws {
+        try await withCommand {
+            try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
+            try await self.client.copy(uids: uids, to: destination)
+        }
+    }
+
+    /// Atomic select-verify STORE \Deleted, the second fallback phase.
+    func archiveStoreDeleted(
+        in path: String,
+        expectedUIDValidity: UInt32?,
+        uids: IMAPUIDSet
+    ) async throws {
+        try await withCommand {
+            try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
+            try await self.client.storeDeleted(uids: uids)
+        }
+    }
+
+    /// Atomic select-verify UID EXPUNGE, the final fallback phase.
+    func archiveExpunge(
+        in path: String,
+        expectedUIDValidity: UInt32?,
+        uids: IMAPUIDSet
+    ) async throws {
+        try await withCommand {
+            try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
+            try await self.client.expunge(uids: uids)
         }
     }
 

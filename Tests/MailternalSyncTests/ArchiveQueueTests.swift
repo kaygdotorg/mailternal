@@ -84,6 +84,79 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
     }
 }
 
+@Test func engineRetriesFallbackAfterCopiedWithoutRepeatingCopy() async throws {
+    try await withSyncStore { store, dir in
+        let world = archiveWorld(capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE"]))
+        world.storeDeletedError = IMAPError.taggedNO(
+            tag: "t",
+            message: "STORE failed",
+            code: nil
+        )
+        let engine = makeEngine(store: store, world: world, dir: dir).0
+        await engine.start()
+        _ = try await waitForArchiveInbox(store)
+        let inbox = try #require(await inboxFolder(store))
+        let message = try #require(await store.page(
+            in: inbox.id,
+            after: nil,
+            limit: 10
+        ).rows.first?.id)
+        try await store.enqueueArchive(message: message)
+
+        try await waitUntil(timeout: .seconds(3)) {
+            let pending = try await store.snapshotArchiveQueue()
+            guard pending.first?.copied == true else { return false }
+            let errors = try await store.fetchErrorLog()
+            return errors.contains {
+                $0.kind == .archive && $0.message.contains("phase STORE")
+            }
+        }
+        world.storeDeletedError = nil
+        try await waitUntil(timeout: .seconds(3)) {
+            try await store.snapshotArchiveQueue().isEmpty
+                && world.archiveCommandSnapshot() == [
+                    "COPY INBOX Archive 1",
+                    "STORE INBOX 1",
+                    "EXPUNGE INBOX 1",
+                ]
+        }
+        await engine.stop()
+    }
+}
+
+@Test func stopWaitsForInFlightArchiveFallback() async throws {
+    try await withSyncStore { store, dir in
+        let world = archiveWorld(capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE"]))
+        world.pauseArchiveStore = true
+        let (engine, factory) = makeEngine(store: store, world: world, dir: dir)
+        await engine.start()
+        _ = try await waitForArchiveInbox(store)
+        let inbox = try #require(await inboxFolder(store))
+        let message = try #require(await store.page(
+            in: inbox.id,
+            after: nil,
+            limit: 10
+        ).rows.first?.id)
+        try await store.enqueueArchive(message: message)
+        try await waitUntil(timeout: .seconds(3)) {
+            world.archiveStoreDidEnter()
+        }
+
+        let stopping = Task { await engine.stop() }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await factory.closedClientCount() == 0)
+
+        world.releaseArchiveStore()
+        await stopping.value
+        #expect(world.archiveCommandSnapshot() == [
+            "COPY INBOX Archive 1",
+            "STORE INBOX 1",
+            "EXPUNGE INBOX 1",
+        ])
+        #expect(try await store.snapshotArchiveQueue().isEmpty)
+    }
+}
+
 @Test func engineDropsArchiveOperationAfterUIDValidityReplacement() async throws {
     try await withSyncStore { store, dir in
         let world = archiveWorld(capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE", "MOVE"]))

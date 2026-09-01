@@ -208,13 +208,22 @@ public struct ArchiveOp: Hashable, Sendable, Identifiable {
     public var folder: FolderID
     public var uidValidity: UInt32
     public var uid: IMAPUID
+    public var copied: Bool
 
-    public init(id: Int64, account: AccountID, folder: FolderID, uidValidity: UInt32, uid: IMAPUID) {
+    public init(
+        id: Int64,
+        account: AccountID,
+        folder: FolderID,
+        uidValidity: UInt32,
+        uid: IMAPUID,
+        copied: Bool = false
+    ) {
         self.id = id
         self.account = account
         self.folder = folder
         self.uidValidity = uidValidity
         self.uid = uid
+        self.copied = copied
     }
 }
 

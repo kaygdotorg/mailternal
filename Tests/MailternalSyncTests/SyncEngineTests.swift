@@ -1015,7 +1015,9 @@ func staleQuarantineFallbackCannotResurrectExpungedUID(
             settings: testSettings(dir: dir, window: 2)
         )
         await engine.start()
-        try await waitUntil(timeout: .seconds(5)) {
+        // Deadlines here are generous: under full-suite parallel load the
+        // scripted engine can take several seconds to reach the fallback.
+        try await waitUntil(timeout: .seconds(15)) {
             world.flagFallbackDidEnter()
         }
 
@@ -1037,7 +1039,7 @@ func staleQuarantineFallbackCannotResurrectExpungedUID(
 
         let inbox = try #require(await inboxFolder(store))
         let generation = try #require(await store.liveGeneration(for: inbox.id))
-        try await waitUntil(timeout: .seconds(5)) {
+        try await waitUntil(timeout: .seconds(15)) {
             guard world.flagFallbackDidReturn() else { return false }
             return try await store.uids(in: generation) == [
                 IMAPUID(rawValue: 1),

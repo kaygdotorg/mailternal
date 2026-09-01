@@ -39,8 +39,8 @@ public actor SyncEngine {
     /// Bumped when a delta observes expunges so an in-flight backfill window
     /// cannot commit a FETCH captured before that deletion.
     private var expungeRevision: [FolderID: UInt64] = [:]
-    private var activeQuarantineOperations = 0
-    private var quarantineDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    private var activeWriteOperations = 0
+    private var writeDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private var qresyncEnabled = false
 
     /// HEADER for threading fields; `1` covers the common single-part body.
@@ -116,9 +116,10 @@ public actor SyncEngine {
     }
     public func stop() async {
         stopping = true
-        // Let a quarantine operation finish its revision check and repair
-        // before closing the command channel or cancelling the session group.
-        await waitForQuarantineDrain()
+        // Let any in-flight mailbox write finish its server sequence and
+        // revision repair before closing the command channel or cancelling
+        // the session group.
+        await waitForWriteDrain()
         // Close first so in-flight send() waiters resume, then cancel the run loop.
         await teardown()
         runTask?.cancel()
@@ -299,24 +300,24 @@ public actor SyncEngine {
         if stopping || runTask == nil { throw SyncEngineError.stopped }
     }
 
-    private func beginQuarantineOperation() {
-        activeQuarantineOperations += 1
+    private func beginWriteOperation() {
+        activeWriteOperations += 1
     }
 
-    private func endQuarantineOperation() {
-        activeQuarantineOperations -= 1
-        guard activeQuarantineOperations == 0 else { return }
-        let waiters = quarantineDrainWaiters
-        quarantineDrainWaiters.removeAll()
+    private func endWriteOperation() {
+        activeWriteOperations -= 1
+        guard activeWriteOperations == 0 else { return }
+        let waiters = writeDrainWaiters
+        writeDrainWaiters.removeAll()
         for waiter in waiters {
             waiter.resume()
         }
     }
 
-    private func waitForQuarantineDrain() async {
-        guard activeQuarantineOperations > 0 else { return }
+    private func waitForWriteDrain() async {
+        guard activeWriteOperations > 0 else { return }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            quarantineDrainWaiters.append(continuation)
+            writeDrainWaiters.append(continuation)
         }
     }
 
@@ -391,7 +392,7 @@ public actor SyncEngine {
             group.addTask { await self.seenLoop() }
             group.addTask { await self.cleanupLoop() }
             group.addTask { await self.watchBye() }
-            while (!self.stopping || self.activeQuarantineOperations > 0)
+            while (!self.stopping || self.activeWriteOperations > 0)
                     && !self.sessionBroken && !Task.isCancelled {
                 try await Task.sleep(for: .milliseconds(200))
             }
@@ -994,6 +995,9 @@ public actor SyncEngine {
             expectedUIDValidity: record.generation.uidValidity,
             .flags(uids: IMAPUIDSet(window))
         )
+        // Stop may have released a paused FLAGS continuation after teardown;
+        // never let that late result start a quarantine write.
+        guard !stopping else { return false }
         let now = clock()
         let incoming = flags.compactMap { fetched -> IncomingMessage? in
             guard let uid = fetched.uid else { return nil }
@@ -1016,8 +1020,8 @@ public actor SyncEngine {
 
         // Once the write begins, stop waits for the post-write revision check
         // and expunge repair instead of cancelling it halfway through.
-        beginQuarantineOperation()
-        defer { endQuarantineOperation() }
+        beginWriteOperation()
+        defer { endWriteOperation() }
         _ = try await store.upsertMessages(incoming)
         if let expectedExpungeRevision,
            expectedExpungeRevision != expungeRevision[record.id, default: 0] {
@@ -1595,27 +1599,76 @@ public actor SyncEngine {
                 try await discardArchive(op, reason: "no Archive folder")
                 continue
             }
+
+            // Keep the gate over the whole server sequence (and its local
+            // acknowledgement), so stop cannot close the channel between
+            // fallback phases.
+            guard !stopping else { return }
+            beginWriteOperation()
+            defer { endWriteOperation() }
+            let capabilities = await channel.capabilities()
+            let useMove = !op.copied && capabilities.move
+            var phase = useMove ? "MOVE" : (op.copied ? "STORE" : "COPY")
             do {
                 let liveNow = try await store.liveGeneration(for: op.folder)
                 if liveNow?.uidValidity != op.uidValidity {
                     try await store.dropStaleArchive(folder: op.folder)
                     continue
                 }
-                try await channel.archive(
-                    in: source.path,
-                    expectedUIDValidity: op.uidValidity,
-                    uids: IMAPUIDSet(uid: op.uid.rawValue),
-                    destination: target.path,
-                    useMove: (await channel.capabilities()).move
-                )
+                let uids = IMAPUIDSet(uid: op.uid.rawValue)
+                if useMove {
+                    try await channel.archiveMove(
+                        in: source.path,
+                        expectedUIDValidity: op.uidValidity,
+                        uids: uids,
+                        destination: target.path
+                    )
+                } else {
+                    if !op.copied {
+                        phase = "COPY"
+                        try await channel.archiveCopy(
+                            in: source.path,
+                            expectedUIDValidity: op.uidValidity,
+                            uids: uids,
+                            destination: target.path
+                        )
+                        try await store.markArchiveCopied(op)
+                    }
+                    phase = "STORE"
+                    try await channel.archiveStoreDeleted(
+                        in: source.path,
+                        expectedUIDValidity: op.uidValidity,
+                        uids: uids
+                    )
+                    phase = "EXPUNGE"
+                    try await channel.archiveExpunge(
+                        in: source.path,
+                        expectedUIDValidity: op.uidValidity,
+                        uids: uids
+                    )
+                }
                 try await store.deleteArchiveOp(op)
             } catch SyncChannelError.staleMailbox {
                 try await store.dropStaleArchive(folder: op.folder)
                 try await store.deleteArchiveOp(op)
             } catch let error as IMAPError {
                 if error.isTaggedNO || error.isTaggedBAD {
-                    try await discardArchive(op, reason: error.description)
+                    if useMove || phase == "COPY" {
+                        // A tagged failure on MOVE/COPY means no fallback
+                        // phase has successfully mutated the source.
+                        try await discardArchive(op, reason: error.description)
+                    } else {
+                        // COPY already completed and was persisted. Keep the
+                        // op and retry only the idempotent remaining phases.
+                        try await retainArchive(
+                            op,
+                            phase: phase,
+                            reason: error.description
+                        )
+                    }
                 } else {
+                    // Transport failures leave the op queued, including after
+                    // a persisted COPY phase.
                     throw error
                 }
             }
@@ -1631,6 +1684,21 @@ public actor SyncEngine {
             generation: MailboxGeneration(folder: op.folder, uidValidity: op.uidValidity),
             uid: op.uid,
             message: reason
+        ))
+    }
+
+    private func retainArchive(
+        _ op: ArchiveOp,
+        phase: String,
+        reason: String
+    ) async throws {
+        try await store.recordError(StoreLogEntry(
+            kind: .archive,
+            account: op.account,
+            folder: op.folder,
+            generation: MailboxGeneration(folder: op.folder, uidValidity: op.uidValidity),
+            uid: op.uid,
+            message: "uid \(op.uid.rawValue) phase \(phase): \(reason)"
         ))
     }
     private func cleanupLoop() async {
