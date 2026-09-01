@@ -322,6 +322,12 @@ struct SyncSettings: Sendable {
     var setupSampleSize: Int
     var windowedDays: Int
     var diskURL: URL
+    var periodicTick: Duration
+    var cleanupTick: Duration
+    var reconnect: IMAPReconnectBackoff
+    /// When false, skip `ENABLE QRESYNC` so a CONDSTORE-capable server stays
+    /// on the CONDSTORE path (QA: 1143 without enable).
+    var allowEnableQResync: Bool
 
     static let production = SyncSettings(
         backfillWindowSize: SyncPolicy.defaultWindowSize,
@@ -332,6 +338,10 @@ struct SyncSettings: Sendable {
         seenPoll: .seconds(2),
         setupSampleSize: SyncPolicy.setupSampleSize,
         windowedDays: SyncPolicy.windowedDays,
-        diskURL: FileManager.default.homeDirectoryForCurrentUser
+        diskURL: FileManager.default.homeDirectoryForCurrentUser,
+        periodicTick: .seconds(15),
+        cleanupTick: .seconds(30),
+        reconnect: IMAPReconnectBackoff(),
+        allowEnableQResync: true
     )
 }

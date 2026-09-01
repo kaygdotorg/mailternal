@@ -25,9 +25,32 @@ public struct NewMailEvent: Sendable {
     }
 }
 
-enum SyncEngineError: Error, Sendable {
+enum SyncEngineError: Error, Sendable, Equatable {
     case stopped
     case messageNotFound
     case partMissing
     case folderNotFound
+    /// `fetchPart` was given something other than a numeric IMAP section
+    /// (`1`, `1.2`, `1.2.HEADER`, `1.2.TEXT`).
+    case invalidPartSpecifier
+}
+
+enum IMAPSectionSpecifier {
+    /// Legal IMAP BODY section: `^[0-9]+(\.[0-9]+)*$` with optional `.HEADER` / `.TEXT`.
+    static func isLegal(_ part: String) -> Bool {
+        let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let upper = trimmed.uppercased()
+        let core: String
+        if upper.hasSuffix(".HEADER") {
+            core = String(trimmed.dropLast(7))
+        } else if upper.hasSuffix(".TEXT") {
+            core = String(trimmed.dropLast(5))
+        } else {
+            core = trimmed
+        }
+        guard !core.isEmpty else { return false }
+        let pieces = core.split(separator: ".", omittingEmptySubsequences: false)
+        return pieces.allSatisfy { !$0.isEmpty && $0.allSatisfy { $0 >= "0" && $0 <= "9" } }
+    }
 }

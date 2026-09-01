@@ -137,6 +137,9 @@ public actor SyncEngine {
     }
 
     public func fetchPart(message: MessageID, part: String) async throws -> URL {
+        guard IMAPSectionSpecifier.isLegal(part) else {
+            throw SyncEngineError.invalidPartSpecifier
+        }
         try ensureRunning()
         guard let ref = try await store.messageRef(message) else {
             throw SyncEngineError.messageNotFound
@@ -151,7 +154,7 @@ public actor SyncEngine {
         )
         guard let data = fetched.first?.parts.first(where: {
             $0.specifier == part || $0.specifier.uppercased() == part.uppercased()
-        })?.data ?? fetched.first?.parts.first?.data, !data.isEmpty else {
+        })?.data, !data.isEmpty else {
             throw SyncEngineError.partMissing
         }
         let stored = try await store.putAttachment(data: data)
@@ -224,7 +227,7 @@ public actor SyncEngine {
             publishStatus(online: false)
             if stopping || Task.isCancelled { break }
             reconnectAttempt += 1
-            let delay = IMAPReconnectBackoff().delay(forAttempt: reconnectAttempt)
+            let delay = settings.reconnect.delay(forAttempt: reconnectAttempt)
             let nanos = UInt64(max(0, delay) * 1_000_000_000)
             try? await Task.sleep(nanoseconds: nanos)
         }
@@ -291,7 +294,7 @@ public actor SyncEngine {
 
     private func enablePreferredExtensions(channel: SyncChannel) async throws {
         let caps = await channel.capabilities()
-        guard caps.qresync else {
+        guard caps.qresync, settings.allowEnableQResync else {
             qresyncEnabled = false
             return
         }
@@ -494,6 +497,14 @@ public actor SyncEngine {
             }
             let uidNext = selected.uidNext ?? record.lastUidNext
 
+            if let low = state.lowWaterUID, state.backfillPhase != .complete {
+                await logSync(
+                    "resuming backfill from cursor",
+                    detail: "path=\(record.path) lowWater=\(low.rawValue) uidNext=\(uidNext)",
+                    folder: folderID
+                )
+            }
+
             state.backfillPhase = .walking
             try await store.saveSyncState(state)
 
@@ -544,6 +555,9 @@ public actor SyncEngine {
                     accumulateSample: record.role == .inbox && !setupDecided
                 )
 
+                // Cursor advances only after a committed window. Cancellation
+                // mid-ingest must not persist low-water (spec: sync.md backfill).
+                try Task.checkCancellation()
                 state.lowWaterUID = IMAPUID(rawValue: window.lowerBound)
                 state.progress = SyncPolicy.backfillProgress(uidNext: uidNext, lowWater: state.lowWaterUID?.rawValue)
                 try await store.saveSyncState(state)
@@ -578,6 +592,8 @@ public actor SyncEngine {
                 uid: true,
                 peek: Self.speculativePeeks
             ))
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             await logSync("window fetch \(record.path)", detail: String(describing: error), folder: record.id)
             if SyncPolicy.isTransport(error) { throw error }
@@ -642,6 +658,8 @@ public actor SyncEngine {
                             parts.append(contentsOf: message.parts)
                             bodies[uid] = parts
                         }
+                    } catch is CancellationError {
+                        throw CancellationError()
                     } catch {
                         await logSync("body peek \(record.path)", detail: String(describing: error), folder: record.id)
                         if SyncPolicy.isTransport(error) { throw error }
@@ -1059,6 +1077,9 @@ public actor SyncEngine {
                     }
                 case .cancel:
                     if stopping || Task.isCancelled { return }
+                    // IDLE event stream ended without a mailbox hint. Back off
+                    // so a dead idle socket cannot spin the run loop.
+                    try? await Task.sleep(for: .milliseconds(400))
                 }
                 if let latest = folders[inboxID] { record = latest }
             } catch is CancellationError {
@@ -1107,7 +1128,7 @@ public actor SyncEngine {
     private func periodicLoop() async {
         await waitUntilWalksSettle()
         while !stopping && !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(15))
+            try? await Task.sleep(for: settings.periodicTick)
             if stopping { return }
             guard let channel = syncChannel else { continue }
             let now = clock()
@@ -1181,11 +1202,18 @@ public actor SyncEngine {
             } catch {
                 await logSync("retired cleanup", detail: String(describing: error))
             }
-            try? await Task.sleep(for: .seconds(30))
+            try? await Task.sleep(for: settings.cleanupTick)
         }
     }
 
     private func logSync(_ message: String, detail: String? = nil, folder: FolderID? = nil) async {
+        if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
+            let extra = detail.map { " " + $0 } ?? ""
+            let line = "[mailternal-qa] sync " + message + extra + "\n"
+            if let data = line.data(using: .utf8) {
+                FileHandle.standardError.write(data)
+            }
+        }
         try? await store.recordError(StoreLogEntry(
             kind: .sync,
             account: config.id,

@@ -108,12 +108,9 @@ actor SyncChannel {
     func select(_ path: String, qresync: IMAPQResyncSelect? = nil) async throws -> IMAPSelectedMailbox {
         try await withCommand {
             try await self.leaveIdleUnlocked()
-            if qresync == nil,
-               let selected = await self.client.selectedMailbox(),
-               selected.name.compare(path, options: .caseInsensitive) == .orderedSame {
-                self.selectedPath = path
-                return selected
-            }
+            // Always re-SELECT. A cached mailbox misses UIDNEXT / VANISHED /
+            // EXISTS that arrived on the IDLE socket (or since the last SELECT),
+            // which breaks CONDSTORE and basic delta ingestion.
             let selected = try await self.client.select(path, qresync: qresync)
             self.selectedPath = path
             return selected
