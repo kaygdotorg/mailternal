@@ -4,7 +4,7 @@ import MailternalInterfaces
 
 /// Session seam used by `SyncEngine`. Production wraps `IMAPSession`;
 /// unit tests inject a scripted client.
-protocol IMAPClient: Sendable {
+package protocol IMAPClient: Sendable {
     nonisolated var events: AsyncStream<IMAPMailboxEvent> { get }
     func capabilities() async -> IMAPCapabilities
     func selectedMailbox() async -> IMAPSelectedMailbox?
@@ -20,7 +20,7 @@ protocol IMAPClient: Sendable {
     func renewIdle() async throws -> IMAPIdle
 }
 
-protocol IMAPClientFactory: Sendable {
+package protocol IMAPClientFactory: Sendable {
     func makeClient(endpoint: IMAPEndpoint, username: String, password: String) -> any IMAPClient
 }
 
@@ -47,7 +47,7 @@ struct LiveIMAPClient: IMAPClient {
     func renewIdle() async throws -> IMAPIdle { try await session.renewIdle() }
 }
 
-struct LiveIMAPClientFactory: IMAPClientFactory {
+package struct LiveIMAPClientFactory: IMAPClientFactory {
     func makeClient(endpoint: IMAPEndpoint, username: String, password: String) -> any IMAPClient {
         LiveIMAPClient(session: IMAPSession(endpoint: endpoint, username: username, password: password))
     }
