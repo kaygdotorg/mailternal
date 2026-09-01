@@ -89,6 +89,34 @@ import Testing
     }
 }
 
+@Test func searchReturnsNewestFirstRegardlessOfInsertOrder() async throws {
+    try await withStore { store, _ in
+        let (_, _, generation) = try await seedInbox(store)
+        // Insert out of date order — including two in the same second — and a
+        // same-term decoy inserted last but dated oldest.
+        let base = 1_700_000_000.0
+        _ = try await store.upsertMessages([
+            makeMessage(generation: generation, uid: 2, subject: "orderedtoken mid",
+                        date: Date(timeIntervalSince1970: base + 100)),
+            makeMessage(generation: generation, uid: 4, subject: "orderedtoken newest",
+                        date: Date(timeIntervalSince1970: base + 200)),
+            makeMessage(generation: generation, uid: 5, subject: "orderedtoken newest-sibling",
+                        date: Date(timeIntervalSince1970: base + 200)),
+            makeMessage(generation: generation, uid: 1, subject: "orderedtoken oldest",
+                        date: Date(timeIntervalSince1970: base)),
+        ])
+        let hits = try await store.search("orderedtoken", limit: 10)
+        #expect(hits.count == 4)
+        let dates = hits.map(\.date)
+        #expect(dates == dates.sorted(by: >))
+        #expect(hits.first?.subject.contains("newest") == true)
+        #expect(hits.last?.subject == "orderedtoken oldest")
+        // Limit keeps the newest, drops the oldest.
+        let top = try await store.search("orderedtoken", limit: 2)
+        #expect(top.allSatisfy { $0.subject.contains("newest") })
+    }
+}
+
 @Test func searchQueryPlanUsesFTSIndex() async throws {
     try await withStore { store, _ in
         let (_, _, generation) = try await seedInbox(store)
