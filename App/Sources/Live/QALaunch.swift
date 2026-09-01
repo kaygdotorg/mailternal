@@ -23,6 +23,9 @@ enum QALaunch: Sendable {
         var accountConfig: AccountConfig {
             AccountConfig(
                 id: accountID,
+                accountLinkID: AccountLinkID(
+                    uuidString: "00000000-0000-4000-8000-000000000002"
+                )!,
                 displayName: "QA",
                 emailAddress: username,
                 username: username,

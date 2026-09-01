@@ -2,6 +2,19 @@ import AppKit
 import Observation
 import SwiftUI
 import MailternalInterfaces
+private enum MailModelRouteError: LocalizedError {
+    case messageUnavailable
+    case linkUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .messageUnavailable:
+            "That message is no longer available."
+        case .linkUnavailable:
+            "That item is no longer available."
+        }
+    }
+}
 
 @MainActor
 @Observable
@@ -32,6 +45,8 @@ final class AppModel {
 
     @ObservationIgnored private var pageTask: Task<Void, Never>?
     @ObservationIgnored private var observeTask: Task<Void, Never>?
+    @ObservationIgnored private var deepLinkQueue = DeepLinkRouteQueue()
+    @ObservationIgnored private var foldersSnapshotReady = false
     @ObservationIgnored private var streamsStarted = false
     @ObservationIgnored private var markedRead: Set<MessageID> = []
 
@@ -39,19 +54,11 @@ final class AppModel {
         folders.first { $0.id == selectedFolderID }
     }
 
-    var specialFolders: [FolderSummary] {
-        folders.filter { $0.role != .none }.sorted {
-            if $0.role.sortRank != $1.role.sortRank { return $0.role.sortRank < $1.role.sortRank }
-            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
-        }
+    /// Display name shown by the message-list title when it is flipped to the
+    /// owning account.
+    var listTitleAccountName: String {
+        facade.accountDisplayName ?? "Account"
     }
-
-    var customFolders: [FolderSummary] {
-        folders.filter { $0.role == .none }.sorted {
-            $0.name.localizedStandardCompare($1.name) == .orderedAscending
-        }
-    }
-
     var hasAccount: Bool {
         if case .none = accountState { return false }
         return true
@@ -66,6 +73,109 @@ final class AppModel {
         self.facade = facade
         self.appearance = appearance
         accountState = facade.accountState
+    }
+
+    /// Receives platform open-URL events. Parsing happens at this one seam so
+    /// malformed URLs can never reach account or folder selection.
+    func openURL(_ url: URL) {
+        guard let link = MailternalDeepLink(url: url) else {
+            toasts.post(
+                title: "Couldn’t open link",
+                detail: "That link is malformed or unsupported.",
+                severity: .error
+            )
+            return
+        }
+        deepLinkQueue.enqueue(
+            link,
+            isReady: { [weak self] in
+                guard let self else { return false }
+                return self.isAccountActive && self.foldersSnapshotReady
+            },
+            route: { [weak self] link in
+                await self?.route(link)
+            }
+        )
+    }
+
+    private func route(_ link: MailternalDeepLink) async {
+        do {
+            guard !Task.isCancelled else { return }
+            guard let resolution = try await facade.resolve(link) else {
+                toasts.post(
+                    title: "Couldn’t open link",
+                    detail: "That account, folder, or message is no longer available.",
+                    severity: .error
+                )
+                return
+            }
+            guard !Task.isCancelled else { return }
+            switch resolution {
+            case .folder(let folderID):
+                prepareFolderForRoute(folderID)
+            case .message(let folderID, let messageID, _):
+                try await routeMessage(
+                    folderID: folderID,
+                    messageID: messageID
+                )
+            }
+            guard !Task.isCancelled else { return }
+            MainWindowController.shared.show(model: self, appearance: appearance)
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            toasts.post(
+                title: "Couldn’t open link",
+                detail: error.localizedDescription,
+                severity: .error
+            )
+        }
+    }
+
+    private func prepareFolderForRoute(_ folderID: FolderID) {
+        if selectedFolderID == folderID {
+            pageTask?.cancel()
+            selectedMessageID = nil
+            detail = nil
+            rawSource = nil
+            isShowingRawSource = false
+            listRows = []
+            listCursor = nil
+            listEpoch += 1
+            return
+        }
+        selectFolder(folderID)
+    }
+
+    private func routeMessage(
+        folderID: FolderID,
+        messageID: MessageID
+    ) async throws {
+        var cursor: MessagePageCursor?
+        var loaded: [MessageRow] = []
+        repeat {
+            let page = try await facade.page(
+                in: folderID,
+                after: cursor,
+                limit: MessageListPrefetch.pageSize
+            )
+            guard !Task.isCancelled else { return }
+            loaded.append(contentsOf: page.rows)
+            if page.rows.contains(where: { $0.id == messageID }) {
+                guard !Task.isCancelled else { return }
+                prepareFolderForRoute(folderID)
+                listRows = loaded
+                listCursor = page.next
+                selectMessage(messageID)
+                return
+            }
+            cursor = page.next
+        } while cursor != nil
+
+        // A concurrent expunge or generation replacement can invalidate a
+        // resolved row before paging reaches it; do not select a substitute.
+        throw MailModelRouteError.messageUnavailable
     }
 
     func start() {
@@ -87,6 +197,7 @@ final class AppModel {
                 guard let self else { return }
                 for await folders in facade.foldersStream {
                     self.folders = folders
+                    self.foldersSnapshotReady = true
                     if selectedFolderID == nil, let inbox = folders.first(where: { $0.role == .inbox }) {
                         selectFolder(inbox.id)
                     } else if let selectedFolderID, folders.contains(where: { $0.id == selectedFolderID }) {
@@ -116,6 +227,7 @@ final class AppModel {
         accountState = state
         switch state {
         case .none:
+            foldersSnapshotReady = false
             folders = []
             selectedFolderID = nil
             selectedMessageID = nil
@@ -123,16 +235,18 @@ final class AppModel {
             listRows = []
             SettingsWindowController.shared.show(model: self, appearance: appearance)
         case .authFailed(let message):
+            foldersSnapshotReady = false
             toasts.post(title: "Couldn’t sign in", detail: message, severity: .error)
             SettingsWindowController.shared.show(model: self, appearance: appearance)
         case .connectionFailed(let message):
+            foldersSnapshotReady = false
             toasts.post(title: "Couldn’t connect", detail: message, severity: .error)
             SettingsWindowController.shared.show(model: self, appearance: appearance)
         case .active:
             if case .active = previous { break }
             else { /* folders stream will populate */ }
         case .validating:
-            break
+            foldersSnapshotReady = false
         }
     }
 
@@ -207,20 +321,43 @@ final class AppModel {
                 guard selectedMessageID == id else { return }
                 detail = loaded
                 isLoadingDetail = false
-                if listRows.first(where: { $0.id == id })?.isRead == false {
-                    listRows = listRows.map { row in
-                        guard row.id == id else { return row }
-                        var updated = row
-                        updated.isRead = true
-                        return updated
-                    }
-                    markedRead.insert(id)
-                    await facade.markRead(id)
-                }
+                markRead(id)
             } catch {
                 isLoadingDetail = false
                 toasts.post(title: "Couldn’t open message", detail: error.localizedDescription)
             }
+        }
+    }
+
+    /// Marks a visible message read immediately and lets the sync engine
+    /// persist the operation through its write queue.
+    func markRead(_ id: MessageID) {
+        guard let index = listRows.firstIndex(where: { $0.id == id }),
+              !listRows[index].isRead else { return }
+        var row = listRows[index]
+        row.isRead = true
+        listRows[index] = row
+        markedRead.insert(id)
+        Task { [weak self] in
+            await self?.facade.markRead(id)
+        }
+    }
+
+    /// Removes a message from the visible list before enqueueing its archive
+    /// move. The sync engine owns the eventual server-side operation.
+    func archive(_ id: MessageID) {
+        guard listRows.contains(where: { $0.id == id }) else { return }
+        listRows.removeAll { $0.id == id }
+        if selectedMessageID == id {
+            selectedMessageID = nil
+            detail = nil
+            isLoadingDetail = false
+            rawSource = nil
+            isShowingRawSource = false
+            isFindPresented = false
+        }
+        Task { [weak self] in
+            await self?.facade.archive(id)
         }
     }
 
@@ -291,11 +428,51 @@ final class AppModel {
     }
 
     func copySelectedSubject() {
-        guard let subject = detail?.envelope.subject ?? listRows.first(where: { $0.id == selectedMessageID })?.subject
-        else { return }
+        guard let id = selectedMessageID else { return }
+        copySubject(for: id)
+    }
+
+    func copySubject(for message: MessageID) {
+        guard let subject = listRows.first(where: { $0.id == message })?.subject
+            ?? (detail?.id == message ? detail?.envelope.subject : nil) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(subject, forType: .string)
     }
+
+    func copyDeepLink(for folder: FolderID) async {
+        do {
+            guard let link = try await facade.makeDeepLink(for: folder),
+                  let value = link.formattedString else {
+                throw MailModelRouteError.linkUnavailable
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(value, forType: .string)
+        } catch {
+            toasts.post(
+                title: "Couldn’t copy link",
+                detail: "That folder is no longer available.",
+                severity: .error
+            )
+        }
+    }
+
+    func copyDeepLink(for message: MessageID) async {
+        do {
+            guard let link = try await facade.makeDeepLink(for: message),
+                  let value = link.formattedString else {
+                throw MailModelRouteError.linkUnavailable
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(value, forType: .string)
+        } catch {
+            toasts.post(
+                title: "Couldn’t copy link",
+                detail: "That message is no longer available.",
+                severity: .error
+            )
+        }
+    }
+
 
     private func applyFirstPage(_ page: MessagePage) {
         if listRows.isEmpty {

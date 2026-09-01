@@ -23,6 +23,14 @@ final class LiveMailFacade: MailFacade {
         didSet { accountContinuation.yield(accountState) }
     }
 
+    var activeAccountID: AccountID? { config?.id }
+    var accountDisplayName: String? {
+        guard let config else { return nil }
+        let displayName = config.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return displayName.isEmpty ? config.emailAddress : displayName
+    }
+
+
     let accountStateStream: AsyncStream<AccountState>
     let foldersStream: AsyncStream<[FolderSummary]>
     let syncStatusStream: AsyncStream<SyncStatus>
@@ -142,25 +150,30 @@ final class LiveMailFacade: MailFacade {
         }
         await stopEngine()
 
+        var storedConfig = config
+        if let existing = try await store.fetchAccount(config.id) {
+            storedConfig.accountLinkID = existing.accountLinkID
+        }
+
         do {
-            try keychain.savePassword(password, for: config.id)
+            try keychain.savePassword(password, for: storedConfig.id)
         } catch {
             let message = error.localizedDescription
             setState(.authFailed(message: message))
             throw LiveMailError(message)
         }
         do {
-            try await store.upsertAccount(config)
+            try await store.upsertAccount(storedConfig)
         } catch {
-            try? keychain.deletePassword(for: config.id)
+            try? keychain.deletePassword(for: storedConfig.id)
             let message = "Could not save the account."
             setState(.connectionFailed(message: message))
             throw LiveMailError(message)
         }
 
-        self.config = config
-        await startEngine(for: config)
-        startFolderObservation(account: config.id)
+        self.config = storedConfig
+        await startEngine(for: storedConfig)
+        startFolderObservation(account: storedConfig.id)
     }
 
     func removeAccount() async throws {
@@ -193,9 +206,27 @@ final class LiveMailFacade: MailFacade {
     func detail(_ id: MessageID) async throws -> MessageDetail {
         try await store.detail(id)
     }
+    func makeDeepLink(for folder: FolderID) async throws -> MailternalDeepLink? {
+        guard let account = activeAccountID else { return nil }
+        return try await store.makeDeepLink(account: account, folder: folder)
+    }
+
+    func makeDeepLink(for message: MessageID) async throws -> MailternalDeepLink? {
+        guard let account = activeAccountID else { return nil }
+        return try await store.makeDeepLink(account: account, message: message)
+    }
+
+    func resolve(_ link: MailternalDeepLink) async throws -> MailternalDeepLinkResolution? {
+        try await store.resolve(link)
+    }
+
 
     func markRead(_ id: MessageID) async {
         try? await store.enqueueSeen(message: id)
+    }
+ 
+    func archive(_ id: MessageID) async {
+        try? await store.enqueueArchive(message: id)
     }
 
     func rawSource(_ id: MessageID) async throws -> String {

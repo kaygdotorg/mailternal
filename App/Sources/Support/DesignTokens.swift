@@ -7,7 +7,6 @@ enum AppShapeScale {
     static let card: CGFloat = 18
     static let toast: CGFloat = 14
     static let row: CGFloat = 12
-    static let compact: CGFloat = 8
 }
 
 enum MessageTypography {
@@ -15,8 +14,19 @@ enum MessageTypography {
     static let bodyLineSpacing: CGFloat = 2
     static let bodyLineHeight: CGFloat = 18
     static let paragraphGap: CGFloat = 10
-    static let readingMeasure: CGFloat = 490
-    static let transcriptInset: CGFloat = 20
+    /// Sample used to average glyph width; the reading measure is expressed in
+    /// characters, and mail bodies are mixed case.
+    private static let measureSample = "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+    /// Width of `MessageViewerLayoutPolicy.plainTextMeasureCharacters` average
+    /// body glyphs. Plain text wraps here inside the full-width body region;
+    /// HTML and raw source are never measured this way. Measured once: the
+    /// body font is fixed, so every reader render can read the same number.
+    static let plainTextMeasure: CGFloat = {
+        let width = (measureSample as NSString).size(withAttributes: [.font: bodyFont]).width
+        let perCharacter = width / CGFloat(measureSample.count)
+        return ceil(perCharacter * CGFloat(MessageViewerLayoutPolicy.plainTextMeasureCharacters))
+    }()
 
     static var bodyFont: NSFont {
         .systemFont(ofSize: bodyPointSize)
@@ -29,6 +39,34 @@ enum MessageTypography {
         style.lineSpacing = bodyLineSpacing
         style.paragraphSpacing = paragraphGap
         return style
+    }
+}
+
+/// The reader's region surfaces: one opaque tone per region, so subject,
+/// envelope, and body separate by material weight instead of by cards, blur,
+/// or glass. Nothing here is translucent, so Reduce Transparency needs no
+/// fallback. A later theme retints these values; call sites never name a color.
+enum MessageReaderSurface {
+    /// Subject band — one step further from the page than the envelope, so the
+    /// title reads as chrome continuing under the window's dissolve.
+    static var subject: Color {
+        Color(nsColor: .windowBackgroundColor).mix(with: Color(nsColor: .textColor), by: 0.06)
+    }
+
+    /// Envelope band — window chrome tone, distinct from the reading page.
+    static var envelope: Color {
+        Color(nsColor: .windowBackgroundColor)
+    }
+
+    /// The reading page, and the scroll canvas behind it.
+    static var page: Color {
+        Color(nsColor: .textBackgroundColor)
+    }
+
+    /// Hairline between regions. Increased contrast trades the hairline for a
+    /// separator that survives a strengthened palette.
+    static func divider(increasedContrast: Bool) -> Color {
+        Color(nsColor: increasedContrast ? .tertiaryLabelColor : .separatorColor)
     }
 }
 
@@ -82,28 +120,5 @@ extension FolderRole {
         case .drafts: "doc"
         case .none: "folder"
         }
-    }
-
-    var sortRank: Int {
-        switch self {
-        case .inbox: 0
-        case .drafts: 1
-        case .sent: 2
-        case .archive: 3
-        case .junk: 4
-        case .trash: 5
-        case .none: 6
-        }
-    }
-}
-
-private struct MailternalAccentColorKey: EnvironmentKey {
-    static let defaultValue = Color(nsColor: .controlAccentColor)
-}
-
-extension EnvironmentValues {
-    var mailternalAccentColor: Color {
-        get { self[MailternalAccentColorKey.self] }
-        set { self[MailternalAccentColorKey.self] = newValue }
     }
 }

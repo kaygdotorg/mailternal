@@ -7,10 +7,10 @@ struct MessageHTMLView: NSViewRepresentable {
     let partProvider: @Sendable (String) async throws -> (data: Data, mimeType: String)
     var onExternalLink: ((URL) -> Void)?
     var allowRemoteImages: Bool = false
+    var emailReadingMode: EmailReadingMode = .original
     var findQuery: String = ""
     var findTick: UInt64 = 0
     var findBackwards: Bool = false
-
     final class Coordinator {
         var lastQuery: String = ""
         var lastTick: UInt64 = .max
@@ -30,7 +30,11 @@ struct MessageHTMLView: NSViewRepresentable {
 
     func updateNSView(_ nsView: MessageWebView, context: Context) {
         nsView.onExternalLink = onExternalLink
-        nsView.render(html: html, partProvider: partProvider)
+        nsView.render(
+            html: html,
+            partProvider: partProvider,
+            emailReadingMode: emailReadingMode
+        )
         nsView.setRemoteImagesAllowed(allowRemoteImages)
         let htmlChanged = context.coordinator.lastHTML != html
         let queryChanged = context.coordinator.lastQuery != findQuery

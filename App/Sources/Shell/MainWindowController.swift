@@ -21,8 +21,8 @@ struct MainSplitRoot: View {
             MainSplitVisibilityBridge(action: { model.toggleSidebar() })
                 .frame(width: 0, height: 0)
         }
-        .tint(appearance.effectiveAccentSwiftUI)
-        .environment(\.mailternalAccentColor, appearance.effectiveAccentSwiftUI)
+        .tint(appearance.accent.color)
+        .environment(appearance.accent)
         .preferredColorScheme(appearance.mode.colorScheme)
         .onExitCommand(perform: handleEscape)
         .task { model.start() }
@@ -58,8 +58,8 @@ struct MainOverlayRoot: View {
                 .zIndex(2)
         }
         .animation(MailMotion.searchPanel(reduceMotion: reduceMotion), value: model.isSearchPresented)
-        .environment(\.mailternalAccentColor, appearance.effectiveAccentSwiftUI)
-        .tint(appearance.effectiveAccentSwiftUI)
+        .environment(appearance.accent)
+        .tint(appearance.accent.color)
     }
 }
 
@@ -116,14 +116,21 @@ final class MainSplitVisibilityBridgeView: NSView {
 
 @MainActor
 enum MainWindowStartupConfiguration {
-    static let defaultContentSize = NSSize(width: 1_040, height: 720)
-    static let minimumContentSize = NSSize(width: 760, height: 480)
+    static let defaultContentSize = NSSize(
+        width: MainWindowLayoutPolicy.defaultContentSize.width,
+        height: MainWindowLayoutPolicy.defaultContentSize.height
+    )
+    static let minimumContentSize = NSSize(
+        width: MainWindowLayoutPolicy.minimumContentSize.width,
+        height: MainWindowLayoutPolicy.minimumContentSize.height
+    )
     static let frameAutosaveName = "Mailternal.MainWindow"
 
     static func prepare(_ window: NSWindow) {
         window.title = ""
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
         window.toolbarStyle = .unified
         window.isReleasedWhenClosed = false
         window.isRestorable = false
@@ -176,10 +183,6 @@ final class MainShellViewController: NSViewController {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func loadView() {
-        view = NSView()
-    }
 
     override func viewDidLoad() {
         super.viewDidLoad()

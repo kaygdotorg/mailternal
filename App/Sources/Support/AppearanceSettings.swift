@@ -1,4 +1,5 @@
 import AppKit
+import Observation
 import SwiftUI
 
 enum AppearanceMode: String, CaseIterable, Identifiable {
@@ -31,14 +32,26 @@ enum AppearanceMode: String, CaseIterable, Identifiable {
     }
 }
 
+public enum EmailReadingMode: String, CaseIterable, Identifiable {
+    case original, dark
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .original: "Original"
+        case .dark: "Dark"
+        }
+    }
+}
+
 enum WindowBackdropKind: String, CaseIterable, Identifiable {
-    case opaque, blur, glass
+    case blur, glass
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
-        case .opaque: "Opaque"
         case .blur: "Blur"
         case .glass: "Liquid Glass"
         }
@@ -77,10 +90,65 @@ struct AccentColorValue: Hashable, Sendable {
         )
     }
 }
+/// Owns the persisted custom accent and resolves the one canonical accent used by
+/// SwiftUI and AppKit. `color` and `nsColor` are views of the same resolved value;
+/// the system accent is never persisted, and changing the override is observable
+/// so every injected consumer updates without a restart or window reopen.
+/// Semantic warning, error, and content colors remain outside this module.
+@MainActor
+@Observable
+final class AccentSource {
+    var accentOverride: AccentColorValue? {
+        didSet {
+            guard oldValue != accentOverride else { return }
+            if let accentOverride {
+                defaults.set(
+                    [accentOverride.red, accentOverride.green, accentOverride.blue, accentOverride.alpha],
+                    forKey: Self.defaultsKey
+                )
+            } else {
+                defaults.removeObject(forKey: Self.defaultsKey)
+            }
+        }
+    }
 
+    /// The current accent, resolving the system value on every access.
+    var nsColor: NSColor {
+        accentOverride?.nsColor ?? .controlAccentColor
+    }
+
+    /// SwiftUI's view of `nsColor`; neither representation stores a second value.
+    var color: Color {
+        Color(nsColor: nsColor)
+    }
+
+    private static let defaultsKey = "mailternal.appearance.accent"
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
+        if let values = defaults.array(forKey: Self.defaultsKey) as? [Double], values.count == 4 {
+            accentOverride = AccentColorValue(
+                red: values[0],
+                green: values[1],
+                blue: values[2],
+                alpha: values[3]
+            )
+        } else {
+            accentOverride = nil
+        }
+    }
+}
+
+/// Owns persisted appearance choices; `accent` is the sole accent source.
+/// Its custom override is the only persisted accent input, and all true accent
+/// surfaces consume `AccentSource` rather than deriving colors independently.
+/// Semantic warning, error, quarantine, find-highlight, and email-content colors
+/// are intentionally not part of the accent interface.
 @MainActor
 @Observable
 final class AppearanceSettings {
+    let accent: AccentSource
     var mode: AppearanceMode {
         didSet {
             guard oldValue != mode else { return }
@@ -88,24 +156,16 @@ final class AppearanceSettings {
             applyAppKitAppearance()
         }
     }
-
-    var accentOverride: AccentColorValue? {
+    var emailReadingMode: EmailReadingMode {
         didSet {
-            guard oldValue != accentOverride else { return }
-            if let accentOverride {
-                defaults.set(
-                    [accentOverride.red, accentOverride.green, accentOverride.blue, accentOverride.alpha],
-                    forKey: Keys.accent
-                )
-            } else {
-                defaults.removeObject(forKey: Keys.accent)
-            }
+            guard oldValue != emailReadingMode else { return }
+            defaults.set(emailReadingMode.rawValue, forKey: Keys.emailReadingMode)
         }
     }
 
     var backgroundOpacity: Double {
         didSet {
-            let clamped = min(max(backgroundOpacity, 0), 1)
+            let clamped = Self.clampBackgroundOpacity(backgroundOpacity)
             if clamped != backgroundOpacity {
                 backgroundOpacity = clamped
                 return
@@ -113,33 +173,107 @@ final class AppearanceSettings {
         }
     }
 
-    var backdropKind: WindowBackdropKind {
+    /// Liquid Glass is a treatment choice, not a second opacity state.
+    var usesLiquidGlass: Bool {
         didSet {
-            guard oldValue != backdropKind else { return }
-            defaults.set(backdropKind.rawValue, forKey: Keys.backdrop)
+            guard oldValue != usesLiquidGlass else { return }
+            defaults.set(usesLiquidGlass, forKey: Keys.usesLiquidGlass)
         }
     }
 
-    var effectiveAccentColor: NSColor {
-        accentOverride?.nsColor ?? .controlAccentColor
+    /// Compatibility mapping for the resolved backdrop plan.
+    ///
+    /// The settings UI uses `usesLiquidGlass` directly so the choice reads as
+    /// a treatment toggle, while callers that resolve a `WindowBackdropKind`
+    /// can still use the same two public treatments.
+    var backdropKind: WindowBackdropKind {
+        get { usesLiquidGlass ? .glass : .blur }
+        set { usesLiquidGlass = newValue == .glass }
+    }
+    /// Number of visible lines in each message-list row, including the subject.
+    ///
+    /// One line keeps only the subject; two lines add sender/date; subsequent
+    /// lines reveal the message preview.
+    var messageListLines: Int {
+        didSet {
+            let clamped = Self.clampMessageListLines(messageListLines)
+            if clamped != messageListLines {
+                messageListLines = clamped
+                return
+            }
+            guard oldValue != messageListLines else { return }
+            defaults.set(messageListLines, forKey: Keys.messageListLines)
+        }
     }
 
-    var effectiveAccentSwiftUI: Color {
-        Color(nsColor: effectiveAccentColor)
+    static let defaultMessageListLines = 3
+    static let messageListLineRange = 1...6
+    static let defaultBackgroundOpacity = 1.0
+    /// The full dial the settings slider offers. 100% resolves to a solid
+    /// window; anything below it shows the chosen treatment, down to a window
+    /// that adds no fill of its own at 0%.
+    static let backgroundOpacityRange = 0.0...1.0
+
+    static func clampMessageListLines(_ value: Int) -> Int {
+        min(max(value, messageListLineRange.lowerBound), messageListLineRange.upperBound)
+    }
+
+    static func clampBackgroundOpacity(_ value: Double) -> Double {
+        value.isFinite
+            ? min(max(value, 0), 1)
+            : defaultBackgroundOpacity
+    }
+
+    static func formattedOpacityPercentage(_ value: Double) -> String {
+        let clamped = clampBackgroundOpacity(value)
+        return "\(Int((clamped * 100).rounded()))%"
     }
 
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        mode = AppearanceMode(rawValue: defaults.string(forKey: Keys.mode) ?? "") ?? .system
-        backdropKind = WindowBackdropKind(rawValue: defaults.string(forKey: Keys.backdrop) ?? "") ?? .opaque
+        self.accent = AccentSource(defaults: defaults)
+        let storedBackdrop = defaults.string(forKey: Keys.backdrop)
+        let hasStoredGlassChoice = defaults.object(forKey: Keys.usesLiquidGlass) != nil
         let storedOpacity = defaults.object(forKey: Keys.opacity) as? Double
-        backgroundOpacity = storedOpacity ?? Self.defaultBackgroundOpacity
-        if let values = defaults.array(forKey: Keys.accent) as? [Double], values.count == 4 {
-            accentOverride = AccentColorValue(red: values[0], green: values[1], blue: values[2], alpha: values[3])
+
+        mode = AppearanceMode(rawValue: defaults.string(forKey: Keys.mode) ?? "") ?? .system
+        emailReadingMode = EmailReadingMode(
+            rawValue: defaults.string(forKey: Keys.emailReadingMode) ?? ""
+        ) ?? .original
+        if hasStoredGlassChoice {
+            usesLiquidGlass = defaults.bool(forKey: Keys.usesLiquidGlass)
+            backgroundOpacity = Self.clampBackgroundOpacity(
+                storedOpacity ?? Self.defaultBackgroundOpacity
+            )
+        } else if let storedKind = WindowBackdropKind(rawValue: storedBackdrop ?? "") {
+            let resolvedUsesLiquidGlass = storedKind == .glass
+            let resolvedOpacity = Self.clampBackgroundOpacity(
+                storedOpacity ?? Self.defaultBackgroundOpacity
+            )
+            usesLiquidGlass = resolvedUsesLiquidGlass
+            backgroundOpacity = resolvedOpacity
+            defaults.set(resolvedUsesLiquidGlass, forKey: Keys.usesLiquidGlass)
+            defaults.removeObject(forKey: Keys.backdrop)
         } else {
-            accentOverride = nil
+            // Missing and legacy Opaque settings both become Blur at 100%.
+            // This keeps the old solid appearance without retaining a
+            // user-facing treatment that duplicates the opacity dial.
+            usesLiquidGlass = false
+            backgroundOpacity = Self.defaultBackgroundOpacity
+            defaults.set(false, forKey: Keys.usesLiquidGlass)
+            defaults.set(Self.defaultBackgroundOpacity, forKey: Keys.opacity)
+            defaults.removeObject(forKey: Keys.backdrop)
+        }
+        if let storedLines = defaults.object(forKey: Keys.messageListLines) as? NSNumber {
+            let normalizedLines = Self.clampMessageListLines(storedLines.intValue)
+            messageListLines = normalizedLines
+            if normalizedLines != storedLines.intValue {
+                defaults.set(normalizedLines, forKey: Keys.messageListLines)
+            }
+        } else {
+            messageListLines = Self.defaultMessageListLines
         }
         applyAppKitAppearance()
     }
@@ -154,12 +288,12 @@ final class AppearanceSettings {
         NSApplication.shared.appearance = mode.nsAppearance
     }
 
-    private static let defaultBackgroundOpacity = 0.85
-
     private enum Keys {
         static let mode = "mailternal.appearance.mode"
         static let backdrop = "mailternal.appearance.backdrop"
+        static let usesLiquidGlass = "mailternal.appearance.usesLiquidGlass"
         static let opacity = "mailternal.appearance.opacity"
-        static let accent = "mailternal.appearance.accent"
+        static let messageListLines = "mailternal.appearance.message-list-lines"
+        static let emailReadingMode = "mailternal.appearance.email-reading"
     }
 }

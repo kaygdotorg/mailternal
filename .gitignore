@@ -2,6 +2,7 @@
 .swiftpm/
 App/Mailternal.xcodeproj/
 App/build/
+App/Mailternal-Info.plist
 DerivedData/
 *.xcuserstate
 .DS_Store

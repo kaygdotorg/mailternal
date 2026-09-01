@@ -9,6 +9,7 @@ struct MailAccountError: LocalizedError, Sendable {
 private struct StoredMessage: Sendable {
     var row: MessageRow
     var uid: IMAPUID
+    var uidValidity: UInt32
     var folder: FolderID
     var detail: MessageDetail
     var raw: String
@@ -35,6 +36,14 @@ final class MockMailFacade: MailFacade {
     private var syncStatus = SyncStatus(mode: .fullHistory, isOnline: true)
     private var seeded = false
     private var nextMessageID: Int64 = 1
+    var activeAccountID: AccountID? { config?.id }
+    var accountDisplayName: String? {
+        guard let config else { return nil }
+        let displayName = config.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return displayName.isEmpty ? config.emailAddress : displayName
+    }
+
+
     private var pageObservers: [UUID: PageObserver] = [:]
     private var config: AccountConfig?
 
@@ -78,7 +87,15 @@ final class MockMailFacade: MailFacade {
             accountState = .authFailed(message: message)
             throw MailAccountError(message)
         }
-        self.config = config
+        let mockConfig = AccountConfig(
+            id: config.id,
+            accountLinkID: Self.mockAccountLinkID,
+            displayName: config.displayName,
+            emailAddress: config.emailAddress,
+            username: config.username,
+            imap: config.imap
+        )
+        self.config = mockConfig
         if !seeded {
             seedMailbox()
             seeded = true
@@ -93,6 +110,52 @@ final class MockMailFacade: MailFacade {
         accountState = .none
         foldersContinuation.yield([])
     }
+
+    func makeDeepLink(for folder: FolderID) async throws -> MailternalDeepLink? {
+        guard accountState == .active,
+              let accountLinkID = config?.accountLinkID,
+              let summary = folders.first(where: { $0.id == folder }) else { return nil }
+        return .folder(
+            accountLinkID: accountLinkID,
+            folderLocator: FolderLocator(kind: .path, value: summary.path)
+        )
+    }
+
+    func makeDeepLink(for message: MessageID) async throws -> MailternalDeepLink? {
+        guard accountState == .active,
+              let accountLinkID = config?.accountLinkID,
+              let stored = byID[message],
+              let summary = folders.first(where: { $0.id == stored.folder }) else { return nil }
+        return .message(
+            accountLinkID: accountLinkID,
+            folderLocator: FolderLocator(kind: .path, value: summary.path),
+            uidValidity: stored.uidValidity,
+            uid: stored.uid
+        )
+    }
+
+    func resolve(_ link: MailternalDeepLink) async throws -> MailternalDeepLinkResolution? {
+        guard accountState == .active,
+              let config,
+              config.accountLinkID == link.accountLinkID else { return nil }
+        guard let folder = folders.first(where: {
+            $0.path == link.folderLocator.value && link.folderLocator.kind == .path
+        }) else { return nil }
+        switch link {
+        case .folder:
+            return .folder(folder.id)
+        case .message(_, _, let uidValidity, let uid):
+            guard let stored = messages[folder.id]?.first(where: {
+                $0.uidValidity == uidValidity && $0.uid == uid
+            }) else { return nil }
+            return .message(folderID: folder.id, messageID: stored.row.id, row: stored.row)
+        }
+    }
+
+    func folderID(for message: MessageID) -> FolderID? {
+        byID[message]?.folder
+    }
+
 
     func page(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) async throws -> MessagePage {
         currentPage(in: folder, after: cursor, limit: limit)
@@ -116,9 +179,6 @@ final class MockMailFacade: MailFacade {
         return stream.stream
     }
 
-    func folderID(for message: MessageID) -> FolderID? {
-        byID[message]?.folder
-    }
 
     func detail(_ id: MessageID) async throws -> MessageDetail {
         guard let stored = byID[id] else {
@@ -141,6 +201,50 @@ final class MockMailFacade: MailFacade {
             foldersContinuation.yield(folders)
         }
         publishObservers(in: stored.folder)
+    }
+ 
+    func archive(_ id: MessageID) async {
+        guard let stored = byID[id] else { return }
+        let source = stored.folder
+        guard var sourceList = messages[source],
+              let sourceIndex = sourceList.firstIndex(where: { $0.row.id == id })
+        else { return }
+        sourceList.remove(at: sourceIndex)
+        messages[source] = sourceList
+
+        let destination = folders.first(where: { $0.role == .archive })?.id
+        if let destination {
+            var archived = stored
+            archived.folder = destination
+            byID[id] = archived
+            var destinationList = messages[destination] ?? []
+            destinationList.append(archived)
+            destinationList.sort {
+                if $0.row.date != $1.row.date { return $0.row.date > $1.row.date }
+                return $0.uid > $1.uid
+            }
+            messages[destination] = destinationList
+        } else {
+            byID.removeValue(forKey: id)
+        }
+
+        if let folderIndex = folders.firstIndex(where: { $0.id == source }) {
+            folders[folderIndex].totalCount = max(0, folders[folderIndex].totalCount - 1)
+            if !stored.row.isRead {
+                folders[folderIndex].unreadCount = max(0, folders[folderIndex].unreadCount - 1)
+            }
+        }
+        if let destination, let folderIndex = folders.firstIndex(where: { $0.id == destination }) {
+            folders[folderIndex].totalCount += 1
+            if !stored.row.isRead {
+                folders[folderIndex].unreadCount += 1
+            }
+        }
+        foldersContinuation.yield(folders)
+        publishObservers(in: source)
+        if let destination {
+            publishObservers(in: destination)
+        }
     }
 
     func rawSource(_ id: MessageID) async throws -> String {
@@ -233,16 +337,28 @@ final class MockMailFacade: MailFacade {
         let now = Date()
         let windowStart = now.addingTimeInterval(-30 * 24 * 3600)
 
-        let specs: [(FolderID, String, String, FolderRole, BackfillState, Int, Double)] = [
-            (FolderID(rawValue: 1), "Inbox", "INBOX", .inbox, .syncing(progress: 0.62), 1200, 0.34),
-            (FolderID(rawValue: 2), "Archive", "Archive", .archive, .complete, 250, 0.04),
-            (FolderID(rawValue: 3), "Sent", "Sent", .sent, .complete, 180, 0.0),
-            (FolderID(rawValue: 4), "Drafts", "Drafts", .drafts, .idle, 12, 0.0),
-            (FolderID(rawValue: 5), "Junk", "Junk", .junk, .complete, 80, 0.55),
-            (FolderID(rawValue: 6), "Trash", "Trash", .trash, .complete, 40, 0.1),
-            (FolderID(rawValue: 7), "Projects", "Projects", .none, .halted(syncedThrough: now.addingTimeInterval(-45 * 24 * 3600)), 150, 0.18),
-            (FolderID(rawValue: 8), "旅行", "旅行", .none, .complete, 40, 0.22),
-            (FolderID(rawValue: 9), "Newsletters", "Newsletters", .none, .syncing(progress: nil), 48, 0.7),
+        let specs: [(id: FolderID, name: String, path: String, separator: Character?, role: FolderRole, backfill: BackfillState, count: Int, unreadRate: Double)] = [
+            (id: FolderID(rawValue: 1), name: "Inbox", path: "INBOX", separator: nil, role: .inbox, backfill: .syncing(progress: 0.62), count: 1200, unreadRate: 0.34),
+            (id: FolderID(rawValue: 2), name: "Archive", path: "Archive", separator: nil, role: .archive, backfill: .complete, count: 250, unreadRate: 0.04),
+            (id: FolderID(rawValue: 3), name: "Sent", path: "Sent", separator: nil, role: .sent, backfill: .complete, count: 180, unreadRate: 0.0),
+            (id: FolderID(rawValue: 4), name: "Drafts", path: "Drafts", separator: nil, role: .drafts, backfill: .idle, count: 12, unreadRate: 0.0),
+            (id: FolderID(rawValue: 5), name: "Junk", path: "Junk", separator: nil, role: .junk, backfill: .complete, count: 80, unreadRate: 0.55),
+            (id: FolderID(rawValue: 6), name: "Trash", path: "Trash", separator: nil, role: .trash, backfill: .complete, count: 40, unreadRate: 0.1),
+            (id: FolderID(rawValue: 7), name: "Projects", path: "Projects", separator: nil, role: .none, backfill: .halted(syncedThrough: now.addingTimeInterval(-45 * 24 * 3600)), count: 150, unreadRate: 0.18),
+            (id: FolderID(rawValue: 8), name: "旅行", path: "旅行", separator: nil, role: .none, backfill: .complete, count: 40, unreadRate: 0.22),
+            (id: FolderID(rawValue: 9), name: "Newsletters", path: "Newsletters", separator: nil, role: .none, backfill: .syncing(progress: nil), count: 48, unreadRate: 0.7),
+            // These folders deliberately carry their server-reported separators. The slash and
+            // dot trees exercise independent hierarchy formats without changing the legacy
+            // special-folder/message fixtures above.
+            (id: FolderID(rawValue: 10), name: "Engineering", path: "Engineering", separator: "/", role: .none, backfill: .syncing(progress: 0.62), count: 0, unreadRate: 0),
+            (id: FolderID(rawValue: 11), name: "Reports", path: "Engineering/Reports", separator: "/", role: .none, backfill: .complete, count: 0, unreadRate: 0),
+            (id: FolderID(rawValue: 12), name: "Weekly", path: "Engineering/Reports/Weekly", separator: "/", role: .none, backfill: .halted(syncedThrough: now.addingTimeInterval(-7 * 24 * 3600)), count: 0, unreadRate: 0),
+            (id: FolderID(rawValue: 13), name: "Research", path: "Research", separator: ".", role: .none, backfill: .complete, count: 0, unreadRate: 0),
+            (id: FolderID(rawValue: 14), name: "Notes", path: "Research.Notes", separator: ".", role: .none, backfill: .complete, count: 0, unreadRate: 0),
+            // There is no separator metadata here: "AdjacentLeaf" must remain a root,
+            // rather than being guessed as a child of "Adjacent".
+            (id: FolderID(rawValue: 15), name: "Adjacent", path: "Adjacent", separator: nil, role: .none, backfill: .complete, count: 0, unreadRate: 0),
+            (id: FolderID(rawValue: 16), name: "Leaf", path: "AdjacentLeaf", separator: nil, role: .none, backfill: .complete, count: 0, unreadRate: 0),
         ]
 
         var rng = SplitMix64(seed: 0x4D41_494C_5445_524E)
@@ -250,14 +366,14 @@ final class MockMailFacade: MailFacade {
         for spec in specs {
             var unread = 0
             var list: [StoredMessage] = []
-            list.reserveCapacity(spec.5)
-            for index in 0..<spec.5 {
+            list.reserveCapacity(spec.count)
+            for index in 0..<spec.count {
                 let stored = makeMessage(
-                    folder: spec.0,
-                    folderName: spec.1,
+                    folder: spec.id,
+                    folderName: spec.name,
                     index: index,
-                    count: spec.5,
-                    unreadRate: spec.6,
+                    count: spec.count,
+                    unreadRate: spec.unreadRate,
                     now: now,
                     rng: &rng
                 )
@@ -269,16 +385,17 @@ final class MockMailFacade: MailFacade {
                 if lhs.row.date != rhs.row.date { return lhs.row.date > rhs.row.date }
                 return lhs.uid > rhs.uid
             }
-            messages[spec.0] = list
+            messages[spec.id] = list
             allFolders.append(
                 FolderSummary(
-                    id: spec.0,
-                    name: spec.1,
-                    path: spec.2,
-                    role: spec.3,
+                    id: spec.id,
+                    name: spec.name,
+                    path: spec.path,
+                    separator: spec.separator,
+                    role: spec.role,
                     unreadCount: unread,
-                    totalCount: spec.5,
-                    backfill: spec.4
+                    totalCount: spec.count,
+                    backfill: spec.backfill
                 )
             )
         }
@@ -387,7 +504,15 @@ final class MockMailFacade: MailFacade {
 
         \(quarantined ? "<unparseable payload>" : body)
         """
-        return StoredMessage(row: row, uid: uid, folder: folder, detail: detail, raw: raw, parts: parts)
+        return StoredMessage(
+            row: row,
+            uid: uid,
+            uidValidity: 1,
+            folder: folder,
+            detail: detail,
+            raw: raw,
+            parts: parts
+        )
     }
 
     private static func subject(index: Int, bucket: Int, folder: String) -> String {
@@ -437,6 +562,9 @@ final class MockMailFacade: MailFacade {
         ("Þóra Einarsdóttir", "thora@example.is"),
     ]
 
+    private static let mockAccountLinkID = AccountLinkID(
+        uuidString: "00000000-0000-4000-8000-000000000001"
+    )!
     fileprivate static let pixelPNG = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
 }
 

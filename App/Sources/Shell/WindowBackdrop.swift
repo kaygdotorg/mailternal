@@ -31,7 +31,7 @@ struct WindowBackdropPlan: Equatable {
         }
         let clamped = min(max(opacity, 0), 1)
         self.opacity = clamped
-        if kind == .opaque || clamped >= 1 {
+        if clamped >= 1 {
             treatment = .opaque
             return
         }
@@ -45,16 +45,20 @@ struct WindowBackdropRoot: View {
 
     var body: some View {
         WindowBackdropViewRepresentable(
-            kind: appearance.backdropKind,
+            kind: appearance.usesLiquidGlass ? .glass : .blur,
             opacity: appearance.backgroundOpacity,
             reduceTransparency: reduceTransparency
         )
         .overlay {
             if shouldShowGlass {
-                RoundedRectangle(cornerRadius: AppShapeScale.window, style: .continuous)
-                    .fill(Color(nsColor: .windowBackgroundColor).opacity(appearance.backgroundOpacity))
-                    .glassEffect(.regular)
-                    .clipShape(RoundedRectangle(cornerRadius: AppShapeScale.window, style: .continuous))
+                let shape = RoundedRectangle(
+                    cornerRadius: 0,
+                    style: .continuous
+                )
+                Color(nsColor: .windowBackgroundColor)
+                    .opacity(appearance.backgroundOpacity)
+                    .clipShape(shape)
+                    .glassEffect(.regular, in: shape)
             }
         }
         .allowsHitTesting(false)
@@ -62,7 +66,7 @@ struct WindowBackdropRoot: View {
 
     private var shouldShowGlass: Bool {
         WindowBackdropPlan(
-            kind: appearance.backdropKind,
+            kind: appearance.usesLiquidGlass ? .glass : .blur,
             opacity: appearance.backgroundOpacity,
             reduceTransparency: reduceTransparency,
             isFullScreen: NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false
@@ -86,7 +90,7 @@ private struct WindowBackdropViewRepresentable: NSViewRepresentable {
 
 @MainActor
 final class WindowBackdropView: NSView {
-    private var kind: WindowBackdropKind = .opaque
+    private var kind: WindowBackdropKind = .blur
     private var opacity: Double = 1
     private var reduceTransparency = false
     private var effectView: NSVisualEffectView?
