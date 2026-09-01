@@ -25,6 +25,14 @@ public struct NewMailEvent: Sendable {
     }
 }
 
+/// Terminal session failure. `Interfaces.SyncStatus` is frozen, so this is a
+/// separate engine stream (`SyncEngine.failures`) — not a `SyncStatus` case.
+/// Transport errors keep reconnecting and are **not** emitted here.
+public enum SyncFailure: Sendable, Equatable {
+    case authentication(message: String)
+    case tls(message: String)
+}
+
 public enum SyncEngineError: Error, Sendable, Equatable {
     case stopped
     case messageNotFound

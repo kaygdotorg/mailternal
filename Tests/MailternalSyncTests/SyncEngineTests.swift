@@ -838,3 +838,64 @@ import Testing
     #expect(try await store.attachmentCacheSize() <= 80)
     await engine.stop()
 }
+
+@Test func engineRetiresVanishedFolderOnSecondDiscovery() async throws {
+    try await withSyncStore { store, dir in
+        var inbox = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 2, highestModSeq: 1)
+        inbox.messages[1] = makePlainMessage(uid: 1, subject: "keep", body: "inbox")
+        var archive = ScriptedMailbox(path: "Archive", uidValidity: 1, uidNext: 2, highestModSeq: 1)
+        archive.messages[1] = makePlainMessage(uid: 1, subject: "gone", body: "archive")
+        let archiveMailbox = IMAPMailbox(
+            path: "Archive",
+            name: "Archive",
+            separator: "/",
+            role: .archive,
+            mailboxID: nil,
+            attributes: ["\\Archive"]
+        )
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox(), archiveMailbox],
+            mailboxes: ["INBOX": inbox, "Archive": archive]
+        )
+        func makeEngine() -> SyncEngine {
+            SyncEngine(
+                store: store,
+                config: sampleConfig(),
+                credentials: StaticPassword(value: "pw"),
+                clientFactory: ScriptedFactory(world: world),
+                disk: FixedDisk(freeBytes: 50 * 1024 * 1024 * 1024, volumeBytes: 100 * 1024 * 1024 * 1024),
+                clock: { Date() },
+                settings: testSettings(dir: dir)
+            )
+        }
+
+        let first = makeEngine()
+        await first.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            let folders = try await store.fetchFolders(account: sampleConfig().id)
+            let paths = Set(folders.map(\.path))
+            return paths == ["INBOX", "Archive"]
+                && folders.allSatisfy { $0.backfill == .complete }
+        }
+        let afterA = try await store.fetchFolders(account: sampleConfig().id)
+        #expect(Set(afterA.map(\.path)) == ["INBOX", "Archive"])
+        #expect(Set(afterA.map(\.id)).count == afterA.count)
+        let vanishedID = try #require(afterA.first { $0.path == "Archive" }?.id)
+        await first.stop()
+
+        world.replaceFolders([inboxMailbox()])
+        let second = makeEngine()
+        await second.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            let folders = try await store.fetchFolders(account: sampleConfig().id)
+            return folders.map(\.path) == ["INBOX"]
+        }
+        let afterB = try await store.fetchFolders(account: sampleConfig().id)
+        #expect(afterB.map(\.path) == ["INBOX"])
+        #expect(Set(afterB.map(\.id)).count == afterB.count)
+        #expect(Set(afterB.map(\.path)).count == afterB.count)
+        #expect(try await store.fetchFolderSummary(vanishedID) == nil)
+        await second.stop()
+    }
+}

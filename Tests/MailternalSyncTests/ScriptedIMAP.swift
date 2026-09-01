@@ -84,6 +84,12 @@ final class ScriptedWorld: @unchecked Sendable {
         mailboxes[path] = box
     }
 
+    func replaceFolders(_ folders: [IMAPMailbox]) {
+        lock.lock()
+        self.folders = folders
+        lock.unlock()
+    }
+
     func applyStoreSeen(path: String, uids: IMAPUIDSet) {
         lock.lock()
         defer { lock.unlock() }

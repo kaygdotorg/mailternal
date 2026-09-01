@@ -348,6 +348,8 @@ public actor SyncEngine {
         }
         var records: [FolderRecord] = []
         records.reserveCapacity(discovery.folders.count)
+        var seen: [FolderKey] = []
+        seen.reserveCapacity(discovery.folders.count)
         for mailbox in discovery.folders {
             let folderID = try await store.upsertFolder(
                 account: config.id,
@@ -356,6 +358,7 @@ public actor SyncEngine {
                 role: mailbox.role,
                 objectID: mailbox.mailboxID
             )
+            seen.append(FolderKey(path: mailbox.path, objectID: mailbox.mailboxID))
             let record = try await prepare(
                 channel: channel,
                 folderID: folderID,
@@ -365,7 +368,15 @@ public actor SyncEngine {
             records.append(record)
             if mailbox.role == .inbox { inboxID = folderID }
         }
+        // Successful LIST only — never call this on a thrown listFolders.
+        // Empty `seen` retires every live folder, which is correct for a
+        // successful empty LIST and wrong for a failed one.
+        let retired = try await store.reconcileFolders(account: config.id, seen: seen)
         folders = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
+        for id in retired {
+            folders.removeValue(forKey: id)
+            if inboxID == id { inboxID = nil }
+        }
     }
 
     private func prepare(
