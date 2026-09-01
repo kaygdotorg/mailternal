@@ -91,11 +91,14 @@ private enum QAChaos {
         return text
     }
 
-    static func inbox(store: MailStore, port: Int) async throws -> FolderSummary {
-        let folders = try await store.fetchFolders(account: config(port: port).id)
-        guard let inbox = folders.first(where: { $0.path == "INBOX" }) else {
-            throw WaitTimeout()
-        }
+    static func inbox(store: MailStore, port: Int) async throws -> FolderSummary? {
+        try await store.fetchFolders(account: config(port: port).id).first(where: {
+            $0.role == .inbox || $0.path.compare("INBOX", options: [.caseInsensitive]) == .orderedSame
+        })
+    }
+
+    static func requireInbox(store: MailStore, port: Int) async throws -> FolderSummary {
+        guard let inbox = try await inbox(store: store, port: port) else { throw WaitTimeout() }
         return inbox
     }
 }
@@ -123,10 +126,10 @@ struct QAChaosTests {
             await engine.start()
 
             try await waitUntil(timeout: .seconds(240), poll: .milliseconds(400)) {
-                let inbox = try await QAChaos.inbox(store: store, port: 1143)
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
                 return inbox.totalCount >= 8_000 && inbox.backfill != .complete
             }
-            let mid = try await QAChaos.inbox(store: store, port: 1143)
+            let mid = try await QAChaos.requireInbox(store: store, port: 1143)
             let oldLive = try #require(await store.liveGeneration(for: mid.id))
             let oldCount = mid.totalCount
             #expect(oldCount >= 8_000)
@@ -135,13 +138,13 @@ struct QAChaosTests {
             _ = try QAChaos.chaos("uidvalidity", "INBOX")
 
             try await waitUntil(timeout: .seconds(480), poll: .milliseconds(500)) {
-                let inbox = try await QAChaos.inbox(store: store, port: 1143)
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
                 guard let live = try await store.liveGeneration(for: inbox.id) else { return false }
                 return live.uidValidity != oldLive.uidValidity
                     && inbox.backfill == .complete
                     && inbox.totalCount >= 1_000
             }
-            let afterUV = try await QAChaos.inbox(store: store, port: 1143)
+            let afterUV = try await QAChaos.requireInbox(store: store, port: 1143)
             let newLive = try #require(await store.liveGeneration(for: afterUV.id))
             #expect(newLive.uidValidity != oldLive.uidValidity)
             #expect(events.snapshot().isEmpty)
@@ -151,7 +154,7 @@ struct QAChaosTests {
             let beforeRestart = afterUV.totalCount
             _ = try QAChaos.chaos("restart")
             try await waitUntil(timeout: .seconds(60), poll: .milliseconds(400)) {
-                let inbox = try await QAChaos.inbox(store: store, port: 1143)
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
                 return inbox.totalCount >= beforeRestart / 2
             }
 
@@ -162,15 +165,16 @@ struct QAChaosTests {
 
             _ = try QAChaos.chaos("deliver", "80", "INBOX")
             try await waitUntil(timeout: .seconds(60), poll: .milliseconds(400)) {
-                try await QAChaos.inbox(store: store, port: 1143).totalCount > beforeRestart
+                (try await QAChaos.inbox(store: store, port: 1143))?.totalCount ?? 0 > beforeRestart
             }
-            let afterDeliver = try await QAChaos.inbox(store: store, port: 1143)
+            let afterDeliver = try await QAChaos.requireInbox(store: store, port: 1143)
             #expect(afterDeliver.totalCount > beforeRestart)
             #expect(events.snapshot().count <= afterDeliver.totalCount - beforeRestart + 8)
 
             _ = try QAChaos.chaos("expunge", "200", "INBOX")
             try await waitUntil(timeout: .seconds(90), poll: .milliseconds(400)) {
-                try await QAChaos.inbox(store: store, port: 1143).totalCount < afterDeliver.totalCount
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
+                return inbox.totalCount < afterDeliver.totalCount
             }
             try await waitUntil(timeout: .seconds(20)) {
                 try await store.snapshotSeenQueue().isEmpty
@@ -181,7 +185,7 @@ struct QAChaosTests {
 
             collector.cancel()
             await engine.stop()
-            print("MAILTERNAL_QA live sequence events=\(events.snapshot().count) final=\(try await QAChaos.inbox(store: store, port: 1143).totalCount)")
+            print("MAILTERNAL_QA live sequence events=\(events.snapshot().count) final=\(try await QAChaos.requireInbox(store: store, port: 1143).totalCount)")
         }
     }
 
@@ -194,16 +198,81 @@ struct QAChaosTests {
             let engine = QAChaos.engine(store: store, port: 1143, dir: dir, allowEnableQResync: false)
             await engine.start()
             try await waitUntil(timeout: .seconds(90), poll: .milliseconds(400)) {
-                let inbox = try await QAChaos.inbox(store: store, port: 1143)
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
                 guard let gen = try await store.liveGeneration(for: inbox.id) else { return false }
                 let state = try await store.fetchSyncState(for: gen)
                 return state?.deltaPath == .condstore && inbox.totalCount >= 200
             }
-            let inbox = try await QAChaos.inbox(store: store, port: 1143)
+            let inbox = try await QAChaos.requireInbox(store: store, port: 1143)
             let gen = try #require(await store.liveGeneration(for: inbox.id))
             let state = try #require(await store.fetchSyncState(for: gen))
             #expect(state.deltaPath == .condstore)
             try await assertStoreInvariants(store)
+            await engine.stop()
+            print("MAILTERNAL_QA condstore path=\(state.deltaPath) count=\(inbox.totalCount)")
+        }
+    }
+
+    /// Scenarios 2–4 against the full instance (1143). Leaves 2143 running.
+    /// Does not bump UIDVALIDITY (that dual-stops the shared volume).
+    @Test(.enabled(if: QAChaos.enabled && QAChaos.mutate))
+    func liveRestartDeliverExpungeOn1143() async throws {
+        try QAChaos.installTrust()
+        defer { IMAPSession.resetAdditionalTrustRoots() }
+        try await QAChaos.probe(port: 1143)
+        try await withSyncStore { store, dir in
+            let engine = QAChaos.engine(store: store, port: 1143, dir: dir)
+            let events = EventLog()
+            let collector = Task {
+                for await event in await engine.newMail { events.append(event) }
+            }
+            await engine.start()
+            try await waitUntil(timeout: .seconds(120), poll: .milliseconds(400)) {
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
+                return inbox.totalCount >= 300
+            }
+            let beforeRestart = try await QAChaos.requireInbox(store: store, port: 1143)
+            let gen = try #require(await store.liveGeneration(for: beforeRestart.id))
+            let path = try #require(await store.fetchSyncState(for: gen)).deltaPath
+            print("MAILTERNAL_QA pre-restart count=\(beforeRestart.totalCount) path=\(path)")
+
+            _ = try QAChaos.chaos("restart")
+            try await waitUntil(timeout: .seconds(90), poll: .milliseconds(400)) {
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
+                return inbox.totalCount >= min(beforeRestart.totalCount, 200)
+            }
+
+            let page = try await store.page(in: beforeRestart.id, after: nil, limit: 1)
+            if let row = page.rows.first {
+                try await store.enqueueSeen(message: row.id)
+            }
+
+            let preDeliver = try await QAChaos.requireInbox(store: store, port: 1143).totalCount
+            _ = try QAChaos.chaos("deliver", "2000", "INBOX")
+            await engine.refreshNow()
+            try await waitUntil(timeout: .seconds(180), poll: .milliseconds(400)) {
+                (try await QAChaos.inbox(store: store, port: 1143))?.totalCount ?? 0 > preDeliver
+            }
+            let afterDeliver = try await QAChaos.requireInbox(store: store, port: 1143)
+            #expect(afterDeliver.totalCount > preDeliver)
+            let newMail = events.snapshot().count
+            #expect(newMail <= afterDeliver.totalCount - preDeliver + 16)
+            print("MAILTERNAL_QA deliver +2000 local=\(afterDeliver.totalCount) newMail=\(newMail)")
+
+            _ = try QAChaos.chaos("expunge", "5000", "INBOX")
+            await engine.refreshNow()
+            try await waitUntil(timeout: .seconds(180), poll: .milliseconds(400)) {
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
+                return inbox.totalCount < afterDeliver.totalCount
+            }
+            try await waitUntil(timeout: .seconds(30)) {
+                try await store.snapshotSeenQueue().isEmpty
+            }
+            let afterExpunge = try await QAChaos.requireInbox(store: store, port: 1143)
+            try await assertStoreInvariants(store, drain: true, expectEmptySeen: true)
+            print("MAILTERNAL_QA expunge -5000 local=\(afterExpunge.totalCount)")
+
+            collector.cancel()
             await engine.stop()
         }
     }

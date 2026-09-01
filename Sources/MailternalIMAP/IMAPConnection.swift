@@ -72,6 +72,9 @@ enum IMAPTLS {
         guard !host.isEmpty else {
             throw IMAPError.tls("Missing hostname for TLS verification")
         }
+        // IP literals skip NIOSSL hostname verification (no SNI). Fail closed
+        // unless QA extra trust roots are installed — see IMAPTrust.
+        try IMAPTrust.requireHostnameVerification(for: host)
         var configuration = TLSConfiguration.makeClientConfiguration()
         configuration.certificateVerification = .fullVerification
         if let extras = try IMAPTrust.additionalCertificates() {

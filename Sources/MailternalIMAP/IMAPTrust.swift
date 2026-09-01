@@ -22,6 +22,23 @@ import Glibc
 /// by SecTrust, which rejects this self-signed leaf (no CA:TRUE). When extras
 /// are present the handler therefore uses the BoringSSL path with
 /// **system anchors + extras**, so production roots stay in effect.
+///
+/// ## IP-literal endpoints
+/// `NIOSSLClientHandler(serverHostname:)` uses one string for SNI **and**
+/// hostname verification, and rejects IP literals (`cannotUseIPAddressInSNI`).
+/// Passing `serverHostname: nil` disables hostname verification entirely:
+/// the chain is still checked, but any trusted certificate can MITM the IP
+/// (violates product.md: hostname + system-trust, no insecure fallback).
+///
+/// Option (a) — `NIOSSLCustomVerificationCallback` that re-implements chain
+/// evaluation **and** IP-SAN matching — is not a clean NIOSSL fit: the
+/// callback *replaces* NIOSSL's verifier rather than adding a SAN check, and
+/// Apple SecTrust rejects the QA self-signed Dovecot leaf (the reason extras
+/// already force BoringSSL). So we **fail closed** (option b): IP-literal
+/// endpoints throw `IMAPError.tls` ("use a hostname") unless extra QA trust
+/// roots are installed via ``IMAPSession/installAdditionalTrustRoots(pem:)``.
+/// Production must use a DNS hostname so `.fullVerification` applies. The QA
+/// `127.0.0.1` + extras path is unchanged.
 enum IMAPTrust {
     private final class Storage: @unchecked Sendable {
         let lock = NSLock()
@@ -35,6 +52,14 @@ enum IMAPTrust {
         storage.lock.lock()
         storage.pemBlobs = pem
         storage.lock.unlock()
+    }
+
+    /// True after ``IMAPSession/installAdditionalTrustRoots(pem:)`` with a
+    /// non-empty PEM list. Production never sets this.
+    static var additionalTrustRootsInstalled: Bool {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        return !storage.pemBlobs.isEmpty
     }
 
     static func additionalCertificates() throws -> [NIOSSLCertificate]? {
@@ -74,6 +99,27 @@ enum IMAPTrust {
     static func sniHostname(for host: String) -> String? {
         isIPAddress(host) ? nil : host
     }
+
+    /// Production IP literals are refused so NIOSSL cannot skip hostname
+    /// verification. QA extras (`installAdditionalTrustRoots`) opt in.
+    static func requireHostnameVerification(for host: String) throws {
+        guard isIPAddress(host) else { return }
+        guard additionalTrustRootsInstalled else {
+            throw IMAPError.tls("Connect using a hostname, not an IP address.")
+        }
+    }
+
+    static func isIPAddress(_ host: String) -> Bool {
+        var candidate = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if candidate.hasPrefix("["), candidate.hasSuffix("]"), candidate.count > 2 {
+            candidate = String(candidate.dropFirst().dropLast())
+        }
+        return candidate.withCString { cstr in
+            var v4 = in_addr()
+            var v6 = in6_addr()
+            return inet_pton(AF_INET, cstr, &v4) == 1 || inet_pton(AF_INET6, cstr, &v6) == 1
+        }
+    }
 }
 
 extension IMAPSession {
@@ -105,11 +151,3 @@ private func systemAnchorCertificates() -> [NIOSSLCertificate] {
 #else
 private func systemAnchorCertificates() -> [NIOSSLCertificate] { [] }
 #endif
-
-private func isIPAddress(_ host: String) -> Bool {
-    host.withCString { cstr in
-        var v4 = in_addr()
-        var v6 = in6_addr()
-        return inet_pton(AF_INET, cstr, &v4) == 1 || inet_pton(AF_INET6, cstr, &v6) == 1
-    }
-}
