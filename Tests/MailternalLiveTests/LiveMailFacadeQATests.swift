@@ -30,6 +30,9 @@ func liveMailFacadeAddsQAAccountAndPagesInbox() async throws {
 
     let config = AccountConfig(
         id: account,
+        accountLinkID: AccountLinkID(
+            uuidString: "00000000-0000-4000-8000-000000000012"
+        )!,
         displayName: "QA",
         emailAddress: "qa@mailternal.test",
         username: "qa@mailternal.test",
@@ -38,6 +41,7 @@ func liveMailFacadeAddsQAAccountAndPagesInbox() async throws {
 
     do {
         try await facade.addAccount(config, password: "qa-password")
+        try await waitForActive(facade)
         #expect(facade.accountState == .active)
         try await waitForInboxPage(facade)
         await stopSoon(facade)
@@ -49,6 +53,22 @@ func liveMailFacadeAddsQAAccountAndPagesInbox() async throws {
         await stopSoon(facade)
         throw error
     }
+}
+
+@MainActor
+private func waitForActive(_ facade: LiveMailFacade) async throws {
+    if case .active = facade.accountState { return }
+    for await state in facade.accountStateStream {
+        switch state {
+        case .active:
+            return
+        case .authFailed(let message), .connectionFailed(let message):
+            throw LiveMailError(message)
+        case .none, .validating:
+            continue
+        }
+    }
+    throw LiveMailError("Account state stream ended before becoming active.")
 }
 
 @MainActor

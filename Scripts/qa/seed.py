@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import socket
 import ssl
 import sys
@@ -833,16 +834,66 @@ def seed_folder(
     return current
 
 
+def parse_append_uids(tagged: str) -> List[int]:
+    match = re.search(r"\[APPENDUID\s+\d+\s+([0-9:]+)\]", tagged, re.IGNORECASE)
+    if not match:
+        return []
+    values: List[int] = []
+    for piece in match.group(1).split(","):
+        bounds = piece.split(":", 1)
+        lo = int(bounds[0])
+        hi = int(bounds[-1])
+        values.extend(range(lo, hi + 1))
+    return values
+
+
+def compact_uids(uids: Sequence[int]) -> str:
+    ordered = sorted(set(uids))
+    if not ordered:
+        return ""
+    ranges: List[str] = []
+    lo = prev = ordered[0]
+    for uid in ordered[1:]:
+        if uid == prev + 1:
+            prev = uid
+            continue
+        ranges.append(str(lo) if lo == prev else "%d:%d" % (lo, prev))
+        lo = prev = uid
+    ranges.append(str(lo) if lo == prev else "%d:%d" % (lo, prev))
+    return ",".join(ranges)
+
+
 def extra_append(
     client: ImapClient, folder: str, count: int, origin: int
 ) -> None:
     client.create(folder)
     base = client.status_messages(folder)
-
-    def factory(i: int) -> Tuple[bytes, str, str]:
-        return gen_message(10_000_000 + origin + i, folder)
-
-    seed_folder(client, folder, base + count, factory, start_index=0)
+    target = base + count
+    delivered: List[int] = []
+    current = base
+    t0 = time.time()
+    while current < target:
+        batch: List[Tuple[bytes, str, str]] = []
+        nbytes = 0
+        while current + len(batch) < target and len(batch) < 40 and nbytes < 512 * 1024:
+            item = gen_message(10_000_000 + origin + current + len(batch), folder)
+            batch.append(item)
+            nbytes += len(item[0])
+        tagged = client.multiappend(folder, batch)
+        delivered.extend(parse_append_uids(tagged))
+        current += len(batch)
+        elapsed = max(time.time() - t0, 0.001)
+        rate = (current - base) / elapsed
+        print(
+            "  %s %d/%d (%.1f%%)  %.0f msg/s  %d bytes this batch"
+            % (folder, current, target, 100.0 * (current - base) / max(count, 1), rate, nbytes),
+            flush=True,
+        )
+    uid_set = compact_uids(delivered)
+    print(
+        "DELIVERED mailbox=%s count=%d uids=%s"
+        % (folder, count, uid_set if uid_set else "unavailable"),
+    )
 
 
 def print_status(client: ImapClient, folders: Sequence[str]) -> None:

@@ -15,6 +15,10 @@ package protocol IMAPClient: Sendable {
     func enableQResync() async throws
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage]
     func storeSeen(uids: IMAPUIDSet) async throws
+    func move(uids: IMAPUIDSet, to mailbox: String) async throws
+    func copy(uids: IMAPUIDSet, to mailbox: String) async throws
+    func storeDeleted(uids: IMAPUIDSet) async throws
+    func expunge(uids: IMAPUIDSet) async throws
     func beginIdle() async throws -> IMAPIdle
     func endIdle() async throws
     func renewIdle() async throws -> IMAPIdle
@@ -42,6 +46,18 @@ struct LiveIMAPClient: IMAPClient {
         try await session.fetch(request)
     }
     func storeSeen(uids: IMAPUIDSet) async throws { try await session.storeSeen(uids: uids) }
+    func move(uids: IMAPUIDSet, to mailbox: String) async throws {
+        try await session.move(uids: uids, to: mailbox)
+    }
+    func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
+        try await session.copy(uids: uids, to: mailbox)
+    }
+    func storeDeleted(uids: IMAPUIDSet) async throws {
+        try await session.storeDeleted(uids: uids)
+    }
+    func expunge(uids: IMAPUIDSet) async throws {
+        try await session.expunge(uids: uids)
+    }
     func beginIdle() async throws -> IMAPIdle { try await session.beginIdle() }
     func endIdle() async throws { try await session.endIdle() }
     func renewIdle() async throws -> IMAPIdle { try await session.renewIdle() }
@@ -151,6 +167,27 @@ actor SyncChannel {
         try await withCommand {
             try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
             try await self.client.storeSeen(uids: uids)
+        }
+    }
+
+    /// Atomic select-verify archive. The source UIDVALIDITY is checked immediately
+    /// before MOVE or the COPY/STORE/EXPUNGE fallback while the channel is exclusive.
+    func archive(
+        in path: String,
+        expectedUIDValidity: UInt32?,
+        uids: IMAPUIDSet,
+        destination: String,
+        useMove: Bool
+    ) async throws {
+        try await withCommand {
+            try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
+            if useMove {
+                try await self.client.move(uids: uids, to: destination)
+            } else {
+                try await self.client.copy(uids: uids, to: destination)
+                try await self.client.storeDeleted(uids: uids)
+                try await self.client.expunge(uids: uids)
+            }
         }
     }
 

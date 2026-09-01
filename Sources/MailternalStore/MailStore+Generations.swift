@@ -95,7 +95,7 @@ extension MailStore {
     }
 
     /// Atomically: old live → retiring, replacement → live, folder pointer swap,
-    /// stale seen-queue ops for the prior UIDVALIDITY dropped.
+    /// stale write-queue ops for the prior UIDVALIDITY dropped.
     public func activateReplacementGeneration(folder: FolderID) async throws {
         try await write { db in
             let folderRow = try MailStore.requireActiveFolder(db, folder)
@@ -122,6 +122,7 @@ extension MailStore {
                 arguments: [replacementID, folder.rawValue]
             )
             try MailStore.dropStaleSeen(db, folder: folder)
+            try MailStore.dropStaleArchive(db, folder: folder)
         }
     }
 

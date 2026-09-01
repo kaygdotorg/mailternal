@@ -44,7 +44,8 @@ message + FTS rows in bounded cleanup batches. Never blank the UI on a big folde
   sets `\Seen` and would mark the whole mailbox read during initial sync. The only
   `\Seen` transition is the explicit queued store below.
 
-### `\Seen` write queue (the sole 0.0.1 mutation)
+### Write queues
+#### `\Seen`
 - Local read enqueues a persisted op `(account, mailbox, UIDVALIDITY, UID)`;
   coalesced; sent as `UID STORE <uid> +FLAGS.SILENT (\Seen)`.
 - Ops whose UIDVALIDITY no longer matches the live generation are discarded.
@@ -55,6 +56,23 @@ message + FTS rows in bounded cleanup batches. Never blank the UI on a big folde
   (the op is idempotent). Tagged `NO`/`BAD` is **terminal**: drop the op, clear the
   pending-read override (server state then wins on next delta), record it in the
   parse/sync error log. No user-facing alert for a single failed `\Seen`.
+
+#### Archive
+- Local archive enqueues a persisted, coalesced op
+  `(account, mailbox, UIDVALIDITY, UID)` and optimistically deletes the message
+  row from the source folder in the same local write transaction. The next delta
+  reconciles server truth after a crash or failed send.
+- When the session advertises `MOVE`, send `UID MOVE <uid> <archive-mailbox>`.
+  Otherwise send `UID COPY <uid> <archive-mailbox>`, then
+  `UID STORE <uid> +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE <uid>` so only
+  the archived UID is expunged.
+- Only a tagged `OK` for the complete server operation dequeues the op. Transport
+  errors, `BYE`, and connection loss retain it for retry; tagged `NO`/`BAD` drops
+  it and records an archive error. If no Archive-role folder exists, the op is
+  dropped and `"no Archive folder"` is recorded.
+- Ops whose UIDVALIDITY no longer matches the live generation are dropped without
+  a server write. Replacement activation and every UIDVALIDITY mismatch cleanup
+  apply this stale-op rule.
 
 ### Backfill algorithm (bounded, resumable)
 - Per folder: walk **descending fixed-size UID windows** from `UIDNEXT-1` (never
@@ -73,21 +91,21 @@ message + FTS rows in bounded cleanup batches. Never blank the UI on a big folde
 
 ### Disk policy (no up-front full scan)
 - Start syncing the newest INBOX window immediately — never block startup on a
-  mailbox-wide size scan.
-- Maintain a running size estimate from streaming BODYSTRUCTURE data: projected store
-  bytes = accumulated text-part sizes × **1.6** (FTS index + WAL + SQLite overhead).
-- **Setup rule**: enter **windowed mode** (last 30 days) when
-  `free_space − projected_store < reserve`, where `reserve = max(5 GiB, 10% of the
-  volume)`. The first estimate uses the newest 1 000 INBOX messages extrapolated by
-  message count (`STATUS (MESSAGES)`); refine as metadata streams in.
-- **Stop threshold**: halt the backward walk per folder when free space <
-  `reserve`; surface "synced through <date>". **Resume threshold**: free space >
+  mailbox-wide size scan or an age-based cutoff.
+- Capacity checks prefer macOS important-usage capacity, then ordinary available
+  capacity. If neither is available, treat capacity as unknown/ample rather than
+  zero.
+- Reserve headroom is real-space based: `reserve = min(20 GiB, max(5 GiB, 2%
+  of the volume))`.
+- Halt the backward walk per folder only when actual free space falls below
+  `reserve`, after at least the newest window has committed; surface "synced
+  through <date>". **Resume threshold:** free space >
   `reserve + 2 GiB` (hysteresis); resume automatically.
-- Windowed mode is a first-class conforming state: the UI persistently discloses
-  "search covers mail since <date>"; it upgrades to full backfill when the setup
-  rule would pass again.
-
-## Live updates & connection topology
+- Every fetched message in every committed window is retained. There is no
+  setup-time 30-day/windowed filter that can discard messages while advancing
+  the durable UID cursor. Windowed mode is only the disclosed, resumable state
+  while actual disk pressure has halted older history; it upgrades to full
+  backfill when headroom recovers.
 - **Two connections**: one dedicated INBOX IDLE connection; one serialized sync/fetch
   connection for everything else. Fallback to a single multiplexed connection when
   the server caps connections (detected via `NO`/`BYE` on connect).
@@ -104,8 +122,8 @@ message + FTS rows in bounded cleanup batches. Never blank the UI on a big folde
 - **One SQLite database** (GRDB, WAL): accounts (non-secret settings only — secrets
   live in Keychain), folders, generations, messages (envelope, flags, body text, raw
   sanitized HTML, normalized `Message-ID`/`References`/`In-Reply-To`), sync state
-  (per-folder path selection, HIGHESTMODSEQ, cursors), seen-op queue, parse-error
-  records.
+  (per-folder path selection, HIGHESTMODSEQ, cursors), seen/archive write queues,
+  parse-error records.
 - All writes through a single writer queue; bounded batch transactions; observation
   notifications debounced/coalesced after commit.
 - **List access is paginated**: keyset pagination on stable

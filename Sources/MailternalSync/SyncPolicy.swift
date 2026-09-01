@@ -7,12 +7,11 @@ import MailternalStore
 /// can pin window math, the UIDNEXT−1 baseline edge, downgrade, disk, and notify.
 enum SyncPolicy: Sendable {
     static let defaultWindowSize: UInt32 = 1_000
-    static let setupSampleSize = 1_000
-    static let windowedDays = 30
-    /// FTS + WAL + SQLite overhead on accumulated text-part bytes.
-    static let storeOverheadNumerator: Int64 = 8
-    static let storeOverheadDenominator: Int64 = 5
+    /// A small newest-first first commit makes the visible folder useful
+    /// before the throughput-oriented history walk begins.
+    static let initialWindowSize: UInt32 = 80
     static let minReserveBytes: Int64 = 5 * 1024 * 1024 * 1024
+    static let maxReserveBytes: Int64 = 20 * 1024 * 1024 * 1024
     static let hysteresisBytes: Int64 = 2 * 1024 * 1024 * 1024
     static let rawSourceCap = 4 * 1024 * 1024
     static let idleRenewal: Duration = .seconds(25 * 60)
@@ -132,22 +131,17 @@ enum SyncPolicy: Sendable {
     // MARK: Disk
 
     static func reserveBytes(volumeBytes: Int64) -> Int64 {
-        max(minReserveBytes, volumeBytes / 10)
+        // Keep at least 5 GiB free, scale gently with larger volumes, and cap
+        // the reserve at 20 GiB. A non-positive volume means capacity is
+        // unavailable; the floor is the only meaningful reserve in that case.
+        guard volumeBytes > 0 else { return minReserveBytes }
+        return min(maxReserveBytes, max(minReserveBytes, volumeBytes / 50))
     }
 
-    static func projectedStoreBytes(textPartBytes: Int64) -> Int64 {
-        let safe = max(0, textPartBytes)
-        return safe * storeOverheadNumerator / storeOverheadDenominator
-    }
-
-    static func extrapolatedTextBytes(sampleTextBytes: Int64, sampleCount: Int, messageCount: Int) -> Int64 {
-        guard sampleCount > 0, messageCount > 0 else { return 0 }
-        let avg = sampleTextBytes / Int64(sampleCount)
-        return avg * Int64(messageCount)
-    }
-
-    static func shouldEnterWindowed(freeBytes: Int64, projectedBytes: Int64, reserveBytes: Int64) -> Bool {
-        freeBytes - projectedBytes < reserveBytes
+    static func backfillWindowSize(configured: UInt32, lowWater: UInt32?) -> UInt32 {
+        let configured = max(1, configured)
+        guard lowWater == nil else { return configured }
+        return min(configured, initialWindowSize)
     }
 
     static func shouldHalt(freeBytes: Int64, reserveBytes: Int64) -> Bool {
@@ -291,6 +285,7 @@ struct FolderRecord: Sendable {
     var highestModseq: UInt64?
     var lastUidNext: UInt32
     var lastDeltaAt: Date
+    var serverMessageCount: Int = 0
     var isReplacement: Bool
 }
 
@@ -320,17 +315,33 @@ struct FileDiskSpace: DiskSpaceProviding {
         keys.insert(.volumeAvailableCapacityForImportantUsageKey)
         #endif
         let values = try? url.resolvingSymlinksInPath().resourceValues(forKeys: keys)
-        var free = Int64(values?.volumeAvailableCapacity ?? 0)
         #if os(macOS)
-        if let important = values?.volumeAvailableCapacityForImportantUsage {
-            free = Int64(important)
-        }
+        let important = values?.volumeAvailableCapacityForImportantUsage.map { (capacity: Int64) -> Int64 in Int64(capacity) }
+        #else
+        let important: Int64? = nil
         #endif
-        let volume = Int64(values?.volumeTotalCapacity ?? 0)
-        if volume <= 0 && free <= 0 {
-            return DiskSnapshot(freeBytes: Int64.max / 8, volumeBytes: Int64.max / 8)
+        return Self.normalizedSnapshot(
+            availableBytes: values?.volumeAvailableCapacity.map { (capacity: Int) -> Int64 in Int64(capacity) },
+            importantUsageBytes: important,
+            volumeBytes: values?.volumeTotalCapacity.map { (capacity: Int) -> Int64 in Int64(capacity) }
+        )
+    }
+
+    static func normalizedSnapshot(
+        availableBytes: Int64?,
+        importantUsageBytes: Int64?,
+        volumeBytes: Int64?
+    ) -> DiskSnapshot {
+        let volume = max(1, volumeBytes ?? 0)
+        if let important = importantUsageBytes, important >= 0 {
+            return DiskSnapshot(freeBytes: important, volumeBytes: volume)
         }
-        return DiskSnapshot(freeBytes: max(0, free), volumeBytes: max(1, volume))
+        if let available = availableBytes, available >= 0 {
+            return DiskSnapshot(freeBytes: available, volumeBytes: volume)
+        }
+        // Capacity lookup can be unavailable inside a sandbox. Unknown space
+        // must not silently become zero and force permanent degraded sync.
+        return DiskSnapshot(freeBytes: Int64.max / 8, volumeBytes: volume)
     }
 }
 
@@ -341,8 +352,7 @@ struct SyncSettings: Sendable {
     var specialUseDelta: Duration
     var otherFolderDelta: Duration
     var seenPoll: Duration
-    var setupSampleSize: Int
-    var windowedDays: Int
+
     var diskURL: URL
     var periodicTick: Duration
     var cleanupTick: Duration
@@ -359,8 +369,6 @@ struct SyncSettings: Sendable {
         specialUseDelta: SyncPolicy.specialUseDelta,
         otherFolderDelta: SyncPolicy.otherFolderDelta,
         seenPoll: .seconds(2),
-        setupSampleSize: SyncPolicy.setupSampleSize,
-        windowedDays: SyncPolicy.windowedDays,
         diskURL: FileManager.default.homeDirectoryForCurrentUser,
         periodicTick: .seconds(15),
         cleanupTick: .seconds(30),

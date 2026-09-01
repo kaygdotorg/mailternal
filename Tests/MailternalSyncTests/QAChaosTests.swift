@@ -26,6 +26,9 @@ private enum QAChaos {
     static func config(port: Int) -> AccountConfig {
         AccountConfig(
             id: AccountID(rawValue: "qa-chaos-\(port)"),
+            accountLinkID: AccountLinkID(
+                uuidString: "00000000-0000-4000-8000-000000000020"
+            )!,
             displayName: "QA Chaos",
             emailAddress: user,
             username: user,
@@ -90,6 +93,42 @@ private enum QAChaos {
         }
         return text
     }
+    static func uidSet(_ output: String, marker: String) throws -> Set<UInt32> {
+        guard let line = output.split(whereSeparator: \.isNewline).first(where: {
+            $0.contains(marker)
+        }),
+        let token = line.split(whereSeparator: \.isWhitespace).first(where: {
+            $0.hasPrefix("uids=")
+        })
+        else {
+            throw WaitTimeout()
+        }
+        let value = token.dropFirst("uids=".count)
+        guard value != "unavailable", !value.isEmpty else { throw WaitTimeout() }
+        var result = Set<UInt32>()
+        for piece in value.split(separator: ",") {
+            let bounds = piece.split(separator: ":", maxSplits: 1).compactMap { UInt32($0) }
+            guard bounds.count == 1 || bounds.count == 2 else { throw WaitTimeout() }
+            let lower = bounds[0]
+            let upper = bounds.count == 1 ? lower : bounds[1]
+            guard lower <= upper else { throw WaitTimeout() }
+            result.formUnion(lower...upper)
+        }
+        return result
+    }
+
+    static func serverCount(_ output: String, marker: String) throws -> Int {
+        guard let line = output.split(whereSeparator: \.isNewline).first(where: {
+            $0.contains(marker)
+        }),
+        let value = line.split(whereSeparator: \.isWhitespace).last,
+        let count = Int(value)
+        else {
+            throw WaitTimeout()
+        }
+        return count
+    }
+
 
     static func inbox(store: MailStore, port: Int) async throws -> FolderSummary? {
         try await store.fetchFolders(account: config(port: port).id).first(where: {
@@ -248,29 +287,77 @@ struct QAChaosTests {
             }
 
             let preDeliver = try await QAChaos.requireInbox(store: store, port: 1143).totalCount
-            _ = try QAChaos.chaos("deliver", "2000", "INBOX")
+            let deliverOutput = try QAChaos.chaos("deliver", "2000", "INBOX")
+            let deliveredUIDs = try QAChaos.uidSet(deliverOutput, marker: "DELIVERED mailbox=INBOX")
+            let serverAfterDeliver = try QAChaos.serverCount(
+                deliverOutput,
+                marker: "STATUS INBOX MESSAGES"
+            )
+            #expect(deliveredUIDs.count == 2_000)
             await engine.refreshNow()
             try await waitUntil(timeout: .seconds(180), poll: .milliseconds(400)) {
-                (try await QAChaos.inbox(store: store, port: 1143))?.totalCount ?? 0 > preDeliver
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143),
+                      let current = try await store.liveGeneration(for: inbox.id)
+                else { return false }
+                let local = Set(try await store.uids(in: current).map(\.rawValue))
+                return deliveredUIDs.isSubset(of: local)
+                    && inbox.totalCount <= serverAfterDeliver
             }
             let afterDeliver = try await QAChaos.requireInbox(store: store, port: 1143)
-            #expect(afterDeliver.totalCount > preDeliver)
+            let deliverGeneration = try #require(await store.liveGeneration(for: afterDeliver.id))
+            let localBeforeExpunge = Set(
+                try await store.uids(in: deliverGeneration).map(\.rawValue)
+            )
+            #expect(afterDeliver.totalCount >= preDeliver)
             let newMail = events.snapshot().count
-            #expect(newMail <= afterDeliver.totalCount - preDeliver + 16)
-            print("MAILTERNAL_QA deliver +2000 local=\(afterDeliver.totalCount) newMail=\(newMail)")
+            #expect(newMail <= deliveredUIDs.count + 16)
+            print(
+                "MAILTERNAL_QA deliver +2000 local=\(afterDeliver.totalCount) "
+                    + "server=\(serverAfterDeliver) newMail=\(newMail)"
+            )
 
-            _ = try QAChaos.chaos("expunge", "5000", "INBOX")
+            let expungeOutput = try QAChaos.chaos("expunge", "5000", "INBOX")
+            let expungedUIDs = try QAChaos.uidSet(expungeOutput, marker: "EXPUNGED mailbox=INBOX")
+            let serverAfterExpunge = try QAChaos.serverCount(expungeOutput, marker: "now EXISTS")
+            let deliveredExpunged = deliveredUIDs.intersection(expungedUIDs)
+            let deliveredSurvivors = deliveredUIDs.subtracting(expungedUIDs)
+            let localExpunged = localBeforeExpunge.intersection(expungedUIDs)
+            #expect(expungedUIDs.count == 5_000)
+            #expect(serverAfterDeliver - serverAfterExpunge == expungedUIDs.count)
+            #expect(!deliveredExpunged.isEmpty)
+            #expect(!deliveredSurvivors.isEmpty)
+            #expect(!localExpunged.isEmpty)
+            let deliveredSurvivor = try #require(deliveredSurvivors.first)
+
             await engine.refreshNow()
             try await waitUntil(timeout: .seconds(180), poll: .milliseconds(400)) {
-                guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
-                return inbox.totalCount < afterDeliver.totalCount
+                guard let inbox = try await QAChaos.inbox(store: store, port: 1143),
+                      let generation = try await store.liveGeneration(for: inbox.id),
+                      let state = try await store.fetchSyncState(for: generation)
+                else { return false }
+                let local = Set(try await store.uids(in: generation).map(\.rawValue))
+                let removed = localExpunged.allSatisfy { !local.contains($0) }
+                    && deliveredExpunged.allSatisfy { !local.contains($0) }
+                let lowWater = state.lowWaterUID?.rawValue ?? UInt32.max
+                let walkPassedExpunged = state.backfillPhase == .complete
+                    || lowWater <= (localExpunged.min() ?? 0)
+                let countConverged = inbox.backfill == .complete
+                    ? inbox.totalCount == serverAfterExpunge
+                    : inbox.totalCount <= serverAfterExpunge
+                return removed
+                    && local.contains(deliveredSurvivor)
+                    && walkPassedExpunged
+                    && countConverged
             }
             try await waitUntil(timeout: .seconds(30)) {
                 try await store.snapshotSeenQueue().isEmpty
             }
             let afterExpunge = try await QAChaos.requireInbox(store: store, port: 1143)
             try await assertStoreInvariants(store, drain: true, expectEmptySeen: true)
-            print("MAILTERNAL_QA expunge -5000 local=\(afterExpunge.totalCount)")
+            print(
+                "MAILTERNAL_QA expunge -\(expungedUIDs.count) local=\(afterExpunge.totalCount) "
+                    + "server=\(serverAfterExpunge) backfill=\(afterExpunge.backfill)"
+            )
 
             collector.cancel()
             await engine.stop()

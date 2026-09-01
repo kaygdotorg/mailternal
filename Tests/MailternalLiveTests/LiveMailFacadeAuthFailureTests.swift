@@ -25,6 +25,9 @@ func restorePersistedAccountMapsTerminalAuthToAuthFailed() async throws {
     let keychain = KeychainStore(service: "org.kayg.mailternal.qa", storage: .memory)
     let config = AccountConfig(
         id: account,
+        accountLinkID: AccountLinkID(
+            uuidString: "00000000-0000-4000-8000-000000000011"
+        )!,
         displayName: "QA",
         emailAddress: "qa@mailternal.test",
         username: "qa@mailternal.test",

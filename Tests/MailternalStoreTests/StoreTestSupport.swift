@@ -23,6 +23,9 @@ func withStore(
 func sampleAccount(_ id: String = "acc-1") -> AccountConfig {
     AccountConfig(
         id: AccountID(rawValue: id),
+        accountLinkID: AccountLinkID(
+            uuidString: "00000000-0000-4000-8000-000000000010"
+        )!,
         displayName: "Test",
         emailAddress: "test@example.com",
         username: "test@example.com",
@@ -37,6 +40,7 @@ func seedInbox(_ store: MailStore, uidValidity: UInt32 = 1) async throws -> (Acc
         account: account.id,
         path: "INBOX",
         name: "INBOX",
+        separator: nil,
         role: .inbox,
         objectID: nil
     )

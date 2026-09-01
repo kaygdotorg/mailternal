@@ -56,6 +56,20 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   Glass = `.glassEffect(.regular)` clipped to continuous window radius.
   Reduce Transparency / fullscreen forces opaque.
 
+## Pane edge dissolves (`MailWindowDissolvePolicy`)
+- One compositing mask per pane, no material overlay: the exposed window backdrop
+  supplies the blur. Shape is Hermternal's smoothstep sampled at eighths; panes
+  share it and differ only in where the top ramp starts.
+- **Sidebar**: the top ramp starts at the *measured* titlebar safe area (documented
+  fallback 52 pt) and is opaque 32 pt below it, so rows are gone before they reach
+  the traffic lights and no ink lands behind them; the `List` carries a matching
+  32 pt top scroll-content margin so the first section rests at the ramp's end.
+  Bottom ramp 48 pt, ending above the fixed account inset.
+- **Message list**: the pane ignores the top safe area, so its ramp is anchored at
+  the physical window top and is opaque at 52 pt; the table's top scroll-content
+  inset is that same depth. Bottom ramp 48 pt at the pane edge. The column carries
+  **no top chrome** — windowed-mode coverage is disclosed in the ⌘K panel.
+
 ## Component vocabulary (reuse the pattern, adapt to mail)
 - **Sidebar rows**: native `List` label rows with context menus, swipes, drag/drop
   (Hermternal `SessionRow`/`FolderRow`/`AccountRow` → Mailternal folder rows with
@@ -100,6 +114,6 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
 | Folder sidebar | Hermternal sidebar List rows + unread badge + per-folder backfill progress |
 | Message list | NSTableView-behind-SwiftUI virtualized list, row radius 12, keyset-paged |
 | Message viewer | Reading-measure content column; WKWebView for HTML inside the same inset geometry |
-| Global search | Command-K panel, verbatim geometry |
+| Global search | Command-K panel, verbatim geometry; carries the windowed-mode coverage line |
 | Account setup | Settings-style grouped form in a floating utility window |
 | Sync/auth errors | Toast stack |

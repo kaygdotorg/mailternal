@@ -136,13 +136,12 @@ cmd_seed() {
 
 python_imap() {
   python3 - "$@" <<'PY'
-import os, sys, socket, ssl, random, time
+import os, re, sys, socket, ssl, random, time
 from pathlib import Path
 
 # Reuse seed.py helpers when present.
 sys.path.insert(0, os.environ.get("QA_ROOT", "."))
 from seed import connect, wait_ready, quote_mailbox, ImapError, USER, PASSWORD  # noqa: E402
-
 host = os.environ.get("QA_IMAP_HOST", "127.0.0.1")
 port = int(os.environ.get("QA_IMAP_PORT", "1143"))
 tls = os.environ.get("QA_IMAP_TLS", "starttls")
@@ -157,6 +156,21 @@ c.login(user, password)
 
 def status(mailbox):
     return c.status_messages(mailbox)
+def compact_uids(uids):
+    ordered = sorted(set(uids))
+    if not ordered:
+        return ""
+    ranges = []
+    lo = prev = ordered[0]
+    for uid in ordered[1:]:
+        if uid == prev + 1:
+            prev = uid
+            continue
+        ranges.append(str(lo) if lo == prev else "%d:%d" % (lo, prev))
+        lo = prev = uid
+    ranges.append(str(lo) if lo == prev else "%d:%d" % (lo, prev))
+    return ",".join(ranges)
+
 
 if op == "status":
     print("CAPABILITY", " ".join(c.caps))
@@ -177,15 +191,24 @@ elif op == "expunge":
         sys.exit(0)
     n = min(n, exists)
     seqs = sorted(random.sample(range(1, exists + 1), n))
-    # STORE in chunks of 50 sequence numbers
+    selected_uids = []
+    # Resolve sequence numbers before marking them. The UID list is the
+    # durable identity the sync test can compare with local rows.
     for i in range(0, len(seqs), 50):
         chunk = seqs[i:i+50]
         set_ = ",".join(str(x) for x in chunk)
+        _, fetched = c.cmd("FETCH %s (UID)" % set_)
+        for line in fetched:
+            match = re.search(r"^\*\s+\d+\s+FETCH\s+\(.*?\bUID\s+(\d+)\b", line, re.IGNORECASE)
+            if match:
+                selected_uids.append(int(match.group(1)))
         c.cmd("STORE %s +FLAGS.SILENT (\\Deleted)" % set_)
     tagged, untagged = c.cmd("EXPUNGE")
     vanished = sum(1 for line in untagged if line.upper().endswith(" EXPUNGE"))
     print("expunged ~%d (STORE %d seqs, EXPUNGE lines %d) mailbox=%s was EXISTS %d" % (
         n, n, vanished, mailbox, exists))
+    print("EXPUNGED mailbox=%s count=%d uids=%s" % (
+        mailbox, len(selected_uids), compact_uids(selected_uids)))
     print("now EXISTS", c.status_messages(mailbox))
 elif op == "caps":
     print("CAPABILITY", " ".join(c.caps))
