@@ -69,6 +69,18 @@ private func deepLinkAccountConfig(_ id: String, linkID: AccountLinkID = deepLin
 
     let zeroes = "mailternal://open/v1/account/123e4567-e89b-42d3-a456-426614174000/folder/path/eA/message/0/1"
     #expect(MailternalDeepLink(string: zeroes) == nil)
+
+    // Format characters and separators exist only to spoof rendered labels.
+    for value in ["\u{202E}x", "zero\u{200B}width", "bom\u{FEFF}", "line\u{2028}break"] {
+        let invisible: MailternalDeepLink = .folder(
+            accountLinkID: deepLinkAccount,
+            folderLocator: FolderLocator(kind: .path, value: value)
+        )
+        #expect(invisible.formattedString == nil, "\(value.unicodeScalars.map(\.value))")
+    }
+    // Same bytes arriving from the URL side: base64url("\u{202E}x").
+    let bidi = "mailternal://open/v1/account/123e4567-e89b-42d3-a456-426614174000/folder/path/4oCueA"
+    #expect(MailternalDeepLink(string: bidi) == nil)
 }
 
 @Test func accountLinkIDPersistsAcrossMetadataUpdates() async throws {

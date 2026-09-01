@@ -186,8 +186,15 @@ public enum MailternalDeepLink: Hashable, Sendable {
         guard !bytes.isEmpty, bytes.count <= 1024,
               let value = String(bytes: bytes, encoding: .utf8),
               value == locator.value else { return false }
+        // Links are cross-app attacker-controllable input: besides C0/C1
+        // controls, reject format characters (Cf: bidi overrides/isolates,
+        // zero-width, BOM) and line/paragraph separators, which exist only
+        // to spoof how a folder label renders.
         return !value.unicodeScalars.contains {
-            CharacterSet.controlCharacters.contains($0) || $0.value == 0
+            CharacterSet.controlCharacters.contains($0)
+                || $0.value == 0
+                || $0.properties.generalCategory == .format
+                || $0.value == 0x2028 || $0.value == 0x2029
         }
     }
 
