@@ -50,6 +50,22 @@ func cssUnclosedCommentFailClosed() {
     #expect(!out.lowercased().contains("url("))
 }
 
+@Test("paint policy rejects url() and keeps colors")
+func cssPaintPolicy() {
+    #expect(CSSSanitizer.sanitizedPaint("url(https://evil.example/x.png)") == nil
+        || CSSSanitizer.sanitizedPaint("url(https://evil.example/x.png)") == "none")
+    let urlPaint = CSSSanitizer.sanitizedPaint("url(https://evil.example/x.png)")
+    #expect(urlPaint != "url(https://evil.example/x.png)")
+    #expect(urlPaint == nil || (urlPaint.map { CSSSanitizer.isURLFree($0) && CSSSanitizer.isColorOrPaint($0) } ?? true))
+    #expect(!((urlPaint ?? "").contains("evil.example")))
+    #expect(CSSSanitizer.sanitizedPaint("u/**/rl(https://evil.example/x.png)") != "u/**/rl(https://evil.example/x.png)")
+    #expect(!((CSSSanitizer.sanitizedPaint("u/**/rl(https://evil.example/x.png)") ?? "").contains("evil.example")))
+    #expect(CSSSanitizer.sanitizedPaint("#00ff00") == "#00ff00")
+    #expect(CSSSanitizer.sanitizedPaint("red") == "red")
+    #expect(CSSSanitizer.sanitizedPaint("none") == "none")
+    #expect(CSSSanitizer.sanitizedPaint("RGB(1, 2, 3)")?.lowercased().hasPrefix("rgb(") == true)
+}
+
 private func assertNoRequestBearingCSS(_ css: String) {
     let out = CSSSanitizer.sanitize(css)
     let lowered = out.lowercased()

@@ -281,6 +281,7 @@ func sanitizeIdempotent() {
         #"<iframe src="https://evil.example"></iframe><form action="https://evil.example"></form>"#,
         "<style>@import 'https://evil.example/s.css'; p{color:red}</style><p>x</p>",
         #"<svg><use href="https://evil.example/u"></use><image href="https://evil.example/i.png"></image></svg>"#,
+        #"<svg><rect fill="url(https://evil.example/p.png)" stroke="url(https://evil.example/s.png)"/></svg>"#,
         #"<img src="https://a.example/x.png" srcset="https://a.example/y.png 2x">"#,
         "plain text only",
         "",
@@ -310,6 +311,68 @@ func svgFilterAndForeignObjectRemoved() {
     let lowered = result.html.lowercased()
     #expect(!lowered.contains("<filter"))
     #expect(!lowered.contains("foreignobject"))
+}
+
+@Test("SVG fill url() is stripped")
+func svgFillURLRejected() {
+    let html = #"<svg><rect fill="url(https://evil.example/paint.png)" width="10" height="10"/></svg>"#
+    let result = HTMLSanitizer.sanitize(html)
+    assertNoExfiltration(result.html)
+    #expect(!result.html.contains("evil.example"))
+    #expect(!result.html.lowercased().contains("url("))
+    #expect(result.manifest.entries.isEmpty)
+}
+
+@Test("SVG stroke url() is stripped")
+func svgStrokeURLRejected() {
+    let html = #"<svg><path stroke="url(https://evil.example/stroke.png)" d="M0 0"/></svg>"#
+    let result = HTMLSanitizer.sanitize(html)
+    assertNoExfiltration(result.html)
+    #expect(!result.html.contains("evil.example"))
+    #expect(result.manifest.entries.isEmpty)
+}
+
+@Test("SVG stop-color url() is stripped")
+func svgStopColorURLRejected() {
+    let html = #"<svg><linearGradient><stop offset="0" stop-color="url(https://evil.example/c.png)"/></linearGradient></svg>"#
+    let result = HTMLSanitizer.sanitize(html)
+    assertNoExfiltration(result.html)
+    #expect(!result.html.contains("evil.example"))
+}
+
+@Test("SVG fill comment-split and escaped url() are stripped")
+func svgFillEvasionRejected() {
+    let samples = [
+        #"<svg><circle fill="u/**/rl(https://evil.example/x.png)" r="4"/></svg>"#,
+        #"<svg><circle fill="\75\72\6c(https://evil.example/x.png)" r="4"/></svg>"#,
+        #"<svg><circle fill="URL(https://evil.example/x.png)" r="4"/></svg>"#,
+        #"<svg><g fill="url('https://evil.example/x.png')"><rect width="1" height="1"/></g></svg>"#,
+    ]
+    for html in samples {
+        let result = HTMLSanitizer.sanitize(html)
+        assertNoExfiltration(result.html)
+        #expect(!result.html.contains("evil.example"), "host survived in \(html) → \(result.html)")
+        #expect(!result.html.lowercased().contains("url("))
+    }
+}
+
+@Test("HTML color/bgcolor url() is stripped")
+func htmlColorURLRejected() {
+    let html = #"<p color="url(https://evil.example/c.png)" bgcolor="url(https://evil.example/b.png)">x</p>"#
+    let result = HTMLSanitizer.sanitize(html)
+    assertNoExfiltration(result.html)
+    #expect(!result.html.contains("evil.example"))
+}
+
+@Test("SVG named and hex fills survive")
+func svgSafePaintsSurvive() {
+    let html = "<svg><rect fill=\"#00ff00\" stroke=\"red\"/><circle fill=\"none\" r=\"1\"/><text fill=\"rgb(1,2,3)\">x</text></svg>"
+    let result = HTMLSanitizer.sanitize(html)
+    assertNoExfiltration(result.html)
+    #expect(result.html.contains("#00ff00"))
+    #expect(result.html.lowercased().contains("red") || result.html.lowercased().contains("stroke=\"red\""))
+    #expect(result.html.lowercased().contains("none") || result.html.lowercased().contains("fill=\"none\""))
+    #expect(result.html.lowercased().contains("rgb("))
 }
 
 private func remoteEntries(_ result: SanitizedHTML) -> [ResourceEntry] {
