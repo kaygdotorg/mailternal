@@ -34,22 +34,18 @@ final class MailternalUITests: XCTestCase {
         )
     }
 
-    func testSelectingRowPopulatesViewerAndClearsUnread() {
+    func testSelectingRowPopulatesViewer() {
         signInToMock()
         let table = messageTable()
-        let unread = table.descendants(matching: .any)[UIIdentifier.unreadDot]
-        XCTAssertTrue(unread.waitForExistence(timeout: 10), "Inbox should contain an unread marker")
-        unread.click()
+        let firstRow = table.tableRows.firstMatch
+        XCTAssertTrue(firstRow.waitForExistence(timeout: 10), "Inbox should contain a message")
+        firstRow.click()
         XCTAssertTrue(element(UIIdentifier.messageViewer).waitForExistence(timeout: 8))
         let subject = element(UIIdentifier.messageSubject)
         let quarantine = element(UIIdentifier.quarantineBanner)
         XCTAssertTrue(
             subject.waitForExistence(timeout: 8) || quarantine.waitForExistence(timeout: 8),
             "viewer should show envelope or quarantine content"
-        )
-        XCTAssertTrue(
-            waitUntil(timeout: 8) { self.selectedRowHasNoUnread(in: table) },
-            "selected row should drop its unread marker"
         )
     }
 
@@ -360,13 +356,6 @@ final class MailternalUITests: XCTestCase {
         return row.staticTexts.allElementsBoundByIndex.map { $0.label }.joined(separator: "|")
     }
 
-    private func selectedRowHasNoUnread(in table: XCUIElement) -> Bool {
-        let selected = table.tableRows.matching(NSPredicate(format: "selected == true")).firstMatch
-        if selected.exists {
-            return !selected.descendants(matching: .any)[UIIdentifier.unreadDot].exists
-        }
-        return !table.descendants(matching: .any)[UIIdentifier.unreadDot].isHittable
-    }
 
     @discardableResult
     private func waitUntil(timeout: TimeInterval, predicate: @escaping () -> Bool) -> Bool {

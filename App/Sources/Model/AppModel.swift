@@ -27,6 +27,9 @@ final class AppModel {
     var accountState: AccountState = .none
     var folders: [FolderSummary] = []
     var selectedFolderID: FolderID?
+    /// The list's full selection. `selectedMessageID` remains the reader
+    /// anchor so a single-message reader survives ordinary list updates.
+    var selectedMessageIDs: Set<MessageID> = []
     var selectedMessageID: MessageID?
     var detail: MessageDetail?
     var rawSource: String?
@@ -43,6 +46,9 @@ final class AppModel {
     var listEpoch: UInt64 = 0
     var isLoadingDetail = false
     var allowRemoteImages = false
+    /// Links are prepared while rows are loaded so AppKit's synchronous drag
+    /// source can place canonical deep-link strings on its pasteboard.
+    var messageDeepLinks: [MessageID: String] = [:]
 
     /// Whether the sanitized message contains an app-controlled remote-image
     /// token. The sanitizer computes this once when the detail is ingested.
@@ -57,6 +63,9 @@ final class AppModel {
     @ObservationIgnored private var streamsStarted = false
     @ObservationIgnored private var markedRead: Set<MessageID> = []
     @ObservationIgnored private var qaSelectionSequence: UInt64 = 0
+#if DEBUG
+    @ObservationIgnored private var qaContextMenuDumped = false
+#endif
 
     var selectedFolder: FolderSummary? {
         folders.first { $0.id == selectedFolderID }
@@ -159,12 +168,14 @@ final class AppModel {
     private func prepareFolderForRoute(_ folderID: FolderID) {
         if selectedFolderID == folderID {
             pageTask?.cancel()
+            selectedMessageIDs.removeAll()
             selectedMessageID = nil
             detail = nil
             rawSource = nil
             isShowingRawSource = false
             listRows = []
             listCursor = nil
+            messageDeepLinks.removeAll()
             listEpoch += 1
             return
         }
@@ -253,9 +264,11 @@ final class AppModel {
             foldersSnapshotReady = false
             folders = []
             selectedFolderID = nil
+            selectedMessageIDs.removeAll()
             selectedMessageID = nil
             detail = nil
             listRows = []
+            messageDeepLinks.removeAll()
             SettingsWindowController.shared.show(model: self, appearance: appearance, actions: actions)
         case .authFailed(let message):
             foldersSnapshotReady = false
@@ -277,12 +290,14 @@ final class AppModel {
         guard selectedFolderID != id else { return }
         selectedFolderID = id
         (facade as? LiveMailFacade)?.reportVisibleFolder(id)
+        selectedMessageIDs.removeAll()
         selectedMessageID = nil
         detail = nil
         rawSource = nil
         isShowingRawSource = false
         listRows = []
         listCursor = nil
+        messageDeepLinks.removeAll()
         isLoadingList = id != nil
         listEpoch += 1
         observeTask?.cancel()
@@ -325,7 +340,35 @@ final class AppModel {
         }
     }
 
+    /// Updates the list selection and keeps a single anchor for the reader.
+    /// Multi-selection deliberately clears detail: there is no ambiguous
+    /// "current message" in the reader while several rows are selected.
+    func selectMessages(_ ids: Set<MessageID>, anchor: MessageID? = nil) {
+        guard !ids.isEmpty else {
+            selectMessage(nil)
+            return
+        }
+        selectedMessageIDs = ids
+        let retainedAnchor = selectedMessageID.flatMap { ids.contains($0) ? $0 : nil }
+        selectedMessageID = anchor.flatMap { ids.contains($0) ? $0 : nil } ?? retainedAnchor ?? ids.first
+        guard ids.count == 1, let selectedMessageID else {
+            clearReaderSelection()
+            return
+        }
+        loadMessageDetail(selectedMessageID)
+    }
+
     func selectMessage(_ id: MessageID?) {
+        selectedMessageIDs = id.map { [$0] } ?? []
+        selectedMessageID = id
+        guard let id else {
+            clearReaderSelection()
+            return
+        }
+        loadMessageDetail(id)
+    }
+
+    private func loadMessageDetail(_ id: MessageID) {
         qaSelectionSequence &+= 1
         let qaSelection = qaSelectionSequence
         #if DEBUG
@@ -335,22 +378,17 @@ final class AppModel {
             )
         }
         #endif
-        selectedMessageID = id
         isShowingRawSource = false
         rawSource = nil
         isFindPresented = false
         findQuery = ""
         allowRemoteImages = false
-        guard let id else {
-            detail = nil
-            return
-        }
         isLoadingDetail = true
         Task { [weak self] in
             guard let self else { return }
             do {
                 let loaded = try await facade.detail(id)
-                guard selectedMessageID == id else { return }
+                guard selectedMessageID == id, selectedMessageIDs == Set([id]) else { return }
                 detail = loaded
                 isLoadingDetail = false
                 #if DEBUG
@@ -366,6 +404,16 @@ final class AppModel {
                 toasts.post(title: "Couldn’t open message", detail: error.localizedDescription)
             }
         }
+    }
+
+    private func clearReaderSelection() {
+        detail = nil
+        isLoadingDetail = false
+        rawSource = nil
+        isShowingRawSource = false
+        isFindPresented = false
+        findQuery = ""
+        allowRemoteImages = false
     }
     #if DEBUG
     /// QA-only selection benchmark. It exercises the same model path used by
@@ -441,47 +489,83 @@ final class AppModel {
     }
 
     func perform(_ kind: SwipeActionKind, on id: MessageID) {
-        guard let index = listRows.firstIndex(where: { $0.id == id }) else { return }
+        perform(kind, on: [id])
+    }
+
+    /// Performs one gesture/menu operation as a single persisted batch.
+    func perform(_ kind: SwipeActionKind, on ids: Set<MessageID>) {
+        let activeIDs = ids.filter { id in listRows.contains { $0.id == id } }
+        guard !activeIDs.isEmpty else { return }
+        let orderedIDs = activeIDs.sorted { $0.rawValue < $1.rawValue }
         switch kind {
         case .archive:
-            removeListRow(id)
-            Task { [weak self] in await self?.facade.archive(id) }
+            removeListRows(activeIDs)
+            Task { [weak self] in await self?.facade.archive(orderedIDs) }
         case .trash:
-            removeListRow(id)
-            Task { [weak self] in await self?.facade.trash(id) }
+            removeListRows(activeIDs)
+            Task { [weak self] in await self?.facade.trash(orderedIDs) }
         case .toggleRead:
-            var row = listRows[index]
-            row.isRead.toggle()
-            listRows[index] = row
-            let isRead = row.isRead
+            let shouldRead = activeIDs.contains { id in
+                !(listRows.first(where: { $0.id == id })?.isRead ?? false)
+            }
+            for index in listRows.indices where activeIDs.contains(listRows[index].id) {
+                listRows[index].isRead = shouldRead
+            }
             Task { [weak self] in
-                if isRead {
-                    await self?.facade.markRead(id)
+                if shouldRead {
+                    await self?.facade.markRead(orderedIDs)
                 } else {
-                    await self?.facade.markUnread(id)
+                    await self?.facade.markUnread(orderedIDs)
                 }
             }
         case .toggleFlag:
-            var row = listRows[index]
-            row.isFlagged.toggle()
-            listRows[index] = row
-            let flagged = row.isFlagged
+            let shouldFlag = activeIDs.contains { id in
+                !(listRows.first(where: { $0.id == id })?.isFlagged ?? false)
+            }
+            for index in listRows.indices where activeIDs.contains(listRows[index].id) {
+                listRows[index].isFlagged = shouldFlag
+            }
             Task { [weak self] in
-                await self?.facade.setFlagged(id, flagged)
+                await self?.facade.setFlagged(orderedIDs, shouldFlag)
             }
         }
     }
 
-    private func removeListRow(_ id: MessageID) {
-        listRows.removeAll { $0.id == id }
-        if selectedMessageID == id {
+    /// Optimistically removes rows, preserving a still-selected reader anchor
+    /// when one exists.
+    private func removeListRows(_ ids: Set<MessageID>) {
+        let anchorRemoved = selectedMessageID.map(ids.contains) ?? false
+        listRows.removeAll { ids.contains($0.id) }
+        selectedMessageIDs.subtract(ids)
+        if anchorRemoved {
+            selectedMessageID = selectedMessageIDs.first
+            clearReaderSelection()
+        } else if selectedMessageIDs.isEmpty {
             selectedMessageID = nil
-            detail = nil
-            isLoadingDetail = false
-            rawSource = nil
-            isShowingRawSource = false
-            isFindPresented = false
+            clearReaderSelection()
         }
+    }
+
+    func move(ids: Set<MessageID>, to folder: FolderID) {
+        guard !ids.isEmpty, folder != selectedFolderID else { return }
+        let activeIDs = ids.filter { id in listRows.contains { $0.id == id } }
+        guard !activeIDs.isEmpty else { return }
+        let orderedIDs = activeIDs.sorted { $0.rawValue < $1.rawValue }
+        removeListRows(activeIDs)
+        Task { [weak self] in
+            await self?.facade.move(orderedIDs, to: folder)
+        }
+    }
+    func moveDroppedLinks(_ links: [String], to folder: FolderID) async {
+        guard folder != selectedFolderID else { return }
+        var ids: Set<MessageID> = []
+        for rawLink in links {
+            guard let link = MailternalDeepLink(string: rawLink),
+                  let resolution = try? await facade.resolve(link),
+                  case .message(_, let messageID, _) = resolution else { continue }
+            ids.insert(messageID)
+        }
+        move(ids: ids, to: folder)
     }
 
     func openSearchResult(_ row: MessageRow) {
@@ -534,6 +618,28 @@ final class AppModel {
         SettingsWindowController.shared.show(model: self, appearance: appearance, actions: actions)
     }
 
+    /// Opens a message in its own reader window. The detail fetch supplies
+    /// the AppKit window title while the window's reader performs its own
+    /// independent detail load.
+    func openMessageWindow(_ id: MessageID) {
+        Task { [weak self] in
+            guard let self else { return }
+            var subject: String?
+            do {
+                let detail = try await facade.detail(id)
+                subject = detail.envelope.subject
+            } catch {
+                subject = nil
+            }
+            guard !Task.isCancelled else { return }
+            MessageWindowController.shared.show(
+                messageID: id,
+                model: self,
+                title: subject
+            )
+        }
+    }
+
     func loadRawSource() async {
         guard let id = selectedMessageID else { return }
         do {
@@ -565,6 +671,40 @@ final class AppModel {
             ?? (detail?.id == message ? detail?.envelope.subject : nil) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(subject, forType: .string)
+    }
+    func copySubjects(for ids: Set<MessageID>) {
+        let subjects = ids.sorted { $0.rawValue < $1.rawValue }.compactMap { id in
+            listRows.first(where: { $0.id == id })?.subject
+                ?? (detail?.id == id ? detail?.envelope.subject : nil)
+        }
+        guard !subjects.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(subjects.joined(separator: "\n"), forType: .string)
+    }
+
+    func copyDeepLinks(for ids: Set<MessageID>) async {
+        var values: [String] = []
+        for id in ids.sorted(by: { $0.rawValue < $1.rawValue }) {
+            if let cached = messageDeepLinks[id] {
+                values.append(cached)
+                continue
+            }
+            if let link = try? await facade.makeDeepLink(for: id),
+               let value = link.formattedString {
+                messageDeepLinks[id] = value
+                values.append(value)
+            }
+        }
+        guard !values.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(values.joined(separator: "\n"), forType: .string)
+    }
+
+    /// Synchronous view-side lookup used by the AppKit drag source. Rows are
+    /// prefetched as they enter the model; an incomplete cache simply omits
+    /// unavailable links rather than emitting a non-canonical identity.
+    func messageLinks(for ids: Set<MessageID>) -> [String] {
+        ids.sorted(by: { $0.rawValue < $1.rawValue }).compactMap { messageDeepLinks[$0] }
     }
 
     func copyDeepLink(for folder: FolderID) async {
@@ -603,6 +743,10 @@ final class AppModel {
 
 
     private func applyFirstPage(_ page: MessagePage) {
+        prefetchDeepLinks(for: page.rows)
+#if DEBUG
+        dumpQAContextMenuIfRequested(firstRow: page.rows.first)
+#endif
         if listRows.isEmpty {
             listRows = page.rows
             listCursor = page.next
@@ -622,10 +766,44 @@ final class AppModel {
     }
 
     private func appendPage(_ page: MessagePage) {
+        prefetchDeepLinks(for: page.rows)
         let existing = Set(listRows.map(\.id))
         listRows.append(contentsOf: page.rows.filter { !existing.contains($0.id) })
         listCursor = page.next
     }
+
+    private func prefetchDeepLinks(for rows: [MessageRow]) {
+        for row in rows where messageDeepLinks[row.id] == nil {
+            let id = row.id
+            Task { [weak self] in
+                guard let self else { return }
+                guard let link = try? await facade.makeDeepLink(for: id),
+                      let value = link.formattedString else { return }
+                messageDeepLinks[id] = value
+            }
+        }
+    }
+#if DEBUG
+    private func dumpQAContextMenuIfRequested(firstRow: MessageRow?) {
+        guard !qaContextMenuDumped,
+              ProcessInfo.processInfo.environment["MAILTERNAL_QA_MENU"] == "1",
+              let firstRow else { return }
+        qaContextMenuDumped = true
+        let readStates = [firstRow.id: firstRow.isRead]
+        let flagStates = [firstRow.id: firstRow.isFlagged]
+        let policyItems = MessageContextMenuPolicy.items(
+            selection: [firstRow.id],
+            isReadStates: readStates,
+            flagStates: flagStates,
+            folders: folders,
+            current: selectedFolderID
+        )
+        let titles = policyItems.flatMap { item in
+            [item.title] + item.children.map(\.title)
+        }
+        QALaunch.log("context-menu titles=\(titles.joined(separator: " | "))")
+    }
+#endif
 
     private func folderContaining(_ id: MessageID) -> FolderID? {
         if let mock = facade as? MockMailFacade {

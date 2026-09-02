@@ -17,7 +17,6 @@ enum UIIdentifier {
     static let quarantineBanner = "quarantine-banner"
     static let toastStack = "toast-stack"
     static let toast = "toast"
-    static let unreadDot = "message-unread-dot"
     static let setupDisplayName = "setup-display-name"
     static let setupEmail = "setup-email"
     static let setupUsername = "setup-username"
@@ -45,6 +44,8 @@ enum UIIdentifier {
         "sidebar-folder-\(path)"
     }
 }
+
+
 
 
 /// Geometry shared by the detail viewer and its focused layout tests.

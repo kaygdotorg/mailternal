@@ -45,11 +45,13 @@ message + FTS rows in bounded cleanup batches. Never blank the UI on a big folde
   `\Seen` transition is the explicit queued store below.
 
 ### Write queues
-0.0.1 supports five user mutations: **seen**, **unseen**, **flagged**,
-**archive**, and **trash**. Flag operations share one persisted queue keyed by
-`(account, mailbox, UIDVALIDITY, UID, flag)`; later operations for the same flag
-replace earlier ones. Move operations share the historical `archive_queue` table
-and carry a destination role.
+0.0.1 supports six user mutations: **seen**, **unseen**, **flagged**,
+**archive**, **trash**, and **move-to-folder**. Flag operations share one
+persisted queue keyed by `(account, mailbox, UIDVALIDITY, UID, flag)`; later
+operations for the same flag replace earlier ones. Move operations share the
+historical `archive_queue` table and carry either a destination role or the
+destination folder identity. Facade batches are enqueued in one local
+transaction and drained as one UID set when their source and destination match.
 
 #### Flags (`\Seen` and `\Flagged`)
 - Local read, unread, flag, and unflag actions enqueue a persisted op with
@@ -65,20 +67,24 @@ and carry a destination role.
   override, and records a sync error.
 - Ops whose UIDVALIDITY no longer matches the live generation are discarded.
 
-#### Moves (`archive` and `trash`)
-- Local archive or trash enqueues a persisted, coalesced op
-  `(account, mailbox, UIDVALIDITY, UID, destination)` and optimistically
-  deletes the message row from the source folder in the same local write
-  transaction. The next delta reconciles server truth after a crash or failed
-  send.
-- When the session advertises `MOVE`, send `UID MOVE <uid> <destination-mailbox>`.
-  Otherwise send `UID COPY <uid> <destination-mailbox>`, then
-  `UID STORE <uid> +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE <uid>` so only
-  the moved UID is expunged.
-- Only a tagged `OK` for the complete server operation dequeues the op. Transport
-  errors, `BYE`, and connection loss retain it for retry; tagged `NO`/`BAD` drops
-  it and records a move error. If the destination role has no folder, the op is
-  dropped and an error-log row records the missing folder.
+#### Moves (`archive`, `trash`, and move-to-folder)
+- Local archive, trash, or move-to-folder enqueues a persisted, coalesced op
+  `(account, mailbox, UIDVALIDITY, UID, destination[, destination_folder_id])`
+  and optimistically deletes the message row from the source folder in the same
+  local write transaction. The next delta reconciles server truth after a crash
+  or failed send.
+- A folder destination is resolved by its stable folder identity to its current
+  server path at drain time; a retired or missing destination is discarded and
+  an error-log row records the failure. Role destinations retain their
+  role-based resolution.
+- When the session advertises `MOVE`, send `UID MOVE <uid-set> <destination-mailbox>`.
+  Otherwise send `UID COPY <uid-set> <destination-mailbox>`, then
+  `UID STORE <uid-set> +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE <uid-set>` so
+  only the moved UIDs are expunged. Matching queued moves are batched into one
+  server operation.
+- Only a tagged `OK` for the complete server operation dequeues the ops.
+  Transport errors, `BYE`, and connection loss retain them for retry; tagged
+  `NO`/`BAD` drops them and records a move error.
 - Ops whose UIDVALIDITY no longer matches the live generation are dropped without
   a server write. Replacement activation and every UIDVALIDITY mismatch cleanup
   apply this stale-op rule.
@@ -131,7 +137,7 @@ and carry a destination role.
 - **One SQLite database** (GRDB, WAL): accounts (non-secret settings only — secrets
   live in Keychain), folders, generations, messages (envelope, flags, body text, raw
   sanitized HTML, normalized `Message-ID`/`References`/`In-Reply-To`), sync state
-  (per-folder path selection, HIGHESTMODSEQ, cursors), seen/archive write queues,
+  (per-folder path selection, HIGHESTMODSEQ, cursors), seen/flag/move write queues,
   parse-error records.
 - All writes through a single writer queue; bounded batch transactions; observation
   notifications debounced/coalesced after commit.

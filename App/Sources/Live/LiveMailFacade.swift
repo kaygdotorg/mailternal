@@ -306,25 +306,37 @@ final class LiveMailFacade: MailFacade {
         try await store.resolve(link)
     }
 
-
-    func markRead(_ id: MessageID) async {
-        try? await store.enqueueFlag(message: id, flag: .seen, set: true)
+    func markRead(_ ids: [MessageID]) async {
+        try? await store.enqueueFlag(messages: ids, flag: .seen, set: true)
     }
 
-    func markUnread(_ id: MessageID) async {
-        try? await store.enqueueFlag(message: id, flag: .seen, set: false)
+    func markUnread(_ ids: [MessageID]) async {
+        try? await store.enqueueFlag(messages: ids, flag: .seen, set: false)
     }
 
-    func trash(_ id: MessageID) async {
-        try? await store.enqueueMove(message: id, to: .trash)
+    func trash(_ ids: [MessageID]) async {
+        guard let destination = await folderID(for: .trash) else { return }
+        await move(ids, to: destination)
     }
 
-    func setFlagged(_ id: MessageID, _ flagged: Bool) async {
-        try? await store.enqueueFlag(message: id, flag: .flagged, set: flagged)
+    func setFlagged(_ ids: [MessageID], _ flagged: Bool) async {
+        try? await store.enqueueFlag(messages: ids, flag: .flagged, set: flagged)
     }
 
-    func archive(_ id: MessageID) async {
-        try? await store.enqueueMove(message: id, to: .archive)
+    func archive(_ ids: [MessageID]) async {
+        guard let destination = await folderID(for: .archive) else { return }
+        await move(ids, to: destination)
+    }
+
+    func move(_ ids: [MessageID], to folder: FolderID) async {
+        try? await store.enqueueMove(messages: ids, to: folder)
+    }
+
+    private func folderID(for role: FolderRole) async -> FolderID? {
+        guard let account = activeAccountID,
+              let folders = try? await store.fetchFolders(account: account)
+        else { return nil }
+        return folders.first(where: { $0.role == role })?.id
     }
 
     func rawSource(_ id: MessageID) async throws -> String {

@@ -31,19 +31,29 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     func detail(_ id: MessageID) async throws -> MessageDetail
     /// User-facing account label for titles and other account context.
     var accountDisplayName: String? { get }
-    /// Enqueues a local read mutation as `UID STORE +FLAGS.SILENT (\Seen)`.
-    func markRead(_ id: MessageID) async
-    /// Enqueues a local unread mutation as `UID STORE -FLAGS.SILENT (\Seen)`.
-    func markUnread(_ id: MessageID) async
+    /// Enqueues local read mutations as `UID STORE +FLAGS.SILENT (\Seen)`.
+    func markRead(_ ids: [MessageID]) async
+    /// Enqueues local unread mutations as `UID STORE -FLAGS.SILENT (\Seen)`.
+    func markUnread(_ ids: [MessageID]) async
+    /// Enqueues local `\Flagged` mutations.
+    func setFlagged(_ ids: [MessageID], _ flagged: Bool) async
     /// Enqueues a move to the server's Trash folder.
-    func trash(_ id: MessageID) async
-    /// Enqueues a local `\Flagged` mutation.
-    func setFlagged(_ id: MessageID, _ flagged: Bool) async
+    func trash(_ ids: [MessageID]) async
     /// Enqueues an archive move; the sync engine drains it. No-op toast-level failure is surfaced via error log.
-    func archive(_ id: MessageID) async
+    func archive(_ ids: [MessageID]) async
+    /// Enqueues a move to an arbitrary folder.
+    func move(_ ids: [MessageID], to folder: FolderID) async
     func rawSource(_ id: MessageID) async throws -> String
     /// On-demand attachment/inline-part fetch → file URL in the attachment cache.
     func fetchAttachment(_ message: MessageID, part: String) async throws -> URL
+
+    // Single-id convenience variants delegate to the atomic batch operations.
+    func markRead(_ id: MessageID) async
+    func markUnread(_ id: MessageID) async
+    func trash(_ id: MessageID) async
+    func setFlagged(_ id: MessageID, _ flagged: Bool) async
+    func archive(_ id: MessageID) async
+    func move(_ id: MessageID, to folder: FolderID) async
 
     // Search (FTS5 over synced history)
     func search(_ query: String, limit: Int) async throws -> [MessageRow]
@@ -57,4 +67,27 @@ public extension MailFacade {
     /// Facades that cannot expose persisted account settings may leave this
     /// unavailable; the app's live and mock facades provide it for editing.
     var accountConfig: AccountConfig? { nil }
+    func markRead(_ id: MessageID) async {
+        await markRead([id])
+    }
+
+    func markUnread(_ id: MessageID) async {
+        await markUnread([id])
+    }
+
+    func trash(_ id: MessageID) async {
+        await trash([id])
+    }
+
+    func setFlagged(_ id: MessageID, _ flagged: Bool) async {
+        await setFlagged([id], flagged)
+    }
+
+    func archive(_ id: MessageID) async {
+        await archive([id])
+    }
+
+    func move(_ id: MessageID, to folder: FolderID) async {
+        await move([id], to: folder)
+    }
 }

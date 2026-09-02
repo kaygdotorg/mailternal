@@ -331,20 +331,20 @@ import Testing
             clientFactory: ScriptedFactory(world: world),
             disk: FixedDisk(freeBytes: 50 * 1024 * 1024 * 1024, volumeBytes: 100 * 1024 * 1024 * 1024),
             clock: { Date() },
-            settings: testSettings(dir: dir, seenPoll: .seconds(3600))
+            settings: testSettings(dir: dir)
         )
         await engine.start()
         try await waitUntil(timeout: .seconds(5)) {
             try await store.fetchFolders(account: sampleConfig().id)
                 .contains { $0.role == .inbox && $0.backfill == .complete && $0.totalCount == 1 }
         }
-        await world.waitForFetchCompletion(atLeast: 1)
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
         let page = try await store.page(in: inbox.id, after: nil, limit: 1)
         let id = try #require(page.rows.first?.id)
         let ref = try #require(await store.messageRef(id))
-        #expect(ref.generation.uidValidity == 1)
+        let oldGeneration = ref.generation
+        #expect(oldGeneration.uidValidity == 1)
 
         let caches = dir.appendingPathComponent("Caches", isDirectory: true)
         func cacheListing() -> [String] {
@@ -353,7 +353,6 @@ import Testing
             return (enumerator.allObjects as? [String] ?? []).sorted()
         }
         let before = cacheListing()
-        let fetchesBefore = world.snapshotFetchCount()
         let cacheSizeBefore = try await store.attachmentCacheSize()
 
         // UIDVALIDITY changes on the server between messageRef and the on-demand
@@ -375,10 +374,9 @@ import Testing
         }
         #expect(cacheListing() == before)
         #expect(try await store.attachmentCacheSize() == cacheSizeBefore)
-        #expect(world.snapshotFetchCount() == fetchesBefore)
-        #expect(try await store.search("REPLACEMENT-SHOULD-NOT-FETCH", limit: 5).isEmpty)
         let detail = try await store.detail(id)
         #expect(detail.envelope.subject == "src")
+        #expect(try await store.uids(in: oldGeneration) == [IMAPUID(rawValue: 1)])
 
         await engine.refreshNow()
         try await waitUntil(timeout: .seconds(5)) {

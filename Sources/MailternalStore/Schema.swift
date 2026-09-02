@@ -95,6 +95,11 @@ enum Schema {
                 t.add(column: "has_remote_references", .boolean)
             }
         }
+        migrator.registerMigration("v9_move_destination_folder_id") { db in
+            try db.alter(table: "archive_queue") { t in
+                t.add(column: "destination_folder_id", .integer)
+            }
+        }
         return migrator
     }
 

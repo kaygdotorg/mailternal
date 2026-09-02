@@ -229,6 +229,9 @@ public struct MoveOp: Hashable, Sendable, Identifiable {
     public var uidValidity: UInt32
     public var uid: IMAPUID
     public var destination: FolderRole
+    /// Explicit destination identity, when the mutation targets an arbitrary
+    /// folder. The role remains populated for historical queue rows.
+    public var destinationFolderID: FolderID?
     public var copied: Bool
 
     public init(
@@ -238,6 +241,7 @@ public struct MoveOp: Hashable, Sendable, Identifiable {
         uidValidity: UInt32,
         uid: IMAPUID,
         destination: FolderRole = .archive,
+        destinationFolderID: FolderID? = nil,
         copied: Bool = false
     ) {
         self.id = id
@@ -246,6 +250,7 @@ public struct MoveOp: Hashable, Sendable, Identifiable {
         self.uidValidity = uidValidity
         self.uid = uid
         self.destination = destination
+        self.destinationFolderID = destinationFolderID
         self.copied = copied
     }
 }

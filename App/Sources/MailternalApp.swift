@@ -92,7 +92,7 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         #if DEBUG
-        if QALaunch.parse() != nil {
+        if let qa = QALaunch.parse(), qa.openWindowLink == nil {
             // SSH/headless: no WindowServer. Don't activate a UI session.
             NSApp.setActivationPolicy(.prohibited)
         } else {
@@ -112,7 +112,7 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
-        if QALaunch.parse() != nil {
+        if let qa = QALaunch.parse(), qa.openWindowLink == nil {
             // SwiftUI `.task` on MainSplitRoot may never fire without a rendered
             // window. Drive restore/engine from the delegate instead.
             QALaunch.log(
@@ -122,10 +122,14 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
             if let count = QALaunch.parse()?.benchSelectCount {
                 model?.runQABenchSelect(count: count)
             }
+            openQAMessageWindowIfRequested()
             return
         }
         #endif
         showMainWindow()
+        #if DEBUG
+        openQAMessageWindowIfRequested()
+        #endif
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -160,4 +164,31 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
         guard let model, let appearance, let actions else { return }
         MainWindowController.shared.show(model: model, appearance: appearance, actions: actions)
     }
+
+    #if DEBUG
+    private func openQAMessageWindowIfRequested() {
+        guard let link = QALaunch.parse()?.openWindowLink else { return }
+        Task { @MainActor [weak self] in
+            guard let self, let model else { return }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+            while !model.isAccountActive, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            guard model.isAccountActive else {
+                QALaunch.log("qa-open-window unavailable reason=account-inactive")
+                return
+            }
+            do {
+                guard let resolution = try await model.facade.resolve(link),
+                      case .message(_, let messageID, _) = resolution else {
+                    QALaunch.log("qa-open-window unavailable reason=message-not-found")
+                    return
+                }
+                model.openMessageWindow(messageID)
+            } catch {
+                QALaunch.log("qa-open-window unavailable reason=\(error.localizedDescription)")
+            }
+        }
+    }
+    #endif
 }
