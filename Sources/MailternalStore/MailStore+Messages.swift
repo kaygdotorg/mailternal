@@ -149,6 +149,26 @@ extension MailStore {
         }
     }
 
+    /// Returns every message ID in the folder's current live generation in the
+    /// same newest-first order as `page`. The generation pointer on `folders`
+    /// makes this a single indexed read without paging or materializing rows.
+    public func messageIDs(in folder: FolderID) async throws -> [MessageID] {
+        try await read { db in
+            let values = try Int64.fetchAll(
+                db,
+                sql: """
+                    SELECT m.id
+                    FROM messages m
+                    JOIN folders f ON f.live_generation_id = m.generation_id
+                    WHERE f.id = ? AND f.retired = 0
+                    ORDER BY m.internal_date DESC, m.uid DESC
+                    """,
+                arguments: [folder.rawValue]
+            )
+            return values.map { MessageID(rawValue: $0) }
+        }
+    }
+
     /// `EXPLAIN QUERY PLAN` for the pagination SELECT. Locks the keyset index.
     public func explainPageQueryPlan(
         in folder: FolderID,

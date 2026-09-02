@@ -20,6 +20,7 @@ enum MessageContextMenuPolicy {
         case moveTo(FolderID)
         case copyLink
         case copySubject
+        case viewRawSource
     }
 
     struct Item: Equatable, Sendable {
@@ -57,6 +58,7 @@ enum MessageContextMenuPolicy {
     ) -> [Item] {
         guard !selection.isEmpty else { return [] }
         let count = selection.count
+        let countLabel = count.formatted(.number)
         let shouldMarkRead = selection.contains { !(isReadStates[$0] ?? false) }
         let shouldFlag = selection.contains { !(flagStates[$0] ?? false) }
         let currentFolder = folders.first { $0.id == current }
@@ -75,17 +77,17 @@ enum MessageContextMenuPolicy {
             ),
             Item(title: shouldFlag ? "Flag" : "Unflag", action: shouldFlag ? .flag : .unflag),
             Item(
-                title: count > 1 ? "Move \(count) Messages to Junk" : "Move to Junk",
+                title: count > 1 ? "Move \(countLabel) Messages to Junk" : "Move to Junk",
                 action: .moveToJunk,
                 isEnabled: canMoveToJunk
             ),
             Item(
-                title: count > 1 ? "Delete \(count) Messages" : "Delete",
+                title: count > 1 ? "Delete \(countLabel) Messages" : "Delete",
                 action: .delete
             ),
             separator,
             Item(
-                title: count > 1 ? "Archive \(count) Messages" : "Archive",
+                title: count > 1 ? "Archive \(countLabel) Messages" : "Archive",
                 action: .archive
             ),
             moveMenu(folders: folders, current: current),
@@ -186,6 +188,131 @@ enum MessageContextMenuPolicy {
         }
     }
 }
+/// Pure policy for the message actions shown in the window toolbar. AppKit
+/// translates these values into `NSToolbarItem`s and `NSMenuItem`s; keeping the
+/// ordering and enablement here makes customization and validation testable
+/// without constructing a window.
+enum MessageToolbarPolicy {
+    enum Identifier: String, CaseIterable, Sendable {
+        case archive = "Mailternal.message.archive"
+        case trash = "Mailternal.message.trash"
+        case flag = "Mailternal.message.flag"
+        case overflow = "Mailternal.message.overflow"
+    }
+
+    struct VisibleItem: Equatable, Sendable {
+        let identifier: Identifier
+        let title: String
+        let imageName: String
+        let isEnabled: Bool
+    }
+
+    static let defaultItemIdentifiers: [Identifier] = [
+        .archive,
+        .trash,
+        .flag,
+        .overflow,
+    ]
+
+    static let allowedItemIdentifiers: [Identifier] = defaultItemIdentifiers
+
+    static func visibleItems(
+        selection: Set<MessageID>,
+        flagStates: [MessageID: Bool]
+    ) -> [VisibleItem] {
+        let count = selection.count
+        let plural = count > 1 ? " \(count.formatted(.number)) Messages" : ""
+        let shouldFlag = selection.contains { !(flagStates[$0] ?? false) }
+        let enabled = !selection.isEmpty
+        return [
+            VisibleItem(
+                identifier: .archive,
+                title: "Archive\(plural)",
+                imageName: "archivebox",
+                isEnabled: enabled
+            ),
+            VisibleItem(
+                identifier: .trash,
+                title: "Trash\(plural)",
+                imageName: "trash",
+                isEnabled: enabled
+            ),
+            VisibleItem(
+                identifier: .flag,
+                title: "\(shouldFlag ? "Flag" : "Unflag")\(plural)",
+                imageName: shouldFlag ? "flag" : "flag.slash",
+                isEnabled: enabled
+            ),
+        ]
+    }
+
+    static func overflowItems(
+        selection: Set<MessageID>,
+        isReadStates: [MessageID: Bool],
+        flagStates: [MessageID: Bool],
+        folders: [FolderSummary],
+        current: FolderID?
+    ) -> [MessageContextMenuPolicy.Item] {
+        let contextItems = MessageContextMenuPolicy.items(
+            selection: selection,
+            isReadStates: isReadStates,
+            flagStates: flagStates,
+            folders: folders,
+            current: current
+        )
+        let shouldMarkRead = selection.isEmpty || selection.contains {
+            !(isReadStates[$0] ?? false)
+        }
+        let markTitle = shouldMarkRead ? "Mark as Read" : "Mark as Unread"
+        let markAction: MessageContextMenuPolicy.Action = shouldMarkRead
+            ? .markRead
+            : .markUnread
+        let fallbackMove = MessageContextMenuPolicy.Item(
+            title: "Move to",
+            isEnabled: false
+        )
+        let itemsByAction: (MessageContextMenuPolicy.Action) -> MessageContextMenuPolicy.Item? = {
+            action in
+            contextItems.first { $0.action == action }
+        }
+        let mark = itemsByAction(markAction) ?? MessageContextMenuPolicy.Item(
+            title: markTitle,
+            action: markAction,
+            isEnabled: false
+        )
+        let junk = itemsByAction(.moveToJunk) ?? MessageContextMenuPolicy.Item(
+            title: selection.count > 1
+                ? "Move \(selection.count.formatted(.number)) Messages to Junk"
+                : "Move to Junk",
+            action: .moveToJunk,
+            isEnabled: false
+        )
+        let move = contextItems.first { $0.title == "Move to" } ?? fallbackMove
+        let open = itemsByAction(.openInNewWindow) ?? MessageContextMenuPolicy.Item(
+            title: "Open in New Window",
+            action: .openInNewWindow,
+            isEnabled: false
+        )
+        let copyLink = itemsByAction(.copyLink) ?? MessageContextMenuPolicy.Item(
+            title: "Copy Link",
+            action: .copyLink,
+            isEnabled: false
+        )
+        let copySubject = itemsByAction(.copySubject) ?? MessageContextMenuPolicy.Item(
+            title: "Copy Subject",
+            action: .copySubject,
+            isEnabled: false
+        )
+        let raw = MessageContextMenuPolicy.Item(
+            title: "View Raw Source",
+            action: .viewRawSource,
+            isEnabled: selection.count == 1
+        )
+        return [mark, junk, move, open, MessageContextMenuPolicy.Item(title: ""),
+                copyLink, copySubject, raw]
+    }
+}
+
 
 private extension Array {
     subscript(safe index: Int) -> Element? {
@@ -194,9 +321,12 @@ private extension Array {
     }
 }
 
-/// The exact pasteboard payload used for dragging messages to a mailbox.
+/// The pasteboard payload used for dragging messages to a mailbox. Canonical
+/// deep links are preferred; local IDs fill the payload for selected rows whose
+/// links have not finished prefetching yet.
 enum MessageLinkPasteboard {
     static let type = "org.kayg.mailternal.message-links"
+    private static let messageIDPrefix = "mailternal-message-id:"
 
     static func encode(_ links: [String]) -> Data {
         (try? JSONEncoder().encode(links)) ?? Data("[]".utf8)
@@ -205,6 +335,16 @@ enum MessageLinkPasteboard {
     static func decode(_ data: Data) -> [String]? {
         try? JSONDecoder().decode([String].self, from: data)
     }
+
+    static func encodeMessageID(_ id: MessageID) -> String {
+        "\(messageIDPrefix)\(id.rawValue)"
+    }
+
+    static func decodeMessageID(_ value: String) -> MessageID? {
+        guard value.hasPrefix(messageIDPrefix),
+              let rawValue = Int64(value.dropFirst(messageIDPrefix.count)) else { return nil }
+        return MessageID(rawValue: rawValue)
+    }
 }
 
 /// Reader state shown instead of a single-message detail when the list has a
@@ -212,7 +352,7 @@ enum MessageLinkPasteboard {
 /// without constructing a SwiftUI view.
 enum MessageReaderStatePolicy {
     static func emptyStateTitle(selectionCount: Int) -> String? {
-        selectionCount > 1 ? "\(selectionCount) Messages Selected" : nil
+        selectionCount > 1 ? "\(selectionCount.formatted(.number)) Messages Selected" : nil
     }
 
     static func emptyStateDetail(selectionCount: Int) -> String? {

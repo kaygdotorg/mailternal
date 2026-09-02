@@ -285,6 +285,10 @@ final class LiveMailFacade: MailFacade {
         try await store.page(in: folder, after: cursor, limit: limit)
     }
 
+    func messageIDs(in folder: FolderID) async throws -> [MessageID] {
+        try await store.messageIDs(in: folder)
+    }
+
     func observePage(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) -> AsyncStream<MessagePage> {
         store.observePage(in: folder, after: cursor, limit: limit)
     }
