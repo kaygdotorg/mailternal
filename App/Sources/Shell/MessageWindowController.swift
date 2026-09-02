@@ -12,7 +12,7 @@ final class MessageWindowController: NSObject, NSWindowDelegate {
     static let shared = MessageWindowController()
 
     private var windows: [MessageID: NSWindow] = [:]
-
+    private var toolbarControllers: [MessageID: MainToolbarController] = [:]
     private override init() {
         super.init()
     }
@@ -36,6 +36,7 @@ final class MessageWindowController: NSObject, NSWindowDelegate {
             appearance: model.appearance,
             actions: model.actions
         )
+        readerModel.selectMessage(messageID)
         let shell = MessageWindowShellViewController(
             model: readerModel,
             messageID: messageID,
@@ -60,16 +61,16 @@ final class MessageWindowController: NSObject, NSWindowDelegate {
         )
         MessageWindowStartupConfiguration.prepare(window)
         window.delegate = self
-        window.title = title ?? ""
-        let toolbar = NSToolbar(identifier: "Mailternal.MessageToolbar")
-        toolbar.displayMode = .iconOnly
-        window.toolbar = toolbar
-        window.contentViewController = shell
-        window.setContentSize(MessageWindowStartupConfiguration.defaultContentSize)
+        let toolbarController = MainToolbarController(
+            model: readerModel,
+            includesSidebarToggle: false
+        )
+        window.toolbar = toolbarController.makeToolbar(identifier: "Mailternal.MessageToolbar")
+        toolbarControllers[messageID] = toolbarController
+        MainWindowStartupConfiguration.attach(shell, to: window)
         window.center()
 
         windows[messageID] = window
-        readerModel.selectMessage(messageID)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
     }
@@ -78,6 +79,7 @@ final class MessageWindowController: NSObject, NSWindowDelegate {
         guard let window = notification.object as? NSWindow else { return }
         if let messageID = windows.first(where: { $0.value === window })?.key {
             windows.removeValue(forKey: messageID)
+            toolbarControllers.removeValue(forKey: messageID)
         }
     }
 
