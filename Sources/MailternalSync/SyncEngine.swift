@@ -350,8 +350,8 @@ public actor SyncEngine {
         for continuation in mailWaiters.values {
             continuation.yield(event)
         }
-    }
 
+    }
     private func ensureRunning() throws {
         if stopping || runTask == nil { throw SyncEngineError.stopped }
     }

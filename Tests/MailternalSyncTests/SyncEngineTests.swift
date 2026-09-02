@@ -26,11 +26,7 @@ import Testing
             clock: { Date(timeIntervalSince1970: 1_800_000_000) },
             settings: testSettings(dir: dir)
         )
-        let events = EventLog()
         let mail = await engine.newMail
-        let collector = Task {
-            for await event in mail { events.append(event) }
-        }
         await engine.start()
         try await waitUntil(timeout: .seconds(15)) {
             let folders = try await store.fetchFolders(account: sampleConfig().id)
@@ -43,7 +39,6 @@ import Testing
         #expect(state.baselineUID?.rawValue == 3)
         #expect(try await store.search("alpha", limit: 5).count == 1)
         #expect(try await store.search("gamma", limit: 5).count == 1)
-        #expect(events.snapshot().isEmpty)
 
         world.updateMailbox("INBOX") { live in
             live.messages[4] = makePlainMessage(uid: 4, subject: "new", body: "delta live")
@@ -54,15 +49,15 @@ import Testing
         try await waitUntil(timeout: .seconds(5)) {
             try await store.search("delta", limit: 5).count == 1
         }
-        try await waitUntil(timeout: .seconds(2)) { events.snapshot().count == 1 }
-        #expect(events.snapshot()[0].subject == "new")
-        #expect(events.snapshot()[0].folder == inbox.id)
+        let event = try await nextMailEvent(from: mail, timeout: .seconds(2))
+        #expect(event.subject == "new")
+        #expect(event.folder == inbox.id)
 
         await engine.refreshNow()
-        try await Task.sleep(for: .milliseconds(80))
-        #expect(events.snapshot().count == 1)
+        await #expect(throws: WaitTimeout.self) {
+            _ = try await nextMailEvent(from: mail, timeout: .seconds(2))
+        }
 
-        collector.cancel()
         await engine.stop()
     }
 }
@@ -428,25 +423,20 @@ import Testing
         }
 
         let second = makeEngine()
-        let events = EventLog()
         let mail = await second.newMail
-        let collector = Task {
-            for await event in mail { events.append(event) }
-        }
         await second.start()
         try await waitUntil(timeout: .seconds(5)) {
             try await store.search("delta", limit: 5).count == 1
         }
-        try await waitUntil(timeout: .seconds(2)) { events.snapshot().count == 1 }
-        #expect(events.snapshot()[0].subject == "offline")
+        let event = try await nextMailEvent(from: mail, timeout: .seconds(2))
+        #expect(event.subject == "offline")
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
         #expect(inbox.totalCount == 4)
-        collector.cancel()
         await second.stop()
+
     }
 }
-
 @Test func engineSwitchesGenerationOnUIDValidityChangeWithoutNotifying() async throws {
     try await withSyncStore { store, dir in
         var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 3, highestModSeq: 4)
@@ -747,11 +737,7 @@ import Testing
 
         world.fetchNanos = 0
         let second = makeEngine()
-        let events = EventLog()
         let mail = await second.newMail
-        let collector = Task {
-            for await event in mail { events.append(event) }
-        }
         await second.start()
         try await waitUntil(timeout: .seconds(8)) {
             try await store.fetchFolders(account: sampleConfig().id)
@@ -759,7 +745,6 @@ import Testing
         }
         let logs = try await store.fetchErrorLog()
         #expect(logs.contains { $0.message == "resuming backfill from cursor" })
-        #expect(events.snapshot().isEmpty)
 
         world.updateMailbox("INBOX") { live in
             live.messages[9] = makePlainMessage(uid: 9, subject: "live-new", body: "fresh")
@@ -770,9 +755,8 @@ import Testing
         try await waitUntil(timeout: .seconds(5)) {
             try await store.search("fresh", limit: 5).count == 1
         }
-        try await waitUntil(timeout: .seconds(2)) { events.snapshot().count == 1 }
-        #expect(events.snapshot()[0].subject == "live-new")
-        collector.cancel()
+        let event = try await nextMailEvent(from: mail, timeout: .seconds(2))
+        #expect(event.subject == "live-new")
         await second.stop()
 
         let third = makeEngine()

@@ -1148,6 +1148,24 @@ func waitUntil(
 }
 
 struct WaitTimeout: Error {}
+func nextMailEvent(
+    from stream: AsyncStream<NewMailEvent>,
+    timeout: Duration
+) async throws -> NewMailEvent {
+    try await withThrowingTaskGroup(of: NewMailEvent.self) { group in
+        group.addTask {
+            var iterator = stream.makeAsyncIterator()
+            guard let event = await iterator.next() else { throw WaitTimeout() }
+            return event
+        }
+        group.addTask {
+            try await Task.sleep(for: timeout)
+            throw WaitTimeout()
+        }
+        defer { group.cancelAll() }
+        return try await group.next()!
+    }
+}
 
 final class EventCountLog: @unchecked Sendable {
     private let lock = NSLock()
