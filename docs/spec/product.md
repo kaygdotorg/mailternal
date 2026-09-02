@@ -33,12 +33,16 @@ two documents appear to conflict, design.md governs UI architecture.
 - v0.0.1: exactly **one IMAP account**.
 - Providers: generic IMAP, iCloud and Fastmail via app-specific passwords
   (setup presets with guidance).
-- **Consumer Gmail is unsupported** until OAuth + CASA verification is worth paying for.
-  Exchange: never.
+- **Gmail** (M4, required on macOS, iOS and CLI): **App Password** is the default,
+  guided path (2-Step Verification required; deep link to Google's page, paste
+  field); **bring-your-own OAuth client** (user's own Google Cloud client id, PKCE,
+  loopback redirect) is the advanced path. No Mailternal-owned client id and no CASA
+  assessment until revenue justifies the annual fee. Never a web-session/scraping
+  path (blocked by Google since 2021; it killed Mailplane). Exchange: never.
 - Account setup: manual host/port/TLS entry + provider presets (a plist, not a
   discovery subsystem). Full Thunderbird-autoconfig/RFC 6186 later.
-- **0.0.1 collects IMAP settings only** — no SMTP credential collection, connection,
-  or validation before 0.0.2 (presets may carry dormant non-secret SMTP defaults).
+- **SMTP is collected only with the composer milestone (M5)**; presets may carry
+  dormant non-secret SMTP defaults until then.
 - **Transport**: implicit TLS or mandatory STARTTLS with hostname + system-trust
   validation; no insecure fallback, no plaintext auth outside TLS; capabilities
   re-fetched after STARTTLS and after auth. The Linux core enforces the same rules
@@ -46,17 +50,18 @@ two documents appear to conflict, design.md governs UI architecture.
   cancelable error UX.
 - **Secrets live in the Keychain**, never in SQLite.
 
-## 0.0.1 surface (macOS only)
-Screens: folder sidebar → flat chronological message list per folder → message viewer →
-account setup. No threading (0.0.2).
+## App surface (macOS first; iOS in M6)
+Screens: folder sidebar → flat chronological message list per folder (configurable
+swipe actions, Settings → Actions → Gestures) → reader as three floating islands
+(subject / expandable headers / body) → account setup. No threading in 0.0.1.
 
-- **Pragmatic read-only**: exactly one server write — `\Seen` propagation — so unread
-  state never rots on the user's other clients. No archive/delete/move/flag/compose.
-  **No sending — hard requirement.**
+- **Mutations**: seen, unseen, flagged/unflagged, archive, trash — all through
+  persisted optimistic queues (sync.md). **No sending until M5.**
 - **Full-text search** over the entire synced history, offline, instant (FTS5).
   Windowed/degraded sync states disclose "search covers mail since <date>".
-- HTML mail in `WKWebView`: **remote images blocked by default**, plain-text fallback,
-  no dark-mode HTML remapping in 0.0.1.
+- HTML mail in `WKWebView`: **remote images blocked by default** (notice shown only
+  when the message references remote content), inline `cid:` parts always shown,
+  Email Reading mode Original/Dark with an opaque canvas, plain-text fallback.
 - Live updates via in-app IMAP IDLE + macOS local notifications (no daemon needed on
   macOS). Notifications fire only for post-activation mail — never from backfill
   (baseline rule in sync.md).
@@ -64,8 +69,10 @@ account setup. No threading (0.0.2).
   per-folder backfill progress in the sidebar; backfill continues in background.
 
 ## Non-goals for 0.0.1
-Compose/send, threading, triage actions, multi-account, unified inbox, iOS, CLI,
-daemon, monetization, rules/snooze/send-later, JMAP, Gmail.
+Threading, multi-account, unified inbox, rules/snooze/send-later, JMAP, monetization,
+a Mailternal-owned Gmail OAuth client. The CLI, iOS and the daemon are **in** 0.0.1
+(roadmap.md); the CLI and automation architecture are specified in `cli.md`,
+`automation.md`, `pairing.md`, `docs.md`.
 
 ## Engineering ground rules
 - Swift everywhere: one core package `MailternalCore` shared by apps, CLI, daemon.

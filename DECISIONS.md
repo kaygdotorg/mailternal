@@ -43,3 +43,41 @@ rationale → revisit-when.
     an NSE for `mutable-content:1` alert payloads; silent `content-available` wakes
     go to the app and are throttled. Generic "New mail" alert + NSE rewrite gives an
     automatic timeout fallback and keeps APNs content-free.
+14. **CLI is a remote control for the whole app, not a second client.** All UI state
+    is one Codable state document mutated only by a `Command` enum; the CLI sends the
+    same commands over a container socket. Structural parity (exhaustive switch)
+    beats "automation bolted on" — every later screen would need its own hooks.
+    Performance thresholds are CI gates (`automation.md`). Revisit: never.
+15. **Unix socket + newline JSON, not XPC.** One protocol serves the app, `mailternald`
+    and a future iOS client; XPC is macOS-only and cannot serve the daemon.
+16. **Remote access = SSH or a paired TLS listener bound to the overlay interface.**
+    Tailscale/NetBird are transport, not auth: per-client bearer token + pinned
+    self-signed cert learned only via pairing. Credentials never leave the Mac.
+17. **Reversibility over gates.** Mutating CLI commands need no `--yes`; an
+    `op_journal` shared with ⌘Z makes them undoable. `--yes` trains agents to pass it
+    reflexively; undo actually protects.
+18. **Message identity is the deep link everywhere** (AccountLinkID + folder locator +
+    UIDVALIDITY/UID): non-secret, stable, cross-device; CLI rows print it as `link`.
+19. **Gmail via App Password (default) + bring-your-own OAuth client (advanced); no
+    CASA.** Google requires an annual lab assessment ($540–1,800/yr) for any app
+    shipping its own restricted-scope client id; Thunderbird/K-9/Mimestream pay it,
+    FairEmail/mutt/aerc don't. Unverified projects cap at 100 lifetime users. App
+    passwords remain officially supported for consumer IMAP/SMTP with 2SV (research/
+    google-gmail-oauth-verification-2026.md). Web-session scraping is blocked by
+    Google and against ToS (it killed Mailplane) — never. Revisit when revenue
+    justifies the fee.
+20. **Pairing is a direction-free handshake.** QR/8-word code carries a session key +
+    rendezvous; the encrypted bundle then flows either way (push or pull), covering
+    every device pair. iCloud Keychain sync when both devices share an iCloud
+    account; CLI reads the same Keychain item via a shared access group.
+21. **Static Linux CLI vendors SQLite.** GRDB expects system `libsqlite3`, which the
+    Static Linux SDK lacks; bundle the amalgamation as a C target (macOS uses system
+    SQLite). Bigger binary accepted; measure, maybe publish both variants.
+22. **Docs are generated reference + hand-written Diátaxis guides, built from the
+    repo by Kiln on tag** (`docs.md`). Public symbols only; denylist grep before
+    deploy. Doc changes ride with the code change (AGENTS.md policy).
+23. **Everything above is 0.0.1** (macOS, CLI, Gmail, iOS + daemon); composer/SMTP is
+    the last milestone. Stability, not calendar, decides the release.
+24. **UI performance is tested with XCUITest + signposts on the mbp runner** under the
+    `agents` user (dedicated automation Mac arrives October). Wall-clock asserts do
+    not belong in the unit suite (load flakes under parallel builds).
