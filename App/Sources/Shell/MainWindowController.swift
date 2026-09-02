@@ -1,4 +1,5 @@
 import AppKit
+import Observation
 import SwiftUI
 import MailternalInterfaces
 
@@ -319,8 +320,9 @@ private extension NSToolbarItem.Identifier {
 }
 
 @MainActor
-final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
+final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemValidation, NSMenuDelegate {
     private var model: AppModel
+    private var modelObservationGeneration: UInt64 = 0
     private let includesSidebarToggle: Bool
     private let toggleAction: @MainActor () -> Void
     private weak var toolbar: NSToolbar?
@@ -354,12 +356,35 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         self.includesSidebarToggle = includesSidebarToggle
         self.toggleAction = toggleAction
         super.init()
+        observeModelChanges()
     }
 
     func update(model: AppModel) {
         self.model = model
+        modelObservationGeneration &+= 1
+        observeModelChanges()
         configureMessageItems()
         toolbar?.validateVisibleItems()
+    }
+
+    /// AppKit's toolbar validation is not driven by SwiftUI's observation
+    /// updates. Keep the native items in step with selection changes while
+    /// leaving per-menu-item validation to `validateMenuItem(_:)`.
+    private func observeModelChanges() {
+        let generation = modelObservationGeneration
+        withObservationTracking {
+            _ = model.selectedMessageIDs
+            _ = model.listRows
+            _ = model.folders
+            _ = model.selectedFolderID
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.modelObservationGeneration == generation else { return }
+                self.configureMessageItems()
+                self.toolbar?.validateVisibleItems()
+                self.observeModelChanges()
+            }
+        }
     }
 
     func makeToolbar(identifier: String = "Mailternal.MainToolbar") -> NSToolbar {
@@ -425,11 +450,11 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         switch item.itemIdentifier {
         case .sidebarToggle:
             item.isEnabled = includesSidebarToggle
-        case .messageArchive, .messageTrash, .messageFlag:
+        case .messageArchive, .messageTrash, .messageFlag, .messageOverflow:
             configureMessageItems()
-            item.isEnabled = !model.selectedMessageIDs.isEmpty
-        case .messageOverflow:
-            configureMessageItems()
+            // NSMenuToolbarItem is a shell for a menu, not an action item;
+            // its own enablement follows selection while its children are
+            // validated independently by validateMenuItem(_:).
             item.isEnabled = !model.selectedMessageIDs.isEmpty
         default:
             return item.isEnabled
@@ -438,6 +463,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
         menu.removeAllItems()
         // NSMenuToolbarItem reserves its first item as the pull-down title.
         menu.addItem(NSMenuItem())
@@ -450,8 +476,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         ) {
             addMenuItem(policyItem, to: menu)
         }
-    }
 
+    }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         guard let action = menuItem.representedObject as? MessageContextMenuPolicy.Action else {
             return menuItem.isEnabled
@@ -547,8 +573,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         item.paletteLabel = "Message Actions"
         item.toolTip = "Message actions"
         item.isBordered = true
-        item.isEnabled = false
-        item.autovalidates = true
+        item.isEnabled = !model.selectedMessageIDs.isEmpty
+        // The menu shell follows model observation; child actions validate
+        // individually through validateMenuItem(_:).
+        item.autovalidates = false
         item.showsIndicator = false
         return item
     }

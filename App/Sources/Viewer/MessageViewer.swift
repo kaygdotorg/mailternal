@@ -635,8 +635,8 @@ struct MessageEnvelopeRegion: View {
 }
 
 /// The complete unfolded header block uses SF Mono, with one copy action for
-/// the whole block. The action remains keyboard-focusable while its icon is
-/// hidden at rest, which keeps the collapsed reader quiet without hiding an
+/// the whole block. The action remains keyboard-focusable and subtly visible
+/// at rest, then becomes fully opaque while the block is hovered or focused.
 private struct RawHeadersBlock: View {
     let headers: [(name: String, value: String)]
     let text: String
@@ -647,6 +647,10 @@ private struct RawHeadersBlock: View {
 
     private var copyButtonVisible: Bool {
         isHovered || blockFocused || copyButtonFocused
+    }
+
+    private var copyButtonOpacity: Double {
+        copyButtonVisible ? 1 : 0.35
     }
 
     var body: some View {
@@ -665,7 +669,9 @@ private struct RawHeadersBlock: View {
                 .textSelection(.enabled)
             }
         }
+        .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .focusable()
         .focused($blockFocused)
         .overlay(alignment: .topTrailing) {
@@ -676,7 +682,7 @@ private struct RawHeadersBlock: View {
             }
             .buttonStyle(.borderless)
             .controlSize(.small)
-            .opacity(copyButtonVisible ? 1 : 0)
+            .opacity(copyButtonOpacity)
             .animation(MailMotion.hover, value: copyButtonVisible)
             .focused($copyButtonFocused)
             .accessibilityLabel("Copy Headers")

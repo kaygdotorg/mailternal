@@ -708,6 +708,33 @@ final class UILogicTests: XCTestCase {
         )
     }
 
+    func testRawHeaderPolicyUnescapesFacadeValuesAndPreservesEncodedWords() {
+        let raw = """
+        Message-ID: &lt;li@example.cn&gt;
+        X-Display: &quot;Mail &amp; Team&quot;
+        Subject: =?UTF-8?B?5L2g5aW9?=
+
+        body
+        """
+
+        let headers = MessageHeaderPolicy.rawHeaders(from: raw)
+
+        XCTAssertEqual(
+            headers.map { $0.value },
+            [
+                "<li@example.cn>",
+                "\"Mail & Team\"",
+                "=?UTF-8?B?5L2g5aW9?=",
+            ]
+        )
+        XCTAssertEqual(
+            MessageHeaderPolicy.rawHeaderBlock(from: raw),
+            "Message-ID: <li@example.cn>\n"
+                + "X-Display: \"Mail & Team\"\n"
+                + "Subject: =?UTF-8?B?5L2g5aW9?="
+        )
+    }
+
     func testRawHeaderPolicyAcceptsLFAndMissingBlankLine() {
         let raw = "X-First: one\n\tcontinued\nX-Second: two"
         let headers = MessageHeaderPolicy.rawHeaders(from: raw)
