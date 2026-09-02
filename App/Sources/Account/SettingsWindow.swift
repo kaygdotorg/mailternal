@@ -51,21 +51,29 @@ struct SettingsDetailView: View {
     let appearance: AppearanceSettings
     let actions: ActionSettings
     var body: some View {
-        Group {
-            switch section {
-            case .account:
-                AccountSetupForm(model: model)
-            case .appearance:
-                AppearanceSettingsForm(appearance: appearance)
-            case .actions:
-                ActionSettingsForm(actions: actions)
+        VStack(alignment: .leading, spacing: 0) {
+            Text(section.title)
+                .font(.title)
+                .fontWeight(.semibold)
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+                .accessibilityIdentifier(UIIdentifier.settingsSectionTitle)
+
+            Group {
+                switch section {
+                case .account:
+                    AccountSetupForm(model: model)
+                case .appearance:
+                    AppearanceSettingsForm(appearance: appearance)
+                case .actions:
+                    ActionSettingsForm(actions: actions)
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .tint(appearance.accent.color)
         .environment(appearance.accent)
         .environment(actions)
-        .padding(.top, 20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
@@ -85,6 +93,7 @@ struct ActionSettingsForm: View {
             .accessibilityIdentifier(UIIdentifier.actionsSection)
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 
     @ViewBuilder
@@ -219,6 +228,7 @@ struct AccountSetupForm: View {
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
         .disabled({
             if case .validating = model.accountState { return true }
             return false
@@ -423,6 +433,7 @@ struct AppearanceSettingsForm: View {
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 }
 

@@ -1,7 +1,9 @@
 import Foundation
+import SwiftUI
 
 enum UIIdentifier {
     static let mainWindow = "main-window"
+    static let settingsSectionTitle = "settings-section-title"
     static let settingsWindow = "settings-window"
     static let sidebar = "folder-sidebar"
     static let messageTable = "message-table"
@@ -10,6 +12,7 @@ enum UIIdentifier {
     static let messageViewer = "message-viewer"
     static let messageSubject = "message-subject"
     static let messageDetails = "message-details"
+    static let messageHeadersCopy = "message-headers-copy"
     static let messageBody = "message-body"
     static let searchPanel = "search-panel"
     static let searchField = "search-field"
@@ -45,19 +48,55 @@ enum UIIdentifier {
     }
 }
 
+/// The sidebar toggle treats `detailOnly` as a temporary hidden state. Any
+/// visible split arrangement is retained so showing the sidebar restores the
+/// user's previous column layout instead of always forcing `.all`.
+///
+/// The split has three columns; hiding the sidebar collapses only the first
+/// (`.doubleColumn`), never the message list. `.detailOnly` is treated as
+/// "sidebar hidden" too so a restored state never strands the toggle.
+enum SidebarVisibilityPolicy {
+    static let defaultVisible: NavigationSplitViewVisibility = .all
+    static let hidden: NavigationSplitViewVisibility = .doubleColumn
+
+    static func isHidden(_ visibility: NavigationSplitViewVisibility) -> Bool {
+        visibility == .doubleColumn || visibility == .detailOnly
+    }
+
+    static func toggled(
+        current: NavigationSplitViewVisibility,
+        lastVisible: NavigationSplitViewVisibility
+    ) -> NavigationSplitViewVisibility {
+        isHidden(current)
+            ? (isHidden(lastVisible) ? defaultVisible : lastVisible)
+            : hidden
+    }
+
+    static func remembered(
+        _ visibility: NavigationSplitViewVisibility,
+        lastVisible: NavigationSplitViewVisibility
+    ) -> NavigationSplitViewVisibility {
+        isHidden(visibility) ? lastVisible : visibility
+    }
+}
+
 
 
 
 /// Geometry shared by the detail viewer and its focused layout tests.
 ///
-/// The reader is one scrolling surface holding three floating islands. The
-/// islands share the list pane's outer inset and are separated by a single
-/// deliberate gap; their contents use the card's normal interior padding.
+/// The reader is one scrolling surface holding two floating islands: one
+/// continuous header surface (subject, envelope, and expandable details) and
+/// the separate body surface. The islands share the list pane's outer inset
+/// and are separated by a single deliberate gap; their contents use the
+/// card's normal interior padding.
 enum MessageViewerLayoutPolicy {
+    /// Number of independent rounded surfaces in the reader.
+    static let islandCount = 2
     /// Leading/trailing inset of every reader island, matching the message
     /// list's content inset.
     static let horizontalPadding: CGFloat = 16
-    /// Vertical distance between the three independent islands.
+    /// Vertical distance between the header and body islands.
     static let islandSpacing: CGFloat = 12
     /// Interior horizontal padding shared by the card-like islands.
     static let islandContentPadding: CGFloat = 18

@@ -39,6 +39,8 @@ final class AppModel {
     var isFindPresented = false
     var findQuery = ""
     var columnVisibility: NavigationSplitViewVisibility = .all
+    /// The last visible arrangement is restored after the sidebar is hidden.
+    var lastVisibleColumnVisibility: NavigationSplitViewVisibility = .all
     var listRows: [MessageRow] = []
     var listCursor: MessagePageCursor?
     var isPaging = false
@@ -358,6 +360,24 @@ final class AppModel {
         loadMessageDetail(selectedMessageID)
     }
 
+    /// Selects the complete current live generation, rather than only the
+    /// page currently materialized by the virtualized table.
+    func selectAllMessages() {
+        guard let folder = selectedFolderID else { return }
+        let epoch = listEpoch
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let ids = try await facade.messageIDs(in: folder)
+                guard !Task.isCancelled, selectedFolderID == folder, listEpoch == epoch else { return }
+                selectMessages(Set(ids), anchor: selectedMessageID)
+            } catch {
+                guard !Task.isCancelled, selectedFolderID == folder, listEpoch == epoch else { return }
+                toasts.post(title: "Couldn’t select messages", detail: error.localizedDescription)
+            }
+        }
+    }
+
     func selectMessage(_ id: MessageID?) {
         selectedMessageIDs = id.map { [$0] } ?? []
         selectedMessageID = id
@@ -494,21 +514,21 @@ final class AppModel {
 
     /// Performs one gesture/menu operation as a single persisted batch.
     func perform(_ kind: SwipeActionKind, on ids: Set<MessageID>) {
-        let activeIDs = ids.filter { id in listRows.contains { $0.id == id } }
-        guard !activeIDs.isEmpty else { return }
-        let orderedIDs = activeIDs.sorted { $0.rawValue < $1.rawValue }
+        guard !ids.isEmpty else { return }
+        let visibleIDs = ids.filter { id in listRows.contains { $0.id == id } }
+        let orderedIDs = ids.sorted { $0.rawValue < $1.rawValue }
         switch kind {
         case .archive:
-            removeListRows(activeIDs)
+            removeListRows(ids)
             Task { [weak self] in await self?.facade.archive(orderedIDs) }
         case .trash:
-            removeListRows(activeIDs)
+            removeListRows(ids)
             Task { [weak self] in await self?.facade.trash(orderedIDs) }
         case .toggleRead:
-            let shouldRead = activeIDs.contains { id in
+            let shouldRead = visibleIDs.isEmpty || visibleIDs.contains { id in
                 !(listRows.first(where: { $0.id == id })?.isRead ?? false)
             }
-            for index in listRows.indices where activeIDs.contains(listRows[index].id) {
+            for index in listRows.indices where visibleIDs.contains(listRows[index].id) {
                 listRows[index].isRead = shouldRead
             }
             Task { [weak self] in
@@ -519,10 +539,10 @@ final class AppModel {
                 }
             }
         case .toggleFlag:
-            let shouldFlag = activeIDs.contains { id in
+            let shouldFlag = visibleIDs.isEmpty || visibleIDs.contains { id in
                 !(listRows.first(where: { $0.id == id })?.isFlagged ?? false)
             }
-            for index in listRows.indices where activeIDs.contains(listRows[index].id) {
+            for index in listRows.indices where visibleIDs.contains(listRows[index].id) {
                 listRows[index].isFlagged = shouldFlag
             }
             Task { [weak self] in
@@ -548,10 +568,8 @@ final class AppModel {
 
     func move(ids: Set<MessageID>, to folder: FolderID) {
         guard !ids.isEmpty, folder != selectedFolderID else { return }
-        let activeIDs = ids.filter { id in listRows.contains { $0.id == id } }
-        guard !activeIDs.isEmpty else { return }
-        let orderedIDs = activeIDs.sorted { $0.rawValue < $1.rawValue }
-        removeListRows(activeIDs)
+        let orderedIDs = ids.sorted { $0.rawValue < $1.rawValue }
+        removeListRows(ids)
         Task { [weak self] in
             await self?.facade.move(orderedIDs, to: folder)
         }
@@ -560,6 +578,10 @@ final class AppModel {
         guard folder != selectedFolderID else { return }
         var ids: Set<MessageID> = []
         for rawLink in links {
+            if let messageID = MessageLinkPasteboard.decodeMessageID(rawLink) {
+                ids.insert(messageID)
+                continue
+            }
             guard let link = MailternalDeepLink(string: rawLink),
                   let resolution = try? await facade.resolve(link),
                   case .message(_, let messageID, _) = resolution else { continue }
@@ -605,8 +627,15 @@ final class AppModel {
 
     func toggleSidebar() {
         withAnimation(MailMotion.sidebarToggle) {
-            columnVisibility = columnVisibility == .all ? .doubleColumn : .all
+            columnVisibility = SidebarVisibilityPolicy.toggled(
+                current: columnVisibility,
+                lastVisible: lastVisibleColumnVisibility
+            )
         }
+        lastVisibleColumnVisibility = SidebarVisibilityPolicy.remembered(
+            columnVisibility,
+            lastVisible: lastVisibleColumnVisibility
+        )
     }
 
     /// Saves edited account settings through the facade boundary.

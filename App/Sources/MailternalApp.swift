@@ -58,6 +58,10 @@ struct MailternalApp: App {
                 .disabled(!model.isAccountActive)
             }
             CommandGroup(after: .sidebar) {
+                Button(SidebarVisibilityPolicy.isHidden(model.columnVisibility) ? "Show Sidebar" : "Hide Sidebar") {
+                    appDelegate.toggleSidebar()
+                }
+                .keyboardShortcut("s", modifiers: [.command, .option])
                 Button("Refresh") {
                     appDelegate.showMainWindow()
                     Task { await model.refresh() }
@@ -163,6 +167,12 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
     func showMainWindow() {
         guard let model, let appearance, let actions else { return }
         MainWindowController.shared.show(model: model, appearance: appearance, actions: actions)
+    }
+
+    func toggleSidebar() {
+        guard let model else { return }
+        showMainWindow()
+        model.toggleSidebar()
     }
 
     #if DEBUG
