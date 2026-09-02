@@ -14,3 +14,11 @@
   no Swift toolchain. Use `rtk` and `code-review-graph` for reading and navigation.
 - Never touch the `kayg` user's session or `/Users/Shared/Mailternal` without being
   asked; QA instances use their own containers.
+- **UI QA on mbp runs through CuaDriver** (`/Applications/CuaDriver.app/Contents/MacOS/cua-driver`,
+  daemon in the `agents` VNC session with Accessibility + Screen Recording granted):
+  `list-tools`, `describe <tool>`, `call <tool> '<json>'` — clicks, drags, hotkeys, menus, AX
+  trees, screenshots (`get_desktop_state {"screenshot_out_file": …}`). Do not use `screencapture`
+  from an SSH context for WebKit content and never ask for `automationmodetool`/TCC changes.
+- Use the deployed bundle or your own chunk build; own QA container per agent
+  (`cp -R ~/mailternal-qa-ReaderIslands ~/mailternal-qa-<agent>`); announce server mutations on
+  hub; restore what you move.
