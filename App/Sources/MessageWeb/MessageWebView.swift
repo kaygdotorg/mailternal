@@ -43,6 +43,12 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     private var fence: NetworkFenceState = .compiling
     private var lastReportedContentHeight: CGFloat?
     private var documentDidFinish = false
+    private var lastMeasuredWidth: CGFloat?
+    private var contentHeightTask: Task<Void, Never>?
+    private var contentHeightMeasurementGeneration: UInt64 = 0
+    #if DEBUG
+    private var qaRenderSequence: UInt64 = 0
+    #endif
 
     private static let isolationLog = Logger(
         subsystem: "org.kayg.mailternal",
@@ -96,8 +102,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         super.layout()
         webView.frame = bounds
         errorLabel.frame = bounds.insetBy(dx: 24, dy: 24)
-        guard documentDidFinish else { return }
-        reportContentHeight()
+        scheduleContentHeightMeasurementIfNeeded()
     }
 
     /// Display already-sanitized HTML. `partProvider` is called with the original
@@ -179,8 +184,16 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             pendingRender = false
             errorLabel.isHidden = true
             webView.isHidden = false
-            lastReportedContentHeight = nil
+            invalidateContentHeightMeasurement()
             documentDidFinish = false
+            #if DEBUG
+            qaRenderSequence &+= 1
+            if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
+                QALaunch.log(
+                    "selection-perf event=html-requested serial=\(qaRenderSequence) t=\(DispatchTime.now().uptimeNanoseconds)"
+                )
+            }
+            #endif
             webView.loadHTMLString(Self.wrap(lastHTML, emailReadingMode: emailReadingMode), baseURL: nil)
         case .refuseHTML:
             pendingRender = false
@@ -327,33 +340,77 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     ) {
         completionHandler(nil)
     }
+
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
+            QALaunch.log(
+                "selection-perf event=did-finish serial=\(qaRenderSequence) t=\(DispatchTime.now().uptimeNanoseconds)"
+            )
+        }
+        #endif
         documentDidFinish = true
         // WebKit may publish the final content size one run-loop turn after
-        // navigation completes, so report after layout has settled.
+        // navigation completes. The measurement helper yields once, then
+        // coalesces any layout callbacks until this document is stable.
+        scheduleContentHeightMeasurementIfNeeded()
+        guard !lastFindQuery.isEmpty else { return }
         Task { @MainActor [weak self] in
-            await Task.yield()
-            self?.reportContentHeight()
-            guard let self, !self.lastFindQuery.isEmpty else { return }
+            guard let self else { return }
             _ = await self.performFind()
         }
     }
 
-    private func reportContentHeight() {
-        Task { @MainActor [weak self] in
+    private func invalidateContentHeightMeasurement() {
+        contentHeightMeasurementGeneration &+= 1
+        contentHeightTask?.cancel()
+        contentHeightTask = nil
+        lastMeasuredWidth = nil
+        lastReportedContentHeight = nil
+    }
+
+    private func scheduleContentHeightMeasurementIfNeeded() {
+        guard documentDidFinish, bounds.width > 0 else { return }
+        guard lastMeasuredWidth.map({ abs(bounds.width - $0) > 0.5 }) ?? true else { return }
+        guard contentHeightTask == nil else { return }
+
+        let expectedWidth = bounds.width
+        let generation = contentHeightMeasurementGeneration
+        contentHeightTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            guard let result = try? await webView.evaluateJavaScript(
+            await Task.yield()
+            guard !Task.isCancelled,
+                  self.contentHeightMeasurementGeneration == generation,
+                  self.documentDidFinish else {
+                if self.contentHeightMeasurementGeneration == generation {
+                    self.contentHeightTask = nil
+                }
+                return
+            }
+            guard let result = try? await self.webView.evaluateJavaScript(
                 "document.documentElement.offsetHeight"
-            ), let number = result as? NSNumber else {
+            ), let number = result as? NSNumber,
+                  !Task.isCancelled,
+                  self.contentHeightMeasurementGeneration == generation,
+                  self.documentDidFinish else {
+                if self.contentHeightMeasurementGeneration == generation {
+                    self.contentHeightTask = nil
+                }
                 return
             }
+            guard abs(self.bounds.width - expectedWidth) <= 0.5 else {
+                self.contentHeightTask = nil
+                self.scheduleContentHeightMeasurementIfNeeded()
+                return
+            }
+            self.lastMeasuredWidth = expectedWidth
             let height = CGFloat(truncating: number)
-            guard height.isFinite, height > 0,
-                  lastReportedContentHeight.map({ abs(height - $0) > 0.5 }) ?? true else {
-                return
+            if height.isFinite, height > 0,
+               self.lastReportedContentHeight.map({ abs(height - $0) > 0.5 }) ?? true {
+                self.lastReportedContentHeight = height
+                self.onContentHeightChange?(height)
             }
-            lastReportedContentHeight = height
-            onContentHeightChange?(height)
+            self.contentHeightTask = nil
         }
     }
 
@@ -372,8 +429,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     /// Reader chrome. Author colors in the HTML are not remapped, but the
     /// reading canvas is always opaque so authored light or dark text has a
     /// stable surface beneath it.
-    /// Matches the dark `NSColor.textBackgroundColor` used by
-    /// `MessageReaderSurface.page`.
+    /// Matches the dark `NSColor.textBackgroundColor`.
     private static let darkCanvasHex = "#1e1e1e"
 
     private static func canvasColor(for mode: EmailReadingMode) -> NSColor {

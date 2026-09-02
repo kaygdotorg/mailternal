@@ -108,8 +108,11 @@ enum MessageAssembler: Sendable {
         }
 
         var sanitized: String?
+        var hasRemoteImageReferences = false
         if let html {
-            sanitized = HTMLSanitizer.sanitize(html).html
+            let result = HTMLSanitizer.sanitize(html)
+            sanitized = result.html
+            hasRemoteImageReferences = result.hasRemoteReferences
         }
 
         let missingText = !needs.isEmpty && needs.allSatisfy {
@@ -125,6 +128,7 @@ enum MessageAssembler: Sendable {
             flags: flags,
             bodyText: plain,
             sanitizedHTML: sanitized,
+            hasRemoteImageReferences: hasRemoteImageReferences,
             attachments: attachments,
             isTruncated: truncated,
             isQuarantined: quarantine,

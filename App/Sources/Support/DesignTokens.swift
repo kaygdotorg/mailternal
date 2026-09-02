@@ -42,13 +42,6 @@ enum MessageTypography {
     }
 }
 
-/// The opaque canvas behind the reader's floating material islands.
-enum MessageReaderSurface {
-    static var page: Color {
-        Color(nsColor: .textBackgroundColor)
-    }
-}
-
 enum MailMotion {
     static let sidebarToggle = Animation.snappy(duration: 0.24, extraBounce: 0)
     static let disclosure = Animation.easeOut(duration: 0.12)

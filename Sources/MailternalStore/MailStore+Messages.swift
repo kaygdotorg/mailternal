@@ -172,9 +172,24 @@ extension MailStore {
     }
 
     public func detail(_ id: MessageID) async throws -> MessageDetail {
-        try await read { db in
-            try MailStore.fetchDetail(db, id: id)
+        let result = try await read { db in
+            try MailStore.fetchDetailWithStorage(db, id: id)
         }
+        if result.storedRemoteReferences == nil {
+            // Do not put a schema backfill on the interactive detail path.
+            // Existing stores have NULL here until they are touched, but the
+            // derived value above is already correct for this response.
+            let remoteReferences = result.detail.hasRemoteImageReferences
+            Task { [self] in
+                try? await write { db in
+                    try db.execute(
+                        sql: "UPDATE messages SET has_remote_references = ? WHERE id = ?",
+                        arguments: [remoteReferences, id.rawValue]
+                    )
+                }
+            }
+        }
+        return result.detail
     }
 
     public func messageID(generation: MailboxGeneration, uid: IMAPUID) async throws -> MessageID? {
@@ -354,7 +369,16 @@ extension MailStore {
         )
     }
 
+    private static let remoteTokenPrefix = "mailternal-part://part/remote."
+
     static func fetchDetail(_ db: Database, id: MessageID) throws -> MessageDetail {
+        try fetchDetailWithStorage(db, id: id).detail
+    }
+
+    private static func fetchDetailWithStorage(
+        _ db: Database,
+        id: MessageID
+    ) throws -> (detail: MessageDetail, storedRemoteReferences: Bool?) {
         guard let row = try Row.fetchOne(db, sql: "SELECT * FROM messages WHERE id = ?", arguments: [id.rawValue]) else {
             throw MailStoreError.messageNotFound
         }
@@ -369,6 +393,9 @@ extension MailStore {
         let inReplyTo: String? = row["in_reply_to"]
         let bodyText: String? = row["body_text"]
         let html: String? = row["sanitized_html"]
+        let storedRemoteReferences: Bool? = row["has_remote_references"]
+        let hasRemoteImageReferences = storedRemoteReferences
+            ?? (html?.contains(remoteTokenPrefix) ?? false)
         let envelope = Envelope(
             subject: row["subject"],
             from: from,
@@ -382,13 +409,17 @@ extension MailStore {
             references: references
         )
         let quarantined: Bool = row["is_quarantined"]
-        return MessageDetail(
-            id: id,
-            envelope: envelope,
-            bodyText: bodyText,
-            sanitizedHTML: html,
-            attachments: attachments,
-            isQuarantined: quarantined
+        return (
+            MessageDetail(
+                id: id,
+                envelope: envelope,
+                bodyText: bodyText,
+                sanitizedHTML: html,
+                hasRemoteImageReferences: hasRemoteImageReferences,
+                attachments: attachments,
+                isQuarantined: quarantined
+            ),
+            storedRemoteReferences
         )
     }
 
@@ -458,7 +489,7 @@ extension MailStore {
                     from_text, to_text, from_display, internal_date, header_date,
                     rfc_message_id, in_reply_to, references_json,
                     is_read, is_flagged, is_answered, is_draft, is_deleted, extra_flags_json,
-                    has_attachments, body_text, sanitized_html, preview,
+                    has_attachments, body_text, sanitized_html, has_remote_references, preview,
                     is_truncated, is_quarantined, parse_defect, attachments_json, decoded_bytes
                 ) VALUES (
                     COALESCE(
@@ -471,7 +502,7 @@ extension MailStore {
                     ?, ?, ?, ?, ?,
                     ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(generation_id, uid) DO UPDATE SET
@@ -497,6 +528,7 @@ extension MailStore {
                     has_attachments = excluded.has_attachments,
                     body_text = excluded.body_text,
                     sanitized_html = excluded.sanitized_html,
+                    has_remote_references = excluded.has_remote_references,
                     preview = excluded.preview,
                     is_truncated = excluded.is_truncated,
                     is_quarantined = excluded.is_quarantined,
@@ -527,6 +559,7 @@ extension MailStore {
                 !message.attachments.isEmpty,
                 message.bodyText,
                 message.sanitizedHTML,
+                message.hasRemoteImageReferences,
                 Preview.make(from: message.bodyText),
                 message.isTruncated,
                 message.isQuarantined,

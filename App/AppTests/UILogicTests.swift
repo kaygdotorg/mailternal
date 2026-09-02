@@ -838,4 +838,10 @@ final class UILogicTests: XCTestCase {
             [.toggleFlag, .archive]
         )
     }
+    func testSwipeActionFactoryUsesMailPalette() {
+        XCTAssertTrue(SwipeActionKind.archive.backgroundColor.isEqual(NSColor.systemYellow))
+        XCTAssertTrue(SwipeActionKind.trash.backgroundColor.isEqual(NSColor.systemRed))
+        XCTAssertTrue(SwipeActionKind.toggleRead.backgroundColor.isEqual(NSColor.systemBlue))
+        XCTAssertTrue(SwipeActionKind.toggleFlag.backgroundColor.isEqual(NSColor.systemOrange))
+    }
 }

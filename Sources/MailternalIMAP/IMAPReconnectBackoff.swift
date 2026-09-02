@@ -3,6 +3,11 @@ import FoundationEssentials
 #else
 import Foundation
 #endif
+#if canImport(Glibc)
+import Glibc  // log/pow: FoundationEssentials does not re-export libm on Linux
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 /// Jittered exponential backoff for IMAP reconnect / `\Seen` retry loops
 /// (spec: sync.md — “jittered exponential backoff”).

@@ -1,5 +1,5 @@
 import Foundation
-#if canImport(CoreFoundation)
+#if canImport(Darwin)
 import CoreFoundation
 #endif
 
@@ -110,7 +110,10 @@ func encodingForIANA(_ normalized: String) -> String.Encoding? {
     if let mapped = charsetMap[normalized] {
         return mapped
     }
-#if canImport(CoreFoundation)
+#if canImport(Darwin)
+    // CoreFoundation exists on Linux too, but String <-> CFString toll-free
+    // bridging does not; the IANA fallback is therefore Apple-only. The
+    // explicit table above is the cross-platform contract.
     let cf = CFStringConvertIANACharSetNameToEncoding(normalized as CFString)
     if cf != kCFStringEncodingInvalidId {
         let ns = CFStringConvertEncodingToNSStringEncoding(cf)

@@ -29,11 +29,19 @@ final class ScriptedWorld: @unchecked Sendable {
     var fetchError: Error?
     var fetchErrorAfter: Int?
     var fetchCount = 0
+    private var completedFetchCount = 0
+    private var fetchCompletionWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     var selectCount = 0
     /// UID ranges requested by envelope/bodystructure metadata fetches.
     /// Follow-up body peeks and bounded flag sweeps are intentionally omitted.
     var metadataFetchRanges: [[ClosedRange<UInt32>]] = []
     var flagFetchRanges: [[ClosedRange<UInt32>]] = []
+    /// Pauses the first metadata FETCH after capturing its mailbox snapshot.
+    /// Tests use this to interleave a deterministic expunge revision.
+    var pauseMetadataFetch = false
+    private var metadataFetchReleased = false
+    private var metadataFetchEntered = false
+    private var metadataFetchWaiters: [CheckedContinuation<Void, Never>] = []
     /// Pauses the quarantine FLAGS fallback after capturing its server response.
     /// This lets tests deterministically interleave an EXPUNGE delta.
     var pauseFlagFallback = false
@@ -252,6 +260,60 @@ final class ScriptedWorld: @unchecked Sendable {
             flagFetchRanges.append(request.uids.ranges)
         }
     }
+    func metadataFetchSnapshotIfPaused(
+        path: String
+    ) -> (snapshot: ScriptedMailbox, alreadyReleased: Bool)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard pauseMetadataFetch else { return nil }
+        let snapshot = mailboxes[path] ?? ScriptedMailbox(path: path)
+        metadataFetchEntered = true
+        return (snapshot, metadataFetchReleased)
+    }
+
+    func waitMetadataFetchPause() async throws {
+        try await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if registerMetadataFetchWaiter(continuation) {
+                    continuation.resume()
+                }
+            }
+        }, onCancel: {
+            releaseMetadataFetch()
+        })
+        try Task.checkCancellation()
+    }
+
+    private func registerMetadataFetchWaiter(
+        _ continuation: CheckedContinuation<Void, Never>
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if metadataFetchReleased || Task.isCancelled {
+            return true
+        }
+        metadataFetchWaiters.append(continuation)
+        return false
+    }
+
+    func metadataFetchDidEnter() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return metadataFetchEntered
+    }
+
+    func releaseMetadataFetch() {
+        lock.lock()
+        metadataFetchReleased = true
+        pauseMetadataFetch = false
+        let waiters = metadataFetchWaiters
+        metadataFetchWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
 
     func flagFallbackSnapshotIfPaused(
         _ request: IMAPFetchRequest,
@@ -458,6 +520,34 @@ final class ScriptedWorld: @unchecked Sendable {
         return fetchError
     }
 
+    func completeFetch() {
+        lock.lock()
+        completedFetchCount += 1
+        var ready: [CheckedContinuation<Void, Never>] = []
+        fetchCompletionWaiters.removeAll { entry in
+            guard entry.0 <= completedFetchCount else { return false }
+            ready.append(entry.1)
+            return true
+        }
+        lock.unlock()
+        for waiter in ready {
+            waiter.resume()
+        }
+    }
+
+    func waitForFetchCompletion(atLeast target: Int) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if completedFetchCount >= target {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                fetchCompletionWaiters.append((target, continuation))
+                lock.unlock()
+            }
+        }
+    }
+
     func noteSelect() {
         lock.lock()
         selectCount += 1
@@ -538,6 +628,7 @@ actor ScriptedIMAPClient: IMAPClient {
     func close() async {
         // Closing a client must not strand a fetch or archive phase paused by
         // the test gates.
+        world.releaseMetadataFetch()
         world.releaseFlagFallback()
         world.releaseArchiveStore()
         connected = false
@@ -569,8 +660,19 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
-        if let error = world.beginFetch() { throw error }
+        let fetchError = world.beginFetch()
+        defer { world.completeFetch() }
+        if let fetchError { throw fetchError }
         world.noteFetch(request)
+        let pausedMetadataSnapshot: (snapshot: ScriptedMailbox, alreadyReleased: Bool)?
+        if (request.envelope || request.bodyStructure), let selectedPath {
+            pausedMetadataSnapshot = world.metadataFetchSnapshotIfPaused(path: selectedPath)
+            if let pausedMetadataSnapshot, !pausedMetadataSnapshot.alreadyReleased {
+                try await world.waitMetadataFetchPause()
+            }
+        } else {
+            pausedMetadataSnapshot = nil
+        }
         let pausedFlagSnapshot: ScriptedMailbox?
         if let selectedPath {
             pausedFlagSnapshot = try await world.flagFallbackSnapshotIfPaused(request, path: selectedPath)
@@ -582,7 +684,7 @@ actor ScriptedIMAPClient: IMAPClient {
             try await Task.sleep(nanoseconds: delay)
         }
         guard let selectedPath else { return [] }
-        let box = pausedFlagSnapshot ?? world.mailbox(selectedPath)
+        let box = pausedFlagSnapshot ?? pausedMetadataSnapshot?.snapshot ?? world.mailbox(selectedPath)
         var results: [IMAPFetchedMessage] = []
         for (uid, message) in box.messages.sorted(by: { $0.key < $1.key }) {
             if !SyncPolicy.contains(request.uids, uid: uid) { continue }

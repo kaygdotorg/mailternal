@@ -5,6 +5,9 @@ import Testing
 func withStore(
     cacheCap: Int64 = MailStore.defaultAttachmentCacheCapBytes,
     observationDebounce: Duration = MailStore.defaultObservationDebounce,
+    observationSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
+        try await Task.sleep(for: duration)
+    },
     _ body: (MailStore, URL) async throws -> Void
 ) async throws {
     let dir = FileManager.default.temporaryDirectory
@@ -15,7 +18,8 @@ func withStore(
         databaseURL: dir.appendingPathComponent("mail.sqlite"),
         cachesDirectory: dir.appendingPathComponent("Caches", isDirectory: true),
         attachmentCacheCapBytes: cacheCap,
-        observationDebounce: observationDebounce
+        observationDebounce: observationDebounce,
+        observationSleep: observationSleep
     )
     try await body(store, dir)
 }

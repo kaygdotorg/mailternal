@@ -20,15 +20,34 @@ public final class MailStore: Sendable {
     let cachesDirectory: URL
     let attachmentCacheCapBytes: Int64
     let observationDebounceNanoseconds: UInt64
+    let observationSleep: @Sendable (Duration) async throws -> Void
     let pins: PinTracker
     private let observationQueue = DispatchQueue(label: "mailternal.store.observation")
 
     /// Opens (or creates) the store at `databaseURL` with attachment files under `cachesDirectory`.
-    public init(
+    public convenience init(
         databaseURL: URL,
         cachesDirectory: URL,
         attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes,
         observationDebounce: Duration = MailStore.defaultObservationDebounce
+    ) throws {
+        try self.init(
+            databaseURL: databaseURL,
+            cachesDirectory: cachesDirectory,
+            attachmentCacheCapBytes: attachmentCacheCapBytes,
+            observationDebounce: observationDebounce,
+            observationSleep: { duration in
+                try await Task.sleep(for: duration)
+            }
+        )
+    }
+
+    package init(
+        databaseURL: URL,
+        cachesDirectory: URL,
+        attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes,
+        observationDebounce: Duration = MailStore.defaultObservationDebounce,
+        observationSleep: @escaping @Sendable (Duration) async throws -> Void
     ) throws {
         var config = Configuration()
         config.foreignKeysEnabled = true
@@ -45,6 +64,7 @@ public final class MailStore: Sendable {
         self.cachesDirectory = cachesDirectory
         self.attachmentCacheCapBytes = max(0, attachmentCacheCapBytes)
         self.observationDebounceNanoseconds = MailStore.nanoseconds(from: observationDebounce)
+        self.observationSleep = observationSleep
         self.pins = PinTracker()
 
         try FileManager.default.createDirectory(at: cachesDirectory, withIntermediateDirectories: true)
@@ -73,7 +93,7 @@ public final class MailStore: Sendable {
         let queue = observationQueue
         let delayNs = observationDebounceNanoseconds
         return AsyncStream { continuation in
-            let debouncer = ObservationDebouncer<T>(queue: queue)
+            let debouncer = ObservationDebouncer<T>(sleep: observationSleep)
             let task = Task {
                 let observation = ValueObservation.tracking(fetch)
                 do {
@@ -113,13 +133,13 @@ public final class MailStore: Sendable {
 /// Newest-value coalescing for GRDB observation (spec: sync.md Storage).
 private final class ObservationDebouncer<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
-    private let queue: DispatchQueue
+    private let sleep: @Sendable (Duration) async throws -> Void
     private var deliveredFirst = false
     private var pending: T?
-    private var work: DispatchWorkItem?
+    private var work: Task<Void, Never>?
 
-    init(queue: DispatchQueue) {
-        self.queue = queue
+    init(sleep: @escaping @Sendable (Duration) async throws -> Void) {
+        self.sleep = sleep
     }
 
     func takeFirst() -> Bool {
@@ -134,21 +154,31 @@ private final class ObservationDebouncer<T: Sendable>: @unchecked Sendable {
         lock.lock()
         pending = value
         work?.cancel()
-        let item = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            let latest = self.pending
-            self.pending = nil
-            self.work = nil
-            self.lock.unlock()
+        let sleep = self.sleep
+        let delay = Duration.nanoseconds(Int64(clamping: delayNs))
+        let item = Task { [weak self] in
+            do {
+                try await sleep(delay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            let latest = self.takePending()
             if let latest {
                 yield(latest)
             }
         }
         work = item
         lock.unlock()
-        let delay = DispatchTimeInterval.nanoseconds(Int(clamping: delayNs))
-        queue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func takePending() -> T? {
+        lock.lock()
+        let latest = pending
+        pending = nil
+        work = nil
+        lock.unlock()
+        return latest
     }
 
     func flush(yield: (T) -> Void) {

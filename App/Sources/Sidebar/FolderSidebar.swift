@@ -17,17 +17,21 @@ struct FolderSidebar: View {
             set: { model.selectFolder($0) }
         )) {
             if !specialRoots.isEmpty {
-                Section("Mailboxes") {
+                Section {
                     ForEach(specialRoots) { node in
                         folderNode(node)
                     }
+                } header: {
+                    sectionHeader("Mailboxes", includeAccountTitle: true)
                 }
             }
             if !customRoots.isEmpty {
-                Section("Folders") {
+                Section {
                     ForEach(customRoots) { node in
                         folderNode(node)
                     }
+                } header: {
+                    sectionHeader("Folders", includeAccountTitle: specialRoots.isEmpty)
                 }
             }
         }
@@ -70,6 +74,24 @@ struct FolderSidebar: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func sectionHeader(_ title: String, includeAccountTitle: Bool) -> some View {
+        if includeAccountTitle, model.hasAccount {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(AccountTitlePolicy.title(for: model.accountConfig) ?? model.listTitleAccountName)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityIdentifier(UIIdentifier.sidebarAccountTitle)
+                Text(title)
+            }
+        } else {
+            Text(title)
         }
     }
 

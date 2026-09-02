@@ -232,6 +232,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 let action = NSTableViewRowAction(style: kind.style, title: title) { [weak self] _, _ in
                     self?.parent?.onAction(kind, rowModel.id)
                 }
+                action.backgroundColor = kind.backgroundColor
                 action.image = NSImage(
                     systemSymbolName: kind.systemImage(isRead: rowModel.isRead, isFlagged: rowModel.isFlagged),
                     accessibilityDescription: title
@@ -440,23 +441,14 @@ final class MessageTableContainer: NSView {
 @MainActor
 final class MessageRowChrome: NSTableRowView {
     static let identifier = NSUserInterfaceItemIdentifier("MessageRowChrome")
-    private let selectionLayer = CALayer()
-    private let hoverLayer = CALayer()
-    private var accentColor: NSColor?
     private var tracking: NSTrackingArea?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        layer?.masksToBounds = false
         focusRingType = .none
         identifier = Self.identifier
-        hoverLayer.cornerRadius = AppShapeScale.row
-        hoverLayer.cornerCurve = .continuous
-        hoverLayer.opacity = 0
-        selectionLayer.cornerRadius = AppShapeScale.row
-        selectionLayer.cornerCurve = .continuous
-        layer?.addSublayer(hoverLayer)
-        layer?.addSublayer(selectionLayer)
     }
 
     @available(*, unavailable)
@@ -464,12 +456,7 @@ final class MessageRowChrome: NSTableRowView {
 
     override func layout() {
         super.layout()
-        let inset = bounds.insetBy(dx: 8, dy: 3)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        hoverLayer.frame = inset
-        selectionLayer.frame = inset
-        CATransaction.commit()
+        messageCellView?.updateSelection(isSelected)
     }
 
     override func updateTrackingAreas() {
@@ -486,56 +473,43 @@ final class MessageRowChrome: NSTableRowView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        hoverLayer.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.12
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            hoverLayer.opacity = isSelected ? 0 : 1
-        }
+        messageCellView?.setHovered(true)
     }
 
     override func mouseExited(with event: NSEvent) {
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.12
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            hoverLayer.opacity = 0
-        }
+        messageCellView?.setHovered(false)
     }
 
     override var isSelected: Bool {
         get { super.isSelected }
         set {
             super.isSelected = newValue
-            refreshChrome()
+            messageCellView?.updateSelection(newValue)
         }
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        refreshChrome()
+        messageCellView?.refreshChrome()
     }
 
     override func drawSelection(in dirtyRect: NSRect) {}
     override func drawBackground(in dirtyRect: NSRect) {}
 
     func updateAccentColor(_ color: NSColor?) {
-        accentColor = color
-        refreshChrome()
+        messageCellView?.updateAccentColor(color)
     }
 
-    private func refreshChrome() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            let accent = accentColor?.usingColorSpace(.sRGB)?.cgColor
-            selectionLayer.backgroundColor = isSelected ? accent : nil
-            hoverLayer.opacity = isSelected ? 0 : hoverLayer.opacity
-        }
+    private var messageCellView: MessageCellView? {
+        subviews.first(where: { $0 is MessageCellView }) as? MessageCellView
     }
-
 }
 
 @MainActor
 final class MessageCellView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("MessageCell")
+    private let selectionLayer = CALayer()
+    private let hoverLayer = CALayer()
     private let unreadDot = NSView()
     private let fromLabel = NSTextField(labelWithString: "")
     private let subjectLabel = NSTextField(labelWithString: "")
@@ -545,14 +519,25 @@ final class MessageCellView: NSTableCellView {
     private let paperclip = NSImageView()
     private var accentColor: NSColor?
     private var isUnread = false
+    private var isSelectedRow = false
+    private var isHovered = false
     private var subjectTopFromConstraint: NSLayoutConstraint!
     private var subjectTopRowConstraint: NSLayoutConstraint!
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = false
         identifier = Self.identifier
         focusRingType = .none
-        unreadDot.wantsLayer = true
+        hoverLayer.opacity = 0
+        hoverLayer.cornerCurve = .continuous
+        selectionLayer.cornerCurve = .continuous
+        layer?.addSublayer(hoverLayer)
+        layer?.addSublayer(selectionLayer)
+#if DEBUG
+        assert(selectionLayer.superlayer === layer)
+#endif
         unreadDot.layer?.cornerRadius = 4
         unreadDot.translatesAutoresizingMaskIntoConstraints = false
         fromLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -620,6 +605,67 @@ final class MessageCellView: NSTableCellView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        updateChromeGeometry()
+    }
+
+    func updateSelection(_ selected: Bool) {
+        isSelectedRow = selected
+        refreshChrome()
+    }
+
+    func setHovered(_ hovered: Bool) {
+        isHovered = hovered
+        let targetOpacity: Float = hovered && !isSelectedRow ? 1 : 0
+        if hovered {
+            hoverLayer.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            hoverLayer.opacity = targetOpacity
+        }
+    }
+
+    func refreshChrome() {
+        updateChromeGeometry()
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let accent = accentColor?.usingColorSpace(.sRGB)?.cgColor
+            selectionLayer.backgroundColor = isSelectedRow ? accent : nil
+            hoverLayer.opacity = isSelectedRow ? 0 : (isHovered ? 1 : 0)
+        }
+    }
+
+    private func updateChromeGeometry() {
+        let height = max(bounds.height - 6, 0)
+        // AppKit's swipe actions are capsules; the moving pill adopts that radius only while swiping, preserving the resting row token.
+        let radius = min(height / 2, bounds.width / 2)
+        let leadingInset = isSwiped ? -radius : 8
+        let chromeFrame = CGRect(
+            x: leadingInset,
+            y: 3,
+            width: max(bounds.width - leadingInset - 8, 0),
+            height: height
+        )
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        hoverLayer.frame = chromeFrame
+        selectionLayer.frame = chromeFrame
+        hoverLayer.cornerRadius = isSwiped ? radius : AppShapeScale.row
+        selectionLayer.cornerRadius = isSwiped ? radius : AppShapeScale.row
+        CATransaction.commit()
+    }
+
+    private var isSwiped: Bool {
+        let frameOffset = frame.minX
+        let modelTransform = layer?.affineTransform().tx ?? 0
+        let presentationTransform = layer?.presentation()?.affineTransform().tx ?? 0
+        return abs(frameOffset) > 0.5
+            || abs(modelTransform) > 0.5
+            || abs(presentationTransform) > 0.5
     }
 
     func apply(_ row: MessageRow, lineCount: Int) {
