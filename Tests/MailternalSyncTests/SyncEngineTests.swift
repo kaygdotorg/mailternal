@@ -5,6 +5,46 @@ import MailternalStore
 import Testing
 @testable import MailternalSync
 
+private actor StreamReadyGate {
+    private var isReady = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        isReady = true
+        let pending = waiters
+        self.waiters.removeAll()
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
+
+    func waitUntilReady() async {
+        if isReady { return }
+        await withCheckedContinuation { continuation in
+            if isReady {
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+            }
+        }
+    }
+}
+
+
+private func nextMailEvent(
+    from task: Task<NewMailEvent?, Never>,
+    timeout: Duration
+) async throws -> NewMailEvent {
+    let timeoutTask = Task {
+        try? await Task.sleep(for: timeout)
+        task.cancel()
+    }
+    let event = await task.value
+    timeoutTask.cancel()
+    guard let event else { throw WaitTimeout() }
+    return event
+}
+
 @Test func engineBackfillPersistsBaselineAndDoesNotNotifyHistoricalUIDs() async throws {
     try await withSyncStore { store, dir in
         var box = ScriptedMailbox(path: "INBOX", uidValidity: 7, uidNext: 4, highestModSeq: 20)
@@ -27,6 +67,14 @@ import Testing
             settings: testSettings(dir: dir)
         )
         let mail = await engine.newMail
+        let listenerReady = StreamReadyGate()
+        let firstEvent = Task<NewMailEvent?, Never> {
+            var iterator = mail.makeAsyncIterator()
+            await listenerReady.signal()
+            return await iterator.next()
+        }
+        defer { firstEvent.cancel() }
+        await listenerReady.waitUntilReady()
         await engine.start()
         try await waitUntil(timeout: .seconds(15)) {
             let folders = try await store.fetchFolders(account: sampleConfig().id)
@@ -45,11 +93,16 @@ import Testing
             live.uidNext = 5
         }
 
-        await engine.refreshNow()
+        let completedFetches = world.snapshotCompletedFetchCount()
+        let refreshTask = Task {
+            await engine.refreshNow()
+        }
+        await world.waitForFetchCompletion(after: completedFetches)
+        await refreshTask.value
         try await waitUntil(timeout: .seconds(5)) {
             try await store.search("delta", limit: 5).count == 1
         }
-        let event = try await nextMailEvent(from: mail, timeout: .seconds(2))
+        let event = try await nextMailEvent(from: firstEvent, timeout: .seconds(2))
         #expect(event.subject == "new")
         #expect(event.folder == inbox.id)
 
