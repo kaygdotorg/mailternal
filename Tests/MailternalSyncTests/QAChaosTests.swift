@@ -163,6 +163,7 @@ struct QAChaosTests {
                 for await event in await engine.newMail { events.append(event) }
             }
             await engine.start()
+            do {
 
             try await waitUntil(timeout: .seconds(240), poll: .milliseconds(400)) {
                 guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
@@ -224,7 +225,14 @@ struct QAChaosTests {
 
             collector.cancel()
             await engine.stop()
+            await collector.value
             print("MAILTERNAL_QA live sequence events=\(events.snapshot().count) final=\(try await QAChaos.requireInbox(store: store, port: 1143).totalCount)")
+            } catch {
+                collector.cancel()
+                await engine.stop()
+                await collector.value
+                throw error
+            }
         }
     }
 
@@ -236,6 +244,7 @@ struct QAChaosTests {
         try await withSyncStore { store, dir in
             let engine = QAChaos.engine(store: store, port: 1143, dir: dir, allowEnableQResync: false)
             await engine.start()
+            do {
             try await waitUntil(timeout: .seconds(90), poll: .milliseconds(400)) {
                 guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
                 guard let gen = try await store.liveGeneration(for: inbox.id) else { return false }
@@ -249,6 +258,10 @@ struct QAChaosTests {
             try await assertStoreInvariants(store)
             await engine.stop()
             print("MAILTERNAL_QA condstore path=\(state.deltaPath) count=\(inbox.totalCount)")
+            } catch {
+                await engine.stop()
+                throw error
+            }
         }
     }
 
@@ -266,6 +279,7 @@ struct QAChaosTests {
                 for await event in await engine.newMail { events.append(event) }
             }
             await engine.start()
+            do {
             try await waitUntil(timeout: .seconds(120), poll: .milliseconds(400)) {
                 guard let inbox = try await QAChaos.inbox(store: store, port: 1143) else { return false }
                 return inbox.totalCount >= 300
@@ -360,7 +374,14 @@ struct QAChaosTests {
             )
 
             collector.cancel()
+            await collector.value
             await engine.stop()
+            } catch {
+                collector.cancel()
+                await engine.stop()
+                await collector.value
+                throw error
+            }
         }
     }
 }

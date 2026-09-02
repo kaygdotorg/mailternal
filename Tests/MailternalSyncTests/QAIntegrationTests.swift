@@ -164,6 +164,7 @@ struct QAIntegrationTests {
             let config = QA.config(port: 2143, security: .startTLS)
             let engine = QA.engine(store: store, port: 2143, dir: dir)
             await engine.start()
+            do {
             try await waitUntil(timeout: .seconds(90), poll: .milliseconds(400)) {
                 let folders = try await store.fetchFolders(account: config.id)
                 guard let inbox = folders.first(where: { $0.path == "INBOX" }) else { return false }
@@ -178,6 +179,10 @@ struct QAIntegrationTests {
             #expect(state.deltaPath == .basic)
             #expect(inbox.totalCount >= 200)
             await engine.stop()
+            } catch {
+                await engine.stop()
+                throw error
+            }
         }
     }
 }
