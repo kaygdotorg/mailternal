@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import MailternalInterfaces
+import UniformTypeIdentifiers
 
 
 struct FolderSidebar: View {
@@ -90,6 +91,7 @@ struct FolderSidebar: View {
                     .accessibilityIdentifier(UIIdentifier.sidebarAccountTitle)
                 Text(title)
             }
+            .padding(.top, 12)
         } else {
             Text(title)
         }
@@ -107,7 +109,23 @@ struct FolderSidebar: View {
                 ? { folder in
                     Task { await model.copyDeepLink(for: folder.id) }
                 }
-                : nil
+                : nil,
+            onDrop: { folderID, providers in
+                guard folderID != model.selectedFolderID else { return false }
+                var accepted = false
+                for provider in providers where provider.hasItemConformingToTypeIdentifier(MessageLinkPasteboard.type) {
+                    accepted = true
+                    provider.loadDataRepresentation(
+                        forTypeIdentifier: MessageLinkPasteboard.type
+                    ) { data, _ in
+                        guard let data, let links = MessageLinkPasteboard.decode(data) else { return }
+                        Task { @MainActor in
+                            await model.moveDroppedLinks(links, to: folderID)
+                        }
+                    }
+                }
+                return accepted
+            }
         )
     }
 
@@ -128,8 +146,9 @@ private struct FolderTreeNodeView: View {
     @Binding var inspectorFolder: FolderSummary?
     let onRefresh: () -> Void
     let onCopyDeepLink: ((FolderSummary) -> Void)?
+    let onDrop: (FolderID, [NSItemProvider]) -> Bool
     @State private var isExpanded = true
-
+    @State private var isDropTargeted = false
     var body: some View {
         if node.children.isEmpty {
             decoratedRow
@@ -141,7 +160,8 @@ private struct FolderTreeNodeView: View {
                         selectedID: selectedID,
                         inspectorFolder: $inspectorFolder,
                         onRefresh: onRefresh,
-                        onCopyDeepLink: onCopyDeepLink
+                        onCopyDeepLink: onCopyDeepLink,
+                        onDrop: onDrop
                     )
                 }
             } label: {
@@ -166,6 +186,24 @@ private struct FolderTreeNodeView: View {
                     Button("Copy Deep Link") {
                         onCopyDeepLink(node.folder)
                     }
+                }
+            }
+            .onDrop(
+                of: [UTType(exportedAs: MessageLinkPasteboard.type)],
+                isTargeted: Binding(
+                    get: { isDropTargeted },
+                    set: { isDropTargeted = node.folder.id != selectedID && $0 }
+                ),
+                perform: { providers in
+                    guard node.folder.id != selectedID else { return false }
+                    return onDrop(node.folder.id, providers)
+                }
+            )
+            .overlay {
+                if isDropTargeted, node.folder.id != selectedID {
+                    RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
+                        .stroke(Color.accentColor, lineWidth: 2)
+                        .padding(.horizontal, 2)
                 }
             }
     }

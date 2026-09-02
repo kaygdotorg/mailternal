@@ -59,6 +59,69 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
     }
 }
 
+@Test func engineBatchesMovesIntoOneUIDSet() async throws {
+    try await withSyncStore { store, dir in
+        let world = archiveWorld(capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE", "MOVE"]))
+        world.updateMailbox("INBOX") { mailbox in
+            mailbox.uidNext = 3
+            mailbox.messages[2] = makePlainMessage(uid: 2, subject: "archive me too")
+        }
+        let engine = makeEngine(store: store, world: world, dir: dir).0
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            guard let inbox = try await inboxFolder(store), inbox.totalCount == 2 else { return false }
+            return inbox.backfill == .complete
+        }
+        let inbox = try #require(await inboxFolder(store))
+        let rows = try await store.page(in: inbox.id, after: nil, limit: 10).rows
+        let archive = try #require(
+            (try await store.fetchFolders(account: sampleConfig().id))
+                .first(where: { $0.role == .archive })?.id
+        )
+        try await store.enqueueMove(messages: rows.map(\.id), to: archive)
+
+        try await waitUntil(timeout: .seconds(3)) {
+            try await store.snapshotMoveQueue().isEmpty
+                && world.archiveCommandSnapshot() == ["MOVE INBOX Archive 1:2"]
+        }
+        await engine.stop()
+    }
+}
+
+@Test func engineDiscardsMoveToRetiredDestinationAndLogsError() async throws {
+    try await withSyncStore { store, dir in
+        let world = archiveWorld(capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE", "MOVE"]))
+        let engine = makeEngine(store: store, world: world, dir: dir).0
+        await engine.start()
+        let (_, message) = try await waitForArchiveInbox(store)
+        let archive = try #require(
+            (try await store.fetchFolders(account: sampleConfig().id))
+                .first(where: { $0.role == .archive })?.id
+        )
+        await engine.stop()
+        world.replaceFolders([inboxMailbox()])
+        await engine.start()
+        // Wait for LIST reconciliation to retire the destination before
+        // creating the move. This prevents drain and discovery racing.
+        try await waitUntil(timeout: .seconds(3)) {
+            try await store.fetchFolderSummary(archive) == nil
+        }
+        try await store.enqueueMove(message: message, to: archive)
+
+        try await waitUntil(timeout: .seconds(3)) {
+            guard try await store.snapshotMoveQueue().isEmpty else { return false }
+            let errors = try await store.fetchErrorLog()
+            return errors.contains {
+                $0.kind == .archive && $0.message.contains("destination folder")
+            }
+        }
+        let errors = try await store.fetchErrorLog()
+        #expect(errors.contains { $0.kind == .archive && $0.message.contains("destination folder") })
+        #expect(world.archiveCommandSnapshot().isEmpty)
+        await engine.stop()
+    }
+}
+
 @Test func engineArchivesWithCopyStoreExpungeFallback() async throws {
     try await withSyncStore { store, dir in
         let world = archiveWorld(capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE"]))

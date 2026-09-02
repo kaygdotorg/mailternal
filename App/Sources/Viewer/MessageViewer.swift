@@ -83,7 +83,16 @@ struct MessageViewer: View {
 
     @ViewBuilder
     private var content: some View {
-        if let detail = model.detail {
+        if let title = MessageReaderStatePolicy.emptyStateTitle(
+            selectionCount: model.selectedMessageIDs.count
+        ) {
+            EmptyMailboxState(
+                title: title,
+                detail: MessageReaderStatePolicy.emptyStateDetail(
+                    selectionCount: model.selectedMessageIDs.count
+                ) ?? "Choose one message to read it."
+            )
+        } else if let detail = model.detail {
             reader(detail)
         } else if model.isLoadingDetail {
             ProgressView()

@@ -1692,9 +1692,13 @@ public actor SyncEngine {
  
     private func drainMove(channel: SyncChannel) async throws {
         let ops = try await store.snapshotMoveQueue(limit: 32)
+        var handled = Set<Int64>()
         for op in ops {
             if stopping { return }
             try Task.checkCancellation()
+            guard !handled.contains(op.id) else { continue }
+            handled.insert(op.id)
+
             let live = try await store.liveGeneration(for: op.folder)
             if live?.uidValidity != op.uidValidity {
                 try await store.dropStaleMove(folder: op.folder)
@@ -1704,11 +1708,44 @@ public actor SyncEngine {
                 try await discardMove(op, reason: "folder missing")
                 continue
             }
-            let destinationName = op.destination.rawValue.capitalized
-            guard let target = folders.values.first(where: { $0.role == op.destination }) else {
+
+            let target: FolderRecord?
+            if let destinationFolderID = op.destinationFolderID {
+                target = folders[destinationFolderID]
+            } else {
+                target = folders.values.first(where: { $0.role == op.destination })
+            }
+            let destinationName: String
+            if let target {
+                destinationName = target.name
+            } else if let destinationFolderID = op.destinationFolderID {
+                destinationName = "destination folder \(destinationFolderID.rawValue)"
+            } else {
+                destinationName = op.destination.rawValue.capitalized
+            }
+            guard let target else {
                 try await discardMove(op, reason: "no \(destinationName) folder")
                 continue
             }
+
+            // Coalesce adjacent operations with the same source generation and
+            // destination identity. One UID MOVE/COPY carries the whole set.
+            let batch = ops.filter { candidate in
+                guard !handled.contains(candidate.id),
+                      candidate.folder == op.folder,
+                      candidate.uidValidity == op.uidValidity,
+                      candidate.copied == op.copied
+                else { return false }
+                if let destinationFolderID = op.destinationFolderID {
+                    return candidate.destinationFolderID == destinationFolderID
+                }
+                return candidate.destinationFolderID == nil
+                    && candidate.destination == op.destination
+            } + [op]
+            for candidate in batch {
+                handled.insert(candidate.id)
+            }
+
             // Keep the gate over the whole server sequence (and its local
             // acknowledgement), so stop cannot close the channel between
             // fallback phases.
@@ -1718,13 +1755,13 @@ public actor SyncEngine {
             let capabilities = await channel.capabilities()
             let useMove = !op.copied && capabilities.move
             var phase = useMove ? "MOVE" : (op.copied ? "STORE" : "COPY")
+            let uids = SyncPolicy.uidSet(uids: batch.map { $0.uid.rawValue })
             do {
                 let liveNow = try await store.liveGeneration(for: op.folder)
                 if liveNow?.uidValidity != op.uidValidity {
                     try await store.dropStaleMove(folder: op.folder)
                     continue
                 }
-                let uids = IMAPUIDSet(uid: op.uid.rawValue)
                 if useMove {
                     try await channel.archiveMove(
                         in: source.path,
@@ -1741,7 +1778,9 @@ public actor SyncEngine {
                             uids: uids,
                             destination: target.path
                         )
-                        try await store.markMoveCopied(op)
+                        for candidate in batch {
+                            try await store.markMoveCopied(candidate)
+                        }
                     }
                     phase = "STORE"
                     try await channel.archiveStoreDeleted(
@@ -1757,20 +1796,26 @@ public actor SyncEngine {
                     )
                 }
                 expungeRevision[op.folder, default: 0] &+= 1
-                try await store.deleteMoveOp(op)
+                for candidate in batch {
+                    try await store.deleteMoveOp(candidate)
+                }
             } catch SyncChannelError.staleMailbox {
                 try await store.dropStaleMove(folder: op.folder)
-                try await store.deleteMoveOp(op)
+                for candidate in batch {
+                    try await store.deleteMoveOp(candidate)
+                }
             } catch let error as IMAPError {
                 if error.isTaggedNO || error.isTaggedBAD {
-                    if useMove || phase == "COPY" {
-                        try await discardMove(op, reason: error.description)
-                    } else {
-                        try await retainMove(
-                            op,
-                            phase: phase,
-                            reason: error.description
-                        )
+                    for candidate in batch {
+                        if useMove || phase == "COPY" {
+                            try await discardMove(candidate, reason: error.description)
+                        } else {
+                            try await retainMove(
+                                candidate,
+                                phase: phase,
+                                reason: error.description
+                            )
+                        }
                     }
                 } else {
                     throw error

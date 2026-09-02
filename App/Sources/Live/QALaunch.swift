@@ -5,7 +5,7 @@ import MailternalStore
 
 /// DEBUG-only headless QA launcher. Parses `-qa-account host port security`
 /// and optional `-qa-container`, `-qa-cache-cap`, `-qa-bench-search`,
-/// `-qa-bench-select`, and `-qa-fetch-cid`.
+/// `-qa-bench-select`, `-qa-fetch-cid`, and `-qa-open-window <link>`.
 ///
 /// Password is never an argv token: `MAILTERNAL_QA_PASSWORD` or `qa-password`.
 enum QALaunch: Sendable {
@@ -21,7 +21,7 @@ enum QALaunch: Sendable {
         var benchSearch: Bool
         var benchSelectCount: Int?
         var fetchCID: Bool
-
+        var openWindowLink: MailternalDeepLink?
         var accountConfig: AccountConfig {
             AccountConfig(
                 id: accountID,
@@ -49,6 +49,7 @@ enum QALaunch: Sendable {
         var benchSearch = false
         var benchSelectCount: Int?
         var fetchCID = false
+        var openWindowLink: MailternalDeepLink?
         var index = 1
         while index < arguments.count {
             let arg = arguments[index]
@@ -77,6 +78,13 @@ enum QALaunch: Sendable {
             case "-qa-fetch-cid":
                 fetchCID = true
                 index += 1
+            case "-qa-open-window":
+                guard index + 1 < arguments.count else { return nil }
+                guard let link = MailternalDeepLink(string: arguments[index + 1]) else {
+                    return nil
+                }
+                openWindowLink = link
+                index += 2
             default:
                 index += 1
             }
@@ -96,7 +104,8 @@ enum QALaunch: Sendable {
             accountID: AccountID(rawValue: "qa-\(host)-\(port)"),
             benchSearch: benchSearch,
             benchSelectCount: benchSelectCount,
-            fetchCID: fetchCID
+            fetchCID: fetchCID,
+            openWindowLink: openWindowLink
         )
         #else
         return nil

@@ -51,6 +51,7 @@ targets:
       - path: Sources/Support/DeepLinkRouteQueue.swift
       - path: AppTests
       - path: Sources/Support/UILogic.swift
+      - path: Sources/Support/MessageListPolicies.swift
       - path: Sources/Viewer/MessageHeaderPolicy.swift
       - path: Sources/Support/AppearanceSettings.swift
       - path: Sources/Support/ActionSettings.swift

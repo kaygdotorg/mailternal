@@ -844,4 +844,117 @@ final class UILogicTests: XCTestCase {
         XCTAssertTrue(SwipeActionKind.toggleRead.backgroundColor.isEqual(NSColor.systemBlue))
         XCTAssertTrue(SwipeActionKind.toggleFlag.backgroundColor.isEqual(NSColor.systemOrange))
     }
+    func testMessageContextMenuPolicyUsesMailOrderAndComposerTooltips() {
+        let id = MessageID(rawValue: 1)
+        let items = MessageContextMenuPolicy.items(
+            selection: [id],
+            isReadStates: [id: false],
+            flagStates: [id: false],
+            folders: [],
+            current: nil
+        )
+        XCTAssertEqual(
+            items.map(\.title),
+            [
+                "Open in New Window", "",
+                "Reply", "Reply All", "Forward", "",
+                "Mark as Read", "Flag", "Move to Junk", "Delete", "",
+                "Archive", "Move to", "",
+                "Copy Link", "Copy Subject",
+            ]
+        )
+        XCTAssertTrue(items[0].isEnabled)
+        XCTAssertFalse(items[2].isEnabled)
+        XCTAssertEqual(items[2].toolTip, "Available with the composer")
+        XCTAssertEqual(items[3].toolTip, "Available with the composer")
+        XCTAssertEqual(items[4].toolTip, "Available with the composer")
+    }
+
+    func testMessageContextMenuPolicyPluralizesAndUsesMixedStateVerbs() {
+        let ids: Set<MessageID> = [MessageID(rawValue: 1), MessageID(rawValue: 2), MessageID(rawValue: 3)]
+        let items = MessageContextMenuPolicy.items(
+            selection: ids,
+            isReadStates: [MessageID(rawValue: 1): true, MessageID(rawValue: 2): false],
+            flagStates: [
+                MessageID(rawValue: 1): true,
+                MessageID(rawValue: 2): true,
+                MessageID(rawValue: 3): true,
+            ],
+            folders: [],
+            current: nil
+        )
+        XCTAssertFalse(items[0].isEnabled)
+        XCTAssertEqual(items[6].title, "Mark as Read")
+        XCTAssertEqual(items[7].title, "Unflag")
+        XCTAssertEqual(items[8].title, "Move 3 Messages to Junk")
+        XCTAssertEqual(items[9].title, "Delete 3 Messages")
+        XCTAssertEqual(items[11].title, "Archive 3 Messages")
+
+        let single = MessageID(rawValue: 4)
+        let singleItems = MessageContextMenuPolicy.items(
+            selection: [single],
+            isReadStates: [single: true],
+            flagStates: [single: true],
+            folders: [],
+            current: nil
+        )
+        XCTAssertEqual(singleItems[6].title, "Mark as Unread")
+        XCTAssertEqual(singleItems[7].title, "Unflag")
+    }
+
+    func testMessageContextMenuPolicyExcludesCurrentAndNestsFolderPaths() throws {
+        func folder(_ id: Int64, _ name: String, _ path: String, _ role: FolderRole = .none) -> FolderSummary {
+            FolderSummary(
+                id: FolderID(rawValue: id),
+                name: name,
+                path: path,
+                separator: "/",
+                role: role,
+                unreadCount: 0,
+                totalCount: 0,
+                backfill: .idle
+            )
+        }
+        let current = folder(1, "Inbox", "Inbox", .inbox)
+        let archive = folder(2, "Archive", "Archive", .archive)
+        let projects = folder(3, "Projects", "Projects")
+        let invoices = folder(4, "Invoices", "Projects/Invoices")
+        let zeta = folder(5, "Zeta", "Zeta")
+        let items = MessageContextMenuPolicy.items(
+            selection: [MessageID(rawValue: 9)],
+            isReadStates: [:],
+            flagStates: [:],
+            folders: [zeta, invoices, current, projects, archive],
+            current: current.id
+        )
+        let move = items[12]
+        XCTAssertEqual(move.title, "Move to")
+        XCTAssertEqual(move.children.map(\.title), ["Archive", "Projects", "Zeta"])
+        XCTAssertFalse(move.children.contains { $0.action == .moveTo(current.id) })
+        let projectsItem = try XCTUnwrap(move.children.first { $0.title == "Projects" })
+        XCTAssertEqual(projectsItem.children.map(\.title), ["Invoices"])
+        XCTAssertEqual(projectsItem.children[0].action, .moveTo(invoices.id))
+    }
+
+    func testMessageLinkPasteboardRoundTripsJSONPayload() {
+        let links = [
+            "mailternal://open/v1/account/00000000-0000-4000-8000-000000000002/folder/path/SU5CT1g/message/1788195160/134810",
+            "mailternal://open/v1/account/00000000-0000-4000-8000-000000000002/folder/path/QXJjaGl2ZQ",
+        ]
+        let decoded = MessageLinkPasteboard.decode(MessageLinkPasteboard.encode(links))
+        XCTAssertEqual(decoded, links)
+    }
+
+    func testMessageReaderStatePolicyShowsSelectionEmptyStateOnlyForMultipleRows() {
+        XCTAssertNil(MessageReaderStatePolicy.emptyStateTitle(selectionCount: 0))
+        XCTAssertNil(MessageReaderStatePolicy.emptyStateTitle(selectionCount: 1))
+        XCTAssertEqual(
+            MessageReaderStatePolicy.emptyStateTitle(selectionCount: 3),
+            "3 Messages Selected"
+        )
+        XCTAssertEqual(
+            MessageReaderStatePolicy.emptyStateDetail(selectionCount: 3),
+            "Choose one message to read it."
+        )
+    }
 }

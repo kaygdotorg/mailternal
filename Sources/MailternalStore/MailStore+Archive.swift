@@ -2,7 +2,8 @@ import Foundation
 import GRDB
 
 extension MailStore {
-    /// Enqueues a coalesced move and optimistically removes the local row.
+    /// Enqueues a coalesced role-based move and optimistically removes the
+    /// local row.
     public func enqueueMove(
         account: AccountID,
         folder: FolderID,
@@ -17,41 +18,88 @@ extension MailStore {
                 folder: folder,
                 uidValidity: uidValidity,
                 uid: uid,
-                destination: destination
+                destination: destination,
+                destinationFolderID: nil
             )
         }
     }
 
-    /// Looks up the message row, enqueues against its generation, and removes
-    /// the row in the same writer transaction.
-    public func enqueueMove(message id: MessageID, to destination: FolderRole) async throws {
+    /// Enqueues a move to an explicit folder identity.
+    public func enqueueMove(
+        account: AccountID,
+        folder: FolderID,
+        uidValidity: UInt32,
+        uid: IMAPUID,
+        to destination: FolderID
+    ) async throws {
         try await write { db in
-            guard let row = try Row.fetchOne(
-                db,
-                sql: """
-                    SELECT m.uid, g.folder_id, g.uid_validity, f.account_id
-                    FROM messages m
-                    JOIN generations g ON g.id = m.generation_id
-                    JOIN folders f ON f.id = g.folder_id
-                    WHERE m.id = ?
-                    """,
-                arguments: [id.rawValue]
-            ) else {
-                throw MailStoreError.messageNotFound
-            }
-            let uid: Int64 = row["uid"]
-            let folderID: Int64 = row["folder_id"]
-            let uidValidity: Int64 = row["uid_validity"]
-            let account: String = row["account_id"]
             try MailStore.enqueueMove(
                 db,
-                account: AccountID(rawValue: account),
-                folder: FolderID(rawValue: folderID),
-                uidValidity: UInt32(uidValidity),
-                uid: IMAPUID(rawValue: UInt32(uid)),
-                destination: destination
+                account: account,
+                folder: folder,
+                uidValidity: uidValidity,
+                uid: uid,
+                destination: .none,
+                destinationFolderID: destination
             )
         }
+    }
+
+    /// Looks up all message rows and enqueues the batch in one transaction.
+    /// Any missing message aborts the transaction, preserving atomicity.
+    public func enqueueMove(messages ids: [MessageID], to destination: FolderID) async throws {
+        try await write { db in
+            let rows = try ids.map { id in
+                guard let row = try MailStore.moveMessageRow(db, id: id) else {
+                    throw MailStoreError.messageNotFound
+                }
+                return row
+            }
+            for row in rows {
+                try MailStore.enqueueMove(
+                    db,
+                    account: AccountID(rawValue: row.account),
+                    folder: FolderID(rawValue: row.folder),
+                    uidValidity: row.uidValidity,
+                    uid: row.uid,
+                    destination: .none,
+                    destinationFolderID: destination
+                )
+            }
+        }
+    }
+
+    /// Role-based batch convenience retained for archive/trash callers.
+    public func enqueueMove(messages ids: [MessageID], to destination: FolderRole) async throws {
+        try await write { db in
+            let rows = try ids.map { id in
+                guard let row = try MailStore.moveMessageRow(db, id: id) else {
+                    throw MailStoreError.messageNotFound
+                }
+                return row
+            }
+            for row in rows {
+                try MailStore.enqueueMove(
+                    db,
+                    account: AccountID(rawValue: row.account),
+                    folder: FolderID(rawValue: row.folder),
+                    uidValidity: row.uidValidity,
+                    uid: row.uid,
+                    destination: destination,
+                    destinationFolderID: nil
+                )
+            }
+        }
+    }
+
+    /// Single-id role move retained for existing store clients.
+    public func enqueueMove(message id: MessageID, to destination: FolderRole) async throws {
+        try await enqueueMove(messages: [id], to: destination)
+    }
+
+    /// Single-id explicit-folder move retained for existing store clients.
+    public func enqueueMove(message id: MessageID, to destination: FolderID) async throws {
+        try await enqueueMove(messages: [id], to: destination)
     }
 
     /// Snapshot of pending moves for sending, oldest first.
@@ -117,17 +165,20 @@ extension MailStore {
         folder: FolderID,
         uidValidity: UInt32,
         uid: IMAPUID,
-        destination: FolderRole
+        destination: FolderRole,
+        destinationFolderID: FolderID?
     ) throws {
         try db.execute(
             sql: """
                 INSERT INTO archive_queue (
-                    account_id, folder_id, uid_validity, uid, enqueued_at, copied, destination
+                    account_id, folder_id, uid_validity, uid, enqueued_at, copied,
+                    destination, destination_folder_id
                 )
-                VALUES (?, ?, ?, ?, ?, 0, ?)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?)
                 ON CONFLICT(account_id, folder_id, uid_validity, uid) DO UPDATE SET
                     enqueued_at = excluded.enqueued_at,
                     destination = excluded.destination,
+                    destination_folder_id = excluded.destination_folder_id,
                     copied = 0
                 """,
             arguments: [
@@ -137,6 +188,7 @@ extension MailStore {
                 Int64(uid.rawValue),
                 Date().timeIntervalSince1970,
                 destination.rawValue,
+                destinationFolderID?.rawValue,
             ]
         )
         // A move mutation leaves this folder. The next delta pass reconciles
@@ -151,6 +203,56 @@ extension MailStore {
                   )
                 """,
             arguments: [Int64(uid.rawValue), folder.rawValue, Int64(uidValidity)]
+        )
+    }
+
+    private struct MoveMessageRow: Sendable {
+        let account: String
+        let folder: Int64
+        let uidValidity: UInt32
+        let uid: IMAPUID
+    }
+
+    private static func moveMessageRow(_ db: Database, id: MessageID) throws -> MoveMessageRow? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: """
+                SELECT m.uid, g.folder_id, g.uid_validity, f.account_id
+                FROM messages m
+                JOIN generations g ON g.id = m.generation_id
+                JOIN folders f ON f.id = g.folder_id
+                WHERE m.id = ?
+                """,
+            arguments: [id.rawValue]
+        ) else {
+            return nil
+        }
+        let uid: Int64 = row["uid"]
+        let uidValidity: Int64 = row["uid_validity"]
+        return MoveMessageRow(
+            account: row["account_id"],
+            folder: row["folder_id"],
+            uidValidity: UInt32(uidValidity),
+            uid: IMAPUID(rawValue: UInt32(uid))
+        )
+    }
+
+    static func enqueueMove(
+        _ db: Database,
+        account: AccountID,
+        folder: FolderID,
+        uidValidity: UInt32,
+        uid: IMAPUID,
+        destination: FolderRole
+    ) throws {
+        try enqueueMove(
+            db,
+            account: account,
+            folder: folder,
+            uidValidity: uidValidity,
+            uid: uid,
+            destination: destination,
+            destinationFolderID: nil
         )
     }
 
@@ -207,6 +309,7 @@ extension MailStore {
         let uid: Int64 = row["uid"]
         let destinationRaw: String = row["destination"]
         let destination = FolderRole(rawValue: destinationRaw) ?? .archive
+        let destinationFolderRaw: Int64? = row["destination_folder_id"]
         return MoveOp(
             id: row["id"],
             account: AccountID(rawValue: row["account_id"]),
@@ -214,8 +317,10 @@ extension MailStore {
             uidValidity: UInt32(uidValidity),
             uid: IMAPUID(rawValue: UInt32(uid)),
             destination: destination,
+            destinationFolderID: destinationFolderRaw.map(FolderID.init(rawValue:)),
             copied: row["copied"]
         )
     }
+
 
 }

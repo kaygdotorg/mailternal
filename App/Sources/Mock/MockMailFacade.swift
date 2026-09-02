@@ -227,7 +227,13 @@ final class MockMailFacade: MailFacade {
         return stored.detail
     }
 
-    func markRead(_ id: MessageID) async {
+    func markRead(_ ids: [MessageID]) async {
+        for id in Set(ids) {
+            markReadOne(id)
+        }
+    }
+
+    private func markReadOne(_ id: MessageID) {
         guard var stored = byID[id], !stored.row.isRead else { return }
         stored.row.isRead = true
         byID[id] = stored
@@ -243,7 +249,13 @@ final class MockMailFacade: MailFacade {
         publishObservers(in: stored.folder)
     }
 
-    func markUnread(_ id: MessageID) async {
+    func markUnread(_ ids: [MessageID]) async {
+        for id in Set(ids) {
+            markUnreadOne(id)
+        }
+    }
+
+    private func markUnreadOne(_ id: MessageID) {
         guard var stored = byID[id], stored.row.isRead else { return }
         stored.row.isRead = false
         byID[id] = stored
@@ -259,28 +271,40 @@ final class MockMailFacade: MailFacade {
         publishObservers(in: stored.folder)
     }
 
-    func setFlagged(_ id: MessageID, _ flagged: Bool) async {
-        guard var stored = byID[id], stored.row.isFlagged != flagged else { return }
-        stored.row.isFlagged = flagged
-        byID[id] = stored
-        if var list = messages[stored.folder],
-           let index = list.firstIndex(where: { $0.row.id == id }) {
-            list[index] = stored
-            messages[stored.folder] = list
+    func setFlagged(_ ids: [MessageID], _ flagged: Bool) async {
+        for id in Set(ids) {
+            guard var stored = byID[id], stored.row.isFlagged != flagged else { continue }
+            stored.row.isFlagged = flagged
+            byID[id] = stored
+            if var list = messages[stored.folder],
+               let index = list.firstIndex(where: { $0.row.id == id }) {
+                list[index] = stored
+                messages[stored.folder] = list
+            }
+            publishObservers(in: stored.folder)
         }
-        publishObservers(in: stored.folder)
     }
 
-    func trash(_ id: MessageID) async {
-        move(id, to: .trash)
+    func trash(_ ids: [MessageID]) async {
+        guard let destination = folders.first(where: { $0.role == .trash })?.id else { return }
+        await move(ids, to: destination)
     }
 
-    func archive(_ id: MessageID) async {
-        move(id, to: .archive)
+    func archive(_ ids: [MessageID]) async {
+        guard let destination = folders.first(where: { $0.role == .archive })?.id else { return }
+        await move(ids, to: destination)
     }
 
-    private func move(_ id: MessageID, to role: FolderRole) {
-        guard let stored = byID[id] else { return }
+    func move(_ ids: [MessageID], to destination: FolderID) async {
+        for id in Set(ids) {
+            moveOne(id, to: destination)
+        }
+    }
+
+    private func moveOne(_ id: MessageID, to destination: FolderID) {
+        guard let stored = byID[id],
+              folders.contains(where: { $0.id == destination })
+        else { return }
         let source = stored.folder
         guard var sourceList = messages[source],
               let sourceIndex = sourceList.firstIndex(where: { $0.row.id == id })
@@ -288,8 +312,7 @@ final class MockMailFacade: MailFacade {
         sourceList.remove(at: sourceIndex)
         messages[source] = sourceList
 
-        let destination = folders.first(where: { $0.role == role })?.id
-        if let destination {
+        if source != destination {
             var moved = stored
             moved.folder = destination
             moved.row.folderName = folders.first(where: { $0.id == destination })?.name ?? moved.row.folderName
@@ -302,16 +325,16 @@ final class MockMailFacade: MailFacade {
             }
             messages[destination] = destinationList
         } else {
-            byID.removeValue(forKey: id)
+            messages[source] = sourceList
         }
 
-        if let folderIndex = folders.firstIndex(where: { $0.id == source }) {
+        if let folderIndex = folders.firstIndex(where: { $0.id == source }), source != destination {
             folders[folderIndex].totalCount = max(0, folders[folderIndex].totalCount - 1)
             if !stored.row.isRead {
                 folders[folderIndex].unreadCount = max(0, folders[folderIndex].unreadCount - 1)
             }
         }
-        if let destination, let folderIndex = folders.firstIndex(where: { $0.id == destination }) {
+        if let folderIndex = folders.firstIndex(where: { $0.id == destination }), source != destination {
             folders[folderIndex].totalCount += 1
             if !stored.row.isRead {
                 folders[folderIndex].unreadCount += 1
@@ -319,7 +342,7 @@ final class MockMailFacade: MailFacade {
         }
         foldersContinuation.yield(folders)
         publishObservers(in: source)
-        if let destination {
+        if source != destination {
             publishObservers(in: destination)
         }
     }

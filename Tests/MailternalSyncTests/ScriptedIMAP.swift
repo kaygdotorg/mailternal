@@ -29,8 +29,6 @@ final class ScriptedWorld: @unchecked Sendable {
     var fetchError: Error?
     var fetchErrorAfter: Int?
     var fetchCount = 0
-    private var completedFetchCount = 0
-    private var fetchCompletionWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     var selectCount = 0
     /// UID ranges requested by envelope/bodystructure metadata fetches.
     /// Follow-up body peeks and bounded flag sweeps are intentionally omitted.
@@ -145,10 +143,13 @@ final class ScriptedWorld: @unchecked Sendable {
         defer { lock.unlock() }
         guard var source = mailboxes[path] else { return }
         var target = mailboxes[destination] ?? ScriptedMailbox(path: destination)
-        for uid in Array(source.messages.keys) where SyncPolicy.contains(uids, uid: uid) {
+        let selected = source.messages.keys.filter { SyncPolicy.contains(uids, uid: $0) }
+        for uid in selected {
             guard let message = source.messages.removeValue(forKey: uid) else { continue }
             target.messages[uid] = message
-            archiveCommands.append("MOVE \(path) \(destination) \(uid)")
+        }
+        if !selected.isEmpty {
+            archiveCommands.append("MOVE \(path) \(destination) \(uidSetDescription(selected))")
         }
         target.uidNext = max(target.uidNext, target.messages.keys.max().map { $0 &+ 1 } ?? target.uidNext)
         mailboxes[path] = source
@@ -160,10 +161,13 @@ final class ScriptedWorld: @unchecked Sendable {
         defer { lock.unlock() }
         guard let source = mailboxes[path] else { return }
         var target = mailboxes[destination] ?? ScriptedMailbox(path: destination)
-        for uid in Array(source.messages.keys) where SyncPolicy.contains(uids, uid: uid) {
+        let selected = source.messages.keys.filter { SyncPolicy.contains(uids, uid: $0) }
+        for uid in selected {
             guard let message = source.messages[uid] else { continue }
             target.messages[uid] = message
-            archiveCommands.append("COPY \(path) \(destination) \(uid)")
+        }
+        if !selected.isEmpty {
+            archiveCommands.append("COPY \(path) \(destination) \(uidSetDescription(selected))")
         }
         target.uidNext = max(target.uidNext, target.messages.keys.max().map { $0 &+ 1 } ?? target.uidNext)
         mailboxes[destination] = target
@@ -173,13 +177,16 @@ final class ScriptedWorld: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard var source = mailboxes[path] else { return }
-        for uid in Array(source.messages.keys) where SyncPolicy.contains(uids, uid: uid) {
+        let selected = source.messages.keys.filter { SyncPolicy.contains(uids, uid: $0) }
+        for uid in selected {
             guard var message = source.messages[uid] else { continue }
             if !message.flags.contains(where: { $0.lowercased().contains("deleted") }) {
                 message.flags.append("\\Deleted")
             }
             source.messages[uid] = message
-            archiveCommands.append("STORE \(path) \(uid)")
+        }
+        if !selected.isEmpty {
+            archiveCommands.append("STORE \(path) \(uidSetDescription(selected))")
         }
         mailboxes[path] = source
     }
@@ -188,14 +195,38 @@ final class ScriptedWorld: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard var source = mailboxes[path] else { return }
-        for uid in Array(source.messages.keys) where SyncPolicy.contains(uids, uid: uid) {
+        let selected = source.messages.keys.filter { SyncPolicy.contains(uids, uid: $0) }
+        var expunged: [UInt32] = []
+        for uid in selected {
             guard let message = source.messages[uid],
                   message.flags.contains(where: { $0.lowercased().contains("deleted") })
             else { continue }
             source.messages.removeValue(forKey: uid)
-            archiveCommands.append("EXPUNGE \(path) \(uid)")
+            expunged.append(uid)
+        }
+        if !expunged.isEmpty {
+            archiveCommands.append("EXPUNGE \(path) \(uidSetDescription(expunged))")
         }
         mailboxes[path] = source
+    }
+
+    private func uidSetDescription<S: Sequence>(_ uids: S) -> String where S.Element == UInt32 {
+        let sorted = uids.sorted()
+        var ranges: [String] = []
+        var index = 0
+        while index < sorted.count {
+            var end = index
+            while end + 1 < sorted.count, sorted[end + 1] == sorted[end] + 1 {
+                end += 1
+            }
+            if index == end {
+                ranges.append(String(sorted[index]))
+            } else {
+                ranges.append("\(sorted[index]):\(sorted[end])")
+            }
+            index = end + 1
+        }
+        return ranges.joined(separator: ",")
     }
 
     func updateMailbox(_ path: String, _ body: (inout ScriptedMailbox) -> Void) {
@@ -520,33 +551,6 @@ final class ScriptedWorld: @unchecked Sendable {
         return fetchError
     }
 
-    func completeFetch() {
-        lock.lock()
-        completedFetchCount += 1
-        var ready: [CheckedContinuation<Void, Never>] = []
-        fetchCompletionWaiters.removeAll { entry in
-            guard entry.0 <= completedFetchCount else { return false }
-            ready.append(entry.1)
-            return true
-        }
-        lock.unlock()
-        for waiter in ready {
-            waiter.resume()
-        }
-    }
-
-    func waitForFetchCompletion(atLeast target: Int) async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            lock.lock()
-            if completedFetchCount >= target {
-                lock.unlock()
-                continuation.resume()
-            } else {
-                fetchCompletionWaiters.append((target, continuation))
-                lock.unlock()
-            }
-        }
-    }
 
     func noteSelect() {
         lock.lock()
@@ -660,9 +664,7 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
-        let fetchError = world.beginFetch()
-        defer { world.completeFetch() }
-        if let fetchError { throw fetchError }
+        if let error = world.beginFetch() { throw error }
         world.noteFetch(request)
         let pausedMetadataSnapshot: (snapshot: ScriptedMailbox, alreadyReleased: Bool)?
         if (request.envelope || request.bodyStructure), let selectedPath {

@@ -146,3 +146,39 @@ import Testing
         #expect(try await store.page(in: folder, after: nil, limit: 10).rows.isEmpty)
     }
 }
+
+@Test func moveQueueBatchIsAtomicAndCoalescesDuplicateMessages() async throws {
+    try await withStore { store, _ in
+        let (account, source, generation) = try await seedInbox(store, uidValidity: 1)
+        let destination = try await store.upsertFolder(
+            account: account.id,
+            path: "Projects",
+            name: "Projects",
+            separator: nil,
+            role: .none,
+            objectID: nil
+        )
+        _ = try await store.upsertMessages([
+            makeMessage(generation: generation, uid: 31, subject: "batch move")
+        ])
+        let id = try #require(await store.messageID(
+            generation: generation,
+            uid: IMAPUID(rawValue: 31)
+        ))
+
+        try await store.enqueueMove(messages: [id, id], to: destination)
+        let pending = try await store.snapshotMoveQueue()
+        #expect(pending.count == 1)
+        #expect(pending[0].destinationFolderID == destination)
+        #expect(try await store.page(in: source, after: nil, limit: 10).rows.isEmpty)
+
+        let secondID = MessageID(rawValue: 999_999)
+        do {
+            try await store.enqueueMove(messages: [id, secondID], to: destination)
+            Issue.record("missing message should abort the batch")
+        } catch MailStoreError.messageNotFound {
+            // The transaction must leave both the existing queue and message state intact.
+        }
+        #expect(try await store.snapshotMoveQueue().count == 1)
+    }
+}

@@ -25,36 +25,30 @@ extension MailStore {
         }
     }
 
-    /// Looks up the message row and enqueues a flag mutation against its generation.
-    public func enqueueFlag(message id: MessageID, flag: FlagKind, set: Bool) async throws {
+    /// Looks up all message rows and enqueues the batch in one transaction.
+    /// Any missing message aborts the transaction, preserving atomicity.
+    public func enqueueFlag(messages ids: [MessageID], flag: FlagKind, set: Bool) async throws {
         try await write { db in
-            guard let row = try Row.fetchOne(
-                db,
-                sql: """
-                    SELECT m.uid, g.folder_id, g.uid_validity, f.account_id
-                    FROM messages m
-                    JOIN generations g ON g.id = m.generation_id
-                    JOIN folders f ON f.id = g.folder_id
-                    WHERE m.id = ?
-                    """,
-                arguments: [id.rawValue]
-            ) else {
-                throw MailStoreError.messageNotFound
+            for id in ids {
+                guard let row = try MailStore.flagMessageRow(db, id: id) else {
+                    throw MailStoreError.messageNotFound
+                }
+                try MailStore.enqueueFlag(
+                    db,
+                    account: AccountID(rawValue: row.account),
+                    folder: FolderID(rawValue: row.folder),
+                    uidValidity: row.uidValidity,
+                    uid: row.uid,
+                    flag: flag,
+                    set: set
+                )
             }
-            let uid: Int64 = row["uid"]
-            let folderID: Int64 = row["folder_id"]
-            let uidValidity: Int64 = row["uid_validity"]
-            let account: String = row["account_id"]
-            try MailStore.enqueueFlag(
-                db,
-                account: AccountID(rawValue: account),
-                folder: FolderID(rawValue: folderID),
-                uidValidity: UInt32(uidValidity),
-                uid: IMAPUID(rawValue: UInt32(uid)),
-                flag: flag,
-                set: set
-            )
         }
+    }
+
+    /// Single-id convenience variant.
+    public func enqueueFlag(message id: MessageID, flag: FlagKind, set: Bool) async throws {
+        try await enqueueFlag(messages: [id], flag: flag, set: set)
     }
 
     /// Snapshot of pending flag mutations for `UID STORE`, oldest first.
@@ -139,12 +133,43 @@ extension MailStore {
         }
     }
 
+    private struct FlagMessageRow: Sendable {
+        let account: String
+        let folder: Int64
+        let uidValidity: UInt32
+        let uid: IMAPUID
+    }
+
+    private static func flagMessageRow(_ db: Database, id: MessageID) throws -> FlagMessageRow? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: """
+                SELECT m.uid, g.folder_id, g.uid_validity, f.account_id
+                FROM messages m
+                JOIN generations g ON g.id = m.generation_id
+                JOIN folders f ON f.id = g.folder_id
+                WHERE m.id = ?
+                """,
+            arguments: [id.rawValue]
+        ) else {
+            return nil
+        }
+        let uid: Int64 = row["uid"]
+        let uidValidity: Int64 = row["uid_validity"]
+        return FlagMessageRow(
+            account: row["account_id"],
+            folder: row["folder_id"],
+            uidValidity: UInt32(uidValidity),
+            uid: IMAPUID(rawValue: UInt32(uid))
+        )
+    }
     static func enqueueFlag(
         _ db: Database,
         account: AccountID,
         folder: FolderID,
         uidValidity: UInt32,
         uid: IMAPUID,
+
         flag: FlagKind,
         set: Bool
     ) throws {

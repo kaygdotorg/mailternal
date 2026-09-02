@@ -26,19 +26,25 @@ struct MessageListPane: View {
             MessageTableRepresentable(
                 rows: model.listRows,
                 selectedID: model.selectedMessageID,
+                selectedIDs: model.selectedMessageIDs,
+                messageLinks: model.messageDeepLinks,
+                folders: model.folders,
+                currentFolder: model.selectedFolderID,
                 epoch: model.listEpoch,
                 lineCount: model.appearance.messageListLines,
                 accent: model.appearance.accent,
                 leading: actions.leadingSwipe,
                 trailing: actions.trailingSwipe,
                 topRestDepth: listDissolvePolicy.restDepth(safeAreaTop: 0),
-                onSelect: { model.selectMessage($0) },
+                onSelect: { ids, anchor in model.selectMessages(ids, anchor: anchor) },
                 onPrefetch: { model.loadMoreIfNeeded(near: $0) },
-                onCopySubject: { messageID in model.copySubject(for: messageID) },
-                onCopyDeepLink: { messageID in
-                    Task { await model.copyDeepLink(for: messageID) }
+                onCopySubject: { ids in model.copySubjects(for: ids) },
+                onCopyDeepLink: { ids in
+                    Task { await model.copyDeepLinks(for: ids) }
                 },
-                onAction: { kind, messageID in model.perform(kind, on: messageID) }
+                onAction: { kind, ids in model.perform(kind, on: ids) },
+                onMove: { ids, folder in model.move(ids: ids, to: folder) },
+                onOpenMessageWindow: { model.openMessageWindow($0) }
             )
             .mailWindowDissolve(listDissolvePolicy)
 
@@ -81,24 +87,30 @@ struct MessageListPane: View {
         // The measured title height moves that origin below the title while
         // keeping the title itself outside the scrolling mask.
         .ignoresSafeArea(.container, edges: .top)
-        .navigationSplitViewColumnWidth(min: 280, ideal: 360, max: .infinity)
-    }
+}
 }
 
 struct MessageTableRepresentable: NSViewRepresentable {
     var rows: [MessageRow]
     var selectedID: MessageID?
+    var selectedIDs: Set<MessageID>
+    var messageLinks: [MessageID: String]
+    var folders: [FolderSummary]
+    var currentFolder: FolderID?
     var epoch: UInt64
     var lineCount: Int
     var accent: AccentSource
     var leading: [SwipeActionKind]
     var trailing: [SwipeActionKind]
     var topRestDepth: CGFloat
-    var onSelect: (MessageID?) -> Void
+    var onSelect: (Set<MessageID>, MessageID?) -> Void
     var onPrefetch: (Int) -> Void
-    var onCopySubject: (MessageID) -> Void
-    var onCopyDeepLink: (MessageID) -> Void
-    var onAction: (SwipeActionKind, MessageID) -> Void
+    var onCopySubject: (Set<MessageID>) -> Void
+    var onCopyDeepLink: (Set<MessageID>) -> Void
+    var onAction: (SwipeActionKind, Set<MessageID>) -> Void
+    var onMove: (Set<MessageID>, FolderID) -> Void
+    var onOpenMessageWindow: (MessageID) -> Void
+
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -130,6 +142,9 @@ struct MessageTableRepresentable: NSViewRepresentable {
             container.tableView.dataSource = self
             container.onVisibleRow = { [weak self] row in
                 self?.parent?.onPrefetch(row)
+            }
+            container.onKeyCommand = { [weak self] command in
+                self?.handleKeyCommand(command)
             }
             container.tableView.menu = makeMenu()
         }
@@ -230,7 +245,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
             return kinds.map { kind in
                 let title = kind.title(isRead: rowModel.isRead, isFlagged: rowModel.isFlagged)
                 let action = NSTableViewRowAction(style: kind.style, title: title) { [weak self] _, _ in
-                    self?.parent?.onAction(kind, rowModel.id)
+                    self?.parent?.onAction(kind, [rowModel.id])
                 }
                 action.backgroundColor = kind.backgroundColor
                 action.image = NSImage(
@@ -246,31 +261,32 @@ struct MessageTableRepresentable: NSViewRepresentable {
         }
 
         func tableViewSelectionDidChange(_ notification: Notification) {
-            guard let tableView else { return }
-            let row = tableView.selectedRow
-            if row >= 0, let id = parent?.rows[safe: row]?.id {
-                if parent?.selectedID != id {
-                    parent?.onSelect(id)
-                }
-            } else if parent?.selectedID != nil {
-                parent?.onSelect(nil)
-            }
+            guard let tableView, let parent else { return }
+            let ids = Set(tableView.selectedRowIndexes.compactMap { index in
+                parent.rows[safe: index]?.id
+            })
+            let clickedID = parent.rows[safe: tableView.clickedRow]?.id
+            let anchor = clickedID.flatMap { ids.contains($0) ? $0 : nil }
+                ?? parent.rows[safe: tableView.selectedRow]?.id
+            guard ids != parent.selectedIDs || anchor != parent.selectedID else { return }
+            parent.onSelect(ids, anchor)
         }
 
         private var lastScrolledSelectionID: MessageID?
-
         private func syncSelection(in tableView: NSTableView) {
-            guard let selectedID = parent?.selectedID,
-                  let index = parent?.rows.firstIndex(where: { $0.id == selectedID })
+            guard let parent else { return }
+            let selectedIndexes = IndexSet(
+                parent.rows.indices.filter { parent.selectedIDs.contains(parent.rows[$0].id) }
+            )
+            if tableView.selectedRowIndexes != selectedIndexes {
+                tableView.selectRowIndexes(selectedIndexes, byExtendingSelection: false)
+            }
+
+            guard let selectedID = parent.selectedID,
+                  let index = parent.rows.firstIndex(where: { $0.id == selectedID })
             else {
                 lastScrolledSelectionID = nil
-                if tableView.selectedRow != -1 {
-                    tableView.deselectAll(nil)
-                }
                 return
-            }
-            if tableView.selectedRow != index {
-                tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
             }
             // A new selection (click, deep link, restoration) is brought into
             // view exactly once; index shifts from backfill prepends and
@@ -281,31 +297,101 @@ struct MessageTableRepresentable: NSViewRepresentable {
             }
         }
 
+        func tableView(
+            _ tableView: NSTableView,
+            pasteboardWriterForRow row: Int
+        ) -> NSPasteboardWriting? {
+            guard let parent, let rowID = parent.rows[safe: row]?.id else { return nil }
+            let ids: Set<MessageID> = parent.selectedIDs.contains(rowID) ? parent.selectedIDs : [rowID]
+            let links = ids.sorted(by: { $0.rawValue < $1.rawValue }).compactMap { parent.messageLinks[$0] }
+            guard links.count == ids.count else { return nil }
+            let item = NSPasteboardItem()
+            item.setData(
+                MessageLinkPasteboard.encode(links),
+                forType: NSPasteboard.PasteboardType(MessageLinkPasteboard.type)
+            )
+            return item
+        }
+
+        private var menuSelection: Set<MessageID>?
+
         private func makeMenu() -> NSMenu {
             let menu = NSMenu()
             menu.delegate = self
             return menu
         }
 
+        func menuWillOpen(_ menu: NSMenu) {
+            menuSelection = nil
+        }
+
+        func menuDidClose(_ menu: NSMenu) {
+            menuSelection = nil
+        }
+
         func menuNeedsUpdate(_ menu: NSMenu) {
             menu.removeAllItems()
-            guard clickedMessageID != nil else { return }
+            guard let parent, let clickedMessageID else { return }
+            let selection: Set<MessageID>
+            if parent.selectedIDs.contains(clickedMessageID) {
+                selection = parent.selectedIDs
+            } else {
+                selection = [clickedMessageID]
+                parent.onSelect(selection, clickedMessageID)
+            }
+            menuSelection = selection
+            let readStates = Dictionary(
+                uniqueKeysWithValues: selection.compactMap { id in
+                    parent.rows.first { $0.id == id }.map { (id, $0.isRead) }
+                }
+            )
+            let flagStates = Dictionary(
+                uniqueKeysWithValues: selection.compactMap { id in
+                    parent.rows.first { $0.id == id }.map { (id, $0.isFlagged) }
+                }
+            )
+            let policyItems = MessageContextMenuPolicy.items(
+                selection: selection,
+                isReadStates: readStates,
+                flagStates: flagStates,
+                folders: parent.folders,
+                current: parent.currentFolder
+            )
+#if DEBUG
+            if ProcessInfo.processInfo.environment["MAILTERNAL_QA_MENU"] == "1" {
+                let titles = policyItems.flatMap { item in
+                    [item.title] + item.children.map(\.title)
+                }
+                QALaunch.log("context-menu titles=\(titles.joined(separator: " | "))")
+            }
+#endif
+            for item in policyItems {
+                addMenuItem(item, to: menu)
+            }
+        }
 
-            let copySubject = NSMenuItem(
-                title: "Copy Subject",
-                action: #selector(copySubject(_:)),
+        private func addMenuItem(_ policyItem: MessageContextMenuPolicy.Item, to menu: NSMenu) {
+            if policyItem.isSeparator {
+                menu.addItem(.separator())
+                return
+            }
+            let menuItem = NSMenuItem(
+                title: policyItem.title,
+                action: policyItem.children.isEmpty ? #selector(performMenuAction(_:)) : nil,
                 keyEquivalent: ""
             )
-            copySubject.target = self
-            menu.addItem(copySubject)
-
-            let copyLink = NSMenuItem(
-                title: "Copy Deep Link",
-                action: #selector(copyDeepLink(_:)),
-                keyEquivalent: ""
-            )
-            copyLink.target = self
-            menu.addItem(copyLink)
+            menuItem.target = policyItem.children.isEmpty ? self : nil
+            menuItem.isEnabled = policyItem.isEnabled
+            menuItem.toolTip = policyItem.toolTip
+            menuItem.representedObject = policyItem.action
+            if !policyItem.children.isEmpty {
+                let submenu = NSMenu()
+                for child in policyItem.children {
+                    addMenuItem(child, to: submenu)
+                }
+                menuItem.submenu = submenu
+            }
+            menu.addItem(menuItem)
         }
 
         private var clickedMessageID: MessageID? {
@@ -315,25 +401,100 @@ struct MessageTableRepresentable: NSViewRepresentable {
             return row.id
         }
 
-        @objc private func copySubject(_ sender: Any?) {
-            guard let messageID = clickedMessageID else { return }
-            parent?.onCopySubject(messageID)
+        @objc private func performMenuAction(_ sender: NSMenuItem) {
+            guard let action = sender.representedObject as? MessageContextMenuPolicy.Action,
+                  let parent else { return }
+            let selection = menuSelection ?? [clickedMessageID].compactMap { $0 }.reduce(into: Set<MessageID>()) {
+                $0.insert($1)
+            }
+            guard !selection.isEmpty else { return }
+            switch action {
+            case .openInNewWindow:
+                guard selection.count == 1, let id = selection.first else { return }
+                parent.onOpenMessageWindow(id)
+            case .reply, .replyAll, .forward:
+                break
+            case .markRead, .markUnread:
+                parent.onAction(.toggleRead, selection)
+            case .flag, .unflag:
+                parent.onAction(.toggleFlag, selection)
+            case .moveToJunk:
+                guard let junk = parent.folders.first(where: { $0.role == .junk }) else { return }
+                parent.onMove(selection, junk.id)
+            case .delete:
+                parent.onAction(.trash, selection)
+            case .archive:
+                parent.onAction(.archive, selection)
+            case .moveTo(let folder):
+                parent.onMove(selection, folder)
+            case .copyLink:
+                parent.onCopyDeepLink(selection)
+            case .copySubject:
+                parent.onCopySubject(selection)
+            }
+        }
+        private func handleKeyCommand(_ command: MessageTableKeyCommand) {
+            guard let parent else { return }
+            let ids: Set<MessageID>
+            if parent.selectedIDs.isEmpty {
+                ids = Set(tableView?.selectedRowIndexes.compactMap { parent.rows[safe: $0]?.id } ?? [])
+            } else {
+                ids = parent.selectedIDs
+            }
+            guard !ids.isEmpty else { return }
+            switch command {
+            case .delete:
+                parent.onAction(.trash, ids)
+            case .toggleRead:
+                parent.onAction(.toggleRead, ids)
+            case .toggleFlag:
+                parent.onAction(.toggleFlag, ids)
+            }
         }
 
-        @objc private func copyDeepLink(_ sender: Any?) {
-            guard let messageID = clickedMessageID else { return }
-            parent?.onCopyDeepLink(messageID)
-        }
-    }
+}
 }
 
+
+fileprivate enum MessageTableKeyCommand {
+    case delete
+    case toggleRead
+    case toggleFlag
+}
+
+@MainActor
+fileprivate final class MessageTableKeyView: NSTableView {
+    var onKeyCommand: ((MessageTableKeyCommand) -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.keyCode == 51, modifiers.isEmpty || modifiers == .command {
+            onKeyCommand?(.delete)
+            return
+        }
+        if modifiers.contains([.command, .shift]) {
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "u":
+                onKeyCommand?(.toggleRead)
+                return
+            case "l":
+                onKeyCommand?(.toggleFlag)
+                return
+            default:
+                break
+            }
+        }
+        super.keyDown(with: event)
+    }
+}
 
 @MainActor
 final class MessageTableContainer: NSView {
     let scrollView = NSScrollView()
-    let tableView = NSTableView()
+    fileprivate let tableView = MessageTableKeyView()
     private(set) var accentColor: NSColor?
     var onVisibleRow: ((Int) -> Void)?
+    fileprivate var onKeyCommand: ((MessageTableKeyCommand) -> Void)?
 
     init(topRestDepth: CGFloat = MailWindowDissolvePolicy.messageList.restDepth(safeAreaTop: 0)) {
         let frameRect = NSRect(origin: .zero, size: .zero)
@@ -343,7 +504,8 @@ final class MessageTableContainer: NSView {
         tableView.addTableColumn(column)
         tableView.headerView = nil
         tableView.allowsEmptySelection = true
-        tableView.allowsMultipleSelection = false
+        tableView.allowsMultipleSelection = true
+        tableView.setDraggingSourceOperationMask(.copy, forLocal: false)
         tableView.selectionHighlightStyle = .none
         tableView.backgroundColor = .clear
         tableView.style = .plain
@@ -510,7 +672,6 @@ final class MessageCellView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("MessageCell")
     private let selectionLayer = CALayer()
     private let hoverLayer = CALayer()
-    private let unreadDot = NSView()
     private let fromLabel = NSTextField(labelWithString: "")
     private let subjectLabel = NSTextField(labelWithString: "")
     private let previewLabel = NSTextField(labelWithString: "")
@@ -518,7 +679,6 @@ final class MessageCellView: NSTableCellView {
     private let flagIcon = NSImageView()
     private let paperclip = NSImageView()
     private var accentColor: NSColor?
-    private var isUnread = false
     private var isSelectedRow = false
     private var isHovered = false
     private var subjectTopFromConstraint: NSLayoutConstraint!
@@ -538,8 +698,6 @@ final class MessageCellView: NSTableCellView {
 #if DEBUG
         assert(selectionLayer.superlayer === layer)
 #endif
-        unreadDot.layer?.cornerRadius = 4
-        unreadDot.translatesAutoresizingMaskIntoConstraints = false
         fromLabel.translatesAutoresizingMaskIntoConstraints = false
         subjectLabel.translatesAutoresizingMaskIntoConstraints = false
         previewLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -567,7 +725,6 @@ final class MessageCellView: NSTableCellView {
         paperclip.image = NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Has attachments")
         paperclip.contentTintColor = .tertiaryLabelColor
         paperclip.symbolConfiguration = .init(pointSize: 11, weight: .regular)
-        addSubview(unreadDot)
         addSubview(fromLabel)
         addSubview(subjectLabel)
         addSubview(previewLabel)
@@ -577,11 +734,7 @@ final class MessageCellView: NSTableCellView {
         subjectTopFromConstraint = subjectLabel.topAnchor.constraint(equalTo: fromLabel.bottomAnchor, constant: 2)
         subjectTopRowConstraint = subjectLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10)
         NSLayoutConstraint.activate([
-            unreadDot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
-            unreadDot.centerYAnchor.constraint(equalTo: fromLabel.centerYAnchor),
-            unreadDot.widthAnchor.constraint(equalToConstant: 8),
-            unreadDot.heightAnchor.constraint(equalToConstant: 8),
-            fromLabel.leadingAnchor.constraint(equalTo: unreadDot.trailingAnchor, constant: 8),
+            fromLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             fromLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             dateLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
             dateLabel.centerYAnchor.constraint(equalTo: fromLabel.centerYAnchor),
@@ -641,15 +794,16 @@ final class MessageCellView: NSTableCellView {
 
     private func updateChromeGeometry() {
         let height = max(bounds.height - 6, 0)
-        // AppKit's swipe actions are capsules; the moving pill adopts that radius only while swiping, preserving the resting row token.
-        let radius = min(height / 2, bounds.width / 2)
-        let leadingInset = isSwiped ? -radius : 8
+        // Keep the capsule within the cell while swiping so both continuous
+        // corners remain visible as the row moves with its content.
+        let horizontalInset: CGFloat = 8
         let chromeFrame = CGRect(
-            x: leadingInset,
+            x: horizontalInset,
             y: 3,
-            width: max(bounds.width - leadingInset - 8, 0),
+            width: max(bounds.width - horizontalInset * 2, 0),
             height: height
         )
+        let radius = min(height / 2, chromeFrame.width / 2)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         hoverLayer.frame = chromeFrame
@@ -669,7 +823,6 @@ final class MessageCellView: NSTableCellView {
     }
 
     func apply(_ row: MessageRow, lineCount: Int) {
-        isUnread = !row.isRead
         let visibility = MessageListLayout.fieldVisibility(for: lineCount)
         fromLabel.isHidden = !visibility.sender
         dateLabel.isHidden = !visibility.date
@@ -694,31 +847,13 @@ final class MessageCellView: NSTableCellView {
         flagIcon.setAccessibilityHidden(!row.isFlagged || !visibility.date)
         flagIcon.toolTip = row.isFlagged ? "Flagged" : nil
         paperclip.isHidden = !row.hasAttachments
-        refreshUnreadDot()
-        unreadDot.toolTip = row.isRead ? nil : "Unread"
-        unreadDot.setAccessibilityElement(true)
-        unreadDot.setAccessibilityIdentifier(UIIdentifier.unreadDot)
-        unreadDot.setAccessibilityLabel("Unread")
-        unreadDot.setAccessibilityHidden(row.isRead)
         let flagDescription = row.isFlagged ? ", Flagged" : ""
         setAccessibilityLabel("\(row.from), \(row.subject), \(MailDateFormat.listRow(row.date))\(flagDescription)")
         setAccessibilityRole(.staticText)
     }
     func updateAccentColor(_ color: NSColor?) {
         accentColor = color
-        refreshUnreadDot()
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        refreshUnreadDot()
-    }
-
-    private func refreshUnreadDot() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            let accent = accentColor?.usingColorSpace(.sRGB)?.cgColor
-            unreadDot.layer?.backgroundColor = isUnread ? accent : NSColor.clear.cgColor
-        }
+        refreshChrome()
     }
 
 }
