@@ -84,9 +84,88 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
             try await store.snapshotMoveQueue().isEmpty
                 && world.archiveCommandSnapshot() == ["MOVE INBOX Archive 1:2"]
         }
+        try await waitUntil(timeout: .seconds(3)) {
+            try await store.page(in: archive, after: nil, limit: 10).rows.count == 2
+        }
+        let archived = try await store.page(in: archive, after: nil, limit: 10).rows
+        #expect(archived.count == 2)
         await engine.stop()
     }
 }
+
+@Test func engineDiscardsMoveToRetiredExplicitDestinationAndLogsError() async throws {
+    try await withSyncStore { store, dir in
+        let world = archiveWorld(capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE", "MOVE"]))
+        let engine = makeEngine(store: store, world: world, dir: dir).0
+        await engine.start()
+        let (_, message) = try await waitForArchiveInbox(store)
+        let archive = try #require(
+            (try await store.fetchFolders(account: sampleConfig().id))
+                .first(where: { $0.role == .archive })?.id
+        )
+        await engine.stop()
+        world.replaceFolders([inboxMailbox()])
+        await engine.start()
+        try await waitUntil(timeout: .seconds(3)) {
+            try await store.fetchFolderSummary(archive) == nil
+        }
+        try await store.enqueueMove(message: message, to: archive)
+
+        try await waitUntil(timeout: .seconds(3)) {
+            guard try await store.snapshotMoveQueue().isEmpty else { return false }
+            return try await store.fetchErrorLog().contains {
+                $0.kind == .archive && $0.message.contains("destination folder")
+            }
+        }
+        let errors = try await store.fetchErrorLog()
+        #expect(errors.contains { $0.kind == .archive && $0.message.contains("destination folder") })
+        #expect(world.archiveCommandSnapshot().isEmpty)
+        await engine.stop()
+    }
+}
+
+@Test func engineDropsExplicitMoveAfterUIDValidityReplacement() async throws {
+    try await withSyncStore { store, dir in
+        let world = archiveWorld(capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE", "MOVE"]))
+        let engine = makeEngine(store: store, world: world, dir: dir).0
+        await engine.start()
+        let (folder, _) = try await waitForArchiveInbox(store)
+        let archive = try #require(
+            (try await store.fetchFolders(account: sampleConfig().id))
+                .first(where: { $0.role == .archive })?.id
+        )
+        // Hold the operation in the queue while replacing the server
+        // generation, then restart so the stale check is deterministic.
+        await engine.stop()
+        world.updateMailbox("INBOX") { live in
+            live.uidValidity = 2
+        }
+        try await store.enqueueMove(
+            account: sampleConfig().id,
+            folder: folder,
+            uidValidity: 1,
+            uid: IMAPUID(rawValue: 1),
+            to: archive
+        )
+        await engine.start()
+
+        try await waitUntil(timeout: .seconds(30)) {
+            guard try await store.snapshotMoveQueue().isEmpty else { return false }
+            guard let live = try await store.liveGeneration(for: folder),
+                  live.uidValidity == 2
+            else { return false }
+            return try await store.fetchErrorLog().contains {
+                $0.kind == .archive && $0.message.contains("stale UIDVALIDITY")
+            }
+        }
+        let errors = try await store.fetchErrorLog()
+        #expect(errors.contains { $0.kind == .archive && $0.message.contains("stale UIDVALIDITY") })
+        #expect(world.archiveCommandSnapshot().isEmpty)
+        await engine.stop()
+    }
+}
+
+
 
 @Test func engineDiscardsMoveToRetiredDestinationAndLogsError() async throws {
     try await withSyncStore { store, dir in
@@ -251,12 +330,15 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
         )
         let engine = makeEngine(store: store, world: world, dir: dir).0
         await engine.start()
-        let (_, message) = try await waitForArchiveInbox(store)
+        let (folder, message) = try await waitForArchiveInbox(store)
 
         try await store.enqueueMove(message: message, to: .archive)
 
         try await waitUntil(timeout: .seconds(3)) {
             try await store.snapshotMoveQueue().isEmpty
+        }
+        try await waitUntil(timeout: .seconds(3)) {
+            try await store.page(in: folder, after: nil, limit: 10).rows.count == 1
         }
         let errors = try await store.fetchErrorLog()
         #expect(errors.contains { $0.kind == .archive && $0.message == "no Archive folder" })
