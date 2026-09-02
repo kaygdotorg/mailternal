@@ -109,11 +109,22 @@ public struct MessageRow: Identifiable, Hashable, Sendable {
     public var date: Date
     public var isRead: Bool
     public var hasAttachments: Bool
+    public var isFlagged: Bool
+    /// Display name of the containing folder (for example, "INBOX" or "Archive").
+    public var folderName: String
     public init(id: MessageID, from: String, subject: String, preview: String,
-                date: Date, isRead: Bool, hasAttachments: Bool) {
+                date: Date, isRead: Bool, hasAttachments: Bool,
+                isFlagged: Bool = false, folderName: String) {
         self.id = id; self.from = from; self.subject = subject; self.preview = preview
         self.date = date; self.isRead = isRead; self.hasAttachments = hasAttachments
+        self.isFlagged = isFlagged; self.folderName = folderName
     }
+}
+
+/// The two user-visible IMAP system flags supported by the mutation queue.
+public enum FlagKind: String, Sendable, Codable, Hashable, CaseIterable {
+    case seen
+    case flagged
 }
 
 /// Keyset pagination cursor over (internalDate DESC, uid DESC) — spec: sync.md storage.
@@ -141,9 +152,20 @@ public struct AttachmentInfo: Identifiable, Hashable, Sendable {
     public var mimeType: String
     public var sizeEstimate: Int?
     public var contentID: String?  // cid: reference, when inline
-    public init(id: String, filename: String?, mimeType: String, sizeEstimate: Int?, contentID: String?) {
+    /// MIME Content-Transfer-Encoding for on-demand IMAP section fetches.
+    /// Optional for rows written before this field was persisted.
+    public var transferEncoding: String?
+    public init(
+        id: String,
+        filename: String?,
+        mimeType: String,
+        sizeEstimate: Int?,
+        contentID: String?,
+        transferEncoding: String? = nil
+    ) {
         self.id = id; self.filename = filename; self.mimeType = mimeType
         self.sizeEstimate = sizeEstimate; self.contentID = contentID
+        self.transferEncoding = transferEncoding
     }
 }
 

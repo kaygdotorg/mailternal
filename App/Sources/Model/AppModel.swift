@@ -2,6 +2,7 @@ import AppKit
 import Observation
 import SwiftUI
 import MailternalInterfaces
+import MailternalSanitizer
 private enum MailModelRouteError: LocalizedError {
     case messageUnavailable
     case linkUnavailable
@@ -21,6 +22,7 @@ private enum MailModelRouteError: LocalizedError {
 final class AppModel {
     let facade: any MailFacade
     let appearance: AppearanceSettings
+    let actions: ActionSettings
     let toasts = ToastPresenter()
 
     var accountState: AccountState = .none
@@ -42,6 +44,13 @@ final class AppModel {
     var listEpoch: UInt64 = 0
     var isLoadingDetail = false
     var allowRemoteImages = false
+
+    /// Whether the sanitized message actually contains an app-controlled
+    /// token for a remote image. Inline `cid:` parts do not require consent.
+    var hasRemoteImageReferences: Bool {
+        guard let html = detail?.sanitizedHTML, !html.isEmpty else { return false }
+        return HTMLSanitizer.sanitize(html).hasRemoteReferences
+    }
 
     @ObservationIgnored private var pageTask: Task<Void, Never>?
     @ObservationIgnored private var observeTask: Task<Void, Never>?
@@ -69,9 +78,10 @@ final class AppModel {
         return false
     }
 
-    init(facade: any MailFacade, appearance: AppearanceSettings) {
+    init(facade: any MailFacade, appearance: AppearanceSettings, actions: ActionSettings) {
         self.facade = facade
         self.appearance = appearance
+        self.actions = actions
         accountState = facade.accountState
     }
 
@@ -120,7 +130,7 @@ final class AppModel {
                 )
             }
             guard !Task.isCancelled else { return }
-            MainWindowController.shared.show(model: self, appearance: appearance)
+            MainWindowController.shared.show(model: self, appearance: appearance, actions: actions)
         } catch is CancellationError {
             return
         } catch {
@@ -217,7 +227,7 @@ final class AppModel {
                 #if DEBUG
                 if QALaunch.parse() != nil { return }
                 #endif
-                SettingsWindowController.shared.show(model: self, appearance: appearance)
+                SettingsWindowController.shared.show(model: self, appearance: appearance, actions: actions)
             }
         }
     }
@@ -233,15 +243,15 @@ final class AppModel {
             selectedMessageID = nil
             detail = nil
             listRows = []
-            SettingsWindowController.shared.show(model: self, appearance: appearance)
+            SettingsWindowController.shared.show(model: self, appearance: appearance, actions: actions)
         case .authFailed(let message):
             foldersSnapshotReady = false
             toasts.post(title: "Couldn’t sign in", detail: message, severity: .error)
-            SettingsWindowController.shared.show(model: self, appearance: appearance)
+            SettingsWindowController.shared.show(model: self, appearance: appearance, actions: actions)
         case .connectionFailed(let message):
             foldersSnapshotReady = false
             toasts.post(title: "Couldn’t connect", detail: message, severity: .error)
-            SettingsWindowController.shared.show(model: self, appearance: appearance)
+            SettingsWindowController.shared.show(model: self, appearance: appearance, actions: actions)
         case .active:
             if case .active = previous { break }
             else { /* folders stream will populate */ }
@@ -343,10 +353,39 @@ final class AppModel {
         }
     }
 
-    /// Removes a message from the visible list before enqueueing its archive
-    /// move. The sync engine owns the eventual server-side operation.
-    func archive(_ id: MessageID) {
-        guard listRows.contains(where: { $0.id == id }) else { return }
+    func perform(_ kind: SwipeActionKind, on id: MessageID) {
+        guard let index = listRows.firstIndex(where: { $0.id == id }) else { return }
+        switch kind {
+        case .archive:
+            removeListRow(id)
+            Task { [weak self] in await self?.facade.archive(id) }
+        case .trash:
+            removeListRow(id)
+            Task { [weak self] in await self?.facade.trash(id) }
+        case .toggleRead:
+            var row = listRows[index]
+            row.isRead.toggle()
+            listRows[index] = row
+            let isRead = row.isRead
+            Task { [weak self] in
+                if isRead {
+                    await self?.facade.markRead(id)
+                } else {
+                    await self?.facade.markUnread(id)
+                }
+            }
+        case .toggleFlag:
+            var row = listRows[index]
+            row.isFlagged.toggle()
+            listRows[index] = row
+            let flagged = row.isFlagged
+            Task { [weak self] in
+                await self?.facade.setFlagged(id, flagged)
+            }
+        }
+    }
+
+    private func removeListRow(_ id: MessageID) {
         listRows.removeAll { $0.id == id }
         if selectedMessageID == id {
             selectedMessageID = nil
@@ -355,9 +394,6 @@ final class AppModel {
             rawSource = nil
             isShowingRawSource = false
             isFindPresented = false
-        }
-        Task { [weak self] in
-            await self?.facade.archive(id)
         }
     }
 
@@ -403,7 +439,7 @@ final class AppModel {
     }
 
     func showSettings() {
-        SettingsWindowController.shared.show(model: self, appearance: appearance)
+        SettingsWindowController.shared.show(model: self, appearance: appearance, actions: actions)
     }
 
     func loadRawSource() async {

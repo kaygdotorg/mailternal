@@ -19,6 +19,7 @@ struct AttachmentInfoDTO: Codable, Sendable {
     var mimeType: String
     var sizeEstimate: Int?
     var contentID: String?
+    var transferEncoding: String?
 
     init(_ info: AttachmentInfo) {
         id = info.id
@@ -26,6 +27,7 @@ struct AttachmentInfoDTO: Codable, Sendable {
         mimeType = info.mimeType
         sizeEstimate = info.sizeEstimate
         contentID = info.contentID
+        transferEncoding = info.transferEncoding
     }
 
     func makeInfo() -> AttachmentInfo {
@@ -34,7 +36,8 @@ struct AttachmentInfoDTO: Codable, Sendable {
             filename: filename,
             mimeType: mimeType,
             sizeEstimate: sizeEstimate,
-            contentID: contentID
+            contentID: contentID,
+            transferEncoding: transferEncoding
         )
     }
 }

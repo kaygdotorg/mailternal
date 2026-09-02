@@ -202,8 +202,44 @@ final class MockMailFacade: MailFacade {
         }
         publishObservers(in: stored.folder)
     }
- 
+
+    func markUnread(_ id: MessageID) async {
+        guard var stored = byID[id], stored.row.isRead else { return }
+        stored.row.isRead = false
+        byID[id] = stored
+        if var list = messages[stored.folder],
+           let index = list.firstIndex(where: { $0.row.id == id }) {
+            list[index] = stored
+            messages[stored.folder] = list
+        }
+        if let folderIndex = folders.firstIndex(where: { $0.id == stored.folder }) {
+            folders[folderIndex].unreadCount += 1
+            foldersContinuation.yield(folders)
+        }
+        publishObservers(in: stored.folder)
+    }
+
+    func setFlagged(_ id: MessageID, _ flagged: Bool) async {
+        guard var stored = byID[id], stored.row.isFlagged != flagged else { return }
+        stored.row.isFlagged = flagged
+        byID[id] = stored
+        if var list = messages[stored.folder],
+           let index = list.firstIndex(where: { $0.row.id == id }) {
+            list[index] = stored
+            messages[stored.folder] = list
+        }
+        publishObservers(in: stored.folder)
+    }
+
+    func trash(_ id: MessageID) async {
+        move(id, to: .trash)
+    }
+
     func archive(_ id: MessageID) async {
+        move(id, to: .archive)
+    }
+
+    private func move(_ id: MessageID, to role: FolderRole) {
         guard let stored = byID[id] else { return }
         let source = stored.folder
         guard var sourceList = messages[source],
@@ -212,13 +248,14 @@ final class MockMailFacade: MailFacade {
         sourceList.remove(at: sourceIndex)
         messages[source] = sourceList
 
-        let destination = folders.first(where: { $0.role == .archive })?.id
+        let destination = folders.first(where: { $0.role == role })?.id
         if let destination {
-            var archived = stored
-            archived.folder = destination
-            byID[id] = archived
+            var moved = stored
+            moved.folder = destination
+            moved.row.folderName = folders.first(where: { $0.id == destination })?.name ?? moved.row.folderName
+            byID[id] = moved
             var destinationList = messages[destination] ?? []
-            destinationList.append(archived)
+            destinationList.append(moved)
             destinationList.sort {
                 if $0.row.date != $1.row.date { return $0.row.date > $1.row.date }
                 return $0.uid > $1.uid
@@ -447,7 +484,6 @@ final class MockMailFacade: MailFacade {
             inReplyTo: nil,
             references: []
         )
-
         var attachments: [AttachmentInfo] = []
         var parts: [String: (data: Data, mimeType: String)] = [:]
         if hasAttachment {
@@ -486,7 +522,9 @@ final class MockMailFacade: MailFacade {
             preview: preview,
             date: date,
             isRead: !unread,
-            hasAttachments: hasAttachment
+            hasAttachments: hasAttachment,
+            isFlagged: false,
+            folderName: folderName
         )
         let detail = MessageDetail(
             id: id,

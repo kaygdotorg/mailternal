@@ -20,7 +20,15 @@ extension MailStore {
             guard let pattern = FTS5Pattern(matchingAllTokensIn: query) else { return [] }
             let sql = """
                 SELECT m.id, m.from_display, m.subject, m.internal_date, m.uid,
-                       m.is_read, m.has_attachments, m.preview,
+                       m.is_read, m.has_attachments, m.is_flagged, m.preview,
+                       COALESCE(NULLIF(f.name, ''), CASE f.role
+                           WHEN 'inbox' THEN 'INBOX'
+                           WHEN 'archive' THEN 'Archive'
+                           WHEN 'trash' THEN 'Trash'
+                           WHEN 'junk' THEN 'Junk'
+                           WHEN 'sent' THEN 'Sent'
+                           WHEN 'drafts' THEN 'Drafts'
+                           ELSE f.path END) AS folder_name,
                        snippet(messages_fts, 3, '', '', '\u{2026}', 24) AS body_snippet,
                        snippet(messages_fts, 0, '', '', '\u{2026}', 16) AS subject_snippet
                 FROM messages_fts

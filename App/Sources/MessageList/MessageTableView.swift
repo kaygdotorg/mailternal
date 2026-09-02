@@ -4,11 +4,15 @@ import MailternalInterfaces
 
 struct MessageListPane: View {
     @Bindable var model: AppModel
+    @Environment(ActionSettings.self) private var actions
     @State private var titleShowsAccount = false
     @State private var titleHeight: CGFloat = 0
 
     private var listDissolvePolicy: MailWindowDissolvePolicy {
-        .messageList.withTopOrigin(titleHeight / 2)
+        // The button measurement includes its 12pt bottom padding and the
+        // font's descent. Starting the mask here puts its clear stop at the
+        // H1 baseline; the 52pt ramp then reaches opaque content below it.
+        .messageList.withTopOrigin(max(titleHeight - 18, 0))
     }
 
     private var listTitle: String {
@@ -25,6 +29,8 @@ struct MessageListPane: View {
                 epoch: model.listEpoch,
                 lineCount: model.appearance.messageListLines,
                 accent: model.appearance.accent,
+                leading: actions.leadingSwipe,
+                trailing: actions.trailingSwipe,
                 topRestDepth: listDissolvePolicy.restDepth(safeAreaTop: 0),
                 onSelect: { model.selectMessage($0) },
                 onPrefetch: { model.loadMoreIfNeeded(near: $0) },
@@ -32,8 +38,7 @@ struct MessageListPane: View {
                 onCopyDeepLink: { messageID in
                     Task { await model.copyDeepLink(for: messageID) }
                 },
-                onArchive: { model.archive($0) },
-                onMarkRead: { model.markRead($0) }
+                onAction: { kind, messageID in model.perform(kind, on: messageID) }
             )
             .mailWindowDissolve(listDissolvePolicy)
 
@@ -43,7 +48,7 @@ struct MessageListPane: View {
                 }
             } label: {
                 Text(listTitle)
-                    .font(.title2.weight(.semibold))
+                    .font(.system(size: 26, weight: .bold))
                     .foregroundStyle(.primary)
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
@@ -54,10 +59,9 @@ struct MessageListPane: View {
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 16)
-            .padding(.top, 12)
+            .padding(.top, 18)
             .padding(.bottom, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.regularMaterial)
             .accessibilityAddTraits(.isHeader)
             .accessibilityIdentifier(UIIdentifier.messageListTitle)
             .onGeometryChange(for: CGFloat.self) { proxy in
@@ -87,13 +91,14 @@ struct MessageTableRepresentable: NSViewRepresentable {
     var epoch: UInt64
     var lineCount: Int
     var accent: AccentSource
+    var leading: [SwipeActionKind]
+    var trailing: [SwipeActionKind]
     var topRestDepth: CGFloat
     var onSelect: (MessageID?) -> Void
     var onPrefetch: (Int) -> Void
     var onCopySubject: (MessageID) -> Void
     var onCopyDeepLink: (MessageID) -> Void
-    var onArchive: (MessageID) -> Void
-    var onMarkRead: (MessageID) -> Void
+    var onAction: (SwipeActionKind, MessageID) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -211,22 +216,27 @@ struct MessageTableRepresentable: NSViewRepresentable {
             rowActionsForRow row: Int,
             edge: NSTableView.RowActionEdge
         ) -> [NSTableViewRowAction] {
-            guard let messageID = parent?.rows[safe: row]?.id else { return [] }
+            guard let rowModel = parent?.rows[safe: row] else { return [] }
+            let kinds: [SwipeActionKind]
             switch edge {
-            case .trailing:
-                return [
-                    NSTableViewRowAction(style: .destructive, title: "Archive") { [weak self] _, _ in
-                        self?.parent?.onArchive(messageID)
-                    }
-                ]
             case .leading:
-                return [
-                    NSTableViewRowAction(style: .regular, title: "Mark as Read") { [weak self] _, _ in
-                        self?.parent?.onMarkRead(messageID)
-                    }
-                ]
+                kinds = parent?.leading ?? []
+            case .trailing:
+                kinds = parent?.trailing ?? []
             @unknown default:
                 return []
+            }
+
+            return kinds.map { kind in
+                let title = kind.title(isRead: rowModel.isRead, isFlagged: rowModel.isFlagged)
+                let action = NSTableViewRowAction(style: kind.style, title: title) { [weak self] _, _ in
+                    self?.parent?.onAction(kind, rowModel.id)
+                }
+                action.image = NSImage(
+                    systemSymbolName: kind.systemImage(isRead: rowModel.isRead, isFlagged: rowModel.isFlagged),
+                    accessibilityDescription: title
+                )
+                return action
             }
         }
 
@@ -343,10 +353,13 @@ final class MessageTableContainer: NSView {
         tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         tableView.focusRingType = .none
         scrollView.documentView = tableView
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
+        scrollView.contentView.backgroundColor = .clear
         // The pane's frame runs to the physical window top, so rows travel up
         // beneath the fixed title and dissolve in the mask's ramp on the way.
         // The scroll CONTENT stops at the ramp's end, so the first row comes
@@ -528,6 +541,7 @@ final class MessageCellView: NSTableCellView {
     private let subjectLabel = NSTextField(labelWithString: "")
     private let previewLabel = NSTextField(labelWithString: "")
     private let dateLabel = NSTextField(labelWithString: "")
+    private let flagIcon = NSImageView()
     private let paperclip = NSImageView()
     private var accentColor: NSColor?
     private var isUnread = false
@@ -545,6 +559,7 @@ final class MessageCellView: NSTableCellView {
         subjectLabel.translatesAutoresizingMaskIntoConstraints = false
         previewLabel.translatesAutoresizingMaskIntoConstraints = false
         dateLabel.translatesAutoresizingMaskIntoConstraints = false
+        flagIcon.translatesAutoresizingMaskIntoConstraints = false
         paperclip.translatesAutoresizingMaskIntoConstraints = false
         fromLabel.lineBreakMode = .byTruncatingTail
         subjectLabel.lineBreakMode = .byTruncatingTail
@@ -557,6 +572,13 @@ final class MessageCellView: NSTableCellView {
         dateLabel.textColor = .secondaryLabelColor
         dateLabel.alignment = .right
         dateLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        flagIcon.image = NSImage(systemSymbolName: "flag.fill", accessibilityDescription: "Flagged")
+        flagIcon.contentTintColor = .systemOrange
+        flagIcon.symbolConfiguration = .init(pointSize: 11, weight: .regular)
+        flagIcon.setAccessibilityElement(true)
+        flagIcon.setAccessibilityLabel("Flagged")
+        flagIcon.isHidden = true
+        flagIcon.setAccessibilityHidden(true)
         paperclip.image = NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Has attachments")
         paperclip.contentTintColor = .tertiaryLabelColor
         paperclip.symbolConfiguration = .init(pointSize: 11, weight: .regular)
@@ -565,6 +587,7 @@ final class MessageCellView: NSTableCellView {
         addSubview(subjectLabel)
         addSubview(previewLabel)
         addSubview(dateLabel)
+        addSubview(flagIcon)
         addSubview(paperclip)
         subjectTopFromConstraint = subjectLabel.topAnchor.constraint(equalTo: fromLabel.bottomAnchor, constant: 2)
         subjectTopRowConstraint = subjectLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10)
@@ -577,7 +600,11 @@ final class MessageCellView: NSTableCellView {
             fromLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             dateLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
             dateLabel.centerYAnchor.constraint(equalTo: fromLabel.centerYAnchor),
-            fromLabel.trailingAnchor.constraint(lessThanOrEqualTo: dateLabel.leadingAnchor, constant: -8),
+            flagIcon.trailingAnchor.constraint(equalTo: dateLabel.leadingAnchor, constant: -6),
+            flagIcon.centerYAnchor.constraint(equalTo: dateLabel.centerYAnchor),
+            flagIcon.widthAnchor.constraint(equalToConstant: 12),
+            flagIcon.heightAnchor.constraint(equalToConstant: 12),
+            fromLabel.trailingAnchor.constraint(lessThanOrEqualTo: flagIcon.leadingAnchor, constant: -8),
             subjectLabel.leadingAnchor.constraint(equalTo: fromLabel.leadingAnchor),
             subjectTopFromConstraint,
             paperclip.trailingAnchor.constraint(equalTo: dateLabel.trailingAnchor),
@@ -617,6 +644,9 @@ final class MessageCellView: NSTableCellView {
         previewLabel.font = .systemFont(ofSize: 12)
         dateLabel.stringValue = MailDateFormat.listRow(row.date)
         dateLabel.font = .systemFont(ofSize: 11, weight: row.isRead ? .regular : .medium)
+        flagIcon.isHidden = !(row.isFlagged && visibility.date)
+        flagIcon.setAccessibilityHidden(!row.isFlagged || !visibility.date)
+        flagIcon.toolTip = row.isFlagged ? "Flagged" : nil
         paperclip.isHidden = !row.hasAttachments
         refreshUnreadDot()
         unreadDot.toolTip = row.isRead ? nil : "Unread"
@@ -624,7 +654,8 @@ final class MessageCellView: NSTableCellView {
         unreadDot.setAccessibilityIdentifier(UIIdentifier.unreadDot)
         unreadDot.setAccessibilityLabel("Unread")
         unreadDot.setAccessibilityHidden(row.isRead)
-        setAccessibilityLabel("\(row.from), \(row.subject), \(MailDateFormat.listRow(row.date))")
+        let flagDescription = row.isFlagged ? ", Flagged" : ""
+        setAccessibilityLabel("\(row.from), \(row.subject), \(MailDateFormat.listRow(row.date))\(flagDescription)")
         setAccessibilityRole(.staticText)
     }
     func updateAccentColor(_ color: NSColor?) {

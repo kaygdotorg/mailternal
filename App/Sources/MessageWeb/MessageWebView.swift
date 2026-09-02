@@ -26,6 +26,8 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     public var onExternalLink: ((URL) -> Void)?
     /// Invoked if the categorical network fence cannot be installed.
     public var onError: ((any Error) -> Void)?
+    /// Reports the rendered document height so an outer reader can own scrolling.
+    public var onContentHeightChange: ((CGFloat) -> Void)?
 
     private let webView: WKWebView
     private let errorLabel: NSTextField
@@ -37,8 +39,10 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     private var lastHTMLIdentity: DisplayedHTMLIdentity?
     private var lastProvider: PartProvider?
     private var emailReadingMode: EmailReadingMode = .original
-    private var fence: NetworkFenceState = .compiling
     private var pendingRender = false
+    private var fence: NetworkFenceState = .compiling
+    private var lastReportedContentHeight: CGFloat?
+    private var documentDidFinish = false
 
     private static let isolationLog = Logger(
         subsystem: "org.kayg.mailternal",
@@ -52,7 +56,6 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         configuration.websiteDataStore = .nonPersistent()
         configuration.userContentController = userContentController
         configuration.defaultWebpagePreferences.allowsContentJavaScript = false
-        configuration.preferences.javaScriptEnabled = false
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         configuration.preferences.isFraudulentWebsiteWarningEnabled = false
         configuration.mediaTypesRequiringUserActionForPlayback = .all
@@ -76,7 +79,6 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         // macOS WKWebView is opaque by default (isOpaque is get-only here);
         // the mode-driven canvas is enforced via underPageBackgroundColor + CSS.
         webView.underPageBackgroundColor = Self.canvasColor(for: .original)
-        webView.autoresizingMask = [.width, .height]
         webView.frame = bounds
         errorLabel.autoresizingMask = [.width, .height]
         errorLabel.frame = bounds.insetBy(dx: 24, dy: 24)
@@ -94,6 +96,8 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         super.layout()
         webView.frame = bounds
         errorLabel.frame = bounds.insetBy(dx: 24, dy: 24)
+        guard documentDidFinish else { return }
+        reportContentHeight()
     }
 
     /// Display already-sanitized HTML. `partProvider` is called with the original
@@ -175,6 +179,8 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             pendingRender = false
             errorLabel.isHidden = true
             webView.isHidden = false
+            lastReportedContentHeight = nil
+            documentDidFinish = false
             webView.loadHTMLString(Self.wrap(lastHTML, emailReadingMode: emailReadingMode), baseURL: nil)
         case .refuseHTML:
             pendingRender = false
@@ -321,13 +327,36 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     ) {
         completionHandler(nil)
     }
-
-    public func webViewDidClose(_ webView: WKWebView) {}
-
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
-        guard !lastFindQuery.isEmpty else { return }
-        Task { _ = await performFind() }
+        documentDidFinish = true
+        // WebKit may publish the final content size one run-loop turn after
+        // navigation completes, so report after layout has settled.
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            self?.reportContentHeight()
+            guard let self, !self.lastFindQuery.isEmpty else { return }
+            _ = await self.performFind()
+        }
     }
+
+    private func reportContentHeight() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let result = try? await webView.evaluateJavaScript(
+                "document.documentElement.offsetHeight"
+            ), let number = result as? NSNumber else {
+                return
+            }
+            let height = CGFloat(truncating: number)
+            guard height.isFinite, height > 0,
+                  lastReportedContentHeight.map({ abs(height - $0) > 0.5 }) ?? true else {
+                return
+            }
+            lastReportedContentHeight = height
+            onContentHeightChange?(height)
+        }
+    }
+
 
     private func isInternalDocumentLoad(_ action: WKNavigationAction, url: URL) -> Bool {
         guard action.navigationType == .other else { return false }
@@ -371,9 +400,9 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         /* The canvas lives on html and stays opaque so mail that declares no
            colors is readable; author body/background declarations must win,
            so only color-scheme is forced. */
-        html { color-scheme: \(colorScheme) !important; background: \(canvas); }
+        html { color-scheme: \(colorScheme) !important; background: \(canvas); height: auto; min-height: 0; }
         body {
-          margin: 0; padding: 0 20px;
+          height: auto; min-height: 0; margin: 0; padding: 18px 20px;
           font: -apple-system-body;
           font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
           font-size: 13px; line-height: 18px;

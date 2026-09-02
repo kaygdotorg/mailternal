@@ -2,27 +2,29 @@ import Foundation
 import GRDB
 
 extension MailStore {
-    /// Enqueues a coalesced archive move and optimistically removes the local row.
-    public func enqueueArchive(
+    /// Enqueues a coalesced move and optimistically removes the local row.
+    public func enqueueMove(
         account: AccountID,
         folder: FolderID,
         uidValidity: UInt32,
-        uid: IMAPUID
+        uid: IMAPUID,
+        to destination: FolderRole
     ) async throws {
         try await write { db in
-            try MailStore.enqueueArchive(
+            try MailStore.enqueueMove(
                 db,
                 account: account,
                 folder: folder,
                 uidValidity: uidValidity,
-                uid: uid
+                uid: uid,
+                destination: destination
             )
         }
     }
 
     /// Looks up the message row, enqueues against its generation, and removes
-    /// the row in the same writer transaction (spec: sync.md Archive queue).
-    public func enqueueArchive(message id: MessageID) async throws {
+    /// the row in the same writer transaction.
+    public func enqueueMove(message id: MessageID, to destination: FolderRole) async throws {
         try await write { db in
             guard let row = try Row.fetchOne(
                 db,
@@ -41,18 +43,19 @@ extension MailStore {
             let folderID: Int64 = row["folder_id"]
             let uidValidity: Int64 = row["uid_validity"]
             let account: String = row["account_id"]
-            try MailStore.enqueueArchive(
+            try MailStore.enqueueMove(
                 db,
                 account: AccountID(rawValue: account),
                 folder: FolderID(rawValue: folderID),
                 uidValidity: UInt32(uidValidity),
-                uid: IMAPUID(rawValue: UInt32(uid))
+                uid: IMAPUID(rawValue: UInt32(uid)),
+                destination: destination
             )
         }
     }
 
-    /// Snapshot of pending archive operations for sending, oldest first.
-    public func snapshotArchiveQueue(limit: Int = 100) async throws -> [ArchiveOp] {
+    /// Snapshot of pending moves for sending, oldest first.
+    public func snapshotMoveQueue(limit: Int = 100) async throws -> [MoveOp] {
         let cap = max(0, limit)
         return try await read { db in
             let rows = try Row.fetchAll(
@@ -60,13 +63,13 @@ extension MailStore {
                 sql: "SELECT * FROM archive_queue ORDER BY enqueued_at ASC, id ASC LIMIT ?",
                 arguments: [cap]
             )
-            return rows.map { MailStore.archiveOp(from: $0) }
+            return rows.map { MailStore.moveOp(from: $0) }
         }
     }
 
-    /// Tagged `OK`: dequeue an archive operation and clear any row that
-    /// arrived from a concurrent FETCH while this operation was pending.
-    public func deleteArchiveOp(_ op: ArchiveOp) async throws {
+    /// Tagged `OK`: dequeue a move and clear any row that arrived from a
+    /// concurrent FETCH while this operation was pending.
+    public func deleteMoveOp(_ op: MoveOp) async throws {
         try await write { db in
             let present = try Int.fetchOne(
                 db,
@@ -89,9 +92,9 @@ extension MailStore {
         }
     }
 
-    /// Persists that the fallback COPY completed. The remaining STORE and
-    /// EXPUNGE phases are safe to retry after a process restart.
-    public func markArchiveCopied(_ op: ArchiveOp) async throws {
+    /// Persists that fallback COPY completed. Remaining STORE and EXPUNGE
+    /// phases are safe to retry after a process restart.
+    public func markMoveCopied(_ op: MoveOp) async throws {
         try await write { db in
             try db.execute(
                 sql: "UPDATE archive_queue SET copied = 1 WHERE id = ?",
@@ -100,27 +103,32 @@ extension MailStore {
         }
     }
 
-    /// Discards archive operations whose UIDVALIDITY no longer matches the live generation.
-    public func dropStaleArchive(folder: FolderID) async throws {
+    /// Discards move operations whose UIDVALIDITY no longer matches the live generation.
+    public func dropStaleMove(folder: FolderID) async throws {
         try await write { db in
-            try MailStore.dropStaleArchive(db, folder: folder)
+            try MailStore.dropStaleMove(db, folder: folder)
         }
     }
 
-    static func enqueueArchive(
+
+    static func enqueueMove(
         _ db: Database,
         account: AccountID,
         folder: FolderID,
         uidValidity: UInt32,
-        uid: IMAPUID
+        uid: IMAPUID,
+        destination: FolderRole
     ) throws {
         try db.execute(
             sql: """
                 INSERT INTO archive_queue (
-                    account_id, folder_id, uid_validity, uid, enqueued_at, copied
+                    account_id, folder_id, uid_validity, uid, enqueued_at, copied, destination
                 )
-                VALUES (?, ?, ?, ?, ?, 0)
-                ON CONFLICT(account_id, folder_id, uid_validity, uid) DO NOTHING
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                ON CONFLICT(account_id, folder_id, uid_validity, uid) DO UPDATE SET
+                    enqueued_at = excluded.enqueued_at,
+                    destination = excluded.destination,
+                    copied = 0
                 """,
             arguments: [
                 account.rawValue,
@@ -128,10 +136,11 @@ extension MailStore {
                 Int64(uidValidity),
                 Int64(uid.rawValue),
                 Date().timeIntervalSince1970,
+                destination.rawValue,
             ]
         )
-        // An archive mutation leaves this folder. The next delta pass reconciles
-        // the server's truth if the operation fails or the process exits.
+        // A move mutation leaves this folder. The next delta pass reconciles
+        // server truth if the operation fails or the process exits.
         try db.execute(
             sql: """
                 DELETE FROM messages
@@ -145,7 +154,7 @@ extension MailStore {
         )
     }
 
-    static func dropStaleArchive(_ db: Database, folder: FolderID) throws {
+    static func dropStaleMove(_ db: Database, folder: FolderID) throws {
         let rows = try Row.fetchAll(
             db,
             sql: """
@@ -193,15 +202,18 @@ extension MailStore {
         )
     }
 
-    static func archiveOp(from row: Row) -> ArchiveOp {
+    static func moveOp(from row: Row) -> MoveOp {
         let uidValidity: Int64 = row["uid_validity"]
         let uid: Int64 = row["uid"]
-        return ArchiveOp(
+        let destinationRaw: String = row["destination"]
+        let destination = FolderRole(rawValue: destinationRaw) ?? .archive
+        return MoveOp(
             id: row["id"],
             account: AccountID(rawValue: row["account_id"]),
             folder: FolderID(rawValue: row["folder_id"]),
             uidValidity: UInt32(uidValidity),
             uid: IMAPUID(rawValue: UInt32(uid)),
+            destination: destination,
             copied: row["copied"]
         )
     }

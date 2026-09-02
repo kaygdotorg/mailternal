@@ -54,6 +54,40 @@ enum Schema {
                 t.add(column: "copied", .boolean).notNull().defaults(to: false)
             }
         }
+        migrator.registerMigration("v6_move_destination") { db in
+            try db.alter(table: "archive_queue") { t in
+                t.add(column: "destination", .text).notNull().defaults(to: FolderRole.archive.rawValue)
+            }
+        }
+        migrator.registerMigration("v7_flag_queue") { db in
+            // The original seen queue was unique per message. Rebuild it so
+            // independent \Seen and \Flagged mutations can coexist while
+            // retaining every existing operation as a pending read.
+            try db.execute(sql: "DROP INDEX IF EXISTS seen_queue_send_idx")
+            try db.execute(sql: "ALTER TABLE seen_queue RENAME TO seen_queue_v6")
+            try db.execute(sql: """
+                CREATE TABLE seen_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+                    uid_validity INTEGER NOT NULL,
+                    uid INTEGER NOT NULL,
+                    enqueued_at DOUBLE NOT NULL,
+                    flag TEXT NOT NULL DEFAULT 'seen',
+                    "set" BOOLEAN NOT NULL DEFAULT 1,
+                    UNIQUE(account_id, folder_id, uid_validity, uid, flag)
+                )
+                """)
+            try db.execute(sql: """
+                INSERT INTO seen_queue (
+                    id, account_id, folder_id, uid_validity, uid, enqueued_at, flag, "set"
+                )
+                SELECT id, account_id, folder_id, uid_validity, uid, enqueued_at, 'seen', 1
+                FROM seen_queue_v6
+                """)
+            try db.execute(sql: "DROP TABLE seen_queue_v6")
+            try db.execute(sql: "CREATE INDEX seen_queue_send_idx ON seen_queue(enqueued_at, id)")
+        }
         return migrator
     }
 

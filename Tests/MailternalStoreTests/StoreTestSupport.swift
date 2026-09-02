@@ -62,6 +62,7 @@ func makeMessage(
     body: String? = "Body text",
     decodedBytes: Int = 0,
     isRead: Bool = false,
+    isFlagged: Bool = false,
     isQuarantined: Bool = false,
     parseDefect: String? = nil
 ) -> IncomingMessage {
@@ -80,7 +81,7 @@ func makeMessage(
             inReplyTo: nil,
             references: uid == 1 ? [] : ["<1@example.com>"]
         ),
-        flags: MessageFlags(isRead: isRead),
+        flags: MessageFlags(isRead: isRead, isFlagged: isFlagged),
         bodyText: body,
         sanitizedHTML: nil,
         attachments: [],

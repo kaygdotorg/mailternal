@@ -5,6 +5,7 @@ import MailternalInterfaces
 struct MainSplitRoot: View {
     @Bindable var model: AppModel
     let appearance: AppearanceSettings
+    let actions: ActionSettings
     var isActive: Bool = true
 
     var body: some View {
@@ -23,6 +24,7 @@ struct MainSplitRoot: View {
         }
         .tint(appearance.accent.color)
         .environment(appearance.accent)
+        .environment(actions)
         .preferredColorScheme(appearance.mode.colorScheme)
         .onExitCommand(perform: handleEscape)
         .task { model.start() }
@@ -40,10 +42,10 @@ struct MainSplitRoot: View {
         }
     }
 }
-
 struct MainOverlayRoot: View {
     @Bindable var model: AppModel
     let appearance: AppearanceSettings
+    let actions: ActionSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -59,6 +61,7 @@ struct MainOverlayRoot: View {
         }
         .animation(MailMotion.searchPanel(reduceMotion: reduceMotion), value: model.isSearchPresented)
         .environment(appearance.accent)
+        .environment(actions)
         .tint(appearance.accent.color)
     }
 }
@@ -167,15 +170,17 @@ enum MainWindowStartupConfiguration {
 final class MainShellViewController: NSViewController {
     private var model: AppModel
     private var appearance: AppearanceSettings
+    private var actions: ActionSettings
     private let contentHosting: NSHostingController<MainSplitRoot>
     private var overlayHosting: OverlayHostingView?
     private var backgroundHosting: NSHostingView<WindowBackdropRoot>?
 
-    init(model: AppModel, appearance: AppearanceSettings) {
+    init(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
         self.model = model
         self.appearance = appearance
+        self.actions = actions
         contentHosting = NSHostingController(
-            rootView: MainSplitRoot(model: model, appearance: appearance)
+            rootView: MainSplitRoot(model: model, appearance: appearance, actions: actions)
         )
         super.init(nibName: nil, bundle: nil)
         contentHosting.sizingOptions = []
@@ -204,16 +209,19 @@ final class MainShellViewController: NSViewController {
         configureWindowIfAttached()
     }
 
-    func update(model: AppModel, appearance: AppearanceSettings) {
+    func update(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
         self.model = model
         self.appearance = appearance
-        contentHosting.rootView = MainSplitRoot(model: model, appearance: appearance)
-        overlayHosting?.rootView = MainOverlayRoot(model: model, appearance: appearance)
+        self.actions = actions
+        contentHosting.rootView = MainSplitRoot(model: model, appearance: appearance, actions: actions)
+        overlayHosting?.rootView = MainOverlayRoot(model: model, appearance: appearance, actions: actions)
         backgroundHosting?.rootView = WindowBackdropRoot(appearance: appearance)
     }
 
     private func makeOverlay() {
-        let hosting = OverlayHostingView(rootView: MainOverlayRoot(model: model, appearance: appearance))
+        let hosting = OverlayHostingView(
+            rootView: MainOverlayRoot(model: model, appearance: appearance, actions: actions)
+        )
         hosting.safeAreaRegions = []
         hosting.sizingOptions = []
         hosting.translatesAutoresizingMaskIntoConstraints = false
@@ -250,15 +258,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var shell: MainShellViewController?
 
     private init() { super.init(window: nil) }
-
-    @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func show(model: AppModel, appearance: AppearanceSettings) {
+    func show(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
         if let shell {
-            shell.update(model: model, appearance: appearance)
+            shell.update(model: model, appearance: appearance, actions: actions)
         } else {
-            let shell = MainShellViewController(model: model, appearance: appearance)
+            let shell = MainShellViewController(model: model, appearance: appearance, actions: actions)
             self.shell = shell
             let window = NSWindow(
                 contentRect: NSRect(origin: .zero, size: MainWindowStartupConfiguration.defaultContentSize),

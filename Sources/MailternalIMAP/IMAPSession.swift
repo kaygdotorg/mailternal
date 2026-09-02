@@ -315,19 +315,25 @@ extension IMAPSession {
         return fetchAssembler.take()
     }
 
-    /// `UID STORE <uids> +FLAGS.SILENT (\Seen)`. Only tagged `OK` is success;
-    /// tagged NO/BAD throw (spec: sync.md write queue).
-    public func storeSeen(uids: IMAPUIDSet) async throws {
+    /// `UID STORE <uids> +/-FLAGS.SILENT (\Seen|\Flagged)`. Only tagged `OK`
+    /// is success.
+    public func storeFlags(uids: IMAPUIDSet, flag: FlagKind, set: Bool) async throws {
         try ensureAuthenticated()
-        guard let set = IMAPCommandFactory.uidSet(uids),
+        guard let uidSet = IMAPCommandFactory.uidSet(uids),
               let command = Command.uidStore(
-                messages: set,
+                messages: uidSet,
                 modifiers: [],
-                data: .flags(.add(silent: true, list: [.seen]))
+                data: .flags(set
+                    ? .add(silent: true, list: [flag == .seen ? .seen : .flagged])
+                    : .remove(silent: true, list: [flag == .seen ? .seen : .flagged]))
               )
         else { return }
         let tagged = try await send(command)
         try throwIfFailed(tagged)
+    }
+
+    public func storeSeen(uids: IMAPUIDSet) async throws {
+        try await storeFlags(uids: uids, flag: .seen, set: true)
     }
  
     /// `UID MOVE <uids> <mailbox>`. Only tagged `OK` is success.

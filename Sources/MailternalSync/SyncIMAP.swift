@@ -14,6 +14,8 @@ package protocol IMAPClient: Sendable {
     func select(_ mailbox: String, qresync: IMAPQResyncSelect?) async throws -> IMAPSelectedMailbox
     func enableQResync() async throws
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage]
+    func storeFlags(uids: IMAPUIDSet, flag: FlagKind, set: Bool) async throws
+    /// Historical convenience retained for existing callers.
     func storeSeen(uids: IMAPUIDSet) async throws
     func move(uids: IMAPUIDSet, to mailbox: String) async throws
     func copy(uids: IMAPUIDSet, to mailbox: String) async throws
@@ -44,6 +46,9 @@ struct LiveIMAPClient: IMAPClient {
     func enableQResync() async throws { try await session.enableQResync() }
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
         try await session.fetch(request)
+    }
+    func storeFlags(uids: IMAPUIDSet, flag: FlagKind, set: Bool) async throws {
+        try await session.storeFlags(uids: uids, flag: flag, set: set)
     }
     func storeSeen(uids: IMAPUIDSet) async throws { try await session.storeSeen(uids: uids) }
     func move(uids: IMAPUIDSet, to mailbox: String) async throws {
@@ -159,6 +164,20 @@ actor SyncChannel {
     /// Atomic select-verify-store for the seen queue: the op's UIDVALIDITY is
     /// re-verified against the *server's* selected mailbox immediately before
     /// STORE, inside one exclusive channel operation.
+    /// Atomic select-verify STORE of one system flag operation.
+    func storeFlags(
+        in path: String,
+        expectedUIDValidity: UInt32?,
+        uids: IMAPUIDSet,
+        flag: FlagKind,
+        set: Bool
+    ) async throws {
+        try await withCommand {
+            try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
+            try await self.client.storeFlags(uids: uids, flag: flag, set: set)
+        }
+    }
+
     func storeSeen(
         in path: String,
         expectedUIDValidity: UInt32?,

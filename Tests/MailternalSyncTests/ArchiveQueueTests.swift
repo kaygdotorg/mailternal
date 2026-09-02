@@ -46,10 +46,10 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
         await engine.start()
         let (folder, message) = try await waitForArchiveInbox(store)
 
-        try await store.enqueueArchive(message: message)
+        try await store.enqueueMove(message: message, to: .archive)
 
         try await waitUntil(timeout: .seconds(3)) {
-            guard try await store.snapshotArchiveQueue().isEmpty else { return false }
+            guard try await store.snapshotMoveQueue().isEmpty else { return false }
             return world.archiveCommandSnapshot() == ["MOVE INBOX Archive 1"]
         }
         #expect(world.mailbox("INBOX").messages[1] == nil)
@@ -68,10 +68,10 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
         let inbox = try #require(await inboxFolder(store))
         let message = try #require(await store.page(in: inbox.id, after: nil, limit: 10).rows.first?.id)
 
-        try await store.enqueueArchive(message: message)
+        try await store.enqueueMove(message: message, to: .archive)
 
         try await waitUntil(timeout: .seconds(3)) {
-            guard try await store.snapshotArchiveQueue().isEmpty else { return false }
+            guard try await store.snapshotMoveQueue().isEmpty else { return false }
             return world.archiveCommandSnapshot() == [
                 "COPY INBOX Archive 1",
                 "STORE INBOX 1",
@@ -101,10 +101,10 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
             after: nil,
             limit: 10
         ).rows.first?.id)
-        try await store.enqueueArchive(message: message)
+        try await store.enqueueMove(message: message, to: .archive)
 
         try await waitUntil(timeout: .seconds(3)) {
-            let pending = try await store.snapshotArchiveQueue()
+            let pending = try await store.snapshotMoveQueue()
             guard pending.first?.copied == true else { return false }
             let errors = try await store.fetchErrorLog()
             return errors.contains {
@@ -113,7 +113,7 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
         }
         world.storeDeletedError = nil
         try await waitUntil(timeout: .seconds(3)) {
-            try await store.snapshotArchiveQueue().isEmpty
+            try await store.snapshotMoveQueue().isEmpty
                 && world.archiveCommandSnapshot() == [
                     "COPY INBOX Archive 1",
                     "STORE INBOX 1",
@@ -137,7 +137,7 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
             after: nil,
             limit: 10
         ).rows.first?.id)
-        try await store.enqueueArchive(message: message)
+        try await store.enqueueMove(message: message, to: .archive)
         try await waitUntil(timeout: .seconds(3)) {
             world.archiveStoreDidEnter()
         }
@@ -153,7 +153,7 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
             "STORE INBOX 1",
             "EXPUNGE INBOX 1",
         ])
-        #expect(try await store.snapshotArchiveQueue().isEmpty)
+        #expect(try await store.snapshotMoveQueue().isEmpty)
     }
 }
 
@@ -167,15 +167,13 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
         world.updateMailbox("INBOX") { live in
             live.uidValidity = 2
         }
-        try await store.enqueueArchive(
-            account: sampleConfig().id,
-            folder: folder,
-            uidValidity: 1,
-            uid: IMAPUID(rawValue: 1)
-        )
+        try await store.enqueueMove(account: sampleConfig().id,
+        folder: folder,
+        uidValidity: 1,
+        uid: IMAPUID(rawValue: 1), to: .archive)
 
         try await waitUntil(timeout: .seconds(3)) {
-            try await store.snapshotArchiveQueue().isEmpty
+            try await store.snapshotMoveQueue().isEmpty
         }
         #expect(world.archiveCommandSnapshot().isEmpty)
         await engine.stop()
@@ -192,10 +190,10 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
         await engine.start()
         let (_, message) = try await waitForArchiveInbox(store)
 
-        try await store.enqueueArchive(message: message)
+        try await store.enqueueMove(message: message, to: .archive)
 
         try await waitUntil(timeout: .seconds(3)) {
-            try await store.snapshotArchiveQueue().isEmpty
+            try await store.snapshotMoveQueue().isEmpty
         }
         let errors = try await store.fetchErrorLog()
         #expect(errors.contains { $0.kind == .archive && $0.message == "no Archive folder" })

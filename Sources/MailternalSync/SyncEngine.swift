@@ -1,6 +1,7 @@
 import Foundation
 import MailternalIMAP
 import MailternalInterfaces
+import MailternalMIME
 import MailternalStore
 
 /// Sync orchestration (spec: docs/spec/sync.md).
@@ -177,6 +178,29 @@ public actor SyncEngine {
             throw SyncEngineError.invalidPartSpecifier
         }
         let located = try await locateLiveMessage(message)
+        let attachment = (try? await store.detail(message))?.attachments.first {
+            $0.id.caseInsensitiveCompare(part) == .orderedSame
+        }
+        var transferEncoding = attachment?.transferEncoding
+        if transferEncoding == nil {
+            do {
+                let headerFetch = try await located.channel.fetch(
+                    in: located.path,
+                    expectedUIDValidity: located.uidValidity,
+                    .peek(
+                        uids: IMAPUIDSet(uid: located.uid),
+                        section: IMAPPeekSection(specifier: "\(part).MIME")
+                    )
+                )
+                if let header = headerFetch.first?.parts.first(where: {
+                    $0.specifier.caseInsensitiveCompare("\(part).MIME") == .orderedSame
+                })?.data {
+                    transferEncoding = Self.transferEncoding(fromMIMEHeader: header)
+                }
+            } catch SyncChannelError.staleMailbox {
+                throw SyncEngineError.staleMessage
+            }
+        }
         let fetched: [IMAPFetchedMessage]
         do {
             fetched = try await located.channel.fetch(
@@ -187,14 +211,40 @@ public actor SyncEngine {
         } catch SyncChannelError.staleMailbox {
             throw SyncEngineError.staleMessage
         }
-        guard let data = fetched.first?.parts.first(where: {
+        guard let rawData = fetched.first?.parts.first(where: {
             $0.specifier == part || $0.specifier.uppercased() == part.uppercased()
-        })?.data, !data.isEmpty else {
+        })?.data, !rawData.isEmpty else {
             throw SyncEngineError.partMissing
         }
+        let data: Data
+        if let transferEncoding {
+            data = try MIMEParser.decodeEncodedPart(
+                rawData,
+                encoding: ContentTransferEncoding(headerValue: transferEncoding)
+            )
+        } else {
+            data = rawData
+        }
+        guard !data.isEmpty else { throw SyncEngineError.partMissing }
         let stored = try await store.putAttachment(data: data)
         return stored.url
     }
+
+    private static func transferEncoding(fromMIMEHeader data: Data) -> String? {
+        let text = String(decoding: data, as: UTF8.self)
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard name.caseInsensitiveCompare("Content-Transfer-Encoding") == .orderedSame else {
+                continue
+            }
+            let value = line[line.index(after: colon)...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : String(value)
+        }
+        return nil
+    }
+
 
     public func rawSource(message: MessageID) async throws -> String {
         let located = try await locateLiveMessage(message)
@@ -1044,8 +1094,8 @@ public actor SyncEngine {
             try await store.activateReplacementGeneration(folder: folderID)
             record.isReplacement = false
             folders[folderID] = record
-            try await store.dropStaleSeen(folder: folderID)
-            try await store.dropStaleArchive(folder: folderID)
+            try await store.dropStaleFlag(folder: folderID)
+            try await store.dropStaleMove(folder: folderID)
         } catch {
             await logSync("activate replacement", detail: String(describing: error), folder: folderID)
         }
@@ -1529,50 +1579,48 @@ public actor SyncEngine {
     private func seenLoop() async {
         while !stopping && !Task.isCancelled {
             if let channel = syncChannel {
-                try? await drainSeen(channel: channel)
-                try? await drainArchive(channel: channel)
+                try? await drainFlags(channel: channel)
+                try? await drainMove(channel: channel)
             }
             try? await Task.sleep(for: settings.seenPoll)
         }
     }
 
-    private func drainSeen(channel: SyncChannel) async throws {
-        let ops = try await store.snapshotSeenQueue(limit: 32)
+    private func drainFlags(channel: SyncChannel) async throws {
+        let ops = try await store.snapshotFlagQueue(limit: 32)
         for op in ops {
             if stopping { return }
             try Task.checkCancellation()
             let live = try await store.liveGeneration(for: op.folder)
             if live?.uidValidity != op.uidValidity {
-                try await store.dropStaleSeen(folder: op.folder)
-                try await store.dropStaleArchive(folder: op.folder)
+                try await store.dropStaleFlag(folder: op.folder)
+                try await store.dropStaleMove(folder: op.folder)
                 continue
             }
             guard let summary = try await store.fetchFolderSummary(op.folder) else {
-                try await store.dropSeen(op, reason: "folder missing")
+                try await store.dropFlag(op, reason: "folder missing")
                 continue
             }
             do {
                 let liveNow = try await store.liveGeneration(for: op.folder)
                 if liveNow?.uidValidity != op.uidValidity {
-                    try await store.dropStaleSeen(folder: op.folder)
-                    try await store.dropStaleArchive(folder: op.folder)
+                    try await store.dropStaleFlag(folder: op.folder)
+                    try await store.dropStaleMove(folder: op.folder)
                     continue
                 }
-                // Atomic select-verify-store: the server's selected UIDVALIDITY
-                // is checked against the op inside one exclusive channel
-                // operation, so a replacement activated during any await here
-                // cannot mark an unrelated message in the new generation.
-                try await channel.storeSeen(
+                try await channel.storeFlags(
                     in: summary.path,
                     expectedUIDValidity: op.uidValidity,
-                    uids: IMAPUIDSet(uid: op.uid.rawValue)
+                    uids: IMAPUIDSet(uid: op.uid.rawValue),
+                    flag: op.flag,
+                    set: op.set
                 )
-                try await store.dequeueSeen(op)
+                try await store.dequeueFlag(op)
             } catch SyncChannelError.staleMailbox {
-                try await store.dropSeen(op, reason: "stale UIDVALIDITY")
+                try await store.dropFlag(op, reason: "stale UIDVALIDITY")
             } catch let error as IMAPError {
                 if error.isTaggedNO || error.isTaggedBAD {
-                    try await store.dropSeen(op, reason: error.description)
+                    try await store.dropFlag(op, reason: error.description)
                 } else {
                     throw error
                 }
@@ -1581,25 +1629,25 @@ public actor SyncEngine {
     }
 
  
-    private func drainArchive(channel: SyncChannel) async throws {
-        let ops = try await store.snapshotArchiveQueue(limit: 32)
+    private func drainMove(channel: SyncChannel) async throws {
+        let ops = try await store.snapshotMoveQueue(limit: 32)
         for op in ops {
             if stopping { return }
             try Task.checkCancellation()
             let live = try await store.liveGeneration(for: op.folder)
             if live?.uidValidity != op.uidValidity {
-                try await store.dropStaleArchive(folder: op.folder)
+                try await store.dropStaleMove(folder: op.folder)
                 continue
             }
             guard let source = try await store.fetchFolderSummary(op.folder) else {
-                try await discardArchive(op, reason: "folder missing")
+                try await discardMove(op, reason: "folder missing")
                 continue
             }
-            guard let target = folders.values.first(where: { $0.role == .archive }) else {
-                try await discardArchive(op, reason: "no Archive folder")
+            let destinationName = op.destination.rawValue.capitalized
+            guard let target = folders.values.first(where: { $0.role == op.destination }) else {
+                try await discardMove(op, reason: "no \(destinationName) folder")
                 continue
             }
-
             // Keep the gate over the whole server sequence (and its local
             // acknowledgement), so stop cannot close the channel between
             // fallback phases.
@@ -1612,7 +1660,7 @@ public actor SyncEngine {
             do {
                 let liveNow = try await store.liveGeneration(for: op.folder)
                 if liveNow?.uidValidity != op.uidValidity {
-                    try await store.dropStaleArchive(folder: op.folder)
+                    try await store.dropStaleMove(folder: op.folder)
                     continue
                 }
                 let uids = IMAPUIDSet(uid: op.uid.rawValue)
@@ -1632,7 +1680,7 @@ public actor SyncEngine {
                             uids: uids,
                             destination: target.path
                         )
-                        try await store.markArchiveCopied(op)
+                        try await store.markMoveCopied(op)
                     }
                     phase = "STORE"
                     try await channel.archiveStoreDeleted(
@@ -1647,43 +1695,31 @@ public actor SyncEngine {
                         uids: uids
                     )
                 }
-                // The MOVE/EXPUNGE just removed this UID from the source
-                // mailbox: it is an expunge we performed ourselves. Bump the
-                // folder's expunge revision so an ingest window whose FETCH
-                // was captured before this removal cannot commit stale rows
-                // that would resurrect the archived message locally
-                // (invariant documented on `expungeRevision`).
                 expungeRevision[op.folder, default: 0] &+= 1
-                try await store.deleteArchiveOp(op)
+                try await store.deleteMoveOp(op)
             } catch SyncChannelError.staleMailbox {
-                try await store.dropStaleArchive(folder: op.folder)
-                try await store.deleteArchiveOp(op)
+                try await store.dropStaleMove(folder: op.folder)
+                try await store.deleteMoveOp(op)
             } catch let error as IMAPError {
                 if error.isTaggedNO || error.isTaggedBAD {
                     if useMove || phase == "COPY" {
-                        // A tagged failure on MOVE/COPY means no fallback
-                        // phase has successfully mutated the source.
-                        try await discardArchive(op, reason: error.description)
+                        try await discardMove(op, reason: error.description)
                     } else {
-                        // COPY already completed and was persisted. Keep the
-                        // op and retry only the idempotent remaining phases.
-                        try await retainArchive(
+                        try await retainMove(
                             op,
                             phase: phase,
                             reason: error.description
                         )
                     }
                 } else {
-                    // Transport failures leave the op queued, including after
-                    // a persisted COPY phase.
                     throw error
                 }
             }
         }
     }
 
-    private func discardArchive(_ op: ArchiveOp, reason: String) async throws {
-        try await store.deleteArchiveOp(op)
+    private func discardMove(_ op: MoveOp, reason: String) async throws {
+        try await store.deleteMoveOp(op)
         try await store.recordError(StoreLogEntry(
             kind: .archive,
             account: op.account,
@@ -1694,8 +1730,8 @@ public actor SyncEngine {
         ))
     }
 
-    private func retainArchive(
-        _ op: ArchiveOp,
+    private func retainMove(
+        _ op: MoveOp,
         phase: String,
         reason: String
     ) async throws {

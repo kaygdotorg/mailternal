@@ -290,6 +290,23 @@ public enum MIMEParser: Sendable {
         )
     }
 
+    /// Decode a non-text MIME body using its Content-Transfer-Encoding.
+    /// Unlike ``decodeTextPart``, this preserves bytes and applies no size cap.
+    public static func decodeEncodedPart(
+        _ data: Data,
+        encoding: ContentTransferEncoding
+    ) throws -> Data {
+        try Task.checkCancellation()
+        let state = ParseState()
+        return try decodeTransferEncoding(
+            data,
+            encoding: encoding,
+            state: state,
+            specifier: nil,
+            cap: nil
+        ).0
+    }
+
     /// Decode one text body section (IMAP `BODY.PEEK[section]` bytes).
     ///
     /// Applies CTE decode, charset conversion (ISO-8859-1 fallback), the 8 MiB

@@ -121,8 +121,8 @@ extension MailStore {
                 sql: "UPDATE folders SET live_generation_id = ? WHERE id = ?",
                 arguments: [replacementID, folder.rawValue]
             )
-            try MailStore.dropStaleSeen(db, folder: folder)
-            try MailStore.dropStaleArchive(db, folder: folder)
+            try MailStore.dropStaleFlag(db, folder: folder)
+            try MailStore.dropStaleMove(db, folder: folder)
         }
     }
 

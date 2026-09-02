@@ -180,34 +180,50 @@ public struct FolderSyncState: Hashable, Sendable {
     }
 }
 
-// MARK: - Seen queue
+// MARK: - Flag queue
 
-/// Persisted `\Seen` mutation (spec: sync.md Seen queue).
-public struct SeenOp: Hashable, Sendable, Identifiable {
+/// Persisted flag mutation. A row is unique per message and flag; a later
+/// opposite operation replaces the earlier row.
+public struct FlagOp: Hashable, Sendable, Identifiable {
     public var id: Int64
     public var account: AccountID
     public var folder: FolderID
     public var uidValidity: UInt32
     public var uid: IMAPUID
+    public var flag: FlagKind
+    public var set: Bool
 
-    public init(id: Int64, account: AccountID, folder: FolderID, uidValidity: UInt32, uid: IMAPUID) {
+    public init(
+        id: Int64,
+        account: AccountID,
+        folder: FolderID,
+        uidValidity: UInt32,
+        uid: IMAPUID,
+        flag: FlagKind,
+        set: Bool
+    ) {
         self.id = id
         self.account = account
         self.folder = folder
         self.uidValidity = uidValidity
         self.uid = uid
+        self.flag = flag
+        self.set = set
     }
 }
- 
-// MARK: - Archive queue
 
-/// Persisted archive mutation (spec: sync.md Archive queue).
-public struct ArchiveOp: Hashable, Sendable, Identifiable {
+
+// MARK: - Move queue
+
+/// Persisted folder move mutation. The table retains its historical
+/// `archive_queue` name for append-only migration compatibility.
+public struct MoveOp: Hashable, Sendable, Identifiable {
     public var id: Int64
     public var account: AccountID
     public var folder: FolderID
     public var uidValidity: UInt32
     public var uid: IMAPUID
+    public var destination: FolderRole
     public var copied: Bool
 
     public init(
@@ -216,6 +232,7 @@ public struct ArchiveOp: Hashable, Sendable, Identifiable {
         folder: FolderID,
         uidValidity: UInt32,
         uid: IMAPUID,
+        destination: FolderRole = .archive,
         copied: Bool = false
     ) {
         self.id = id
@@ -223,9 +240,11 @@ public struct ArchiveOp: Hashable, Sendable, Identifiable {
         self.folder = folder
         self.uidValidity = uidValidity
         self.uid = uid
+        self.destination = destination
         self.copied = copied
     }
 }
+
 
 
 // MARK: - Error log

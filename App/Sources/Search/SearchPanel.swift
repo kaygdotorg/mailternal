@@ -289,9 +289,15 @@ private struct SearchPanelSurface: View {
                                 Text(row.subject)
                                     .font(.body.weight(selectedIndex == index ? .semibold : .regular))
                                     .lineLimit(2)
-                                HStack {
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
                                     Text(row.from)
-                                    Spacer()
+                                    Spacer(minLength: 8)
+                                    if !row.folderName.isEmpty {
+                                        Text(row.folderName)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                            .foregroundStyle(.tertiary)
+                                    }
                                     Text(MailDateFormat.listRow(row.date))
                                 }
                                 .font(.caption)

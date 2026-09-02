@@ -621,23 +621,28 @@ final class UILogicTests: XCTestCase {
         }
     }
 
-    func testReaderRegionsAreFullWidthAndHTMLTakesWhatTheEnvelopeLeaves() {
-        XCTAssertEqual(MessageViewerLayoutPolicy.horizontalPadding, 24)
+    func testReaderIslandsShareListInsetAndHTMLUsesDocumentHeight() {
+        XCTAssertEqual(MessageViewerLayoutPolicy.horizontalPadding, 16)
+        XCTAssertEqual(MessageViewerLayoutPolicy.islandSpacing, 12)
+        XCTAssertEqual(MessageViewerLayoutPolicy.islandContentPadding, 18)
         XCTAssertEqual(MessageViewerLayoutPolicy.bottomPadding, 40)
-        XCTAssertEqual(MessageViewerLayoutPolicy.htmlMinimumHeight, 280)
+        XCTAssertEqual(MessageViewerLayoutPolicy.htmlMinimumHeight, 80)
         XCTAssertEqual(MessageViewerLayoutPolicy.plainTextMeasureCharacters, 72)
 
         XCTAssertEqual(
-            MessageViewerLayoutPolicy.htmlHeight(containerHeight: 900, reservedHeight: 260),
-            640
+            MessageViewerLayoutPolicy.htmlHeight(contentHeight: 900),
+            900
         )
-        // A tall envelope never shrinks the HTML surface past its floor.
         XCTAssertEqual(
-            MessageViewerLayoutPolicy.htmlHeight(containerHeight: 400, reservedHeight: 380),
+            MessageViewerLayoutPolicy.htmlHeight(contentHeight: 120),
+            120
+        )
+        XCTAssertEqual(
+            MessageViewerLayoutPolicy.htmlHeight(contentHeight: 0),
             MessageViewerLayoutPolicy.htmlMinimumHeight
         )
         XCTAssertEqual(
-            MessageViewerLayoutPolicy.htmlHeight(containerHeight: 0, reservedHeight: 0),
+            MessageViewerLayoutPolicy.htmlHeight(contentHeight: .infinity),
             MessageViewerLayoutPolicy.htmlMinimumHeight
         )
     }
@@ -752,5 +757,85 @@ final class UILogicTests: XCTestCase {
             .fullSizeContentView,
         ]
         XCTAssertTrue(styleMask.contains(.resizable))
+    }
+
+    @MainActor
+    func testActionSettingsDefaults() {
+        let suiteName = "Mailternal.ActionDefaults.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = ActionSettings(defaults: defaults)
+
+        XCTAssertEqual(settings.leadingSwipe, [.toggleRead])
+        XCTAssertEqual(settings.trailingSwipe, [.archive, .trash])
+    }
+
+    @MainActor
+    func testActionSettingsClampsTrailingActions() {
+        let suiteName = "Mailternal.ActionClamp.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("[\"archive\",\"trash\",\"toggleRead\",\"toggleFlag\"]", forKey: "mailternal.actions.swipe.trailing")
+
+        let settings = ActionSettings(defaults: defaults)
+
+        XCTAssertEqual(settings.trailingSwipe, [.archive, .trash, .toggleRead])
+    }
+
+    @MainActor
+    func testActionSettingsDropsUnknownAndDuplicateActions() {
+        let suiteName = "Mailternal.ActionNormalization.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(
+            "[\"toggleFlag\",\"not-an-action\",\"toggleFlag\",\"archive\"]",
+            forKey: "mailternal.actions.swipe.leading"
+        )
+
+        let settings = ActionSettings(defaults: defaults)
+
+        XCTAssertEqual(settings.leadingSwipe, [.toggleFlag, .archive])
+    }
+
+    @MainActor
+    func testActionSettingsRoundTripsPersistence() {
+        let suiteName = "Mailternal.ActionRoundTrip.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = ActionSettings(defaults: defaults)
+        settings.leadingSwipe = [.toggleFlag, .archive]
+        settings.trailingSwipe = [.trash]
+
+        XCTAssertEqual(
+            defaults.string(forKey: "mailternal.actions.swipe.leading"),
+            "[\"toggleFlag\",\"archive\"]"
+        )
+        XCTAssertEqual(
+            ActionSettings(defaults: defaults).trailingSwipe,
+            [.trash]
+        )
+    }
+
+    func testActionSettingsPickerNoneCompactsRemainingActions() {
+        XCTAssertEqual(
+            ActionSettings.applying(
+                nil,
+                at: 1,
+                to: [.archive, .trash, .toggleFlag],
+                maxCount: 3
+            ),
+            [.archive, .toggleFlag]
+        )
+        XCTAssertEqual(
+            ActionSettings.applying(
+                .toggleFlag,
+                at: 0,
+                to: [.archive, .toggleFlag],
+                maxCount: 3
+            ),
+            [.toggleFlag, .archive]
+        )
     }
 }

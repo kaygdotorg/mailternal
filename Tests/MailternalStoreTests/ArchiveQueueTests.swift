@@ -10,15 +10,13 @@ import Testing
         ])
         let id = try #require(await store.messageID(generation: generation, uid: IMAPUID(rawValue: 3)))
 
-        try await store.enqueueArchive(message: id)
-        try await store.enqueueArchive(
-            account: account.id,
-            folder: folder,
-            uidValidity: 1,
-            uid: IMAPUID(rawValue: 3)
-        )
+        try await store.enqueueMove(message: id, to: .archive)
+        try await store.enqueueMove(account: account.id,
+        folder: folder,
+        uidValidity: 1,
+        uid: IMAPUID(rawValue: 3), to: .archive)
 
-        let pending = try await store.snapshotArchiveQueue()
+        let pending = try await store.snapshotMoveQueue()
         #expect(pending.count == 1)
         #expect(pending[0].uid.rawValue == 3)
         #expect(try await store.page(in: folder, after: nil, limit: 10).rows.isEmpty)
@@ -28,30 +26,26 @@ import Testing
 @Test func archiveQueuePersistsCopiedPhaseFromV5Migration() async throws {
     try await withStore { store, _ in
         let (account, folder, _) = try await seedInbox(store)
-        try await store.enqueueArchive(
-            account: account.id,
-            folder: folder,
-            uidValidity: 1,
-            uid: IMAPUID(rawValue: 7)
-        )
+        try await store.enqueueMove(account: account.id,
+        folder: folder,
+        uidValidity: 1,
+        uid: IMAPUID(rawValue: 7), to: .archive)
 
-        let pendingOps = try await store.snapshotArchiveQueue()
+        let pendingOps = try await store.snapshotMoveQueue()
         let pending = try #require(pendingOps.first)
         #expect(pending.copied == false)
-        try await store.markArchiveCopied(pending)
-        #expect(try await store.snapshotArchiveQueue().first?.copied == true)
+        try await store.markMoveCopied(pending)
+        #expect(try await store.snapshotMoveQueue().first?.copied == true)
     }
 }
 
 @Test func archiveQueueSkipsCapturedFetchAfterEnqueue() async throws {
     try await withStore { store, _ in
         let (account, folder, generation) = try await seedInbox(store)
-        try await store.enqueueArchive(
-            account: account.id,
-            folder: folder,
-            uidValidity: generation.uidValidity,
-            uid: IMAPUID(rawValue: 12)
-        )
+        try await store.enqueueMove(account: account.id,
+        folder: folder,
+        uidValidity: generation.uidValidity,
+        uid: IMAPUID(rawValue: 12), to: .archive)
 
         _ = try await store.upsertMessages([
             makeMessage(generation: generation, uid: 12, subject: "captured")
@@ -67,7 +61,7 @@ import Testing
     try await withStore { store, _ in
         let (account, folder, generation) = try await seedInbox(store)
         // Construct the interleave directly: a stale FETCH commits first,
-        // then enqueueArchive's queue row appears before the drain dequeue.
+        // then enqueueMove's queue row appears before the drain dequeue.
         try await store.write { db in
             try MailStore.upsertMessage(
                 db,
@@ -88,9 +82,9 @@ import Testing
                 ]
             )
         }
-        let pendingOps = try await store.snapshotArchiveQueue()
+        let pendingOps = try await store.snapshotMoveQueue()
         let pending = try #require(pendingOps.first)
-        try await store.deleteArchiveOp(pending)
+        try await store.deleteMoveOp(pending)
         #expect(try await store.messageID(
             generation: generation,
             uid: IMAPUID(rawValue: 13)
@@ -101,41 +95,54 @@ import Testing
 @Test func archiveQueueDropsStaleUIDValidity() async throws {
     try await withStore { store, _ in
         let (account, folder, _) = try await seedInbox(store, uidValidity: 1)
-        try await store.enqueueArchive(
-            account: account.id,
-            folder: folder,
-            uidValidity: 9,
-            uid: IMAPUID(rawValue: 7)
-        )
-        #expect(try await store.snapshotArchiveQueue().count == 1)
+        try await store.enqueueMove(account: account.id,
+        folder: folder,
+        uidValidity: 9,
+        uid: IMAPUID(rawValue: 7), to: .archive)
+        #expect(try await store.snapshotMoveQueue().count == 1)
 
-        try await store.dropStaleArchive(folder: folder)
+        try await store.dropStaleMove(folder: folder)
 
-        #expect(try await store.snapshotArchiveQueue().isEmpty)
+        #expect(try await store.snapshotMoveQueue().isEmpty)
     }
 }
 
 @Test func archiveQueueDeleteRemovesOnlyAcknowledgedOperation() async throws {
     try await withStore { store, _ in
         let (account, folder, _) = try await seedInbox(store)
-        try await store.enqueueArchive(
-            account: account.id,
-            folder: folder,
-            uidValidity: 1,
-            uid: IMAPUID(rawValue: 10)
-        )
-        try await store.enqueueArchive(
-            account: account.id,
-            folder: folder,
-            uidValidity: 1,
-            uid: IMAPUID(rawValue: 11)
-        )
-        let pending = try await store.snapshotArchiveQueue()
+        try await store.enqueueMove(account: account.id,
+        folder: folder,
+        uidValidity: 1,
+        uid: IMAPUID(rawValue: 10), to: .archive)
+        try await store.enqueueMove(account: account.id,
+        folder: folder,
+        uidValidity: 1,
+        uid: IMAPUID(rawValue: 11), to: .archive)
+        let pending = try await store.snapshotMoveQueue()
         try #require(pending.count == 2)
 
-        try await store.deleteArchiveOp(pending[0])
+        try await store.deleteMoveOp(pending[0])
 
-        let remaining = try await store.snapshotArchiveQueue()
+        let remaining = try await store.snapshotMoveQueue()
         #expect(remaining.map(\.uid.rawValue) == [11])
+    }
+}
+
+@Test func moveQueuePersistsTrashDestination() async throws {
+    try await withStore { store, _ in
+        let (account, folder, generation) = try await seedInbox(store)
+        _ = try await store.upsertMessages([
+            makeMessage(generation: generation, uid: 21, subject: "trash me")
+        ])
+        let id = try #require(await store.messageID(
+            generation: generation,
+            uid: IMAPUID(rawValue: 21)
+        ))
+
+        try await store.enqueueMove(message: id, to: .trash)
+        let pending = try #require(await store.snapshotMoveQueue().first)
+        #expect(pending.destination == .trash)
+        #expect(pending.account == account.id)
+        #expect(try await store.page(in: folder, after: nil, limit: 10).rows.isEmpty)
     }
 }

@@ -170,25 +170,21 @@ import Testing
         }
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
-        try await store.enqueueSeen(
-            account: sampleConfig().id,
-            folder: inbox.id,
-            uidValidity: 3,
-            uid: IMAPUID(rawValue: 1)
-        )
+        try await store.enqueueFlag(account: sampleConfig().id,
+        folder: inbox.id,
+        uidValidity: 3,
+        uid: IMAPUID(rawValue: 1), flag: .seen, set: true)
         try await waitUntil(timeout: .seconds(3)) {
-            try await store.snapshotSeenQueue().isEmpty && world.seenUIDs().contains(1)
+            try await store.snapshotFlagQueue().isEmpty && world.seenUIDs().contains(1)
         }
 
         world.storeSeenError = IMAPError.taggedNO(tag: "t", message: "nope", code: nil)
-        try await store.enqueueSeen(
-            account: sampleConfig().id,
-            folder: inbox.id,
-            uidValidity: 3,
-            uid: IMAPUID(rawValue: 2)
-        )
+        try await store.enqueueFlag(account: sampleConfig().id,
+        folder: inbox.id,
+        uidValidity: 3,
+        uid: IMAPUID(rawValue: 2), flag: .seen, set: true)
         try await waitUntil(timeout: .seconds(3)) {
-            try await store.snapshotSeenQueue().isEmpty
+            try await store.snapshotFlagQueue().isEmpty
         }
         let log = try await store.fetchErrorLog()
         #expect(log.contains { $0.kind == .seen || $0.message.lowercased().contains("nope") })
@@ -971,14 +967,12 @@ import Testing
         }
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
-        try await store.enqueueSeen(
-            account: sampleConfig().id,
-            folder: inbox.id,
-            uidValidity: 3,
-            uid: IMAPUID(rawValue: 1)
-        )
+        try await store.enqueueFlag(account: sampleConfig().id,
+        folder: inbox.id,
+        uidValidity: 3,
+        uid: IMAPUID(rawValue: 1), flag: .seen, set: true)
         try await waitUntil(timeout: .seconds(3)) {
-            try await store.snapshotSeenQueue().isEmpty
+            try await store.snapshotFlagQueue().isEmpty
         }
         #expect(world.seenUIDs().isEmpty)
         await engine.stop()
@@ -1404,6 +1398,60 @@ func staleQuarantineFallbackCannotResurrectExpungedUID(
         }
         let converged = try await requireInbox(store)
         #expect(converged.totalCount == 217)
+        await engine.stop()
+    }
+}
+
+@Test func engineDrainsUnreadFlagAndTrashMoveWithExactCommands() async throws {
+    try await withSyncStore { store, dir in
+        var inbox = ScriptedMailbox(path: "INBOX", uidValidity: 4, uidNext: 2, highestModSeq: 2)
+        inbox.messages[1] = makePlainMessage(uid: 1, subject: "mutate")
+        let trash = ScriptedMailbox(path: "Trash", uidValidity: 1, uidNext: 1, highestModSeq: 1)
+        let world = ScriptedWorld(
+            capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE", "MOVE"]),
+            folders: [inboxMailbox(), trashMailbox()],
+            mailboxes: ["INBOX": inbox, "Trash": trash]
+        )
+        let engine = makeEngine(store: store, world: world, dir: dir, window: 1).0
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            try await store.fetchFolders(account: sampleConfig().id).contains { $0.role == .inbox && $0.totalCount == 1 }
+        }
+        let folder = try #require(await inboxFolder(store))
+        try await store.enqueueFlag(
+            account: sampleConfig().id,
+            folder: folder.id,
+            uidValidity: 4,
+            uid: IMAPUID(rawValue: 1),
+            flag: .seen,
+            set: false
+        )
+        try await store.enqueueFlag(
+            account: sampleConfig().id,
+            folder: folder.id,
+            uidValidity: 4,
+            uid: IMAPUID(rawValue: 1),
+            flag: .flagged,
+            set: true
+        )
+        try await waitUntil(timeout: .seconds(3)) {
+            try await store.snapshotFlagQueue().isEmpty
+                && world.flagCommandSnapshot() == [
+                    "STORE INBOX 1 -FLAGS.SILENT (\\Seen)",
+                    "STORE INBOX 1 +FLAGS.SILENT (\\Flagged)",
+                ]
+        }
+        try await store.enqueueMove(
+            account: sampleConfig().id,
+            folder: folder.id,
+            uidValidity: 4,
+            uid: IMAPUID(rawValue: 1),
+            to: .trash
+        )
+        try await waitUntil(timeout: .seconds(3)) {
+            try await store.snapshotMoveQueue().isEmpty
+                && world.archiveCommandSnapshot() == ["MOVE INBOX Trash 1"]
+        }
         await engine.stop()
     }
 }

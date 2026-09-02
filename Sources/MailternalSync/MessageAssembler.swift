@@ -215,7 +215,8 @@ enum MessageAssembler: Sendable {
             filename: node.filename,
             mimeType: "\(node.type)/\(node.subtype)",
             sizeEstimate: node.octetCount,
-            contentID: stripAngles(node.contentID)
+            contentID: stripAngles(node.contentID),
+            transferEncoding: node.encoding
         ))
     }
 

@@ -70,7 +70,16 @@ extension MailStore {
                     db,
                     sql: """
                         SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date,
-                               m.is_read, m.has_attachments
+                               m.is_read, m.has_attachments, m.is_flagged,
+                               COALESCE(NULLIF(f.name, ''), CASE f.role
+                                   WHEN 'inbox' THEN 'INBOX'
+                                   WHEN 'archive' THEN 'Archive'
+                                   WHEN 'trash' THEN 'Trash'
+                                   WHEN 'junk' THEN 'Junk'
+                                   WHEN 'sent' THEN 'Sent'
+                                   WHEN 'drafts' THEN 'Drafts'
+                                   ELSE f.path
+                               END) AS folder_name
                         FROM messages m
                         JOIN generations g ON g.id = m.generation_id
                             AND g.folder_id = ? AND g.uid_validity = ? AND g.state = ?

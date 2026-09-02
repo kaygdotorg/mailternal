@@ -83,7 +83,7 @@ final class PartSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable
         registry.stop(ObjectIdentifier(urlSchemeTask))
     }
 
-    private func resolve(
+    func resolve(
         _ url: URL,
         provider: PartProvider?,
         remoteAllowed: Bool
