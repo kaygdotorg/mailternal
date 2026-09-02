@@ -2,6 +2,53 @@ import Foundation
 import Testing
 @testable import MailternalStore
 
+actor ObservationReadyGate {
+    private var isReady = false
+    private var isReleased = false
+    private var readyWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func signalReady() {
+        isReady = true
+        let waiters = readyWaiters
+        readyWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    func waitUntilReady() async {
+        if isReady { return }
+        await withCheckedContinuation { continuation in
+            if isReady {
+                continuation.resume()
+            } else {
+                readyWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitForRelease() async {
+        if isReleased { return }
+        await withCheckedContinuation { continuation in
+            if isReleased {
+                continuation.resume()
+            } else {
+                releaseWaiters.append(continuation)
+            }
+        }
+    }
+
+    func release() {
+        isReleased = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
 actor CountCollector {
     private(set) var values: [FolderCounts] = []
 
@@ -28,30 +75,47 @@ actor CountCollector {
         ])
 
         let collector = CountCollector()
+        let ready = ObservationReadyGate()
         let stream = store.observeCounts(in: folder)
         let listen = Task {
+            var first = true
             for await counts in stream {
                 await collector.add(counts)
+                if first {
+                    first = false
+                    await ready.signalReady()
+                    await ready.waitForRelease()
+                }
             }
         }
-        defer { listen.cancel() }
+        defer {
+            listen.cancel()
+            Task { await ready.release() }
+        }
 
         let gotFirst = await waitUntil(timeout: .milliseconds(500)) {
             await collector.snapshot().count >= 1
         }
-        #expect(gotFirst)
+        try #require(gotFirst)
+        await ready.waitUntilReady()
         #expect(await collector.snapshot().first?.total == 1)
         let baseline = await collector.snapshot().count
 
+        var sleepCalls = await clock.sleepCallCount()
         for uid in 2...6 {
             _ = try await store.upsertMessages([
                 makeMessage(generation: generation, uid: UInt32(uid), subject: "m\(uid)"),
             ])
+            // Do not advance until this commit's observation callback has
+            // reached the debouncer; otherwise a late callback can consume
+            // the manual tick and schedule a second delivery.
+            await clock.waitUntilSleeping(after: sleepCalls)
+            sleepCalls = await clock.sleepCallCount()
         }
 
-        await clock.waitUntilSleeping()
         #expect(await collector.snapshot().count == baseline, "burst must not deliver immediately")
 
+        await ready.release()
         await clock.advance()
         let gotSecond = await waitUntil(timeout: .milliseconds(700)) {
             await collector.snapshot().count > baseline
@@ -89,34 +153,42 @@ private func waitUntil(timeout: Duration, _ predicate: @Sendable () async -> Boo
 
 private actor ManualObservationClock {
     private var sleepers: [CheckedContinuation<Void, Never>] = []
-    private var sleepingWaiters: [CheckedContinuation<Void, Never>] = []
+    private var nextSleepWaiters: [
+        (after: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+    private var sleepCalls = 0
     private var advancePending = false
 
     func sleep(for _: Duration) async throws {
         try Task.checkCancellation()
+        sleepCalls += 1
+        let waiters = nextSleepWaiters.filter { $0.after < sleepCalls }
+        nextSleepWaiters.removeAll { $0.after < sleepCalls }
+        for waiter in waiters {
+            waiter.continuation.resume()
+        }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             if advancePending {
                 advancePending = false
                 continuation.resume()
             } else {
                 sleepers.append(continuation)
-                let waiters = sleepingWaiters
-                sleepingWaiters.removeAll()
-                for waiter in waiters {
-                    waiter.resume()
-                }
             }
         }
         try Task.checkCancellation()
     }
 
-    func waitUntilSleeping() async {
-        if !sleepers.isEmpty { return }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            if sleepers.isEmpty {
-                sleepingWaiters.append(continuation)
-            } else {
+    func sleepCallCount() -> Int {
+        sleepCalls
+    }
+
+    func waitUntilSleeping(after count: Int) async {
+        if sleepCalls > count { return }
+        await withCheckedContinuation { continuation in
+            if sleepCalls > count {
                 continuation.resume()
+            } else {
+                nextSleepWaiters.append((count, continuation))
             }
         }
     }

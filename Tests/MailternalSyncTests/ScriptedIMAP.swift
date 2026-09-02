@@ -29,6 +29,10 @@ final class ScriptedWorld: @unchecked Sendable {
     var fetchError: Error?
     var fetchErrorAfter: Int?
     var fetchCount = 0
+    private var completedFetchCount = 0
+    private var fetchCompletionWaiters: [
+        (after: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
     var selectCount = 0
     /// UID ranges requested by envelope/bodystructure metadata fetches.
     /// Follow-up body peeks and bounded flag sweeps are intentionally omitted.
@@ -550,6 +554,35 @@ final class ScriptedWorld: @unchecked Sendable {
         }
         return fetchError
     }
+    func noteFetchCompleted() {
+        lock.lock()
+        completedFetchCount += 1
+        let waiters = fetchCompletionWaiters.filter { $0.after < completedFetchCount }
+        fetchCompletionWaiters.removeAll { $0.after < completedFetchCount }
+        lock.unlock()
+        for waiter in waiters {
+            waiter.continuation.resume()
+        }
+    }
+
+    func snapshotCompletedFetchCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return completedFetchCount
+    }
+
+    func waitForFetchCompletion(after count: Int) async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if completedFetchCount > count {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                fetchCompletionWaiters.append((count, continuation))
+                lock.unlock()
+            }
+        }
+    }
 
 
     func noteSelect() {
@@ -685,7 +718,10 @@ actor ScriptedIMAPClient: IMAPClient {
         if delay > 0 {
             try await Task.sleep(nanoseconds: delay)
         }
-        guard let selectedPath else { return [] }
+        guard let selectedPath else {
+            world.noteFetchCompleted()
+            return []
+        }
         let box = pausedFlagSnapshot ?? pausedMetadataSnapshot?.snapshot ?? world.mailbox(selectedPath)
         var results: [IMAPFetchedMessage] = []
         for (uid, message) in box.messages.sorted(by: { $0.key < $1.key }) {
@@ -727,6 +763,7 @@ actor ScriptedIMAPClient: IMAPClient {
                 parts: parts
             ))
         }
+        world.noteFetchCompleted()
         return results
     }
 
@@ -1108,16 +1145,29 @@ func pageSubjects(_ store: MailStore, folder: FolderID, limit: Int = 200) async 
     return subjects
 }
 
-func withSyncStore(_ body: (MailStore, URL) async throws -> Void) async throws {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("mailternal-sync-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: dir) }
+private func runSyncStore(
+    _ body: (MailStore, URL) async throws -> Void,
+    dir: URL
+) async throws {
     let store = try MailStore(
         databaseURL: dir.appendingPathComponent("mail.sqlite"),
         cachesDirectory: dir.appendingPathComponent("Caches", isDirectory: true)
     )
     try await body(store, dir)
+}
+
+func withSyncStore(_ body: (MailStore, URL) async throws -> Void) async throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailternal-sync-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+    do {
+        try await runSyncStore(body, dir: dir)
+    } catch {
+        try? FileManager.default.removeItem(at: dir)
+        throw error
+    }
+    try? FileManager.default.removeItem(at: dir)
 }
 
 func sampleConfig() -> AccountConfig {
