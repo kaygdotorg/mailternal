@@ -106,35 +106,74 @@ private enum QAMoveQA {
     static func probe() async throws {
         try await withSession { _ in () }
     }
+    private static func runQAMoveStore(
+        _ body: (MailStore, URL) async throws -> Void,
+        dir: URL,
+        databaseURL: URL
+    ) async throws {
+        let store = try MailStore(
+            databaseURL: databaseURL,
+            cachesDirectory: dir.appendingPathComponent("Caches", isDirectory: true)
+        )
+        try await body(store, dir)
+    }
+
+    private static func snapshotStore(
+        from template: URL,
+        to destination: URL
+    ) throws {
+        guard FileManager.default.isReadableFile(atPath: template.path) else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["sqlite3", template.path]
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = output
+        let destinationPath = destination.path.replacingOccurrences(of: "'", with: "''")
+        let sql = "PRAGMA busy_timeout=10000;\nVACUUM INTO '\(destinationPath)';\n"
+
+        try process.run()
+        input.fileHandleForWriting.write(Data(sql.utf8))
+        input.fileHandleForWriting.closeFile()
+        process.waitUntilExit()
+
+        let outputText = String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationStatus == 0,
+              FileManager.default.isReadableFile(atPath: destination.path)
+        else {
+            throw InvariantFailure(
+                issues: [
+                    "sqlite snapshot failed (\(process.terminationStatus)): \(outputText)"
+                ]
+            )
+        }
+    }
+
     static func withQAMoveStore(
         _ body: (MailStore, URL) async throws -> Void
     ) async throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("mailternal-qamove-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
 
         let template = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("mailternal-qa-ReaderIslands/store.sqlite")
         let destination = dir.appendingPathComponent("mail.sqlite")
-        if FileManager.default.isReadableFile(atPath: template.path) {
-            try FileManager.default.copyItem(at: template, to: destination)
-            for suffix in ["-wal", "-shm"] {
-                let sidecar = template.deletingLastPathComponent()
-                    .appendingPathComponent(template.lastPathComponent + suffix)
-                if FileManager.default.fileExists(atPath: sidecar.path) {
-                    try FileManager.default.copyItem(
-                        at: sidecar,
-                        to: dir.appendingPathComponent("mail.sqlite\(suffix)")
-                    )
-                }
-            }
+
+        do {
+            try snapshotStore(from: template, to: destination)
+            try await runQAMoveStore(body, dir: dir, databaseURL: destination)
+        } catch {
+            try? FileManager.default.removeItem(at: dir)
+            throw error
         }
-        let store = try MailStore(
-            databaseURL: destination,
-            cachesDirectory: dir.appendingPathComponent("Caches", isDirectory: true)
-        )
-        try await body(store, dir)
+        try? FileManager.default.removeItem(at: dir)
     }
 
     static func state(_ mailbox: String) async throws -> State {
@@ -669,33 +708,38 @@ struct QAMoveLiveTests {
         try await QAMoveQA.withQAMoveStore { store, dir in
             let engine = QAMoveQA.engine(store: store, dir: dir)
             await engine.start()
-            let sourceFolder = try await QAMoveQA.waitForFolder(store, path: source, count: 100)
-            let destinationFolder = try await QAMoveQA.requireFolder(store, path: destination)
-            let selected = try await QAMoveQA.localMessages(store, folder: sourceFolder.id, limit: 100)
-            let beforeDestination = try await QAMoveQA.state(destination)
-            try await store.enqueueMove(messages: selected.map(\.id), to: destinationFolder.id)
-            let stopping = Task { await engine.stop() }
-            try await Task.sleep(for: .milliseconds(25))
-            let pendingAtStop = try await store.snapshotMoveQueue().count
-            await stopping.value
-            print("MAILTERNAL_QA move stop mid-drain pending=\(pendingAtStop)")
-            await engine.start()
-            try await waitUntil(timeout: .seconds(180), poll: .milliseconds(250)) {
-                try await store.snapshotMoveQueue().isEmpty
-            }
-            let afterDestination = try await QAMoveQA.state(destination)
-            #expect(afterDestination.exists == beforeDestination.exists + 100)
-            let moved = try await QAMoveQA.fetchAdded(mailbox: destination, after: beforeDestination.uidNext)
-            #expect(moved.count == 100, "restart created duplicate destination messages")
-            try await QAMoveQA.assertIntegrity(store, dir: dir, label: "stop-restart")
+            do {
+                let sourceFolder = try await QAMoveQA.waitForFolder(store, path: source, count: 100)
+                let destinationFolder = try await QAMoveQA.requireFolder(store, path: destination)
+                let selected = try await QAMoveQA.localMessages(store, folder: sourceFolder.id, limit: 100)
+                let beforeDestination = try await QAMoveQA.state(destination)
+                try await store.enqueueMove(messages: selected.map(\.id), to: destinationFolder.id)
+                let stopping = Task { await engine.stop() }
+                try await Task.sleep(for: .milliseconds(25))
+                let pendingAtStop = try await store.snapshotMoveQueue().count
+                await stopping.value
+                print("MAILTERNAL_QA move stop mid-drain pending=\(pendingAtStop)")
+                await engine.start()
+                try await waitUntil(timeout: .seconds(180), poll: .milliseconds(250)) {
+                    try await store.snapshotMoveQueue().isEmpty
+                }
+                let afterDestination = try await QAMoveQA.state(destination)
+                #expect(afterDestination.exists == beforeDestination.exists + 100)
+                let moved = try await QAMoveQA.fetchAdded(mailbox: destination, after: beforeDestination.uidNext)
+                #expect(moved.count == 100, "restart created duplicate destination messages")
+                try await QAMoveQA.assertIntegrity(store, dir: dir, label: "stop-restart")
 
-            await engine.stop()
-            try await QAMoveQA.directRestore(
-                mailbox: destination,
-                to: source,
-                after: beforeDestination.uidNext,
-                keys: Set(moved.map(\.key))
-            )
+                await engine.stop()
+                try await QAMoveQA.directRestore(
+                    mailbox: destination,
+                    to: source,
+                    after: beforeDestination.uidNext,
+                    keys: Set(moved.map(\.key))
+                )
+            } catch {
+                await engine.stop()
+                throw error
+            }
         }
     }
 
