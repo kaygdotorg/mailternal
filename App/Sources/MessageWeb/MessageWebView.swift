@@ -42,6 +42,9 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     private var pendingRender = false
     private var fence: NetworkFenceState = .compiling
     private var lastReportedContentHeight: CGFloat?
+    /// The last height that completed a settle pass. During a new render or
+    /// width change, provisional measurements may grow this value but never
+    /// shrink below it until the document has settled.
     private var documentDidFinish = false
     private var lastMeasuredWidth: CGFloat?
     private var contentHeightTask: Task<Void, Never>?
@@ -186,6 +189,10 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             webView.isHidden = false
             invalidateContentHeightMeasurement()
             documentDidFinish = false
+            // Clear the outer reader's old island height before WebKit starts
+            // laying out the replacement document. A tall previous message
+            // must not become the floor for a short one.
+            onContentHeightChange?(0)
             #if DEBUG
             qaRenderSequence &+= 1
             if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
@@ -378,40 +385,85 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         let generation = contentHeightMeasurementGeneration
         contentHeightTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await Task.yield()
-            guard !Task.isCancelled,
-                  self.contentHeightMeasurementGeneration == generation,
-                  self.documentDidFinish else {
-                if self.contentHeightMeasurementGeneration == generation {
+            var rescheduled = false
+            defer {
+                if !rescheduled, self.contentHeightMeasurementGeneration == generation {
                     self.contentHeightTask = nil
                 }
-                return
             }
-            guard let result = try? await self.webView.evaluateJavaScript(
-                "document.documentElement.offsetHeight"
-            ), let number = result as? NSNumber,
-                  !Task.isCancelled,
-                  self.contentHeightMeasurementGeneration == generation,
-                  self.documentDidFinish else {
-                if self.contentHeightMeasurementGeneration == generation {
-                    self.contentHeightTask = nil
+
+            // A nested table can still be laying out after didFinish. Always
+            // sample through a bounded settle window and report the largest
+            // reading seen for this load. The reader resets to its floor before
+            // every load, so "largest so far" can only ratchet within one
+            // document, never across documents.
+            let delays: [Duration] = [
+                .zero,
+                .milliseconds(100),
+                .milliseconds(300),
+                .milliseconds(1000),
+                .milliseconds(2000),
+            ]
+            var largest: CGFloat = 0
+
+            for delay in delays {
+                if delay != .zero {
+                    do {
+                        try await Task.sleep(for: delay)
+                    } catch {
+                        return
+                    }
                 }
-                return
+                guard !Task.isCancelled,
+                      self.contentHeightMeasurementGeneration == generation,
+                      self.documentDidFinish,
+                      abs(self.bounds.width - expectedWidth) <= 0.5 else {
+                    if self.contentHeightMeasurementGeneration == generation,
+                       self.documentDidFinish,
+                       abs(self.bounds.width - expectedWidth) > 0.5 {
+                        rescheduled = true
+                        self.contentHeightTask = nil
+                        self.scheduleContentHeightMeasurementIfNeeded()
+                    }
+                    return
+                }
+                // The root's overflow is propagated to the viewport, so the
+                // root box itself keeps its content height; the body's scroll
+                // extent covers content that escapes the root (absolutely
+                // positioned mail chrome).
+                guard let result = try? await self.webView.evaluateJavaScript(
+                    "Math.max(document.documentElement.offsetHeight, "
+                        + "document.documentElement.scrollHeight, "
+                        + "(document.body ? document.body.scrollHeight : 0))"
+                ), let number = result as? NSNumber else {
+                    continue
+                }
+                let height = CGFloat(truncating: number)
+                guard height.isFinite, height > largest else { continue }
+                largest = height
+                self.reportContentHeight(largest)
             }
+            guard largest > 0 else { return }
+
             guard abs(self.bounds.width - expectedWidth) <= 0.5 else {
+                rescheduled = true
                 self.contentHeightTask = nil
                 self.scheduleContentHeightMeasurementIfNeeded()
                 return
             }
+            let resolvedHeight = largest
+            self.reportContentHeight(resolvedHeight)
             self.lastMeasuredWidth = expectedWidth
-            let height = CGFloat(truncating: number)
-            if height.isFinite, height > 0,
-               self.lastReportedContentHeight.map({ abs(height - $0) > 0.5 }) ?? true {
-                self.lastReportedContentHeight = height
-                self.onContentHeightChange?(height)
-            }
-            self.contentHeightTask = nil
         }
+    }
+
+    private func reportContentHeight(_ height: CGFloat) {
+        guard height.isFinite, height > 0,
+              lastReportedContentHeight.map({ abs(height - $0) > 0.5 }) ?? true else {
+            return
+        }
+        lastReportedContentHeight = height
+        onContentHeightChange?(height)
     }
 
 
@@ -456,7 +508,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         /* The canvas lives on html and stays opaque so mail that declares no
            colors is readable; author body/background declarations must win,
            so only color-scheme is forced. */
-        html { color-scheme: \(colorScheme) !important; background: \(canvas); height: auto; min-height: 0; overflow-y: hidden; }
+        html { color-scheme: \(colorScheme) !important; background: \(canvas); height: auto; min-height: 0; }
         body {
           height: auto; min-height: 0; margin: 0; padding: 18px 20px;
           font: -apple-system-body;

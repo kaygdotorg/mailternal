@@ -11,7 +11,9 @@ enum MessageHeaderPolicy {
     static let noSubjectPlaceholder = "(No Subject)"
 
     /// A raw header is returned as one logical line. Field names retain the
-    /// source spelling and values are unfolded, trimmed field bodies.
+    /// source spelling and values are unfolded, trimmed field bodies. The
+    /// sync facade escapes raw bytes for safe source rendering; decode that
+    /// transport escaping once here, without touching RFC 2047 encoded words.
     static func rawHeaders(from rawSource: String) -> [(name: String, value: String)] {
         let normalized = rawSource
             .replacingOccurrences(of: "\r\n", with: "\n")
@@ -33,7 +35,9 @@ enum MessageHeaderPolicy {
 
             if line.first == " " || line.first == "\t" {
                 guard currentName != nil else { continue }
-                let continuation = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                let continuation = unescapeRawValue(
+                    line.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
                 if !continuation.isEmpty {
                     if !currentValue.isEmpty { currentValue.append(" ") }
                     currentValue.append(contentsOf: continuation)
@@ -56,11 +60,26 @@ enum MessageHeaderPolicy {
             }
             appendCurrent()
             currentName = name
-            currentValue = line[line.index(after: colon)...]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            currentValue = unescapeRawValue(
+                line[line.index(after: colon)...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
         }
         appendCurrent()
         return headers
+    }
+
+    /// `MessageAssembler.escapeRaw` escapes the source before crossing the
+    /// facade boundary. Decode only the entities that transport uses, once:
+    /// an original literal `&lt;` arrives as `&amp;lt;` and becomes `&lt;`.
+    /// RFC 2047 encoded-words contain no matching entity and remain untouched.
+    private static func unescapeRawValue(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&amp;", with: "&")
     }
 
     /// The copy/display representation of the complete unfolded header block.
