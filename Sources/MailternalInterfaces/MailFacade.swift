@@ -22,8 +22,10 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     // Folders
     var foldersStream: AsyncStream<[FolderSummary]> { get }
 
-    // Messages — keyset-paged; never a whole-folder query (spec: sync.md storage)
+    // Messages — keyset-paged for rendering; full-folder IDs are a single indexed
+    // query used by ⌘A and batch operations.
     func page(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) async throws -> MessagePage
+    func messageIDs(in folder: FolderID) async throws -> [MessageID]
     /// Live changes for the currently visible page window of a folder.
     func observePage(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) -> AsyncStream<MessagePage>
 

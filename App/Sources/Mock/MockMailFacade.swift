@@ -201,6 +201,10 @@ final class MockMailFacade: MailFacade {
         currentPage(in: folder, after: cursor, limit: limit)
     }
 
+    func messageIDs(in folder: FolderID) async throws -> [MessageID] {
+        (messages[folder] ?? []).map(\.row.id)
+    }
+
     func observePage(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) -> AsyncStream<MessagePage> {
         let stream = AsyncStream.makeStream(of: MessagePage.self, bufferingPolicy: .bufferingNewest(8))
         let id = UUID()

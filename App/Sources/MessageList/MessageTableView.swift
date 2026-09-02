@@ -37,6 +37,7 @@ struct MessageListPane: View {
                 trailing: actions.trailingSwipe,
                 topRestDepth: listDissolvePolicy.restDepth(safeAreaTop: 0),
                 onSelect: { ids, anchor in model.selectMessages(ids, anchor: anchor) },
+                onSelectAll: { model.selectAllMessages() },
                 onPrefetch: { model.loadMoreIfNeeded(near: $0) },
                 onCopySubject: { ids in model.copySubjects(for: ids) },
                 onCopyDeepLink: { ids in
@@ -104,6 +105,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
     var trailing: [SwipeActionKind]
     var topRestDepth: CGFloat
     var onSelect: (Set<MessageID>, MessageID?) -> Void
+    var onSelectAll: () -> Void
     var onPrefetch: (Int) -> Void
     var onCopySubject: (Set<MessageID>) -> Void
     var onCopyDeepLink: (Set<MessageID>) -> Void
@@ -146,7 +148,19 @@ struct MessageTableRepresentable: NSViewRepresentable {
             container.onKeyCommand = { [weak self] command in
                 self?.handleKeyCommand(command)
             }
+            container.onSelectAll = { [weak self] in
+                self?.parent?.onSelectAll()
+            }
             container.tableView.menu = makeMenu()
+            container.tableView.target = self
+            container.tableView.doubleAction = #selector(handleDoubleAction(_:))
+        }
+
+        @objc private func handleDoubleAction(_ sender: NSTableView) {
+            guard let parent else { return }
+            let row = sender.clickedRow >= 0 ? sender.clickedRow : sender.selectedRow
+            guard let messageID = parent.rows[safe: row]?.id else { return }
+            parent.onOpenMessageWindow(messageID)
         }
 
         func update(container: MessageTableContainer, parent: MessageTableRepresentable) {
@@ -266,6 +280,19 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 parent.rows[safe: index]?.id
             })
             let clickedID = parent.rows[safe: tableView.clickedRow]?.id
+            let modifiers = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
+            if modifiers.contains(.command), let clickedID {
+                var selection = parent.selectedIDs
+                if ids.contains(clickedID) {
+                    selection.insert(clickedID)
+                } else {
+                    selection.remove(clickedID)
+                }
+                let anchor = selection.contains(clickedID) ? clickedID : selection.first
+                guard selection != parent.selectedIDs || anchor != parent.selectedID else { return }
+                parent.onSelect(selection, anchor)
+                return
+            }
             let anchor = clickedID.flatMap { ids.contains($0) ? $0 : nil }
                 ?? parent.rows[safe: tableView.selectedRow]?.id
             guard ids != parent.selectedIDs || anchor != parent.selectedID else { return }
@@ -303,11 +330,13 @@ struct MessageTableRepresentable: NSViewRepresentable {
         ) -> NSPasteboardWriting? {
             guard let parent, let rowID = parent.rows[safe: row]?.id else { return nil }
             let ids: Set<MessageID> = parent.selectedIDs.contains(rowID) ? parent.selectedIDs : [rowID]
-            let links = ids.sorted(by: { $0.rawValue < $1.rawValue }).compactMap { parent.messageLinks[$0] }
-            guard links.count == ids.count else { return nil }
+            let orderedIDs = ids.sorted(by: { $0.rawValue < $1.rawValue })
+            let payload = orderedIDs.map { id in
+                parent.messageLinks[id] ?? MessageLinkPasteboard.encodeMessageID(id)
+            }
             let item = NSPasteboardItem()
             item.setData(
-                MessageLinkPasteboard.encode(links),
+                MessageLinkPasteboard.encode(payload),
                 forType: NSPasteboard.PasteboardType(MessageLinkPasteboard.type)
             )
             return item
@@ -412,7 +441,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
             case .openInNewWindow:
                 guard selection.count == 1, let id = selection.first else { return }
                 parent.onOpenMessageWindow(id)
-            case .reply, .replyAll, .forward:
+            case .reply, .replyAll, .forward, .viewRawSource:
                 break
             case .markRead, .markUnread:
                 parent.onAction(.toggleRead, selection)
@@ -433,8 +462,13 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 parent.onCopySubject(selection)
             }
         }
+
         private func handleKeyCommand(_ command: MessageTableKeyCommand) {
             guard let parent else { return }
+            if case .selectAll = command {
+                parent.onSelectAll()
+                return
+            }
             let ids: Set<MessageID>
             if parent.selectedIDs.isEmpty {
                 ids = Set(tableView?.selectedRowIndexes.compactMap { parent.rows[safe: $0]?.id } ?? [])
@@ -443,6 +477,8 @@ struct MessageTableRepresentable: NSViewRepresentable {
             }
             guard !ids.isEmpty else { return }
             switch command {
+            case .selectAll:
+                break
             case .delete:
                 parent.onAction(.trash, ids)
             case .toggleRead:
@@ -451,12 +487,12 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 parent.onAction(.toggleFlag, ids)
             }
         }
-
 }
 }
 
 
 fileprivate enum MessageTableKeyCommand {
+    case selectAll
     case delete
     case toggleRead
     case toggleFlag
@@ -468,6 +504,11 @@ fileprivate final class MessageTableKeyView: NSTableView {
 
     override func keyDown(with event: NSEvent) {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers == .command,
+           event.charactersIgnoringModifiers?.lowercased() == "a" {
+            onKeyCommand?(.selectAll)
+            return
+        }
         if event.keyCode == 51, modifiers.isEmpty || modifiers == .command {
             onKeyCommand?(.delete)
             return
@@ -492,6 +533,7 @@ fileprivate final class MessageTableKeyView: NSTableView {
 final class MessageTableContainer: NSView {
     let scrollView = NSScrollView()
     fileprivate let tableView = MessageTableKeyView()
+    fileprivate var onSelectAll: (() -> Void)?
     private(set) var accentColor: NSColor?
     var onVisibleRow: ((Int) -> Void)?
     fileprivate var onKeyCommand: ((MessageTableKeyCommand) -> Void)?
