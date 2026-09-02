@@ -1,12 +1,17 @@
-# Mailternal — Roadmap (frozen 2026-08-31)
+# Mailternal — Roadmap (re-cut 2026-09-02)
 
-| Version | Contents |
-|---|---|
-| **0.0.1** | macOS only. 1 IMAP account, text-only full-history newest-first sync, collapsible nested folder hierarchy, flat/non-threaded message list, viewer, `\Seen`-only writes, offline FTS search, IDLE + local notifications, MAS build. |
-| **0.0.2** | Threading (References/In-Reply-To graph), triage actions (archive/delete/flag/move), compose + SMTP send. |
-| **0.0.3** | iOS/iPadOS app, `mailternald`, APNs gateway, NSE content-free wake pipeline. |
-| **0.0.4** | CLI (automation surface: search/export/daemon admin), multi-account, unified inbox. |
-| Later | JMAP + Fastmail zero-knowledge push, Gmail OAuth + CASA, Thunderbird autoconfig, rules/snooze/send-later, monetization switch-on (lifetime purchase). |
+**0.0.1 is the whole surface below.** Stability is the release criterion, not the
+calendar. Milestones are ordered by dependency, not versioned.
+
+| Milestone | Contents | Status |
+|---|---|---|
+| **M1 macOS app** | 1 IMAP account, text-only full-history newest-first sync, folder hierarchy, message list with swipe actions (configurable), reader islands, seen/unseen/flag/archive/trash queues, offline FTS search, IDLE + local notifications, deep links, MAS build. | landed, hardening |
+| **M2 automation architecture** | State document + `Command` log, container socket, undo journal, settings surface, perf CI gates (`automation.md`). | next |
+| **M3 CLI** | Bundled `mailternal` with read/triage parity, `--host` (SSH + paired TLS listener), Linux static build with vendored SQLite, `schema`, docs pipeline live (`cli.md`, `docs.md`). | |
+| **M4 Gmail** | App Password path (default, guided) + bring-your-own OAuth client (advanced, PKCE, loopback); Gmail folder semantics (All Mail = archive, labels). Required on macOS, iOS and CLI. No CASA. | |
+| **M5 composer + SMTP** | Composer state document (CLI-editable from day one), SMTP submission, `send`/`reply` in app and CLI together. | deferred until M1–M4 + iOS ship |
+| **M6 iOS/iPadOS** | Same SwiftUI code, `NavigationSplitView`; `mailternald` + APNs gateway on a Proxmox VM; NSE content-free wake pipeline (`push.md`); pairing + iCloud Keychain handoff (`pairing.md`). | |
+| Later | JMAP + Fastmail zero-knowledge push, our own verified Gmail OAuth client (when revenue justifies the annual assessment), Thunderbird autoconfig, threading, rules/snooze/send-later, monetization switch-on (lifetime purchase). | |
 
 Scope changes to this ladder require explicit sign-off; nothing shrinks silently.
 
