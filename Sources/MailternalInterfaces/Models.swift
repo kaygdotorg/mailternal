@@ -175,12 +175,24 @@ public struct MessageDetail: Sendable {
     public var bodyText: String?
     /// Already-sanitized HTML (spec: sync.md HTML isolation). Never raw.
     public var sanitizedHTML: String?
+    /// Computed by the sanitizer once and carried with the detail. This avoids
+    /// reparsing the full HTML on every SwiftUI observation pass.
+    public var hasRemoteImageReferences: Bool
     public var attachments: [AttachmentInfo]
     public var isQuarantined: Bool // parse failure; viewer offers capped raw fetch
-    public init(id: MessageID, envelope: Envelope, bodyText: String?, sanitizedHTML: String?,
-                attachments: [AttachmentInfo], isQuarantined: Bool) {
+    public init(
+        id: MessageID,
+        envelope: Envelope,
+        bodyText: String?,
+        sanitizedHTML: String?,
+        hasRemoteImageReferences: Bool = false,
+        attachments: [AttachmentInfo],
+        isQuarantined: Bool
+    ) {
         self.id = id; self.envelope = envelope; self.bodyText = bodyText
-        self.sanitizedHTML = sanitizedHTML; self.attachments = attachments
+        self.sanitizedHTML = sanitizedHTML
+        self.hasRemoteImageReferences = hasRemoteImageReferences
+        self.attachments = attachments
         self.isQuarantined = isQuarantined
     }
 }

@@ -3,6 +3,12 @@ import MailternalIMAP
 import MailternalInterfaces
 import MailternalMIME
 import MailternalStore
+private enum BackfillAttemptResult: Equatable {
+    case committed
+    case invalidated
+    case halted
+}
+
 
 /// Sync orchestration (spec: docs/spec/sync.md).
 ///
@@ -624,12 +630,31 @@ public actor SyncEngine {
             isReplacement: isReplacement
         )
     }
-
     private func backfillAll() async {
         let ordered = SyncPolicy.sortFolders(Array(folders.values))
+        let maxRevisionRetries = 3
         for record in ordered {
-            if stopping || Task.isCancelled { return }
-            await syncFolderHistory(folderID: record.id)
+            var revisionRetries = 0
+            while !stopping && !Task.isCancelled {
+                let revisionBefore = expungeRevision[record.id, default: 0]
+                let result = await syncFolderHistory(folderID: record.id)
+                let revisionAfter = expungeRevision[record.id, default: 0]
+                let state: FolderSyncState?
+                if let current = folders[record.id] {
+                    state = try? await store.fetchSyncState(for: current.generation)
+                } else {
+                    state = nil
+                }
+                let shouldRetry = result == .invalidated
+                    && !stopping
+                    && !Task.isCancelled
+                    && !sessionBroken
+                    && state?.backfillPhase == .walking
+                    && revisionAfter != revisionBefore
+                    && revisionRetries < maxRevisionRetries
+                guard shouldRetry else { break }
+                revisionRetries += 1
+            }
         }
         if !stopping && !Task.isCancelled {
             backfillPassFinished = true
@@ -677,9 +702,10 @@ public actor SyncEngine {
     }
 
     /// Backfill, then atomically switch a replacement generation only once it is complete.
-    private func syncFolderHistory(folderID: FolderID) async {
-        await backfill(folderID: folderID)
+    private func syncFolderHistory(folderID: FolderID) async -> BackfillAttemptResult {
+        let result = await backfill(folderID: folderID)
         await activateIfReplacementComplete(folderID: folderID)
+        return result
     }
 
     private func activateIfReplacementComplete(folderID: FolderID) async {
@@ -690,12 +716,12 @@ public actor SyncEngine {
         await activateReplacement(folderID: folderID)
     }
 
-    private func backfill(folderID: FolderID) async {
-        guard var record = folders[folderID], let channel = syncChannel else { return }
+    private func backfill(folderID: FolderID) async -> BackfillAttemptResult {
+        guard var record = folders[folderID], let channel = syncChannel else { return .halted }
         do {
             var state = try await store.fetchSyncState(for: record.generation)
                 ?? FolderSyncState(generation: record.generation, baselineUID: record.baseline)
-            if state.backfillPhase == .complete { return }
+            if state.backfillPhase == .complete { return .committed }
             if state.backfillPhase == .halted {
                 let snap = disk.snapshot(for: settings.diskURL)
                 let reserve = SyncPolicy.reserveBytes(volumeBytes: snap.volumeBytes)
@@ -716,7 +742,7 @@ public actor SyncEngine {
                     if let windowedSince {
                         publishStatus(mode: .windowed(since: windowedSince))
                     }
-                    return
+                    return .halted
                 }
             }
 
@@ -727,7 +753,7 @@ public actor SyncEngine {
             if record.generation != previousGeneration {
                 state = try await store.fetchSyncState(for: record.generation)
                     ?? FolderSyncState(generation: record.generation, baselineUID: record.baseline)
-                if state.backfillPhase == .complete { return }
+                if state.backfillPhase == .complete { return .committed }
             }
             let uidNext = selected.uidNext ?? record.lastUidNext
 
@@ -767,7 +793,7 @@ public actor SyncEngine {
                     if let since = windowedSince {
                         publishStatus(mode: .windowed(since: since))
                     }
-                    return
+                    return .halted
                 }
 
                 let windowSize = SyncPolicy.backfillWindowSize(
@@ -783,10 +809,10 @@ public actor SyncEngine {
                     state.progress = 1
                     try await store.saveSyncState(state)
                     await clearWindowedModeIfResolved()
-                    return
+                    return .committed
                 }
                 let capturedGeneration = record.generation
-                let committed = try await ingestWindow(
+                let result = try await ingestWindow(
                     record: record,
                     window: window,
                     channel: channel,
@@ -797,25 +823,30 @@ public actor SyncEngine {
                 // Cursor advances only after a committed window. Cancellation
                 // mid-ingest must not persist low-water (spec: sync.md backfill).
                 try Task.checkCancellation()
-                if !committed {
-                    return
+                switch result {
+                case .committed:
+                    break
+                case .invalidated, .halted:
+                    return result
                 }
-                guard stillCurrentGeneration(capturedGeneration, folder: folderID) else { return }
+                guard stillCurrentGeneration(capturedGeneration, folder: folderID) else { return .invalidated }
                 state.lowWaterUID = IMAPUID(rawValue: window.lowerBound)
                 state.progress = SyncPolicy.backfillProgress(uidNext: uidNext, lowWater: state.lowWaterUID?.rawValue)
                 try await store.saveSyncState(state)
             }
         } catch is CancellationError {
-            return
+            return .halted
         } catch {
             if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
-                return
+                return .halted
             }
             await logSync("backfill \(record.path)", detail: String(describing: error), folder: folderID)
             if SyncPolicy.isTransport(error) {
                 sessionBroken = true
             }
+            return .halted
         }
+        return .halted
     }
 
     private func ingestWindow(
@@ -824,7 +855,7 @@ public actor SyncEngine {
         channel: SyncChannel,
         notify: Bool,
         expectedExpungeRevision: UInt64? = nil
-    ) async throws -> Bool {
+    ) async throws -> BackfillAttemptResult {
         let capturedGeneration = record.generation
         let uidSet = IMAPUIDSet(window)
         let meta: [IMAPFetchedMessage]
@@ -847,21 +878,20 @@ public actor SyncEngine {
         } catch SyncChannelError.staleMailbox {
             // UIDVALIDITY moved; the next delta pass opens a replacement
             // generation. Window not committed.
-            return false
+            return .invalidated
         } catch {
             if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
-                return false
+                return .halted
             }
             await logSync("window fetch \(record.path)", detail: String(describing: error), folder: record.id)
             if SyncPolicy.isTransport(error) { throw error }
-            let committed = try await quarantineUnknown(
+            return try await quarantineUnknown(
                 record: record,
                 window: window,
                 channel: channel,
                 reason: String(describing: error),
                 expectedExpungeRevision: expectedExpungeRevision
             )
-            return committed
         }
 
 
@@ -921,7 +951,7 @@ public actor SyncEngine {
                         throw CancellationError()
                     } catch {
                         if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
-                            return false
+                            return .halted
                         }
                         await logSync("body peek \(record.path)", detail: String(describing: error), folder: record.id)
                         if SyncPolicy.isTransport(error) { throw error }
@@ -945,8 +975,8 @@ public actor SyncEngine {
             built.append(incoming)
         }
 
-        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return false }
-        if built.isEmpty { return true }
+        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return .invalidated }
+        if built.isEmpty { return .committed }
         built.sort { $0.uid > $1.uid }
 
         let canNotify = notify && record.role == .inbox && !record.isReplacement
@@ -962,9 +992,9 @@ public actor SyncEngine {
 
         if let expectedExpungeRevision,
            expectedExpungeRevision != expungeRevision[record.id, default: 0] {
-            return false
+            return .invalidated
         }
-        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return false }
+        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return .invalidated }
         _ = try await store.upsertMessages(built)
 
         // An expunge can arrive while the upsert is suspended. Reconcile
@@ -979,7 +1009,7 @@ public actor SyncEngine {
                 channel: channel,
                 revisionAlreadyAdvanced: true
             )
-            return true
+            return .committed
         }
 
         if canNotify {
@@ -996,7 +1026,7 @@ public actor SyncEngine {
                 }
             }
         }
-        return true
+        return .committed
     }
 
     private func ingestNewUIDs(
@@ -1007,26 +1037,50 @@ public actor SyncEngine {
         notify: Bool,
         expectedExpungeRevision: UInt64? = nil
     ) async throws {
-        var lowWater: UInt32? = nil
         let uidNext = hi < UInt32.max ? hi &+ 1 : hi
-        while let window = SyncPolicy.nextWindow(
-            uidNext: uidNext,
-            windowSize: settings.backfillWindowSize,
-            lowWater: lowWater
-        ) {
-            let start = max(window.lowerBound, lo)
-            if start <= window.upperBound {
-                let committed = try await ingestWindow(
-                    record: record,
-                    window: start...window.upperBound,
-                    channel: channel,
-                    notify: notify,
-                    expectedExpungeRevision: expectedExpungeRevision
-                )
-                if !committed { return }
+        var expectedRevision = expectedExpungeRevision
+
+        // A concurrent EXPUNGE/append can invalidate a FETCH after it has
+        // captured its UID range. Retry the complete append range against the
+        // new revision so a delta never advances lastUidNext past unwritten
+        // messages. A generation replacement is not retryable with this
+        // record, and repeated revisions are bounded.
+        for _ in 0...3 {
+            var lowWater: UInt32? = nil
+            var invalidated = false
+            while let window = SyncPolicy.nextWindow(
+                uidNext: uidNext,
+                windowSize: settings.backfillWindowSize,
+                lowWater: lowWater
+            ) {
+                let start = max(window.lowerBound, lo)
+                if start <= window.upperBound {
+                    let result = try await ingestWindow(
+                        record: record,
+                        window: start...window.upperBound,
+                        channel: channel,
+                        notify: notify,
+                        expectedExpungeRevision: expectedRevision
+                    )
+                    switch result {
+                    case .committed:
+                        break
+                    case .invalidated:
+                        invalidated = true
+                    case .halted:
+                        return
+                    }
+                    if invalidated { break }
+                }
+                if window.lowerBound <= lo { break }
+                lowWater = window.lowerBound
             }
-            if window.lowerBound <= lo { break }
-            lowWater = window.lowerBound
+            if !invalidated { return }
+            guard !stopping, !Task.isCancelled,
+                  folders[record.id]?.generation == record.generation else {
+                return
+            }
+            expectedRevision = expungeRevision[record.id, default: 0]
         }
     }
 
@@ -1036,7 +1090,7 @@ public actor SyncEngine {
         channel: SyncChannel,
         reason: String,
         expectedExpungeRevision: UInt64? = nil
-    ) async throws -> Bool {
+    ) async throws -> BackfillAttemptResult {
         // Quarantine rows are what make cursor advance legal for a failed
         // window (spec: every UID committed as message or quarantine). A
         // failure here must propagate so the cursor never skips the window.
@@ -1047,7 +1101,7 @@ public actor SyncEngine {
         )
         // Stop may have released a paused FLAGS continuation after teardown;
         // never let that late result start a quarantine write.
-        guard !stopping else { return false }
+        guard !stopping else { return .halted }
         let now = clock()
         let incoming = flags.compactMap { fetched -> IncomingMessage? in
             guard let uid = fetched.uid else { return nil }
@@ -1064,9 +1118,9 @@ public actor SyncEngine {
            expectedExpungeRevision != expungeRevision[record.id, default: 0] {
             // The fallback FLAGS reply may have crossed an EXPUNGE delta.
             // Do not write its stale UID set or advance the cursor.
-            return false
+            return .invalidated
         }
-        guard !incoming.isEmpty else { return true }
+        guard !incoming.isEmpty else { return .committed }
 
         // Once the write begins, stop waits for the post-write revision check
         // and expunge repair instead of cancelling it halfway through.
@@ -1082,9 +1136,9 @@ public actor SyncEngine {
                 channel: channel,
                 revisionAlreadyAdvanced: true
             )
-            return false
+            return .invalidated
         }
-        return true
+        return .committed
     }
 
 
@@ -1325,7 +1379,7 @@ public actor SyncEngine {
 
         folders[record.id] = record
         if record.isReplacement {
-            await backfill(folderID: record.id)
+            _ = await backfill(folderID: record.id)
             await activateIfReplacementComplete(folderID: record.id)
             if let latest = folders[record.id] {
                 record = latest
@@ -1552,7 +1606,7 @@ public actor SyncEngine {
                 if stopping { return }
                 if let state = try? await store.fetchSyncState(for: record.generation),
                    state.backfillPhase != .complete {
-                    await syncFolderHistory(folderID: record.id)
+                    _ = await syncFolderHistory(folderID: record.id)
                 } else {
                     await activateIfReplacementComplete(folderID: record.id)
                 }
@@ -1575,6 +1629,13 @@ public actor SyncEngine {
         record.isReplacement = true
         folders[folder] = record
     }
+    /// Test seam: simulate an expunge revision arriving while a FETCH is in
+    /// flight, without relying on scheduler timing to run a second SELECT.
+    func bumpExpungeRevisionForTesting(_ folder: FolderID) {
+        expungeRevision[folder, default: 0] &+= 1
+    }
+
+
 
     private func seenLoop() async {
         while !stopping && !Task.isCancelled {
@@ -1781,3 +1842,4 @@ private func durationSeconds(_ duration: Duration) -> TimeInterval {
     let c = duration.components
     return TimeInterval(c.seconds) + TimeInterval(c.attoseconds) / 1e18
 }
+

@@ -57,6 +57,15 @@ enum SwipeActionKind: String, CaseIterable, Codable, Identifiable {
         case .toggleRead, .toggleFlag: .regular
         }
     }
+    
+    var backgroundColor: NSColor {
+        switch self {
+        case .archive: .systemYellow
+        case .trash: .systemRed
+        case .toggleRead: .systemBlue
+        case .toggleFlag: .systemOrange
+        }
+    }
 }
 
 @MainActor

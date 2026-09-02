@@ -58,6 +58,8 @@ targets:
       - path: Sources/Support/PartFetchRouting.swift
       - path: Sources/MessageWeb/PartSchemeHandler.swift
       - path: Sources/Sidebar/FolderHierarchy.swift
+      - path: Sources/Mock/MockMailFacade.swift
+      - path: Sources/Support/AccountTitlePolicy.swift
     dependencies:
       - package: MailternalCore
         product: MailternalCore

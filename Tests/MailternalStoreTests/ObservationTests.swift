@@ -15,7 +15,13 @@ actor CountCollector {
 }
 
 @Test func observationDebounceCoalescesBursts() async throws {
-    try await withStore(observationDebounce: .milliseconds(180)) { store, _ in
+    let clock = ManualObservationClock()
+    try await withStore(
+        observationDebounce: .milliseconds(180),
+        observationSleep: { duration in
+            try await clock.sleep(for: duration)
+        }
+    ) { store, _ in
         let (_, folder, generation) = try await seedInbox(store)
         _ = try await store.upsertMessages([
             makeMessage(generation: generation, uid: 1, subject: "one"),
@@ -43,9 +49,10 @@ actor CountCollector {
             ])
         }
 
-        try await Task.sleep(for: .milliseconds(40))
+        await clock.waitUntilSleeping()
         #expect(await collector.snapshot().count == baseline, "burst must not deliver immediately")
 
+        await clock.advance()
         let gotSecond = await waitUntil(timeout: .milliseconds(700)) {
             await collector.snapshot().count > baseline
         }
@@ -78,4 +85,48 @@ private func waitUntil(timeout: Duration, _ predicate: @Sendable () async -> Boo
         try? await Task.sleep(for: .milliseconds(10))
     }
     return await predicate()
+}
+
+private actor ManualObservationClock {
+    private var sleepers: [CheckedContinuation<Void, Never>] = []
+    private var sleepingWaiters: [CheckedContinuation<Void, Never>] = []
+    private var advancePending = false
+
+    func sleep(for _: Duration) async throws {
+        try Task.checkCancellation()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            if advancePending {
+                advancePending = false
+                continuation.resume()
+            } else {
+                sleepers.append(continuation)
+                let waiters = sleepingWaiters
+                sleepingWaiters.removeAll()
+                for waiter in waiters {
+                    waiter.resume()
+                }
+            }
+        }
+        try Task.checkCancellation()
+    }
+
+    func waitUntilSleeping() async {
+        if !sleepers.isEmpty { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            if sleepers.isEmpty {
+                sleepingWaiters.append(continuation)
+            } else {
+                continuation.resume()
+            }
+        }
+    }
+
+    func advance() {
+        let waiters = sleepers
+        sleepers.removeAll()
+        advancePending = true
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
 }

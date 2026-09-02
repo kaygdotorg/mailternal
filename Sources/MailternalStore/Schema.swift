@@ -88,6 +88,13 @@ enum Schema {
             try db.execute(sql: "DROP TABLE seen_queue_v6")
             try db.execute(sql: "CREATE INDEX seen_queue_send_idx ON seen_queue(enqueued_at, id)")
         }
+        migrator.registerMigration("v8_remote_image_references") { db in
+            // Existing rows are left NULL so detail() can derive the value
+            // from their already-sanitized token stream and backfill lazily.
+            try db.alter(table: "messages") { t in
+                t.add(column: "has_remote_references", .boolean)
+            }
+        }
         return migrator
     }
 

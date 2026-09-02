@@ -108,12 +108,14 @@ struct MessageViewer: View {
                     isShowingRawSource: model.isShowingRawSource,
                     showRawSource: { Task { await model.loadRawSource() } },
                     showFormatted: { model.isShowingRawSource = false },
-                    copySubject: { model.copySelectedSubject() }
+                    copySubject: { model.copySelectedSubject() },
+                    backdropKind: model.appearance.backdropKind
                 )
                 MessageEnvelopeRegion(
                     envelope: detail.envelope,
                     attachments: detail.attachments,
-                    isDetailsExpanded: $isDetailsExpanded
+                    isDetailsExpanded: $isDetailsExpanded,
+                    backdropKind: model.appearance.backdropKind
                 )
                 bodyRegion(detail)
             }
@@ -135,7 +137,6 @@ struct MessageViewer: View {
                 value: isDetailsExpanded
             )
         }
-        .background(MessageReaderSurface.page)
         .background {
             ScrollEdgeEffectSuppressor()
         }
@@ -157,7 +158,10 @@ struct MessageViewer: View {
             bodyContent(detail)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .readerIslandSurface()
+        .readerIslandSurface(
+            role: .body,
+            backdropKind: model.appearance.backdropKind
+        )
         .accessibilityIdentifier(UIIdentifier.messageBody)
     }
 
@@ -258,13 +262,34 @@ struct MessageViewer: View {
     }
 }
 
+private enum ReaderIslandRole: Equatable {
+    case translucent
+    case body
+}
+
 private struct ReaderIslandSurface: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var contrast
+    let role: ReaderIslandRole
+    let backdropKind: WindowBackdropKind
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: AppShapeScale.card, style: .continuous)
         content
-            .background(.thinMaterial, in: shape)
+            .background {
+                surfaceBackground(in: shape)
+            }
+            .overlay {
+                if !reduceTransparency, role == .translucent,
+                   let image = ReaderFilmGrain.image {
+                    Image(decorative: image, scale: 1, orientation: .up)
+                        .resizable(resizingMode: .tile)
+                        .opacity(0.04)
+                        .blendMode(.overlay)
+                        .clipShape(shape)
+                        .allowsHitTesting(false)
+                }
+            }
             .overlay {
                 shape.strokeBorder(
                     contrast == .increased ? Color.primary : Color.primary.opacity(0.18),
@@ -274,11 +299,58 @@ private struct ReaderIslandSurface: ViewModifier {
             .clipShape(shape)
             .shadow(color: .black.opacity(0.14), radius: 12, y: 5)
     }
+
+    @ViewBuilder
+    private func surfaceBackground(in shape: RoundedRectangle) -> some View {
+        if reduceTransparency || role == .body {
+            shape.fill(Color(nsColor: .windowBackgroundColor))
+        } else {
+            switch backdropKind {
+            case .glass:
+                shape
+                    .fill(Color.clear)
+                    .glassEffect(.regular, in: shape)
+            case .blur:
+                shape.fill(.ultraThinMaterial)
+            }
+        }
+    }
+}
+
+private enum ReaderFilmGrain {
+    static let image: CGImage? = {
+        let side = 128
+        var bytes = [UInt8](repeating: 0, count: side * side)
+        var seed: UInt64 = 0x4D61696C7465726E
+        for index in bytes.indices {
+            seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            bytes[index] = UInt8(truncatingIfNeeded: seed >> 56)
+        }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData) else {
+            return nil
+        }
+        return CGImage(
+            width: side,
+            height: side,
+            bitsPerComponent: 8,
+            bitsPerPixel: 8,
+            bytesPerRow: side,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )
+    }()
 }
 
 private extension View {
-    func readerIslandSurface() -> some View {
-        modifier(ReaderIslandSurface())
+    func readerIslandSurface(
+        role: ReaderIslandRole = .translucent,
+        backdropKind: WindowBackdropKind = .blur
+    ) -> some View {
+        modifier(ReaderIslandSurface(role: role, backdropKind: backdropKind))
     }
 }
 
@@ -290,6 +362,7 @@ struct MessageSubjectRegion: View {
     let showRawSource: () -> Void
     let showFormatted: () -> Void
     let copySubject: () -> Void
+    let backdropKind: WindowBackdropKind
 
     var body: some View {
         let display = MessageHeaderPolicy.subject(subject)
@@ -308,7 +381,7 @@ struct MessageSubjectRegion: View {
         .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
         .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .readerIslandSurface()
+        .readerIslandSurface(backdropKind: backdropKind)
     }
 
     private var actions: some View {
@@ -339,6 +412,7 @@ struct MessageEnvelopeRegion: View {
     let envelope: Envelope
     let attachments: [AttachmentInfo]
     @Binding var isDetailsExpanded: Bool
+    let backdropKind: WindowBackdropKind
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -359,7 +433,7 @@ struct MessageEnvelopeRegion: View {
         .padding(.top, MessageViewerLayoutPolicy.envelopeTopPadding)
         .padding(.bottom, MessageViewerLayoutPolicy.envelopeBottomPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .readerIslandSurface()
+        .readerIslandSurface(backdropKind: backdropKind)
     }
 
     /// Sender and date share a line until the line no longer fits — at a narrow

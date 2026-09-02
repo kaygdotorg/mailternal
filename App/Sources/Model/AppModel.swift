@@ -2,7 +2,6 @@ import AppKit
 import Observation
 import SwiftUI
 import MailternalInterfaces
-import MailternalSanitizer
 private enum MailModelRouteError: LocalizedError {
     case messageUnavailable
     case linkUnavailable
@@ -45,11 +44,10 @@ final class AppModel {
     var isLoadingDetail = false
     var allowRemoteImages = false
 
-    /// Whether the sanitized message actually contains an app-controlled
-    /// token for a remote image. Inline `cid:` parts do not require consent.
+    /// Whether the sanitized message contains an app-controlled remote-image
+    /// token. The sanitizer computes this once when the detail is ingested.
     var hasRemoteImageReferences: Bool {
-        guard let html = detail?.sanitizedHTML, !html.isEmpty else { return false }
-        return HTMLSanitizer.sanitize(html).hasRemoteReferences
+        detail?.hasRemoteImageReferences ?? false
     }
 
     @ObservationIgnored private var pageTask: Task<Void, Never>?
@@ -58,6 +56,7 @@ final class AppModel {
     @ObservationIgnored private var foldersSnapshotReady = false
     @ObservationIgnored private var streamsStarted = false
     @ObservationIgnored private var markedRead: Set<MessageID> = []
+    @ObservationIgnored private var qaSelectionSequence: UInt64 = 0
 
     var selectedFolder: FolderSummary? {
         folders.first { $0.id == selectedFolderID }
@@ -66,8 +65,22 @@ final class AppModel {
     /// Display name shown by the message-list title when it is flipped to the
     /// owning account.
     var listTitleAccountName: String {
-        facade.accountDisplayName ?? "Account"
+        if let accountTitle = AccountTitlePolicy.title(for: accountConfig) {
+            return accountTitle
+        }
+        if let name = facade.accountDisplayName?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !name.isEmpty {
+            return name
+        }
+        return "Account"
     }
+
+    /// The persisted non-secret values used to populate the account editor.
+    var accountConfig: AccountConfig? {
+        facade.accountConfig
+    }
+
     var hasAccount: Bool {
         if case .none = accountState { return false }
         return true
@@ -313,6 +326,15 @@ final class AppModel {
     }
 
     func selectMessage(_ id: MessageID?) {
+        qaSelectionSequence &+= 1
+        let qaSelection = qaSelectionSequence
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
+            QALaunch.log(
+                "selection-perf event=select serial=\(qaSelection) t=\(DispatchTime.now().uptimeNanoseconds)"
+            )
+        }
+        #endif
         selectedMessageID = id
         isShowingRawSource = false
         rawSource = nil
@@ -331,6 +353,13 @@ final class AppModel {
                 guard selectedMessageID == id else { return }
                 detail = loaded
                 isLoadingDetail = false
+                #if DEBUG
+                if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
+                    QALaunch.log(
+                        "selection-perf event=detail serial=\(qaSelection) t=\(DispatchTime.now().uptimeNanoseconds)"
+                    )
+                }
+                #endif
                 markRead(id)
             } catch {
                 isLoadingDetail = false
@@ -338,6 +367,64 @@ final class AppModel {
             }
         }
     }
+    #if DEBUG
+    /// QA-only selection benchmark. It exercises the same model path used by
+    /// list selection without requiring an AppKit window or synthetic events.
+    func runQABenchSelect(count: Int) {
+        guard count > 0 else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let waitDeadline = ContinuousClock.now.advanced(by: .seconds(30))
+            while (!foldersSnapshotReady || listRows.isEmpty), ContinuousClock.now < waitDeadline {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            guard let folder = selectedFolderID else {
+                QALaunch.log("selection-perf bench unavailable reason=no-folder")
+                return
+            }
+            do {
+                let page = try await facade.page(
+                    in: folder,
+                    after: nil,
+                    limit: count
+                )
+                let ids = page.rows.prefix(count).map(\.id)
+                guard !ids.isEmpty else {
+                    QALaunch.log("selection-perf bench unavailable reason=no-messages")
+                    return
+                }
+                let clock = ContinuousClock()
+                var samples: [Double] = []
+                samples.reserveCapacity(ids.count)
+                for (offset, id) in ids.enumerated() {
+                    let started = clock.now
+                    selectMessage(id)
+                    while detail?.id != id {
+                        try? await Task.sleep(for: .milliseconds(1))
+                    }
+                    _ = hasRemoteImageReferences
+                    let elapsed = started.duration(to: clock.now)
+                    let components = elapsed.components
+                    let milliseconds = Double(components.seconds) * 1_000
+                        + Double(components.attoseconds) / 1_000_000_000_000_000
+                    samples.append(milliseconds)
+                    QALaunch.log(
+                        "selection-perf bench event=rendered serial=\(offset + 1) ms=\(String(format: "%.3f", milliseconds))"
+                    )
+                }
+                samples.sort()
+                let p50 = samples[(samples.count - 1) / 2]
+                let p95 = samples[min(samples.count - 1, (samples.count * 95) / 100)]
+                QALaunch.log(
+                    "selection-perf bench n=\(samples.count) p50=\(String(format: "%.3f", p50))ms p95=\(String(format: "%.3f", p95))ms"
+                )
+            } catch {
+                QALaunch.log("selection-perf bench unavailable reason=\(error.localizedDescription)")
+            }
+        }
+    }
+    #endif
+
 
     /// Marks a visible message read immediately and lets the sync engine
     /// persist the operation through its write queue.
@@ -436,6 +523,11 @@ final class AppModel {
         withAnimation(MailMotion.sidebarToggle) {
             columnVisibility = columnVisibility == .all ? .doubleColumn : .all
         }
+    }
+
+    /// Saves edited account settings through the facade boundary.
+    func updateAccount(_ config: AccountConfig, password: String?) async throws {
+        try await facade.updateAccount(config, password: password)
     }
 
     func showSettings() {

@@ -77,6 +77,9 @@ public struct IncomingMessage: Sendable {
     public var flags: MessageFlags
     public var bodyText: String?
     public var sanitizedHTML: String?
+    /// Computed while sanitizing the HTML, then persisted with the message so
+    /// detail presentation never needs to parse the document again.
+    public var hasRemoteImageReferences: Bool
     public var attachments: [AttachmentInfo]
     public var isTruncated: Bool
     public var isQuarantined: Bool
@@ -92,6 +95,7 @@ public struct IncomingMessage: Sendable {
         flags: MessageFlags = MessageFlags(),
         bodyText: String? = nil,
         sanitizedHTML: String? = nil,
+        hasRemoteImageReferences: Bool = false,
         attachments: [AttachmentInfo] = [],
         isTruncated: Bool = false,
         isQuarantined: Bool = false,
@@ -104,6 +108,7 @@ public struct IncomingMessage: Sendable {
         self.flags = flags
         self.bodyText = bodyText
         self.sanitizedHTML = sanitizedHTML
+        self.hasRemoteImageReferences = hasRemoteImageReferences
         self.attachments = attachments
         self.isTruncated = isTruncated
         self.isQuarantined = isQuarantined

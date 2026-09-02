@@ -119,6 +119,9 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
                 "headless launch pid=\(ProcessInfo.processInfo.processIdentifier) footprint=\(QALaunch.footprintBytes())"
             )
             model?.start()
+            if let count = QALaunch.parse()?.benchSelectCount {
+                model?.runQABenchSelect(count: count)
+            }
             return
         }
         #endif

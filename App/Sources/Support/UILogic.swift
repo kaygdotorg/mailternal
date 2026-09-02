@@ -24,6 +24,8 @@ enum UIIdentifier {
     static let setupPassword = "setup-password"
     static let setupHost = "setup-host"
     static let setupPort = "setup-port"
+    static let accountSave = "account-save"
+    static let sidebarAccountTitle = "sidebar-account-title"
     static let emailReadingMode = "appearance-email-reading"
     static let actionsSection = "settings-actions"
     static let actionsSwipeLeading0 = "actions-swipe-leading-0"
@@ -43,6 +45,7 @@ enum UIIdentifier {
         "sidebar-folder-\(path)"
     }
 }
+
 
 /// Geometry shared by the detail viewer and its focused layout tests.
 ///

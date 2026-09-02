@@ -37,6 +37,7 @@ final class MockMailFacade: MailFacade {
     private var seeded = false
     private var nextMessageID: Int64 = 1
     var activeAccountID: AccountID? { config?.id }
+    var accountConfig: AccountConfig? { config }
     var accountDisplayName: String? {
         guard let config else { return nil }
         let displayName = config.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -46,7 +47,8 @@ final class MockMailFacade: MailFacade {
 
     private var pageObservers: [UUID: PageObserver] = [:]
     private var config: AccountConfig?
-
+    private var storedPassword = ""
+    private(set) var validationCallCount = 0
     private struct PageObserver {
         var folder: FolderID
         var cursor: MessagePageCursor?
@@ -71,6 +73,58 @@ final class MockMailFacade: MailFacade {
 
     func addAccount(_ config: AccountConfig, password: String) async throws {
         accountState = .validating
+        try await validate(config, password: password)
+        let mockConfig = AccountConfig(
+            id: config.id,
+            accountLinkID: Self.mockAccountLinkID,
+            displayName: config.displayName,
+            emailAddress: config.emailAddress,
+            username: config.username,
+            imap: config.imap
+        )
+        self.config = mockConfig
+        storedPassword = password
+        if !seeded {
+            seedMailbox()
+            seeded = true
+        }
+        accountState = .active
+        foldersContinuation.yield(folders)
+        syncContinuation.yield(syncStatus)
+    }
+
+    func updateAccount(_ config: AccountConfig, password: String?) async throws {
+        guard let existing = self.config else {
+            throw MailAccountError("No account is configured.")
+        }
+        guard existing.id == config.id else {
+            throw MailAccountError("That account is no longer active.")
+        }
+
+        var updated = config
+        updated.accountLinkID = existing.accountLinkID
+        let requiresValidation =
+            existing.emailAddress != updated.emailAddress
+            || existing.username != updated.username
+            || existing.imap != updated.imap
+            || password != nil
+        if requiresValidation {
+            accountState = .validating
+            try await validate(updated, password: password ?? storedPassword)
+        }
+        self.config = updated
+        if let password {
+            storedPassword = password
+        }
+        accountState = .active
+    }
+
+    func resetValidationCallCount() {
+        validationCallCount = 0
+    }
+
+    private func validate(_ config: AccountConfig, password: String) async throws {
+        validationCallCount += 1
         try await Task.sleep(for: .milliseconds(280))
         if password == "wrong" {
             let message = "The username or password was rejected."
@@ -87,29 +141,15 @@ final class MockMailFacade: MailFacade {
             accountState = .authFailed(message: message)
             throw MailAccountError(message)
         }
-        let mockConfig = AccountConfig(
-            id: config.id,
-            accountLinkID: Self.mockAccountLinkID,
-            displayName: config.displayName,
-            emailAddress: config.emailAddress,
-            username: config.username,
-            imap: config.imap
-        )
-        self.config = mockConfig
-        if !seeded {
-            seedMailbox()
-            seeded = true
-        }
-        accountState = .active
-        foldersContinuation.yield(folders)
-        syncContinuation.yield(syncStatus)
     }
 
     func removeAccount() async throws {
         config = nil
+        storedPassword = ""
         accountState = .none
         foldersContinuation.yield([])
     }
+
 
     func makeDeepLink(for folder: FolderID) async throws -> MailternalDeepLink? {
         guard accountState == .active,

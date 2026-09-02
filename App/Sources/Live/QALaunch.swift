@@ -4,7 +4,8 @@ import MailternalInterfaces
 import MailternalStore
 
 /// DEBUG-only headless QA launcher. Parses `-qa-account host port security`
-/// and optional `-qa-container`, `-qa-cache-cap`, `-qa-bench-search`, `-qa-fetch-cid`.
+/// and optional `-qa-container`, `-qa-cache-cap`, `-qa-bench-search`,
+/// `-qa-bench-select`, and `-qa-fetch-cid`.
 ///
 /// Password is never an argv token: `MAILTERNAL_QA_PASSWORD` or `qa-password`.
 enum QALaunch: Sendable {
@@ -18,6 +19,7 @@ enum QALaunch: Sendable {
         var password: String
         var accountID: AccountID
         var benchSearch: Bool
+        var benchSelectCount: Int?
         var fetchCID: Bool
 
         var accountConfig: AccountConfig {
@@ -45,6 +47,7 @@ enum QALaunch: Sendable {
         var container: URL?
         var cacheCap: Int64?
         var benchSearch = false
+        var benchSelectCount: Int?
         var fetchCID = false
         var index = 1
         while index < arguments.count {
@@ -67,6 +70,10 @@ enum QALaunch: Sendable {
             case "-qa-bench-search":
                 benchSearch = true
                 index += 1
+            case "-qa-bench-select":
+                guard index + 1 < arguments.count else { return nil }
+                benchSelectCount = Int(arguments[index + 1]).map { max(0, $0) }
+                index += 2
             case "-qa-fetch-cid":
                 fetchCID = true
                 index += 1
@@ -88,6 +95,7 @@ enum QALaunch: Sendable {
             password: password,
             accountID: AccountID(rawValue: "qa-\(host)-\(port)"),
             benchSearch: benchSearch,
+            benchSelectCount: benchSelectCount,
             fetchCID: fetchCID
         )
         #else

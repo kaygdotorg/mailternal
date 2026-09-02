@@ -1,6 +1,6 @@
-// The UI ⇄ engine boundary — FROZEN during wave 1.
-// AppShell (chunk A) consumes this against an in-memory mock; AccountPlumbing
-// (chunk G) implements it over the real sync engine in wave 2.
+// The UI ⇄ engine boundary.
+// AppShell consumes this against an in-memory mock; the live facade implements
+// it over the real sync engine.
 import Foundation
 
 @MainActor
@@ -8,9 +8,15 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     // Account lifecycle (0.0.1: exactly one IMAP account)
     var accountState: AccountState { get }
     var accountStateStream: AsyncStream<AccountState> { get }
+    /// The persisted non-secret configuration for the active account.
+    /// `nil` means no account has been configured.
+    var accountConfig: AccountConfig? { get }
     /// Validates transport + auth per spec (TLS rules), stores secret in Keychain,
     /// activates the account. Throws a user-presentable error on failure.
     func addAccount(_ config: AccountConfig, password: String) async throws
+    /// Updates the active account. A nil password keeps the stored secret.
+    /// Display-name-only changes do not contact the server.
+    func updateAccount(_ config: AccountConfig, password: String?) async throws
     func removeAccount() async throws
 
     // Folders
@@ -45,4 +51,10 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     // Sync surface
     var syncStatusStream: AsyncStream<SyncStatus> { get }
     func refresh() async // user-initiated ⌘R: run delta pass now
+}
+
+public extension MailFacade {
+    /// Facades that cannot expose persisted account settings may leave this
+    /// unavailable; the app's live and mock facades provide it for editing.
+    var accountConfig: AccountConfig? { nil }
 }

@@ -138,6 +138,14 @@ struct AccountSetupForm: View {
     @State private var security: IMAPEndpoint.Security = .implicitTLS
     @State private var fieldError: String?
 
+    private var editingConfig: AccountConfig? {
+        model.accountConfig
+    }
+
+    private var isEditing: Bool {
+        editingConfig != nil
+    }
+
     var body: some View {
         Form {
             Section("Provider") {
@@ -167,9 +175,13 @@ struct AccountSetupForm: View {
                 TextField("Username", text: $username)
                     .textContentType(.username)
                     .accessibilityIdentifier(UIIdentifier.setupUsername)
-                SecureField("Password", text: $password)
-                    .textContentType(.password)
-                    .accessibilityIdentifier(UIIdentifier.setupPassword)
+                SecureField(
+                    "Password",
+                    text: $password,
+                    prompt: isEditing ? Text("unchanged") : nil
+                )
+                .textContentType(.password)
+                .accessibilityIdentifier(UIIdentifier.setupPassword)
             }
 
             Section("IMAP") {
@@ -192,11 +204,12 @@ struct AccountSetupForm: View {
             Section {
                 statusRow
                 HStack {
-                    Button("Sign In") {
+                    Button(isEditing ? "Save Changes" : "Sign In") {
                         Task { await submit() }
                     }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!canSubmit)
+                    .accessibilityIdentifier(isEditing ? UIIdentifier.accountSave : "")
                     if case .active = model.accountState {
                         Button("Remove Account", role: .destructive) {
                             Task { try? await model.facade.removeAccount() }
@@ -210,9 +223,11 @@ struct AccountSetupForm: View {
             if case .validating = model.accountState { return true }
             return false
         }())
-        .onAppear {
-            if displayName.isEmpty { displayName = NSFullUserName() }
+        .onAppear(perform: loadFields)
+        .onChange(of: model.accountConfig) { _, _ in
+            loadFields()
         }
+
     }
 
     @ViewBuilder
@@ -243,7 +258,8 @@ struct AccountSetupForm: View {
 
     private var canSubmit: Bool {
         if case .validating = model.accountState { return false }
-        return !host.isEmpty && !username.isEmpty && !password.isEmpty && Int(port) != nil
+        let hasPassword = isEditing || !password.isEmpty
+        return !host.isEmpty && !username.isEmpty && hasPassword && Int(port) != nil
     }
 
     private func applyPreset(named name: String) {
@@ -252,6 +268,22 @@ struct AccountSetupForm: View {
         port = String(preset.port)
         security = preset.security
         if username.isEmpty { username = email }
+    }
+
+    private func loadFields() {
+        guard let config = editingConfig else {
+            if displayName.isEmpty { displayName = NSFullUserName() }
+            return
+        }
+        presetName = "Custom"
+        displayName = config.displayName
+        email = config.emailAddress
+        username = config.username
+        host = config.imap.host
+        port = String(config.imap.port)
+        security = config.imap.security
+        password = ""
+        fieldError = nil
     }
 
     private func submit() async {
@@ -268,16 +300,24 @@ struct AccountSetupForm: View {
             fieldError = "Enter a username."
             return
         }
+        let existing = editingConfig
         let config = AccountConfig(
-            id: AccountID(rawValue: "account-1"),
-            accountLinkID: .random(),
-            displayName: displayName.isEmpty ? email : displayName,
+            id: existing?.id ?? AccountID(rawValue: "account-1"),
+            accountLinkID: existing?.accountLinkID ?? .random(),
+            displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
             emailAddress: email,
             username: username,
             imap: IMAPEndpoint(host: host, port: portNumber, security: security)
         )
         do {
-            try await model.facade.addAccount(config, password: password)
+            if existing != nil {
+                try await model.updateAccount(
+                    config,
+                    password: password.isEmpty ? nil : password
+                )
+            } else {
+                try await model.facade.addAccount(config, password: password)
+            }
             password = ""
         } catch {
             fieldError = error.localizedDescription

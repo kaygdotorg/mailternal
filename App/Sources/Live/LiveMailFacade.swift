@@ -24,6 +24,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     var activeAccountID: AccountID? { config?.id }
+    var accountConfig: AccountConfig? { config }
     var accountDisplayName: String? {
         guard let config else { return nil }
         let displayName = config.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -175,6 +176,91 @@ final class LiveMailFacade: MailFacade {
         await startEngine(for: storedConfig)
         startFolderObservation(account: storedConfig.id)
     }
+
+    func updateAccount(_ config: AccountConfig, password: String?) async throws {
+        guard let existing = self.config else {
+            let message = "No account is configured."
+            setState(.none)
+            throw LiveMailError(message)
+        }
+        guard existing.id == config.id else {
+            let message = "That account is no longer active."
+            throw LiveMailError(message)
+        }
+
+        var storedConfig = config
+        // AccountLinkID is the stable identity used by deep links. Editing
+        // settings must never generate a new identity.
+        storedConfig.accountLinkID = existing.accountLinkID
+
+        let requiresValidation =
+            existing.emailAddress != storedConfig.emailAddress
+            || existing.username != storedConfig.username
+            || existing.imap != storedConfig.imap
+            || password != nil
+
+        guard requiresValidation else {
+            do {
+                try await store.upsertAccount(storedConfig)
+            } catch {
+                let message = "Could not save the account."
+                setState(.connectionFailed(message: message))
+                throw LiveMailError(message)
+            }
+            self.config = storedConfig
+            // Even when only the label changed, observers need a fresh event
+            // so titles in the main window update immediately.
+            setState(.active)
+            return
+        }
+
+        let previousPassword = try? keychain.loadPassword(for: existing.id)
+        let validationPassword: String
+        if let password {
+            validationPassword = password
+        } else {
+            do {
+                validationPassword = try keychain.loadPassword(for: existing.id)
+            } catch {
+                let message = "The saved password is missing from the Keychain."
+                setState(.authFailed(message: message))
+                throw LiveMailError(message)
+            }
+        }
+
+        setState(.validating)
+        try await validate(storedConfig, password: validationPassword)
+
+        if let password {
+            do {
+                try keychain.savePassword(password, for: storedConfig.id)
+            } catch {
+                let message = error.localizedDescription
+                setState(.authFailed(message: message))
+                throw LiveMailError(message)
+            }
+        }
+
+        do {
+            try await store.upsertAccount(storedConfig)
+        } catch {
+            if let previousPassword {
+                try? keychain.savePassword(previousPassword, for: existing.id)
+            }
+            let message = "Could not save the account."
+            setState(.connectionFailed(message: message))
+            throw LiveMailError(message)
+        }
+
+        // Persist first, then replace the running engine with one bound to
+        // the new endpoint/credentials.
+        await stopEngine()
+        self.config = storedConfig
+        await startEngine(for: storedConfig)
+        startFolderObservation(account: storedConfig.id)
+        setState(.active)
+    }
+
 
     func removeAccount() async throws {
         await stopEngine()
