@@ -571,7 +571,8 @@ private func collectAttachments(_ part: MIMEPart, into out: inout [AttachmentInf
                 filename: part.filename,
                 mimeType: part.mediaType,
                 sizeEstimate: size,
-                contentID: part.contentID
+                contentID: part.contentID,
+                transferEncoding: part.transferEncoding.rawValue
             )
         )
     }

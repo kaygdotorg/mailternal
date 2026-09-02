@@ -199,7 +199,7 @@ struct QAChaosTests {
 
             let page = try await store.page(in: afterUV.id, after: nil, limit: 1)
             if let row = page.rows.first {
-                try await store.enqueueSeen(message: row.id)
+                try await store.enqueueFlag(message: row.id, flag: .seen, set: true)
             }
 
             _ = try QAChaos.chaos("deliver", "80", "INBOX")
@@ -216,7 +216,7 @@ struct QAChaosTests {
                 return inbox.totalCount < afterDeliver.totalCount
             }
             try await waitUntil(timeout: .seconds(20)) {
-                try await store.snapshotSeenQueue().isEmpty
+                try await store.snapshotFlagQueue().isEmpty
             }
 
             try await drainRetired(store)
@@ -283,7 +283,7 @@ struct QAChaosTests {
 
             let page = try await store.page(in: beforeRestart.id, after: nil, limit: 1)
             if let row = page.rows.first {
-                try await store.enqueueSeen(message: row.id)
+                try await store.enqueueFlag(message: row.id, flag: .seen, set: true)
             }
 
             let preDeliver = try await QAChaos.requireInbox(store: store, port: 1143).totalCount
@@ -350,7 +350,7 @@ struct QAChaosTests {
                     && countConverged
             }
             try await waitUntil(timeout: .seconds(30)) {
-                try await store.snapshotSeenQueue().isEmpty
+                try await store.snapshotFlagQueue().isEmpty
             }
             let afterExpunge = try await QAChaos.requireInbox(store: store, port: 1143)
             try await assertStoreInvariants(store, drain: true, expectEmptySeen: true)

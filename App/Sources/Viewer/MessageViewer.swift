@@ -12,9 +12,7 @@ struct MessageViewer: View {
     /// Titlebar depth measured where the pane still has a safe area, i.e.
     /// outside the scrolling surface's own `ignoresSafeArea`.
     @State private var safeAreaTop: CGFloat = 0
-    /// Height the subject and envelope regions spend, so the isolated HTML
-    /// surface can take the rest of the pane instead of a fixed stub.
-    @State private var readerChromeHeight: CGFloat = 0
+    @State private var htmlContentHeight: CGFloat = 0
     @State private var isDetailsExpanded = false
 
     private var findHaystack: String {
@@ -72,6 +70,7 @@ struct MessageViewer: View {
         }
         .onChange(of: model.detail?.id) { _, _ in
             isDetailsExpanded = false
+            htmlContentHeight = 0
             restartFind()
         }
         .onChange(of: model.isShowingRawSource) { _, _ in
@@ -98,31 +97,43 @@ struct MessageViewer: View {
         }
     }
 
-    /// One scroll owner, three full-width regions: subject, envelope, body.
+    /// One scroll owner, three disjoint floating islands: subject, envelope,
+    /// and body. The web view reports its document height and does not own a
+    /// scrolling viewport, so the reader scrolls the whole message as one page.
     private func reader(_ detail: MessageDetail) -> some View {
         ScrollView(.vertical) {
-            VStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 0) {
-                    MessageSubjectRegion(
-                        subject: detail.envelope.subject,
-                        topInset: MessageViewerLayoutPolicy.readerTopInset(safeAreaTop: safeAreaTop),
-                        isShowingRawSource: model.isShowingRawSource,
-                        showRawSource: { Task { await model.loadRawSource() } },
-                        showFormatted: { model.isShowingRawSource = false },
-                        copySubject: { model.copySelectedSubject() }
-                    )
-                    MessageEnvelopeRegion(
-                        envelope: detail.envelope,
-                        attachments: detail.attachments,
-                        isDetailsExpanded: $isDetailsExpanded
-                    )
-                }
-                .onGeometryChange(for: CGFloat.self) { proxy in
-                    proxy.size.height
-                } action: { readerChromeHeight = $0 }
+            VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.islandSpacing) {
+                MessageSubjectRegion(
+                    subject: detail.envelope.subject,
+                    isShowingRawSource: model.isShowingRawSource,
+                    showRawSource: { Task { await model.loadRawSource() } },
+                    showFormatted: { model.isShowingRawSource = false },
+                    copySubject: { model.copySelectedSubject() }
+                )
+                MessageEnvelopeRegion(
+                    envelope: detail.envelope,
+                    attachments: detail.attachments,
+                    isDetailsExpanded: $isDetailsExpanded
+                )
                 bodyRegion(detail)
             }
+            .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
+            // The first subject glyph retains the old dissolve contract while
+            // the card's top edge can softly enter the end of the ramp.
+            .padding(
+                .top,
+                max(
+                    MessageViewerLayoutPolicy.readerTopInset(safeAreaTop: safeAreaTop)
+                        - MessageViewerLayoutPolicy.islandVerticalPadding,
+                    0
+                )
+            )
+            .padding(.bottom, MessageViewerLayoutPolicy.bottomPadding)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .animation(
+                reduceMotion ? .easeOut(duration: 0.01) : MailMotion.disclosure,
+                value: isDetailsExpanded
+            )
         }
         .background(MessageReaderSurface.page)
         .background {
@@ -134,20 +145,19 @@ struct MessageViewer: View {
     }
 
     private func bodyRegion(_ detail: MessageDetail) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.bodyContentSpacing) {
             if detail.isQuarantined {
                 QuarantineBanner(
                     showingRaw: model.isShowingRawSource,
                     loadRaw: { Task { await model.loadRawSource() } }
                 )
+                .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                .padding(.top, MessageViewerLayoutPolicy.islandVerticalPadding)
             }
             bodyContent(detail)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
-        .padding(.top, MessageViewerLayoutPolicy.bodyTopPadding)
-        .padding(.bottom, MessageViewerLayoutPolicy.bottomPadding)
-        .background(MessageReaderSurface.page)
+        .readerIslandSurface()
         .accessibilityIdentifier(UIIdentifier.messageBody)
     }
 
@@ -160,10 +170,14 @@ struct MessageViewer: View {
                 selectedMatchIndex: findSnapshot.index,
                 findTick: findTick
             )
+            .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+            .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
         } else if detail.isQuarantined {
             Text("The original source is available if you need it.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
         } else if let html = detail.sanitizedHTML, !html.isEmpty {
             htmlBody(detail, html: html)
         } else if let text = detail.bodyText, !text.isEmpty {
@@ -173,19 +187,26 @@ struct MessageViewer: View {
                 selectedMatchIndex: findSnapshot.index,
                 findTick: findTick
             )
+            .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+            .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
             // The pane stays full width; only the plain-text measure narrows.
             .frame(maxWidth: MessageTypography.plainTextMeasure, alignment: .leading)
         } else {
             Text("This message has no text.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
         }
     }
 
     private func htmlBody(_ detail: MessageDetail, html: String) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if !model.allowRemoteImages {
+        let showRemoteImageNotice = model.hasRemoteImageReferences && !model.allowRemoteImages
+        return VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.bodyContentSpacing) {
+            if showRemoteImageNotice {
                 RemoteImageNotice { model.allowRemoteImages = true }
+                    .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                    .padding(.top, MessageViewerLayoutPolicy.islandVerticalPadding)
             }
             MessageHTMLView(
                 html: html,
@@ -193,27 +214,27 @@ struct MessageViewer: View {
                 onExternalLink: { url in
                     NSWorkspace.shared.open(url)
                 },
+                onContentHeightChange: { height in
+                    guard height.isFinite, height > 0 else { return }
+                    let messageID = detail.id
+                    Task { @MainActor in
+                        guard model.detail?.id == messageID else { return }
+                        let measured = MessageViewerLayoutPolicy.htmlHeight(contentHeight: height)
+                        guard abs(htmlContentHeight - measured) > 0.5 else { return }
+                        htmlContentHeight = measured
+                    }
+                },
                 allowRemoteImages: model.allowRemoteImages,
                 emailReadingMode: model.appearance.emailReadingMode,
                 findQuery: activeFindQuery,
                 findTick: findTick,
                 findBackwards: findBackwards
             )
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-        }
-        // JavaScript is off inside the isolated web view (network isolation),
-        // so nothing can report the document height and the web view keeps its
-        // own scroller. Sizing this region to exactly what the subject and
-        // envelope leave free keeps the outer scroll from stacking on top of
-        // that inner one, and keeps the inner one from being a small window in
-        // a tall empty pane.
-        .containerRelativeFrame(.vertical) { height, _ in
-            MessageViewerLayoutPolicy.htmlHeight(
-                containerHeight: height,
-                reservedHeight: readerChromeHeight
-                    + MessageViewerLayoutPolicy.bodyTopPadding
-                    + MessageViewerLayoutPolicy.bottomPadding
-            )
+            // The web page is the body island's canvas. Its document height
+            // exactly owns the island height, so the outer reader is the only
+            // scroll view even for long HTML messages.
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: MessageViewerLayoutPolicy.htmlHeight(contentHeight: htmlContentHeight))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -237,11 +258,34 @@ struct MessageViewer: View {
     }
 }
 
+private struct ReaderIslandSurface: ViewModifier {
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: AppShapeScale.card, style: .continuous)
+        content
+            .background(.thinMaterial, in: shape)
+            .overlay {
+                shape.strokeBorder(
+                    contrast == .increased ? Color.primary : Color.primary.opacity(0.18),
+                    lineWidth: contrast == .increased ? 1.5 : 0.75
+                )
+            }
+            .clipShape(shape)
+            .shadow(color: .black.opacity(0.14), radius: 12, y: 5)
+    }
+}
+
+private extension View {
+    func readerIslandSurface() -> some View {
+        modifier(ReaderIslandSurface())
+    }
+}
+
 /// Reading anchor: the strongest contrast in the reader, wrapping without
 /// limit, resting below the window's dissolve rather than inside its ramp.
 struct MessageSubjectRegion: View {
     let subject: String
-    let topInset: CGFloat
     let isShowingRawSource: Bool
     let showRawSource: () -> Void
     let showFormatted: () -> Void
@@ -261,12 +305,10 @@ struct MessageSubjectRegion: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             actions
         }
-        .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
-        .padding(.top, topInset)
-        .padding(.bottom, MessageViewerLayoutPolicy.subjectBottomPadding)
+        .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+        .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(MessageReaderSurface.subject)
-        .overlay(alignment: .bottom) { ReaderRegionDivider() }
+        .readerIslandSurface()
     }
 
     private var actions: some View {
@@ -290,6 +332,7 @@ struct MessageSubjectRegion: View {
     }
 }
 
+
 /// Envelope: who sent it, who received it, when, what came attached — and a
 /// disclosure for every remaining header the store actually parsed.
 struct MessageEnvelopeRegion: View {
@@ -312,12 +355,11 @@ struct MessageEnvelopeRegion: View {
                 .padding(.top, MessageViewerLayoutPolicy.envelopeRowSpacing)
         }
         .font(.subheadline)
-        .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
+        .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
         .padding(.top, MessageViewerLayoutPolicy.envelopeTopPadding)
         .padding(.bottom, MessageViewerLayoutPolicy.envelopeBottomPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(MessageReaderSurface.envelope)
-        .overlay(alignment: .bottom) { ReaderRegionDivider() }
+        .readerIslandSurface()
     }
 
     /// Sender and date share a line until the line no longer fits — at a narrow
@@ -471,18 +513,6 @@ struct MessageEnvelopeRegion: View {
     }
 }
 
-/// The 1pt boundary between reader regions. Increased contrast asks for a
-/// separator that survives a strengthened palette, so the role changes rather
-/// than the geometry.
-private struct ReaderRegionDivider: View {
-    @Environment(\.colorSchemeContrast) private var contrast
-
-    var body: some View {
-        Rectangle()
-            .fill(MessageReaderSurface.divider(increasedContrast: contrast == .increased))
-            .frame(height: 1)
-    }
-}
 
 /// Blocked remote content is a body state the reader discloses before the
 /// message is read, not a permanently disabled control after it.
@@ -523,8 +553,8 @@ struct PlainTextBody: View {
     }
 }
 
-/// A parse failure is a message state, not a floating card: it sits at the top
-/// of the body region on the same opaque page as the text it replaces.
+/// A parse failure is a message state: it sits at the top of the body island,
+/// above the source text it replaces.
 struct QuarantineBanner: View {
     let showingRaw: Bool
     let loadRaw: () -> Void
@@ -548,7 +578,6 @@ struct QuarantineBanner: View {
             Spacer(minLength: 0)
         }
         .padding(.bottom, 14)
-        .overlay(alignment: .bottom) { ReaderRegionDivider() }
         .accessibilityIdentifier(UIIdentifier.quarantineBanner)
     }
 }

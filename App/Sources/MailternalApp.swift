@@ -7,13 +7,16 @@ struct MailternalApp: App {
     @NSApplicationDelegateAdaptor(MailternalAppDelegate.self) private var appDelegate
     @State private var model: AppModel
     @State private var appearance: AppearanceSettings
+    @State private var actions: ActionSettings
 
     init() {
         let appearance = AppearanceSettings()
-        let model = AppModel(facade: Self.makeFacade(), appearance: appearance)
+        let actions = ActionSettings()
+        let model = AppModel(facade: Self.makeFacade(), appearance: appearance, actions: actions)
         _appearance = State(initialValue: appearance)
+        _actions = State(initialValue: actions)
         _model = State(initialValue: model)
-        MailternalAppDelegate.bootstrap(model: model, appearance: appearance)
+        MailternalAppDelegate.bootstrap(model: model, appearance: appearance, actions: actions)
     }
 
     private static func makeFacade() -> any MailFacade {
@@ -71,18 +74,20 @@ struct MailternalApp: App {
         }
     }
 }
-
 @MainActor
 final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
     private static var pendingModel: AppModel?
     private static var pendingAppearance: AppearanceSettings?
+    private static var pendingActions: ActionSettings?
 
     private var model: AppModel?
     private var appearance: AppearanceSettings?
+    private var actions: ActionSettings?
 
-    static func bootstrap(model: AppModel, appearance: AppearanceSettings) {
+    static func bootstrap(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
         pendingModel = model
         pendingAppearance = appearance
+        pendingActions = actions
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -96,9 +101,12 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
         #else
         NSApp.setActivationPolicy(.regular)
         #endif
-        if let model = Self.pendingModel, let appearance = Self.pendingAppearance {
+        if let model = Self.pendingModel,
+           let appearance = Self.pendingAppearance,
+           let actions = Self.pendingActions {
             self.model = model
             self.appearance = appearance
+            self.actions = actions
         }
     }
 
@@ -146,7 +154,7 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showMainWindow() {
-        guard let model, let appearance else { return }
-        MainWindowController.shared.show(model: model, appearance: appearance)
+        guard let model, let appearance, let actions else { return }
+        MainWindowController.shared.show(model: model, appearance: appearance, actions: actions)
     }
 }

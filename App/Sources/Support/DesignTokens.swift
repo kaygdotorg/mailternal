@@ -42,31 +42,10 @@ enum MessageTypography {
     }
 }
 
-/// The reader's region surfaces: one opaque tone per region, so subject,
-/// envelope, and body separate by material weight instead of by cards, blur,
-/// or glass. Nothing here is translucent, so Reduce Transparency needs no
-/// fallback. A later theme retints these values; call sites never name a color.
+/// The opaque canvas behind the reader's floating material islands.
 enum MessageReaderSurface {
-    /// Subject band — one step further from the page than the envelope, so the
-    /// title reads as chrome continuing under the window's dissolve.
-    static var subject: Color {
-        Color(nsColor: .windowBackgroundColor).mix(with: Color(nsColor: .textColor), by: 0.06)
-    }
-
-    /// Envelope band — window chrome tone, distinct from the reading page.
-    static var envelope: Color {
-        Color(nsColor: .windowBackgroundColor)
-    }
-
-    /// The reading page, and the scroll canvas behind it.
     static var page: Color {
         Color(nsColor: .textBackgroundColor)
-    }
-
-    /// Hairline between regions. Increased contrast trades the hairline for a
-    /// separator that survives a strengthened palette.
-    static func divider(increasedContrast: Bool) -> Color {
-        Color(nsColor: increasedContrast ? .tertiaryLabelColor : .separatorColor)
     }
 }
 

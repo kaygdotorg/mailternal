@@ -25,7 +25,20 @@ enum UIIdentifier {
     static let setupHost = "setup-host"
     static let setupPort = "setup-port"
     static let emailReadingMode = "appearance-email-reading"
+    static let actionsSection = "settings-actions"
+    static let actionsSwipeLeading0 = "actions-swipe-leading-0"
+    static let actionsSwipeLeading1 = "actions-swipe-leading-1"
+    static let actionsSwipeTrailing0 = "actions-swipe-trailing-0"
+    static let actionsSwipeTrailing1 = "actions-swipe-trailing-1"
+    static let actionsSwipeTrailing2 = "actions-swipe-trailing-2"
 
+    static func actionsSwipeLeading(_ index: Int) -> String {
+        "actions-swipe-leading-\(index)"
+    }
+
+    static func actionsSwipeTrailing(_ index: Int) -> String {
+        "actions-swipe-trailing-\(index)"
+    }
     static func sidebarFolder(_ path: String) -> String {
         "sidebar-folder-\(path)"
     }
@@ -33,25 +46,34 @@ enum UIIdentifier {
 
 /// Geometry shared by the detail viewer and its focused layout tests.
 ///
-/// The reader is one scrolling surface holding three full-width regions, so
-/// the geometry is small: where readable content clears the window's top
-/// dissolve, how far every region is inset from the pane edges, and how the
-/// regions are spaced from one another.
+/// The reader is one scrolling surface holding three floating islands. The
+/// islands share the list pane's outer inset and are separated by a single
+/// deliberate gap; their contents use the card's normal interior padding.
 enum MessageViewerLayoutPolicy {
-    /// Leading/trailing inset of every reader region. Regions themselves stay
-    /// full-width; this insets their content, not their surfaces.
-    static let horizontalPadding: CGFloat = 24
-    /// Clearance between the end of the viewer's top dissolve and the subject.
+    /// Leading/trailing inset of every reader island, matching the message
+    /// list's content inset.
+    static let horizontalPadding: CGFloat = 16
+    /// Vertical distance between the three independent islands.
+    static let islandSpacing: CGFloat = 12
+    /// Interior horizontal padding shared by the card-like islands.
+    static let islandContentPadding: CGFloat = 18
+    /// Interior vertical padding shared by the card-like islands.
+    static let islandVerticalPadding: CGFloat = 16
+    /// Clearance between the end of the viewer's top dissolve and the first
+    /// subject glyph. The island itself begins one interior inset earlier so
+    /// its material can softly enter the dissolve rather than clipping the
+    /// title.
     static let fadeGuard: CGFloat = 12
-    static let subjectBottomPadding: CGFloat = 14
     static let envelopeTopPadding: CGFloat = 12
     static let envelopeBottomPadding: CGFloat = 12
     static let envelopeRowSpacing: CGFloat = 8
     static let envelopePairSpacing: CGFloat = 6
     static let attachmentSpacing: CGFloat = 10
-    static let bodyTopPadding: CGFloat = 20
+    static let bodyContentSpacing: CGFloat = 12
     static let bottomPadding: CGFloat = 40
-    static let htmlMinimumHeight: CGFloat = 280
+    /// A just-loaded web view reports no useful document height yet. Keep a
+    /// small page surface until the first real measurement arrives.
+    static let htmlMinimumHeight: CGFloat = 80
     /// Comfortable reading measure for plain text. HTML is authored layout and
     /// keeps the whole pane; only plain text is measured.
     static let plainTextMeasureCharacters = 72
@@ -65,11 +87,14 @@ enum MessageViewerLayoutPolicy {
         return max(fadeReach, max(safeAreaTop, 0)) + fadeGuard
     }
 
-    /// Height of the HTML body region — the isolated web view plus any
-    /// blocked-content notice — given the space the subject and envelope
-    /// regions already spend.
-    static func htmlHeight(containerHeight: CGFloat, reservedHeight: CGFloat) -> CGFloat {
-        max(containerHeight - reservedHeight, htmlMinimumHeight)
+    /// Height of the HTML page island from its document measurement. Invalid
+    /// or transient zero measurements use the floor rather than creating a
+    /// nested scrolling viewport or collapsing the card.
+    static func htmlHeight(contentHeight: CGFloat) -> CGFloat {
+        guard contentHeight.isFinite, contentHeight > 0 else {
+            return htmlMinimumHeight
+        }
+        return contentHeight
     }
 }
 

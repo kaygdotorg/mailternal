@@ -12,12 +12,14 @@ final class ScriptedWorld: @unchecked Sendable {
     var failQResync = false
     var failSelect: Error?
     var storeSeenError: Error?
+    var storeFlagsError: Error?
     var isGmail = false
     var moveError: Error?
     var copyError: Error?
     var storeDeletedError: Error?
     var expungeError: Error?
     var storedSeen: [UInt32] = []
+    var flagCommands: [String] = []
     var archiveCommands: [String] = []
     var fetchNanos: UInt64 = 0
     /// Sleep `fetchNanos` only on fetches after this count. `nil` sleeps every fetch.
@@ -84,6 +86,12 @@ final class ScriptedWorld: @unchecked Sendable {
         defer { lock.unlock() }
         return storeSeenError
     }
+    func flagsError() -> Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storeFlagsError ?? storeSeenError
+    }
+
 
     func mailbox(_ path: String) -> ScriptedMailbox {
         lock.lock()
@@ -99,6 +107,12 @@ final class ScriptedWorld: @unchecked Sendable {
         defer { lock.unlock() }
         return storedSeen
     }
+    func flagCommandSnapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return flagCommands
+    }
+
 
     func archiveCommandSnapshot() -> [String] {
         lock.lock()
@@ -190,20 +204,33 @@ final class ScriptedWorld: @unchecked Sendable {
         lock.unlock()
     }
 
-    func applyStoreSeen(path: String, uids: IMAPUIDSet) {
+    func applyStoreFlags(path: String, flag: FlagKind, set: Bool, uids: IMAPUIDSet) {
         lock.lock()
         defer { lock.unlock() }
         guard var box = mailboxes[path] else { return }
+        let rawFlag = flag == .seen ? "\\Seen" : "\\Flagged"
+        let operation = set ? "+FLAGS.SILENT" : "-FLAGS.SILENT"
         for (uid, var message) in box.messages {
             if SyncPolicy.contains(uids, uid: uid) {
-                if !message.flags.contains(where: { $0.lowercased().contains("seen") }) {
-                    message.flags.append("\\Seen")
+                if set {
+                    if !message.flags.contains(where: { $0.lowercased() == rawFlag.lowercased() }) {
+                        message.flags.append(rawFlag)
+                    }
+                } else {
+                    message.flags.removeAll { $0.lowercased() == rawFlag.lowercased() }
                 }
                 box.messages[uid] = message
-                storedSeen.append(uid)
+                flagCommands.append("STORE \(path) \(uid) \(operation) (\(rawFlag))")
+                if flag == .seen && set {
+                    storedSeen.append(uid)
+                }
             }
         }
         mailboxes[path] = box
+    }
+
+    func applyStoreSeen(path: String, uids: IMAPUIDSet) {
+        applyStoreFlags(path: path, flag: .seen, set: true, uids: uids)
     }
 
     func fetchSleepNanos() -> UInt64 {
@@ -599,10 +626,14 @@ actor ScriptedIMAPClient: IMAPClient {
         return results
     }
 
-    func storeSeen(uids: IMAPUIDSet) async throws {
-        if let error = world.seenError() { throw error }
+    func storeFlags(uids: IMAPUIDSet, flag: FlagKind, set: Bool) async throws {
+        if let error = world.flagsError() { throw error }
         guard let selectedPath else { return }
-        world.applyStoreSeen(path: selectedPath, uids: uids)
+        world.applyStoreFlags(path: selectedPath, flag: flag, set: set, uids: uids)
+    }
+
+    func storeSeen(uids: IMAPUIDSet) async throws {
+        try await storeFlags(uids: uids, flag: .seen, set: true)
     }
  
     func move(uids: IMAPUIDSet, to mailbox: String) async throws {
@@ -823,6 +854,10 @@ enum EqualExistsRacePath: String, CaseIterable, Sendable {
 
 func inboxMailbox() -> IMAPMailbox {
     IMAPMailbox(path: "INBOX", name: "INBOX", separator: "/", role: .inbox, mailboxID: nil, attributes: [])
+}
+
+func trashMailbox() -> IMAPMailbox {
+    IMAPMailbox(path: "Trash", name: "Trash", separator: "/", role: .trash, mailboxID: nil, attributes: [])
 }
 
 func testSettings(

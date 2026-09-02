@@ -6,6 +6,7 @@ struct MessageHTMLView: NSViewRepresentable {
     let html: String
     let partProvider: @Sendable (String) async throws -> (data: Data, mimeType: String)
     var onExternalLink: ((URL) -> Void)?
+    var onContentHeightChange: ((CGFloat) -> Void)?
     var allowRemoteImages: Bool = false
     var emailReadingMode: EmailReadingMode = .original
     var findQuery: String = ""
@@ -25,11 +26,13 @@ struct MessageHTMLView: NSViewRepresentable {
     func makeNSView(context: Context) -> MessageWebView {
         let view = MessageWebView(frame: .zero)
         view.onExternalLink = onExternalLink
+        view.onContentHeightChange = onContentHeightChange
         return view
     }
 
     func updateNSView(_ nsView: MessageWebView, context: Context) {
         nsView.onExternalLink = onExternalLink
+        nsView.onContentHeightChange = onContentHeightChange
         nsView.render(
             html: html,
             partProvider: partProvider,

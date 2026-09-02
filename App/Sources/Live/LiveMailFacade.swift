@@ -222,11 +222,23 @@ final class LiveMailFacade: MailFacade {
 
 
     func markRead(_ id: MessageID) async {
-        try? await store.enqueueSeen(message: id)
+        try? await store.enqueueFlag(message: id, flag: .seen, set: true)
     }
- 
+
+    func markUnread(_ id: MessageID) async {
+        try? await store.enqueueFlag(message: id, flag: .seen, set: false)
+    }
+
+    func trash(_ id: MessageID) async {
+        try? await store.enqueueMove(message: id, to: .trash)
+    }
+
+    func setFlagged(_ id: MessageID, _ flagged: Bool) async {
+        try? await store.enqueueFlag(message: id, flag: .flagged, set: flagged)
+    }
+
     func archive(_ id: MessageID) async {
-        try? await store.enqueueArchive(message: id)
+        try? await store.enqueueMove(message: id, to: .archive)
     }
 
     func rawSource(_ id: MessageID) async throws -> String {
@@ -262,20 +274,24 @@ final class LiveMailFacade: MailFacade {
     /// `cid:` keys from the HTML handler map onto BODYSTRUCTURE part ids.
     private func imapSection(for message: MessageID, part: String) async throws -> String {
         let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cid: String
-        if trimmed.lowercased().hasPrefix("cid:") {
-            cid = String(trimmed.dropFirst(4))
-        } else {
-            return trimmed
-        }
+        guard trimmed.lowercased().hasPrefix("cid:") else { return trimmed }
+        let cid = Self.normalizedCID(String(trimmed.dropFirst(4)))
         let detail = try await store.detail(message)
         if let match = detail.attachments.first(where: {
             guard let contentID = $0.contentID else { return false }
-            return contentID.caseInsensitiveCompare(cid) == .orderedSame
+            return Self.normalizedCID(contentID).caseInsensitiveCompare(cid) == .orderedSame
         }) {
             return match.id
         }
         throw LiveMailError("Could not find that inline part.")
+    }
+
+    private static func normalizedCID(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("<"), value.hasSuffix(">"), value.count >= 2 {
+            value = String(value.dropFirst().dropLast())
+        }
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func search(_ query: String, limit: Int) async throws -> [MessageRow] {

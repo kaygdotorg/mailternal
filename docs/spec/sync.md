@@ -45,31 +45,40 @@ message + FTS rows in bounded cleanup batches. Never blank the UI on a big folde
   `\Seen` transition is the explicit queued store below.
 
 ### Write queues
-#### `\Seen`
-- Local read enqueues a persisted op `(account, mailbox, UIDVALIDITY, UID)`;
-  coalesced; sent as `UID STORE <uid> +FLAGS.SILENT (\Seen)`.
-- Ops whose UIDVALIDITY no longer matches the live generation are discarded.
-- Conflict precedence: a pending local read wins over inbound unseen state until the
-  store is acknowledged.
-- Failure semantics: only a tagged `OK` dequeues an op. Transport errors, `BYE`, and
-  connection loss → retry with the connection's jittered backoff, indefinitely
-  (the op is idempotent). Tagged `NO`/`BAD` is **terminal**: drop the op, clear the
-  pending-read override (server state then wins on next delta), record it in the
-  parse/sync error log. No user-facing alert for a single failed `\Seen`.
+0.0.1 supports five user mutations: **seen**, **unseen**, **flagged**,
+**archive**, and **trash**. Flag operations share one persisted queue keyed by
+`(account, mailbox, UIDVALIDITY, UID, flag)`; later operations for the same flag
+replace earlier ones. Move operations share the historical `archive_queue` table
+and carry a destination role.
 
-#### Archive
-- Local archive enqueues a persisted, coalesced op
-  `(account, mailbox, UIDVALIDITY, UID)` and optimistically deletes the message
-  row from the source folder in the same local write transaction. The next delta
-  reconciles server truth after a crash or failed send.
-- When the session advertises `MOVE`, send `UID MOVE <uid> <archive-mailbox>`.
-  Otherwise send `UID COPY <uid> <archive-mailbox>`, then
+#### Flags (`\Seen` and `\Flagged`)
+- Local read, unread, flag, and unflag actions enqueue a persisted op with
+  `(account, mailbox, UIDVALIDITY, UID, flag, set)` and optimistically update
+  the message row.
+- Ops are sent as `UID STORE <uid> +FLAGS.SILENT (\Seen|\Flagged)` when `set`
+  is true, or `UID STORE <uid> -FLAGS.SILENT (\Seen|\Flagged)` when false.
+- Pending local `seen=true` wins over inbound unseen, `seen=false` wins over
+  inbound seen, and pending `flagged` set/clear wins over inbound state until
+  the corresponding STORE is acknowledged.
+- Only tagged `OK` dequeues an op. Transport errors, `BYE`, and connection loss
+  retain it for retry. Tagged `NO`/`BAD` drops it, clears the optimistic
+  override, and records a sync error.
+- Ops whose UIDVALIDITY no longer matches the live generation are discarded.
+
+#### Moves (`archive` and `trash`)
+- Local archive or trash enqueues a persisted, coalesced op
+  `(account, mailbox, UIDVALIDITY, UID, destination)` and optimistically
+  deletes the message row from the source folder in the same local write
+  transaction. The next delta reconciles server truth after a crash or failed
+  send.
+- When the session advertises `MOVE`, send `UID MOVE <uid> <destination-mailbox>`.
+  Otherwise send `UID COPY <uid> <destination-mailbox>`, then
   `UID STORE <uid> +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE <uid>` so only
-  the archived UID is expunged.
+  the moved UID is expunged.
 - Only a tagged `OK` for the complete server operation dequeues the op. Transport
   errors, `BYE`, and connection loss retain it for retry; tagged `NO`/`BAD` drops
-  it and records an archive error. If no Archive-role folder exists, the op is
-  dropped and `"no Archive folder"` is recorded.
+  it and records a move error. If the destination role has no folder, the op is
+  dropped and an error-log row records the missing folder.
 - Ops whose UIDVALIDITY no longer matches the live generation are dropped without
   a server write. Replacement activation and every UIDVALIDITY mismatch cleanup
   apply this stale-op rule.

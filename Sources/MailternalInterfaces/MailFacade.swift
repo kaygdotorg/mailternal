@@ -25,8 +25,14 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     func detail(_ id: MessageID) async throws -> MessageDetail
     /// User-facing account label for titles and other account context.
     var accountDisplayName: String? { get }
-    /// One of two queued 0.0.1 mutations: enqueue \Seen (spec: sync.md write queue).
+    /// Enqueues a local read mutation as `UID STORE +FLAGS.SILENT (\Seen)`.
     func markRead(_ id: MessageID) async
+    /// Enqueues a local unread mutation as `UID STORE -FLAGS.SILENT (\Seen)`.
+    func markUnread(_ id: MessageID) async
+    /// Enqueues a move to the server's Trash folder.
+    func trash(_ id: MessageID) async
+    /// Enqueues a local `\Flagged` mutation.
+    func setFlagged(_ id: MessageID, _ flagged: Bool) async
     /// Enqueues an archive move; the sync engine drains it. No-op toast-level failure is surfaced via error log.
     func archive(_ id: MessageID) async
     func rawSource(_ id: MessageID) async throws -> String

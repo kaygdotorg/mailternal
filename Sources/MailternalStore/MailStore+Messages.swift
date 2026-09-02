@@ -85,8 +85,8 @@ extension MailStore {
         )
     }
 
-    /// Applies remote flag deltas. A pending local `\Seen` wins over inbound unseen
-    /// until the store is acknowledged (spec: sync.md Seen queue).
+    /// Applies remote flag deltas. Pending local flag operations take
+    /// precedence over inbound state until their STORE is acknowledged.
     public func applyFlags(
         generation: MailboxGeneration,
         deltas: [FlagDelta]
@@ -97,16 +97,24 @@ extension MailStore {
             let folderID = generation.folder.rawValue
             let uv = Int64(generation.uidValidity)
             for delta in deltas {
-                let pending = try Int.fetchOne(
+                let pendingRows = try Row.fetchAll(
                     db,
                     sql: """
-                        SELECT EXISTS(
-                            SELECT 1 FROM seen_queue
-                            WHERE folder_id = ? AND uid_validity = ? AND uid = ?
-                        )
+                        SELECT flag, "set" FROM seen_queue
+                        WHERE folder_id = ? AND uid_validity = ? AND uid = ?
                         """,
                     arguments: [folderID, uv, Int64(delta.uid.rawValue)]
-                ) == 1
+                )
+                var isRead = delta.flags.isRead
+                var isFlagged = delta.flags.isFlagged
+                for pending in pendingRows {
+                    let flag = FlagKind(rawValue: pending["flag"] as String) ?? .seen
+                    let set: Bool = pending["set"]
+                    switch flag {
+                    case .seen: isRead = set
+                    case .flagged: isFlagged = set
+                    }
+                }
                 try db.execute(
                     sql: """
                         UPDATE messages SET
@@ -115,8 +123,8 @@ extension MailStore {
                         WHERE generation_id = ? AND uid = ?
                         """,
                     arguments: [
-                        delta.flags.isRead || pending,
-                        delta.flags.isFlagged,
+                        isRead,
+                        isFlagged,
                         delta.flags.isAnswered,
                         delta.flags.isDraft,
                         delta.flags.isDeleted,
@@ -257,11 +265,18 @@ extension MailStore {
 
         var sql = """
             SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date, m.uid,
-                   m.is_read, m.has_attachments
+                   m.is_read, m.has_attachments, m.is_flagged,
+                   COALESCE(NULLIF(f.name, ''), CASE f.role
+                       WHEN 'inbox' THEN 'INBOX'
+                       WHEN 'archive' THEN 'Archive'
+                       WHEN 'trash' THEN 'Trash'
+                       WHEN 'junk' THEN 'Junk'
+                       WHEN 'sent' THEN 'Sent'
+                       WHEN 'drafts' THEN 'Drafts'
+                       ELSE f.path END) AS folder_name
             FROM messages m
-            WHERE m.generation_id = (
-                SELECT live_generation_id FROM folders WHERE id = ? AND retired = 0
-            )
+            JOIN folders f ON f.live_generation_id = m.generation_id
+            WHERE f.id = ? AND f.retired = 0
             """
         var arguments: StatementArguments = [folder.rawValue]
         if let cursor {
@@ -296,11 +311,18 @@ extension MailStore {
         let cap = max(limit, 0)
         var sql = """
             SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date, m.uid,
-                   m.is_read, m.has_attachments
+                   m.is_read, m.has_attachments, m.is_flagged,
+                   COALESCE(NULLIF(f.name, ''), CASE f.role
+                       WHEN 'inbox' THEN 'INBOX'
+                       WHEN 'archive' THEN 'Archive'
+                       WHEN 'trash' THEN 'Trash'
+                       WHEN 'junk' THEN 'Junk'
+                       WHEN 'sent' THEN 'Sent'
+                       WHEN 'drafts' THEN 'Drafts'
+                       ELSE f.path END) AS folder_name
             FROM messages m
-            WHERE m.generation_id = (
-                SELECT live_generation_id FROM folders WHERE id = ? AND retired = 0
-            )
+            JOIN folders f ON f.live_generation_id = m.generation_id
+            WHERE f.id = ? AND f.retired = 0
             """
         var arguments: StatementArguments = [folder.rawValue]
         if let cursor {
@@ -326,7 +348,9 @@ extension MailStore {
             preview: preview,
             date: Date(timeIntervalSince1970: row["internal_date"]),
             isRead: row["is_read"],
-            hasAttachments: row["has_attachments"]
+            hasAttachments: row["has_attachments"],
+            isFlagged: row["is_flagged"],
+            folderName: row["folder_name"]
         )
     }
 
@@ -370,7 +394,7 @@ extension MailStore {
 
     static func upsertMessage(_ db: Database, _ message: IncomingMessage) throws {
         let genID = try requireGenerationID(db, message.generation)
-        // A FETCH captured before enqueueArchive must not resurrect the
+        // A FETCH captured before enqueueMove must not resurrect the
         // optimistically hidden message. The queue entry is checked in the same
         // writer transaction as this upsert, so either ordering is safe.
         let pendingArchive = try Int.fetchOne(
@@ -396,22 +420,30 @@ extension MailStore {
         let refsJSON = try StoreJSON.encode(env.references)
         let extraJSON = try StoreJSON.encode(message.flags.extra)
         let attJSON = try StoreJSON.encode(message.attachments.map(AttachmentInfoDTO.init))
-        // Pending local `\Seen` wins over inbound unseen until STORE is acknowledged.
-        let pendingSeen = try Int.fetchOne(
+        // Pending local moves must not be resurrected by a FETCH captured
+        // before enqueueMove committed.
+        let pendingFlags = try Row.fetchAll(
             db,
             sql: """
-                SELECT EXISTS(
-                    SELECT 1 FROM seen_queue
-                    WHERE folder_id = ? AND uid_validity = ? AND uid = ?
-                )
+                SELECT flag, "set" FROM seen_queue
+                WHERE folder_id = ? AND uid_validity = ? AND uid = ?
                 """,
             arguments: [
                 message.generation.folder.rawValue,
                 Int64(message.generation.uidValidity),
                 Int64(message.uid.rawValue),
             ]
-        ) == 1
-        let isRead = message.flags.isRead || pendingSeen
+        )
+        var isRead = message.flags.isRead
+        var isFlagged = message.flags.isFlagged
+        for pending in pendingFlags {
+            let flag = FlagKind(rawValue: pending["flag"] as String) ?? .seen
+            let set: Bool = pending["set"]
+            switch flag {
+            case .seen: isRead = set
+            case .flagged: isFlagged = set
+            }
+        }
         // Date-ordered primary key: id = (internal_date seconds << 22) + seq
         // within that second-bucket (writer-serialized, race-free). The FTS
         // external-content rowid inherits this order, so newest-first search is
@@ -487,7 +519,7 @@ extension MailStore {
                 env.inReplyTo,
                 refsJSON,
                 isRead,
-                message.flags.isFlagged,
+                isFlagged,
                 message.flags.isAnswered,
                 message.flags.isDraft,
                 message.flags.isDeleted,

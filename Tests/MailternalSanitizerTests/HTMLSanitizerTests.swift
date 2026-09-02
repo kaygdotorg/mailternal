@@ -37,6 +37,30 @@ func imgSrcCIDRewrite() {
     #expect(!result.html.contains("cid:ii_abc123@mail.example"))
 }
 
+@Test("remote-reference fact excludes inline cid resources")
+func remoteReferenceFact() {
+    let inlineHTML = HTMLSanitizer.sanitize(#"<img src="cid:logo.0@mailternal.test">"#).html
+    #expect(!HTMLSanitizer.sanitize(inlineHTML).hasRemoteReferences)
+
+    let remoteHTML = HTMLSanitizer.sanitize(#"<img src="https://example.test/logo.png">"#).html
+    #expect(HTMLSanitizer.sanitize(remoteHTML).hasRemoteReferences)
+}
+
+
+@Test("QA cid token decodes to the attachment Content-ID")
+func qaCIDTokenDecodes() {
+    let token = URL(string: "mailternal-part://part/cid.bG9nby4wQG1haWx0ZXJuYWwudGVzdA")!
+    guard let reference = PartURL.decode(token) else {
+        Issue.record("expected QA cid token to decode")
+        return
+    }
+    if case .cid(let value) = reference {
+        #expect(value == "logo.0@mailternal.test")
+        #expect(reference.providerKey == "cid:logo.0@mailternal.test")
+    } else {
+        Issue.record("expected cid reference")
+    }
+}
 @Test("cid rewrite is case-insensitive on the scheme")
 func cidSchemeCase() {
     let result = HTMLSanitizer.sanitize(#"<img src="CID:Foo@Bar">"#)

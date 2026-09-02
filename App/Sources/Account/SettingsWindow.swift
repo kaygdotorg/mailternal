@@ -3,7 +3,7 @@ import SwiftUI
 import MailternalInterfaces
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case account, appearance
+    case account, appearance, actions
 
     var id: Self { self }
 
@@ -11,6 +11,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .account: "Account"
         case .appearance: "Appearance"
+        case .actions: "Actions"
         }
     }
 
@@ -18,13 +19,16 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .account: "at"
         case .appearance: "paintbrush"
+        case .actions: "hand.draw"
         }
     }
 }
 
+
 struct SettingsSourceList: View {
     @Binding var selection: SettingsSection?
     let appearance: AppearanceSettings
+    let actions: ActionSettings
 
     var body: some View {
         List(SettingsSection.allCases, selection: $selection) { section in
@@ -34,6 +38,7 @@ struct SettingsSourceList: View {
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
         .focusEffectDisabled(true)
+        .environment(actions)
         .tint(appearance.accent.color)
         .environment(appearance.accent)
         .padding(.top, 46)
@@ -44,7 +49,7 @@ struct SettingsDetailView: View {
     let section: SettingsSection
     @Bindable var model: AppModel
     let appearance: AppearanceSettings
-
+    let actions: ActionSettings
     var body: some View {
         Group {
             switch section {
@@ -52,12 +57,72 @@ struct SettingsDetailView: View {
                 AccountSetupForm(model: model)
             case .appearance:
                 AppearanceSettingsForm(appearance: appearance)
+            case .actions:
+                ActionSettingsForm(actions: actions)
             }
         }
         .tint(appearance.accent.color)
         .environment(appearance.accent)
+        .environment(actions)
         .padding(.top, 20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+struct ActionSettingsForm: View {
+    @Bindable var actions: ActionSettings
+
+    var body: some View {
+        Form {
+            Section {
+                swipeGroup(title: "Swipe left", edge: .trailing, limit: ActionSettings.trailingSwipeLimit)
+                swipeGroup(title: "Swipe right", edge: .leading, limit: ActionSettings.leadingSwipeLimit)
+            } header: {
+                Text("Gestures")
+            } footer: {
+                Text("Swipe actions apply to messages in the message list.")
+            }
+            .accessibilityIdentifier(UIIdentifier.actionsSection)
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private func swipeGroup(title: String, edge: SwipeEdge, limit: Int) -> some View {
+        Text(title)
+            .font(.headline)
+        // Both edges share one Section; plain indices would collide and
+        // SwiftUI would reuse the first edge's rows for the second.
+        ForEach(0..<limit, id: \.self) { index in
+            Picker(selection: pickerBinding(for: edge, at: index)) {
+                Text("None").tag(nil as SwipeActionKind?)
+                ForEach(SwipeActionKind.allCases) { kind in
+                    Text(kind.title).tag(Optional(kind))
+                }
+            } label: {
+                Text("Action \(index + 1)")
+            }
+            .id(pickerIdentifier(for: edge, at: index))
+            .accessibilityIdentifier(pickerIdentifier(for: edge, at: index))
+        }
+    }
+
+    private func pickerBinding(for edge: SwipeEdge, at index: Int) -> Binding<SwipeActionKind?> {
+        Binding(
+            get: {
+                actions.swipeActions(for: edge).indices.contains(index)
+                    ? actions.swipeActions(for: edge)[index]
+                    : nil
+            },
+            set: { actions.setSwipeAction($0, at: index, edge: edge) }
+        )
+    }
+
+    private func pickerIdentifier(for edge: SwipeEdge, at index: Int) -> String {
+        switch edge {
+        case .leading: UIIdentifier.actionsSwipeLeading(index)
+        case .trailing: UIIdentifier.actionsSwipeTrailing(index)
+        }
     }
 }
 
@@ -329,15 +394,21 @@ final class SettingsSplitController: NSSplitViewController {
     private var backgroundEffect: NSVisualEffectView?
     private var didSetDivider = false
 
-    init(model: AppModel, appearance: AppearanceSettings, selection: Binding<SettingsSection?>) {
+    init(
+        model: AppModel,
+        appearance: AppearanceSettings,
+        actions: ActionSettings,
+        selection: Binding<SettingsSection?>
+    ) {
         sidebarHosting = NSHostingController(
-            rootView: SettingsSourceList(selection: selection, appearance: appearance)
+            rootView: SettingsSourceList(selection: selection, appearance: appearance, actions: actions)
         )
         detailHosting = NSHostingController(
             rootView: SettingsDetailView(
                 section: selection.wrappedValue ?? .account,
                 model: model,
-                appearance: appearance
+                appearance: appearance,
+                actions: actions
             )
         )
         sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarHosting)
@@ -359,13 +430,18 @@ final class SettingsSplitController: NSSplitViewController {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    func update(model: AppModel, appearance: AppearanceSettings, selection: Binding<SettingsSection?>) {
-        sidebarHosting.rootView = SettingsSourceList(selection: selection, appearance: appearance)
+    func update(
+        model: AppModel,
+        appearance: AppearanceSettings,
+        actions: ActionSettings,
+        selection: Binding<SettingsSection?>
+    ) {
+        sidebarHosting.rootView = SettingsSourceList(selection: selection, appearance: appearance, actions: actions)
         detailHosting.rootView = SettingsDetailView(
             section: selection.wrappedValue ?? .account,
             model: model,
-            appearance: appearance
+            appearance: appearance,
+            actions: actions
         )
         configureWindow()
     }
@@ -408,6 +484,7 @@ final class SettingsWindowController: NSWindowController {
             refresh()
         }
     }
+    private var actions: ActionSettings?
     private var split: SettingsSplitController?
     private var model: AppModel?
     private var appearance: AppearanceSettings?
@@ -418,16 +495,27 @@ final class SettingsWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func show(model: AppModel, appearance: AppearanceSettings) {
+    func show(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
         self.model = model
         self.appearance = appearance
+        self.actions = actions
         if case .none = model.accountState {
             selection = .account
         }
         if let split {
-            split.update(model: model, appearance: appearance, selection: selectionBinding)
+            split.update(
+                model: model,
+                appearance: appearance,
+                actions: actions,
+                selection: selectionBinding
+            )
         } else {
-            let split = SettingsSplitController(model: model, appearance: appearance, selection: selectionBinding)
+            let split = SettingsSplitController(
+                model: model,
+                appearance: appearance,
+                actions: actions,
+                selection: selectionBinding
+            )
             self.split = split
             split.preferredContentSize = NSSize(width: 720, height: 460)
             let window = NSWindow(
@@ -465,8 +553,13 @@ final class SettingsWindowController: NSWindowController {
     }
 
     private func refresh() {
-        guard let split, let model, let appearance else { return }
-        split.update(model: model, appearance: appearance, selection: selectionBinding)
+        guard let split, let model, let appearance, let actions else { return }
+        split.update(
+            model: model,
+            appearance: appearance,
+            actions: actions,
+            selection: selectionBinding
+        )
     }
 
     private var selectionBinding: Binding<SettingsSection?> {

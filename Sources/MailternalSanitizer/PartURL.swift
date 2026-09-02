@@ -59,6 +59,12 @@ public struct SanitizedHTML: Hashable, Sendable {
         self.html = html
         self.manifest = manifest
     }
+
+    /// True only when the sanitized resource manifest contains an HTTP(S)
+    /// image reference. Inline `cid:` resources are local and need no consent.
+    public var hasRemoteReferences: Bool {
+        manifest.entries.values.contains { $0.reference.isRemote }
+    }
 }
 
 /// Encoding of ``PartReference`` as the app-controlled `mailternal-part` URL.

@@ -88,11 +88,14 @@ final class MailternalUITests: XCTestCase {
     func testMessageListHasNoSearchChromeWhileSearchStaysReachable() {
         signInToMock()
         let table = messageTable()
-        XCTAssertTrue(table.tableRows.firstMatch.waitForExistence(timeout: 10))
+        let firstRow = table.tableRows.firstMatch
+        XCTAssertTrue(firstRow.waitForExistence(timeout: 10))
+        let title = element(UIIdentifier.messageListTitle)
+        XCTAssertTrue(title.waitForExistence(timeout: 8), "message list title")
 
         // The middle pane's windowed-mode banner is gone: nothing over the list
         // discloses search coverage while the panel is closed, and nothing
-        // reserves height above the first row.
+        // reserves height above the measured title.
         XCTAssertFalse(
             element(UIIdentifier.searchCoverage).exists,
             "no search chrome should stand over the message list"
@@ -105,18 +108,25 @@ final class MailternalUITests: XCTestCase {
             "coverage disclosure must not be list chrome"
         )
 
-        // Measured against the window, not the pane, so this is a depth below
-        // the physical window top.
-        let restDepth = MailWindowDissolvePolicy.messageList.restDepth(safeAreaTop: 0)
-        let depth = table.tableRows.firstMatch.frame.minY - mainWindow.frame.minY
+        // The title is measured in the same window coordinate space as the
+        // table. Wait for the measured title-driven inset to settle before
+        // asserting the first row's resting position.
+        XCTAssertTrue(
+            waitUntil(timeout: 5) {
+                firstRow.frame.minY >= title.frame.maxY - 1
+            },
+            "first row should rest below the title's bottom edge"
+        )
+        let titleBottomDepth = title.frame.maxY - mainWindow.frame.minY
+        let depth = firstRow.frame.minY - mainWindow.frame.minY
         XCTAssertGreaterThanOrEqual(
             depth,
-            restDepth - 1,
-            "first row should rest at the ramp's end, not inside it"
+            titleBottomDepth - 1,
+            "first row should rest below the title's bottom edge"
         )
         XCTAssertLessThan(
             depth,
-            restDepth + 24,
+            titleBottomDepth + MailWindowDissolvePolicy.messageList.topReach + 1,
             "no banner or spacer should reserve height above the first row"
         )
 

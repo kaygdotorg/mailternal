@@ -267,11 +267,11 @@ struct QAArchiveLiveTests {
                     #expect(ref.uid == pair.1)
                     #expect(countsBefore.inbox >= inbox.totalCount)
 
-                    try await store.enqueueArchive(message: pair.0)
+                    try await store.enqueueMove(message: pair.0, to: .archive)
                     let afterEnqueueRef = try await store.messageRef(pair.0)
                     #expect(afterEnqueueRef == nil)
                     try await waitUntil(timeout: .seconds(30), poll: .milliseconds(200)) {
-                        try await store.snapshotArchiveQueue().isEmpty
+                        try await store.snapshotMoveQueue().isEmpty
                     }
 
                     let moved = try await QAArchive.withSession { side in
@@ -347,7 +347,7 @@ struct QAArchiveLiveTests {
                     let details = try await pairs.asyncMap { try await store.detail($0.0) }
                     restoreSubjects = Set(details.map { $0.envelope.subject })
                     #expect(restoreSubjects.count == 25)
-                    for pair in pairs { try await store.enqueueArchive(message: pair.0) }
+                    for pair in pairs { try await store.enqueueMove(message: pair.0, to: .archive) }
                     probePairs = pairs
                     mark("enqueued")
                     let immediateGone = try await QAArchive.goneFromGeneration(
@@ -357,7 +357,7 @@ struct QAArchiveLiveTests {
                     )
                     #expect(immediateGone)
                     try await waitUntil(timeout: .seconds(120), poll: .milliseconds(250)) {
-                        try await store.snapshotArchiveQueue().isEmpty
+                        try await store.snapshotMoveQueue().isEmpty
                     }
                     mark("queue-empty")
                     let countsAfter = try await QAArchive.waitForServerCounts(
@@ -368,7 +368,7 @@ struct QAArchiveLiveTests {
                     mark("counts-after \(countsAfter)")
                     #expect(countsAfter.inbox == countsBefore.inbox - 25)
                     #expect(countsAfter.archive == countsBefore.archive + 25)
-                    #expect(try await store.snapshotArchiveQueue().isEmpty)
+                    #expect(try await store.snapshotMoveQueue().isEmpty)
                     await engine.refreshNow()
                     mark("refreshed")
                     try await waitUntil(timeout: .seconds(30), poll: .milliseconds(300)) {
@@ -386,7 +386,7 @@ struct QAArchiveLiveTests {
                 } catch {
                     // Post-mortem before the temp store vanishes: every archive
                     // dequeue path that skips the server must leave a log row.
-                    let pending = (try? await store.snapshotArchiveQueue()) ?? []
+                    let pending = (try? await store.snapshotMoveQueue()) ?? []
                     let logs = (try? await store.fetchErrorLog()) ?? []
                     print("MAILTERNAL_QA archive burst postmortem pending=\(pending.count)")
                     for op in pending {
@@ -440,10 +440,10 @@ struct QAArchiveLiveTests {
                     let detail = try await store.detail(pair.0)
                     restoreSubjects = [detail.envelope.subject]
                     let ref = try #require(await store.messageRef(pair.0))
-                    try await store.enqueueArchive(message: pair.0)
+                    try await store.enqueueMove(message: pair.0, to: .archive)
                     let afterEnqueueRef = try await store.messageRef(pair.0)
                     #expect(afterEnqueueRef == nil)
-                    let pendingBeforeExpunge = !(try await store.snapshotArchiveQueue()).isEmpty
+                    let pendingBeforeExpunge = !(try await store.snapshotMoveQueue()).isEmpty
                     if !pendingBeforeExpunge {
                         print("MAILTERNAL_QA archive adversarial race: drain completed before side EXPUNGE")
                     }
@@ -465,7 +465,7 @@ struct QAArchiveLiveTests {
                     }
 
                     try await waitUntil(timeout: .seconds(45), poll: .milliseconds(250)) {
-                        try await store.snapshotArchiveQueue().isEmpty
+                        try await store.snapshotMoveQueue().isEmpty
                     }
                     await engine.refreshNow()
                     try await waitUntil(timeout: .seconds(30), poll: .milliseconds(300)) {
