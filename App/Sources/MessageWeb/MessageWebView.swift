@@ -67,7 +67,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         configuration.mediaTypesRequiringUserActionForPlayback = .all
         configuration.allowsAirPlayForMediaPlayback = false
         configuration.setURLSchemeHandler(handler, forURLScheme: PartURL.scheme)
-        let webView = WKWebView(frame: .zero, configuration: configuration)
+        let webView = DocumentWebView(frame: .zero, configuration: configuration)
         let errorLabel = NSTextField(wrappingLabelWithString: "")
         errorLabel.isSelectable = true
         errorLabel.alignment = .center
@@ -456,7 +456,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         /* The canvas lives on html and stays opaque so mail that declares no
            colors is readable; author body/background declarations must win,
            so only color-scheme is forced. */
-        html { color-scheme: \(colorScheme) !important; background: \(canvas); height: auto; min-height: 0; }
+        html { color-scheme: \(colorScheme) !important; background: \(canvas); height: auto; min-height: 0; overflow-y: hidden; }
         body {
           height: auto; min-height: 0; margin: 0; padding: 18px 20px;
           font: -apple-system-body;
@@ -516,5 +516,22 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
       { "trigger": { "url-filter": "^data:image/" }, "action": { "type": "ignore-previous-rules" } }
     ]
     """
+}
+
+/// The message body is sized to its whole document (see the content-height
+/// callback), so it never has anything to scroll vertically itself: the
+/// reader is one scroll surface, like Mail. WKWebView still swallows wheel
+/// events, so vertical scrolling is handed to the enclosing scroll view.
+/// Horizontal deltas stay with the document so wide mail can still be panned.
+@MainActor
+private final class DocumentWebView: WKWebView {
+    override func scrollWheel(with event: NSEvent) {
+        let vertical = abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX)
+        if vertical, let scrollView = enclosingScrollView {
+            scrollView.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
 }
 #endif

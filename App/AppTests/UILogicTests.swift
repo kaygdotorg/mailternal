@@ -3,6 +3,37 @@ import AppKit
 import SwiftUI
 import MailternalInterfaces
 final class UILogicTests: XCTestCase {
+    func testSidebarVisibilityToggleHidesOnlyTheSidebar() {
+        // Hiding collapses the first column only; the message list stays.
+        XCTAssertEqual(
+            SidebarVisibilityPolicy.toggled(current: .all, lastVisible: .all),
+            .doubleColumn
+        )
+        // Showing again restores the last visible arrangement.
+        XCTAssertEqual(
+            SidebarVisibilityPolicy.toggled(current: .doubleColumn, lastVisible: .all),
+            .all
+        )
+        // A restored detail-only state still counts as hidden.
+        XCTAssertEqual(
+            SidebarVisibilityPolicy.toggled(current: .detailOnly, lastVisible: .detailOnly),
+            .all
+        )
+        XCTAssertEqual(
+            SidebarVisibilityPolicy.remembered(.doubleColumn, lastVisible: .all),
+            .all
+        )
+        XCTAssertEqual(
+            SidebarVisibilityPolicy.remembered(.all, lastVisible: .doubleColumn),
+            .all
+        )
+        XCTAssertTrue(SidebarVisibilityPolicy.isHidden(.doubleColumn))
+        XCTAssertFalse(SidebarVisibilityPolicy.isHidden(.all))
+    }
+
+    func testSettingsSectionTitleIdentifierIsStable() {
+        XCTAssertEqual(UIIdentifier.settingsSectionTitle, "settings-section-title")
+    }
     func testListRowTodayUsesRelativeNamedNarrowFormat() {
         let now = Date()
         let calendar = Calendar.current
@@ -622,6 +653,7 @@ final class UILogicTests: XCTestCase {
     }
 
     func testReaderIslandsShareListInsetAndHTMLUsesDocumentHeight() {
+        XCTAssertEqual(MessageViewerLayoutPolicy.islandCount, 2)
         XCTAssertEqual(MessageViewerLayoutPolicy.horizontalPadding, 16)
         XCTAssertEqual(MessageViewerLayoutPolicy.islandSpacing, 12)
         XCTAssertEqual(MessageViewerLayoutPolicy.islandContentPadding, 18)
@@ -645,6 +677,43 @@ final class UILogicTests: XCTestCase {
             MessageViewerLayoutPolicy.htmlHeight(contentHeight: .infinity),
             MessageViewerLayoutPolicy.htmlMinimumHeight
         )
+    }
+
+    func testRawHeaderPolicyUnfoldsAndPreservesOrderedHeaders() {
+        let raw = """
+        Received: from mx.example\r
+         by mail.example; Tue, 2 Sep 2026 12:00:00 +0000\r
+        Message-ID: <abc@example.com>\r
+        Content-Type: text/plain;\r
+         charset=utf-8\r
+        \r
+        This is the body.
+        """
+
+        let headers = MessageHeaderPolicy.rawHeaders(from: raw)
+        XCTAssertEqual(headers.map { $0.name }, ["Received", "Message-ID", "Content-Type"])
+        XCTAssertEqual(
+            headers.map { $0.value },
+            [
+                "from mx.example by mail.example; Tue, 2 Sep 2026 12:00:00 +0000",
+                "<abc@example.com>",
+                "text/plain; charset=utf-8",
+            ]
+        )
+        XCTAssertEqual(
+            MessageHeaderPolicy.rawHeaderBlock(from: raw),
+            "Received: from mx.example by mail.example; Tue, 2 Sep 2026 12:00:00 +0000\n"
+                + "Message-ID: <abc@example.com>\n"
+                + "Content-Type: text/plain; charset=utf-8"
+        )
+    }
+
+    func testRawHeaderPolicyAcceptsLFAndMissingBlankLine() {
+        let raw = "X-First: one\n\tcontinued\nX-Second: two"
+        let headers = MessageHeaderPolicy.rawHeaders(from: raw)
+
+        XCTAssertEqual(headers.map { $0.name }, ["X-First", "X-Second"])
+        XCTAssertEqual(headers.map { $0.value }, ["one continued", "two"])
     }
 
     func testDetailRowsExposeEveryStoredHeaderAndInventNothing() {
@@ -936,6 +1005,80 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(projectsItem.children[0].action, .moveTo(invoices.id))
     }
 
+    func testMessageToolbarPolicyOrdersItemsAndTracksSelectionState() {
+        let first = MessageID(rawValue: 1)
+        let second = MessageID(rawValue: 2)
+        let selection: Set<MessageID> = [first, second]
+        XCTAssertEqual(
+            MessageToolbarPolicy.defaultItemIdentifiers,
+            [.archive, .trash, .flag, .overflow]
+        )
+        XCTAssertEqual(
+            MessageToolbarPolicy.allowedItemIdentifiers,
+            MessageToolbarPolicy.defaultItemIdentifiers
+        )
+        let visible = MessageToolbarPolicy.visibleItems(
+            selection: selection,
+            flagStates: [first: true, second: true]
+        )
+        XCTAssertEqual(
+            visible.map(\.identifier),
+            [.archive, .trash, .flag]
+        )
+        XCTAssertEqual(visible.map(\.title), [
+            "Archive 2 Messages",
+            "Trash 2 Messages",
+            "Unflag 2 Messages",
+        ])
+        XCTAssertEqual(visible.map(\.imageName), ["archivebox", "trash", "flag.slash"])
+        XCTAssertTrue(visible.allSatisfy(\.isEnabled))
+
+        let emptyVisible = MessageToolbarPolicy.visibleItems(selection: [], flagStates: [:])
+        XCTAssertTrue(emptyVisible.allSatisfy { !$0.isEnabled })
+    }
+
+    func testMessageToolbarPolicyOrdersOverflowAndValidatesSelection() throws {
+        let id = MessageID(rawValue: 9)
+        let items = MessageToolbarPolicy.overflowItems(
+            selection: [id],
+            isReadStates: [id: false],
+            flagStates: [id: false],
+            folders: [],
+            current: nil
+        )
+        XCTAssertTrue(items[0].isEnabled)
+        XCTAssertFalse(items[1].isEnabled)
+        XCTAssertFalse(items[2].isEnabled)
+        XCTAssertTrue(items[3].isEnabled)
+        XCTAssertTrue(items[5].isEnabled)
+        XCTAssertTrue(items[6].isEnabled)
+        XCTAssertTrue(items[7].isEnabled)
+        XCTAssertEqual(items.map(\.title), [
+            "Mark as Read",
+            "Move to Junk",
+            "Move to",
+            "Open in New Window",
+            "",
+            "Copy Link",
+            "Copy Subject",
+            "View Raw Source",
+        ])
+        XCTAssertEqual(items[0].action, .markRead)
+        XCTAssertEqual(items[7].action, .viewRawSource)
+
+        let empty = MessageToolbarPolicy.overflowItems(
+            selection: [],
+            isReadStates: [:],
+            flagStates: [:],
+            folders: [],
+            current: nil
+        )
+        XCTAssertEqual(empty.map(\.title), items.map(\.title))
+        XCTAssertTrue(empty.allSatisfy { !$0.isEnabled || $0.isSeparator })
+        XCTAssertFalse(empty[3].isEnabled)
+        XCTAssertFalse(empty[7].isEnabled)
+    }
+
     func testMessageLinkPasteboardRoundTripsJSONPayload() {
         let links = [
             "mailternal://open/v1/account/00000000-0000-4000-8000-000000000002/folder/path/SU5CT1g/message/1788195160/134810",
@@ -945,12 +1088,25 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(decoded, links)
     }
 
-    func testMessageReaderStatePolicyShowsSelectionEmptyStateOnlyForMultipleRows() {
+    func testMessageLinkPasteboardRoundTripsUnprefetchedMessageID() {
+        let id = MessageID(rawValue: 94_002)
+        let payload = MessageLinkPasteboard.encode([MessageLinkPasteboard.encodeMessageID(id)])
+        XCTAssertEqual(
+            MessageLinkPasteboard.decode(payload).flatMap { $0.first }.flatMap(MessageLinkPasteboard.decodeMessageID),
+            id
+        )
+    }
+
+    func testMessageReaderStatePolicyFormatsFullMailboxSelectionCount() {
         XCTAssertNil(MessageReaderStatePolicy.emptyStateTitle(selectionCount: 0))
         XCTAssertNil(MessageReaderStatePolicy.emptyStateTitle(selectionCount: 1))
         XCTAssertEqual(
             MessageReaderStatePolicy.emptyStateTitle(selectionCount: 3),
             "3 Messages Selected"
+        )
+        XCTAssertEqual(
+            MessageReaderStatePolicy.emptyStateTitle(selectionCount: 94_002),
+            "94,002 Messages Selected"
         )
         XCTAssertEqual(
             MessageReaderStatePolicy.emptyStateDetail(selectionCount: 3),
