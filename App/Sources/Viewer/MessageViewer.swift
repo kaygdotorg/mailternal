@@ -9,12 +9,17 @@ struct MessageViewer: View {
     @State private var findIndex: Int?
     @State private var findBackwards = false
     @State private var findTick: UInt64 = 0
+    @State private var headersStore: MessageHeadersStore
     /// Titlebar depth measured where the pane still has a safe area, i.e.
     /// outside the scrolling surface's own `ignoresSafeArea`.
     @State private var safeAreaTop: CGFloat = 0
     @State private var htmlContentHeight: CGFloat = 0
     @State private var isDetailsExpanded = false
 
+    init(model: AppModel) {
+        self.model = model
+        _headersStore = State(initialValue: MessageHeadersStore(facade: model.facade))
+    }
     private var findHaystack: String {
         MessageFind.haystack(
             bodyText: model.detail?.bodyText,
@@ -106,24 +111,20 @@ struct MessageViewer: View {
         }
     }
 
-    /// One scroll owner, three disjoint floating islands: subject, envelope,
-    /// and body. The web view reports its document height and does not own a
-    /// scrolling viewport, so the reader scrolls the whole message as one page.
+    /// One scroll owner, two disjoint floating islands: a continuous header
+    /// surface (subject, envelope, and details) followed by the body. The web
+    /// view reports its document height and does not own a scrolling viewport,
+    /// so the reader scrolls the whole message as one page.
     private func reader(_ detail: MessageDetail) -> some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.islandSpacing) {
                 MessageSubjectRegion(
                     subject: detail.envelope.subject,
-                    isShowingRawSource: model.isShowingRawSource,
-                    showRawSource: { Task { await model.loadRawSource() } },
-                    showFormatted: { model.isShowingRawSource = false },
-                    copySubject: { model.copySelectedSubject() },
-                    backdropKind: model.appearance.backdropKind
-                )
-                MessageEnvelopeRegion(
                     envelope: detail.envelope,
                     attachments: detail.attachments,
+                    messageID: detail.id,
                     isDetailsExpanded: $isDetailsExpanded,
+                    headersStore: headersStore,
                     backdropKind: model.appearance.backdropKind
                 )
                 bodyRegion(detail)
@@ -365,63 +366,56 @@ private extension View {
 
 /// Reading anchor: the strongest contrast in the reader, wrapping without
 /// limit, resting below the window's dissolve rather than inside its ramp.
+/// The envelope and Details rows deliberately live inside this same surface,
+/// so the reader has two islands rather than a subject island plus a headers
+/// island.
 struct MessageSubjectRegion: View {
     let subject: String
-    let isShowingRawSource: Bool
-    let showRawSource: () -> Void
-    let showFormatted: () -> Void
-    let copySubject: () -> Void
+    let envelope: Envelope
+    let attachments: [AttachmentInfo]
+    let messageID: MessageID
+    @Binding var isDetailsExpanded: Bool
+    let headersStore: MessageHeadersStore
     let backdropKind: WindowBackdropKind
 
     var body: some View {
         let display = MessageHeaderPolicy.subject(subject)
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text(display.text)
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(display.isPlaceholder ? Color.secondary : Color.primary)
-                .multilineTextAlignment(.leading)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-                .accessibilityAddTraits(.isHeader)
-                .accessibilityIdentifier(UIIdentifier.messageSubject)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            actions
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(display.text)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(display.isPlaceholder ? Color.secondary : Color.primary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityIdentifier(UIIdentifier.messageSubject)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
+
+            MessageEnvelopeRegion(
+                envelope: envelope,
+                attachments: attachments,
+                messageID: messageID,
+                isDetailsExpanded: $isDetailsExpanded,
+                headersStore: headersStore
+            )
         }
         .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
-        .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
         .readerIslandSurface(backdropKind: backdropKind)
     }
-
-    private var actions: some View {
-        Menu {
-            if isShowingRawSource {
-                Button("Show Formatted Message", action: showFormatted)
-            } else {
-                Button("View Raw Source", action: showRawSource)
-            }
-            Button("Copy Subject", action: copySubject)
-        } label: {
-            Image(systemName: "ellipsis.circle")
-                .font(.title3)
-                .foregroundStyle(.secondary)
-        }
-        .menuStyle(.button)
-        .buttonStyle(.borderless)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .accessibilityLabel("Message actions")
-    }
 }
 
-
 /// Envelope: who sent it, who received it, when, what came attached — and a
-/// disclosure for every remaining header the store actually parsed.
+/// disclosure for the complete raw header block.
 struct MessageEnvelopeRegion: View {
     let envelope: Envelope
     let attachments: [AttachmentInfo]
+    let messageID: MessageID
     @Binding var isDetailsExpanded: Bool
-    let backdropKind: WindowBackdropKind
+    let headersStore: MessageHeadersStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -438,11 +432,9 @@ struct MessageEnvelopeRegion: View {
                 .padding(.top, MessageViewerLayoutPolicy.envelopeRowSpacing)
         }
         .font(.subheadline)
-        .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
         .padding(.top, MessageViewerLayoutPolicy.envelopeTopPadding)
         .padding(.bottom, MessageViewerLayoutPolicy.envelopeBottomPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .readerIslandSurface(backdropKind: backdropKind)
     }
 
     /// Sender and date share a line until the line no longer fits — at a narrow
@@ -561,27 +553,31 @@ struct MessageEnvelopeRegion: View {
         }
     }
 
-    /// A real disclosure control: tab reaches it, Space and Return toggle it,
-    /// and VoiceOver speaks its expanded state. It holds every stored header
-    /// with a value — raw MIME stays behind the separate raw-source action.
+    /// Details keeps the structured envelope rows above the complete raw
+    /// block. The latter is fetched only when this disclosure opens.
     private var details: some View {
         DisclosureGroup(isExpanded: $isDetailsExpanded) {
-            Grid(
-                alignment: .leadingFirstTextBaseline,
-                horizontalSpacing: 10,
-                verticalSpacing: MessageViewerLayoutPolicy.envelopePairSpacing
-            ) {
-                ForEach(MessageHeaderPolicy.detailRows(for: envelope)) { row in
-                    GridRow {
-                        Text(row.label)
-                            .foregroundStyle(.secondary)
-                            .gridColumnAlignment(.leading)
-                        Text(row.value)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 0) {
+                Grid(
+                    alignment: .leadingFirstTextBaseline,
+                    horizontalSpacing: 10,
+                    verticalSpacing: MessageViewerLayoutPolicy.envelopePairSpacing
+                ) {
+                    ForEach(MessageHeaderPolicy.detailRows(for: envelope)) { row in
+                        GridRow {
+                            Text(row.label)
+                                .foregroundStyle(.secondary)
+                                .gridColumnAlignment(.leading)
+                            Text(row.value)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                rawHeaderContent
             }
             .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -593,6 +589,115 @@ struct MessageEnvelopeRegion: View {
                 .accessibilityLabel("Message details")
         }
         .accessibilityIdentifier(UIIdentifier.messageDetails)
+        .onChange(of: isDetailsExpanded) { _, expanded in
+            if expanded {
+                headersStore.loadIfNeeded(for: messageID)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var rawHeaderContent: some View {
+        switch headersStore.state(for: messageID) {
+        case .idle:
+            EmptyView()
+        case .loading:
+            ProgressView("Loading headers…")
+                .controlSize(.small)
+                .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
+        case .failed(let message):
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Couldn’t load headers", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary)
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Retry") {
+                    headersStore.retry(messageID)
+                }
+                .buttonStyle(.link)
+            }
+            .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
+            .accessibilityIdentifier("message-headers-error")
+        case .loaded(let headers, let text):
+            if headers.isEmpty {
+                Text("No raw headers found.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
+            } else {
+                RawHeadersBlock(headers: headers, text: text)
+                    .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
+            }
+        }
+    }
+}
+
+/// The complete unfolded header block uses SF Mono, with one copy action for
+/// the whole block. The action remains keyboard-focusable while its icon is
+/// hidden at rest, which keeps the collapsed reader quiet without hiding an
+private struct RawHeadersBlock: View {
+    let headers: [(name: String, value: String)]
+    let text: String
+    @State private var isHovered = false
+    @State private var didCopy = false
+    @FocusState private var blockFocused: Bool
+    @FocusState private var copyButtonFocused: Bool
+
+    private var copyButtonVisible: Bool {
+        isHovered || blockFocused || copyButtonFocused
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.envelopePairSpacing) {
+            ForEach(Array(headers.enumerated()), id: \.offset) { _, header in
+                HStack(alignment: .firstTextBaseline, spacing: 0) {
+                    Text("\(header.name): ")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: true, vertical: false)
+                    Text(header.value)
+                        .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .focusable()
+        .focused($blockFocused)
+        .overlay(alignment: .topTrailing) {
+            Button {
+                copyHeaders()
+            } label: {
+                Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .opacity(copyButtonVisible ? 1 : 0)
+            .animation(MailMotion.hover, value: copyButtonVisible)
+            .focused($copyButtonFocused)
+            .accessibilityLabel("Copy Headers")
+            .accessibilityIdentifier(UIIdentifier.messageHeadersCopy)
+        }
+        .onHover { isHovered = $0 }
+    }
+
+    private func copyHeaders() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        withAnimation(MailMotion.hover) {
+            didCopy = true
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            withAnimation(MailMotion.hover) {
+                didCopy = false
+            }
+        }
     }
 }
 

@@ -1,15 +1,78 @@
 import Foundation
 import MailternalInterfaces
 
-/// What the reader may honestly say about a message envelope.
+/// What the reader may honestly say about a message envelope and its raw
+/// headers.
 ///
 /// `Envelope` stores From, Reply-To, To, Cc, both dates, and the threading
-/// headers — and nothing else. There is no Bcc and there are no authentication
-/// results, so the reader's disclosure is called "Details" rather than "Full
-/// Headers", and a field the store never parsed simply has no row. Raw routing
-/// data stays in the separate raw-source pathway.
+/// headers. The on-demand raw-source path supplies the complete header block
+/// when the reader's Details disclosure is expanded.
 enum MessageHeaderPolicy {
     static let noSubjectPlaceholder = "(No Subject)"
+
+    /// A raw header is returned as one logical line. Field names retain the
+    /// source spelling and values are unfolded, trimmed field bodies.
+    static func rawHeaders(from rawSource: String) -> [(name: String, value: String)] {
+        let normalized = rawSource
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var headers: [(name: String, value: String)] = []
+        var currentName: String?
+        var currentValue = ""
+
+        func appendCurrent() {
+            guard let currentName else { return }
+            headers.append((name: currentName, value: currentValue))
+        }
+
+        for lineSlice in normalized.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(lineSlice)
+            if line.isEmpty {
+                break
+            }
+
+            if line.first == " " || line.first == "\t" {
+                guard currentName != nil else { continue }
+                let continuation = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !continuation.isEmpty {
+                    if !currentValue.isEmpty { currentValue.append(" ") }
+                    currentValue.append(contentsOf: continuation)
+                }
+                continue
+            }
+
+            guard let colon = line.firstIndex(of: ":") else {
+                appendCurrent()
+                currentName = nil
+                currentValue = ""
+                continue
+            }
+            let name = line[..<colon].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else {
+                appendCurrent()
+                currentName = nil
+                currentValue = ""
+                continue
+            }
+            appendCurrent()
+            currentName = name
+            currentValue = line[line.index(after: colon)...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        appendCurrent()
+        return headers
+    }
+
+    /// The copy/display representation of the complete unfolded header block.
+    static func rawHeaderBlock(from rawSource: String) -> String {
+        rawHeaders(from: rawSource)
+            .map { header in
+                header.value.isEmpty
+                    ? "\(header.name):"
+                    : "\(header.name): \(header.value)"
+            }
+            .joined(separator: "\n")
+    }
 
     struct DetailRow: Identifiable, Equatable {
         let label: String
