@@ -62,11 +62,8 @@ struct MessageViewer: View {
         .onChange(of: model.findQuery) { _, _ in
             restartFind()
         }
-        .onChange(of: model.isShowingRawSource) { _, showing in
+        .onChange(of: model.isShowingRawSource) { _, _ in
             restartFind()
-            if showing, model.rawSource == nil {
-                Task { await model.loadRawSource() }
-            }
         }
         .onChange(of: model.isFindPresented) { _, presented in
             if presented { restartFind() }
@@ -111,7 +108,7 @@ struct MessageViewer: View {
                     attachments: detail.attachments,
                     messageID: detail.id,
                     headersStore: headersStore,
-                    backdropKind: model.appearance.backdropKind,
+                    backdropStyle: model.appearance.backdropStyle,
                     showsSenderIcons: model.appearance.showsSenderIcons,
                     isShowingRawSource: model.isShowingRawSource,
                     accent: model.appearance.accent.color
@@ -131,10 +128,6 @@ struct MessageViewer: View {
             )
             .padding(.bottom, MessageViewerLayoutPolicy.bottomPadding)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .animation(
-                reduceMotion ? .easeOut(duration: 0.01) : MailMotion.settle,
-                value: model.isShowingRawSource
-            )
         }
         .background {
             ScrollEdgeEffectSuppressor()
@@ -159,22 +152,30 @@ struct MessageViewer: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .readerIslandSurface(
             role: .body,
-            backdropKind: model.appearance.backdropKind
+            backdropStyle: model.appearance.backdropStyle
         )
         .accessibilityIdentifier(UIIdentifier.messageBody)
     }
 
     @ViewBuilder
     private func bodyContent(_ detail: MessageDetail) -> some View {
-        if model.isShowingRawSource, let raw = model.rawSource {
-            RawSourceView(
-                text: raw,
-                query: activeFindQuery,
-                selectedMatchIndex: findSnapshot.index,
-                findTick: findTick
-            )
-            .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
-            .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
+        if model.isShowingRawSource {
+            if let raw = model.rawSource {
+                RawSourceView(
+                    text: raw,
+                    query: activeFindQuery,
+                    selectedMatchIndex: findSnapshot.index,
+                    findTick: findTick
+                )
+                .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
+            } else {
+                ProgressView("Loading source…")
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                    .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
+            }
         } else if detail.isQuarantined {
             Text("The original source is available if you need it.")
                 .font(.callout)
@@ -203,14 +204,26 @@ struct MessageViewer: View {
         }
     }
 
+
     private func htmlBody(_ detail: MessageDetail, html: String) -> some View {
         let showRemoteImageNotice = model.hasRemoteImageReferences && !model.allowRemoteImages
-        return VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.bodyContentSpacing) {
-            if showRemoteImageNotice {
-                RemoteImageNotice { model.allowRemoteImages = true }
-                    .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
-                    .padding(.top, MessageViewerLayoutPolicy.islandVerticalPadding)
+        return VStack(alignment: .leading, spacing: 0) {
+            // Keep a stable slot ahead of the representable. If the notice is
+            // removed as a sibling, SwiftUI can shift MessageHTMLView's
+            // structural identity and recreate its WKWebView instead of
+            // delivering the consent update to updateNSView.
+            ZStack(alignment: .topLeading) {
+                if showRemoteImageNotice {
+                    RemoteImageNotice { model.allowRemoteImages = true }
+                        .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                        .padding(.top, MessageViewerLayoutPolicy.islandVerticalPadding)
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(
+                .bottom,
+                showRemoteImageNotice ? MessageViewerLayoutPolicy.bodyContentSpacing : 0
+            )
             MessageHTMLView(
                 html: html,
                 partProvider: model.partProvider(for: detail.id),
@@ -270,7 +283,7 @@ private struct ReaderIslandSurface: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var contrast
     let role: ReaderIslandRole
-    let backdropKind: WindowBackdropKind
+    let backdropStyle: WindowBackdropStyle
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: AppShapeScale.card, style: .continuous)
@@ -304,12 +317,15 @@ private struct ReaderIslandSurface: ViewModifier {
         if reduceTransparency || role == .body {
             shape.fill(Color(nsColor: .windowBackgroundColor))
         } else {
-            switch backdropKind {
-            case .glass:
+            switch backdropStyle {
+            case .clearGlass, .regularGlass:
                 shape
                     .fill(Color.clear)
-                    .glassEffect(.regular, in: shape)
-            case .blur:
+                    .glassEffect(
+                        backdropStyle == .clearGlass ? .clear : .regular,
+                        in: shape
+                    )
+            case .frostedBlur:
                 shape.fill(.ultraThinMaterial)
             }
         }
@@ -347,9 +363,9 @@ private enum ReaderFilmGrain {
 private extension View {
     func readerIslandSurface(
         role: ReaderIslandRole = .translucent,
-        backdropKind: WindowBackdropKind = .blur
+        backdropStyle: WindowBackdropStyle = .frostedBlur
     ) -> some View {
-        modifier(ReaderIslandSurface(role: role, backdropKind: backdropKind))
+        modifier(ReaderIslandSurface(role: role, backdropStyle: backdropStyle))
     }
 }
 
@@ -363,7 +379,7 @@ struct MessageSubjectRegion: View {
     let attachments: [AttachmentInfo]
     let messageID: MessageID
     let headersStore: MessageHeadersStore
-    let backdropKind: WindowBackdropKind
+    let backdropStyle: WindowBackdropStyle
     let showsSenderIcons: Bool
     let isShowingRawSource: Bool
     let accent: Color
@@ -396,7 +412,7 @@ struct MessageSubjectRegion: View {
         }
         .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .readerIslandSurface(backdropKind: backdropKind)
+        .readerIslandSurface(backdropStyle: backdropStyle)
     }
 }
 
@@ -469,7 +485,7 @@ struct MessageEnvelopeRegion: View {
                 accessibilityLabel: "Sender, \(MessageHeaderPolicy.full(sender))",
                 accent: accent
             ) {
-                HStack(alignment: .top, spacing: 8) {
+                HStack(alignment: .center, spacing: 8) {
                     if showsSenderIcons {
                         MonogramView(
                             initials: MessageHeaderPolicy.initials(for: sender),
@@ -501,7 +517,7 @@ struct MessageEnvelopeRegion: View {
                 accessibilityLabel: "Recipient, \(MessageHeaderPolicy.full(recipients.first))",
                 accent: accent
             ) {
-                HStack(alignment: .top, spacing: 8) {
+                HStack(alignment: .center, spacing: 8) {
                     if showsSenderIcons {
                         MonogramView(
                             initials: MessageHeaderPolicy.initials(for: recipients.first),
@@ -581,12 +597,16 @@ struct MessageEnvelopeRegion: View {
     @ViewBuilder
     private var rawHeaderContent: some View {
         switch headersStore.state(for: messageID) {
-        case .idle:
-            ProgressView("Loading headers…")
-                .controlSize(.small)
-        case .loading:
-            ProgressView("Loading headers…")
-                .controlSize(.small)
+        case .idle, .loading:
+            if let headers = headersStore.headers(for: messageID, fallback: envelope) {
+                RawHeadersBlock(
+                    headers: headers,
+                    text: MessageHeaderPolicy.rawHeaderBlock(from: headers)
+                )
+            } else {
+                ProgressView("Loading headers…")
+                    .controlSize(.small)
+            }
         case .failed(let message):
             VStack(alignment: .leading, spacing: 6) {
                 Label("Couldn’t load headers", systemImage: "exclamationmark.triangle")
@@ -611,6 +631,7 @@ struct MessageEnvelopeRegion: View {
             }
         }
     }
+
 }
 
 /// A small accent wash keeps the monogram legible without fetching an avatar.
@@ -628,17 +649,55 @@ private struct MonogramView: View {
     }
 }
 
+/// Replaces a copy target's text with a clipboard glyph without changing the
+/// target's measured size. Reduced Motion swaps the two states immediately.
+private struct CopyFeedbackLabel<Label: View>: View {
+    let label: Label
+    let isShowingCopy: Bool
+    let reduceMotion: Bool
+
+    init(
+        isShowingCopy: Bool,
+        reduceMotion: Bool,
+        @ViewBuilder label: () -> Label
+    ) {
+        self.label = label()
+        self.isShowingCopy = isShowingCopy
+        self.reduceMotion = reduceMotion
+    }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            label
+                .opacity(isShowingCopy ? 0 : 1)
+            Image(systemName: "doc.on.clipboard")
+                .opacity(isShowingCopy ? 1 : 0)
+                .accessibilityHidden(true)
+        }
+        .animation(
+            reduceMotion
+                ? nil
+                : .easeOut(duration: isShowingCopy ? 0.12 : 0.15),
+            value: isShowingCopy
+        )
+    }
+}
+
+
 /// A copy target presents the same interaction for identities and dates:
-/// rounded hover wash, pointer cursor, and a spring-driven checkmark for one
-/// second after the payload reaches the pasteboard.
+/// rounded hover wash, pointer cursor, and a brief clipboard confirmation in
+/// place of the copied text.
 private struct EnvelopeCopyItem<Label: View>: View {
     let symbol: String
     let payload: String
     let accessibilityLabel: String
     let accent: Color
     let label: Label
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovered = false
     @State private var didCopy = false
+    @State private var isShowingQRCode = false
+    @State private var copyFeedbackGeneration = 0
 
     init(
         symbol: String,
@@ -656,12 +715,16 @@ private struct EnvelopeCopyItem<Label: View>: View {
 
     var body: some View {
         Button(action: copy) {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: didCopy ? "checkmark" : symbol)
+            HStack(alignment: .center, spacing: 8) {
+                Image(systemName: symbol)
                     .foregroundStyle(accent)
                     .frame(width: 18, alignment: .center)
-                    .contentTransition(.symbolEffect(.replace))
-                label
+                CopyFeedbackLabel(
+                    isShowingCopy: didCopy,
+                    reduceMotion: reduceMotion
+                ) {
+                    label
+                }
             }
             .padding(.horizontal, 7)
             .padding(.vertical, 5)
@@ -677,6 +740,15 @@ private struct EnvelopeCopyItem<Label: View>: View {
         .focusEffectDisabled()
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityLabel)
+        .contextMenu {
+            Button("Copy", systemImage: "doc.on.clipboard", action: copy)
+            Button("Show QR Code", systemImage: "qrcode", action: showQRCode)
+                .disabled(!QRCodePolicy.canEncode(payload))
+                .help(QRCodePolicy.menuHelp(for: payload))
+        }
+        .popover(isPresented: $isShowingQRCode, arrowEdge: .top) {
+            QRCodeCard(payload: payload)
+        }
         .onHover { hovered in
             isHovered = hovered
             if hovered {
@@ -688,40 +760,34 @@ private struct EnvelopeCopyItem<Label: View>: View {
         .animation(MailMotion.hover, value: isHovered)
     }
 
+    private func showQRCode() {
+        guard QRCodePolicy.canEncode(payload) else { return }
+        isShowingQRCode = true
+    }
+
     private func copy() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(payload, forType: .string)
-        withAnimation(MailMotion.searchPanel) {
-            didCopy = true
-        }
+
+        copyFeedbackGeneration &+= 1
+        let generation = copyFeedbackGeneration
+        didCopy = true
+
         Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled else { return }
-            withAnimation(MailMotion.searchPanel) {
-                didCopy = false
-            }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled, generation == copyFeedbackGeneration else { return }
+            didCopy = false
         }
     }
 }
 
-/// The complete unfolded header block uses SF Mono. The whole-block action
-/// remains keyboard-focusable and subtly visible at rest, while every
-/// individual line gets a trailing copy action on hover.
+
+/// The complete unfolded header block uses SF Mono. Each header name and
+/// value is its own copy target; there is no block-level control.
 private struct RawHeadersBlock: View {
     let headers: [MessageHeaderPolicy.HeaderItem]
     let text: String
-    @State private var isHovered = false
-    @State private var didCopy = false
     @FocusState private var blockFocused: Bool
-    @FocusState private var copyButtonFocused: Bool
-
-    private var copyButtonVisible: Bool {
-        isHovered || blockFocused || copyButtonFocused
-    }
-
-    private var copyButtonOpacity: Double {
-        copyButtonVisible ? 1 : 0.35
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.envelopePairSpacing) {
@@ -735,81 +801,87 @@ private struct RawHeadersBlock: View {
         .focusable()
         .focusEffectDisabled()
         .focused($blockFocused)
-        .overlay(alignment: .topTrailing) {
-            Button {
-                copyHeaders()
-            } label: {
-                Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .buttonStyle(.borderless)
-            .controlSize(.small)
-            .opacity(copyButtonOpacity)
-            .animation(MailMotion.hover, value: copyButtonVisible)
-            .focused($copyButtonFocused)
-            .focusEffectDisabled()
-            .accessibilityLabel("Copy Headers")
-            .accessibilityIdentifier(UIIdentifier.messageHeadersCopy)
-        }
-        .onHover { isHovered = $0 }
-    }
-
-    private func copyHeaders() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-        withAnimation(MailMotion.searchPanel) {
-            didCopy = true
-        }
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled else { return }
-            withAnimation(MailMotion.searchPanel) {
-                didCopy = false
-            }
-        }
     }
 }
 
 private struct RawHeaderRow: View {
     let header: MessageHeaderPolicy.HeaderItem
-    @State private var isHovered = false
-    @State private var didCopy = false
-    @FocusState private var copyButtonFocused: Bool
-
-    private var copyButtonOpacity: Double {
-        isHovered || copyButtonFocused ? 1 : 0.35
-    }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 0) {
-                Text("\(header.name): ")
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: true, vertical: false)
-                Text(header.value)
-                    .foregroundStyle(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            Button {
-                copyHeader()
-            } label: {
-                Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .buttonStyle(.borderless)
-            .controlSize(.small)
-            .opacity(copyButtonOpacity)
-            .animation(MailMotion.hover, value: copyButtonOpacity)
-            .focused($copyButtonFocused)
-            .focusEffectDisabled()
-            .accessibilityLabel("Copy \(header.name)")
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            RawHeaderField(
+                text: "\(header.name):",
+                payload: header.keyCopyText,
+                accessibilityLabel: "\(header.name), header name",
+                expands: false
+            )
+            RawHeaderField(
+                text: header.value,
+                payload: header.valueCopyText,
+                accessibilityLabel: "\(header.name), header value",
+                expands: true
+            )
         }
         .font(.system(.callout, design: .monospaced))
         .textSelection(.enabled)
-        .contentShape(Rectangle())
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct RawHeaderField: View {
+    let text: String
+    let payload: String
+    let accessibilityLabel: String
+    let expands: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isHovered = false
+    @State private var didCopy = false
+    @State private var isShowingQRCode = false
+    @State private var copyFeedbackGeneration = 0
+
+    var body: some View {
+        Button(action: copy) {
+            Text(text)
+                .opacity(didCopy ? 0 : 1)
+                .frame(
+                    maxWidth: expands ? .infinity : nil,
+                    alignment: expands ? .leading : .center
+                )
+                .fixedSize(horizontal: !expands, vertical: false)
+                .overlay {
+                    Image(systemName: "doc.on.clipboard")
+                        .opacity(didCopy ? 1 : 0)
+                        .accessibilityHidden(true)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
+                .background {
+                    if isHovered {
+                        RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
+                            .fill(Color.primary.opacity(0.08))
+                    }
+                }
+                .contentShape(RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous))
+                .animation(
+                    reduceMotion
+                        ? nil
+                        : .easeOut(duration: didCopy ? 0.12 : 0.15),
+                    value: didCopy
+                )
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityHint("Copies \(payload)")
+        .contextMenu {
+            Button("Copy", systemImage: "doc.on.clipboard", action: copy)
+            Button("Show QR Code", systemImage: "qrcode", action: showQRCode)
+                .disabled(!QRCodePolicy.canEncode(payload))
+                .help(QRCodePolicy.menuHelp(for: payload))
+        }
+        .popover(isPresented: $isShowingQRCode, arrowEdge: .top) {
+            QRCodeCard(payload: payload)
+        }
         .onHover { hovered in
             isHovered = hovered
             if hovered {
@@ -818,23 +890,32 @@ private struct RawHeaderRow: View {
                 NSCursor.pop()
             }
         }
+        .animation(MailMotion.hover, value: isHovered)
     }
 
-    private func copyHeader() {
+    private func showQRCode() {
+        guard QRCodePolicy.canEncode(payload) else { return }
+        isShowingQRCode = true
+    }
+
+    private func copy() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(header.copyText, forType: .string)
-        withAnimation(MailMotion.searchPanel) {
-            didCopy = true
-        }
+        NSPasteboard.general.setString(payload, forType: .string)
+
+        copyFeedbackGeneration &+= 1
+        let generation = copyFeedbackGeneration
+        didCopy = true
+
         Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled else { return }
-            withAnimation(MailMotion.searchPanel) {
-                didCopy = false
-            }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled, generation == copyFeedbackGeneration else { return }
+            didCopy = false
         }
     }
 }
+
+
+
 
 /// Blocked remote content is a body state the reader discloses before the
 /// message is read, not a permanently disabled control after it.

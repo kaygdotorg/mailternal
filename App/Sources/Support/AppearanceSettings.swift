@@ -45,15 +45,16 @@ public enum EmailReadingMode: String, CaseIterable, Identifiable {
     }
 }
 
-enum WindowBackdropKind: String, CaseIterable, Identifiable {
-    case blur, glass
+enum WindowBackdropStyle: String, CaseIterable, Identifiable {
+    case clearGlass, frostedBlur, regularGlass
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
-        case .blur: "Blur"
-        case .glass: "Liquid Glass"
+        case .clearGlass: "Clear glass"
+        case .frostedBlur: "Frosted blur"
+        case .regularGlass: "Regular glass"
         }
     }
 }
@@ -180,22 +181,11 @@ final class AppearanceSettings {
         }
     }
 
-    /// Liquid Glass is a treatment choice, not a second opacity state.
-    var usesLiquidGlass: Bool {
+    var backdropStyle: WindowBackdropStyle {
         didSet {
-            guard oldValue != usesLiquidGlass else { return }
-            defaults.set(usesLiquidGlass, forKey: Keys.usesLiquidGlass)
+            guard oldValue != backdropStyle else { return }
+            defaults.set(backdropStyle.rawValue, forKey: Keys.backdropStyle)
         }
-    }
-
-    /// Compatibility mapping for the resolved backdrop plan.
-    ///
-    /// The settings UI uses `usesLiquidGlass` directly so the choice reads as
-    /// a treatment toggle, while callers that resolve a `WindowBackdropKind`
-    /// can still use the same two public treatments.
-    var backdropKind: WindowBackdropKind {
-        get { usesLiquidGlass ? .glass : .blur }
-        set { usesLiquidGlass = newValue == .glass }
     }
 
     /// Number of visible lines in each message-list row, including the subject.
@@ -219,7 +209,7 @@ final class AppearanceSettings {
     static let defaultBackgroundOpacity = 0.80
     /// Incremented when a persisted preference's meaning changes. Values
     /// written by older builds are migrated exactly once per suite.
-    static let defaultsVersion = 1
+    static let defaultsVersion = 2
     /// The full dial the settings slider offers. 100% resolves to a solid
     /// window; anything below it shows the chosen treatment, down to a window
     /// that adds no fill of its own at 0%.
@@ -245,15 +235,20 @@ final class AppearanceSettings {
         self.defaults = defaults
         self.accent = AccentSource(defaults: defaults)
 
-        let storedBackdrop = defaults.string(forKey: Keys.backdrop)
-        let hasStoredGlassChoice = defaults.object(forKey: Keys.usesLiquidGlass) != nil
+        let storedStyle = defaults.string(forKey: Keys.backdropStyle)
+            .flatMap(WindowBackdropStyle.init(rawValue:))
+        let legacyToggle = defaults.object(forKey: Keys.legacyUsesLiquidGlass) != nil
+            ? defaults.bool(forKey: Keys.legacyUsesLiquidGlass)
+            : nil
+        let legacyBackdrop = defaults.string(forKey: Keys.legacyBackdrop)
         let hasStoredOpacity = defaults.object(forKey: Keys.opacity) != nil
         let storedOpacity = hasStoredOpacity ? defaults.double(forKey: Keys.opacity) : nil
         let storedVersion = defaults.object(forKey: Keys.defaultsVersion) == nil
             ? 0
             : defaults.integer(forKey: Keys.defaultsVersion)
+        let shouldMigrateLegacyBackdropStyle = storedVersion < Self.defaultsVersion
         let shouldMigrateLegacyFullOpacity =
-            storedVersion < Self.defaultsVersion
+            storedVersion == 0
             && storedOpacity == 1
             && !defaults.bool(forKey: Keys.opacityUserWritten)
 
@@ -268,23 +263,28 @@ final class AppearanceSettings {
                 ? Self.defaultBackgroundOpacity
                 : (storedOpacity ?? Self.defaultBackgroundOpacity)
         )
-        if hasStoredGlassChoice {
-            usesLiquidGlass = defaults.bool(forKey: Keys.usesLiquidGlass)
-            backgroundOpacity = resolvedOpacity
-        } else if let storedKind = WindowBackdropKind(rawValue: storedBackdrop ?? "") {
-            let resolvedUsesLiquidGlass = storedKind == .glass
-            usesLiquidGlass = resolvedUsesLiquidGlass
-            backgroundOpacity = resolvedOpacity
-            defaults.set(resolvedUsesLiquidGlass, forKey: Keys.usesLiquidGlass)
-            defaults.removeObject(forKey: Keys.backdrop)
+        let resolvedStyle: WindowBackdropStyle
+        if let storedStyle {
+            resolvedStyle = storedStyle
+        } else if shouldMigrateLegacyBackdropStyle, let legacyToggle {
+            resolvedStyle = legacyToggle ? .regularGlass : .frostedBlur
+        } else if shouldMigrateLegacyBackdropStyle, let legacyBackdrop {
+            switch legacyBackdrop {
+            case "glass":
+                resolvedStyle = .regularGlass
+            case "blur", "opaque":
+                resolvedStyle = .frostedBlur
+            default:
+                resolvedStyle = .frostedBlur
+            }
         } else {
-            // Missing and legacy opaque settings become the shipping default:
-            // Blur with a solid-enough, but not fully opaque, tint.
-            usesLiquidGlass = false
-            backgroundOpacity = resolvedOpacity
-            defaults.set(false, forKey: Keys.usesLiquidGlass)
-            defaults.removeObject(forKey: Keys.backdrop)
+            resolvedStyle = .frostedBlur
         }
+        backdropStyle = resolvedStyle
+        backgroundOpacity = resolvedOpacity
+        defaults.set(resolvedStyle.rawValue, forKey: Keys.backdropStyle)
+        defaults.removeObject(forKey: Keys.legacyUsesLiquidGlass)
+        defaults.removeObject(forKey: Keys.legacyBackdrop)
 
         if let storedLines = defaults.object(forKey: Keys.messageListLines) as? NSNumber {
             let normalizedLines = Self.clampMessageListLines(storedLines.intValue)
@@ -318,8 +318,9 @@ final class AppearanceSettings {
 
     private enum Keys {
         static let mode = "mailternal.appearance.mode"
-        static let backdrop = "mailternal.appearance.backdrop"
-        static let usesLiquidGlass = "mailternal.appearance.usesLiquidGlass"
+        static let backdropStyle = "mailternal.appearance.backdropStyle"
+        static let legacyBackdrop = "mailternal.appearance.backdrop"
+        static let legacyUsesLiquidGlass = "mailternal.appearance.usesLiquidGlass"
         static let opacity = "mailternal.appearance.opacity"
         static let opacityUserWritten = "mailternal.appearance.opacity-user-written"
         static let defaultsVersion = "mailternal.appearance.defaultsVersion"

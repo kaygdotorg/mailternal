@@ -37,14 +37,22 @@ struct FolderSidebar: View {
             }
         }
         .listStyle(.sidebar)
-        // The sidebar reaches under the titlebar and its list starts at the
-        // window top; the account header carries the fixed inset itself.
-        // Never inset the scroll view: SwiftUI rewrites a `.sidebar` List's
-        // content insets from the safe area on every layout, and any inset
-        // placed there flips in and out (measured: title jumping by 40pt).
-        .ignoresSafeArea(.container, edges: .top)
+        // The List keeps its own safe-area layout; the header carries the
+        // remaining inset (PaneHeaderInsetPolicy.sidebarHeaderPadding). Never
+        // inset the scroll view: SwiftUI rewrites a `.sidebar` List's content
+        // insets from the safe area on every layout and any inset placed there
+        // flips in and out (measured: the title jumping by 40pt).
         .background {
             ScrollEdgeEffectSuppressor()
+                .allowsHitTesting(false)
+        }
+        .background {
+            // Public-API fallback for macOS 26's sidebar material. The
+            // concentric glass view hosts the sidebar content, so hiding it
+            // hides the whole column; only the BlurryAlleyway layer is hidden.
+            // These class-name checks are intentionally guarded: if SwiftUI
+            // renames its implementation, this bridge simply does nothing.
+            SidebarSystemMaterialSuppressor()
                 .allowsHitTesting(false)
         }
         .mailWindowDissolve(.sidebar)
@@ -96,6 +104,7 @@ struct FolderSidebar: View {
                 }
             }
             .padding(.top, PaneHeaderInsetPolicy.sidebarHeaderPadding)
+            .padding(.bottom, PaneHeaderInsetPolicy.sidebarHeaderBottomPadding)
         } else if let title {
             Text(title)
         }
@@ -141,6 +150,120 @@ struct FolderSidebar: View {
         case .authFailed: "Sign-in failed"
         case .connectionFailed: "Offline"
         }
+    }
+}
+
+private struct SidebarSystemMaterialSuppressor: NSViewRepresentable {
+    func makeNSView(context: Context) -> SidebarSystemMaterialSuppressingView {
+        SidebarSystemMaterialSuppressingView()
+    }
+
+    func updateNSView(
+        _ nsView: SidebarSystemMaterialSuppressingView,
+        context: Context
+    ) {
+        nsView.suppressSystemMaterial()
+        nsView.scheduleSuppression()
+    }
+}
+
+@MainActor
+private final class SidebarSystemMaterialSuppressingView: NSView {
+    private weak var observedWindow: NSWindow?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: .zero)
+        alphaValue = 0
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        observeWindow()
+        suppressSystemMaterial()
+        scheduleSuppression()
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            removeWindowObservers()
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    func scheduleSuppression() {
+        DispatchQueue.main.async { [weak self] in
+            self?.suppressSystemMaterial()
+        }
+    }
+
+    func suppressSystemMaterial() {
+        guard let wrapper = nearestSplitItemWrapper() else { return }
+        hideSystemMaterial(in: wrapper)
+    }
+
+    private func observeWindow() {
+        removeWindowObservers()
+        guard let window else { return }
+        observedWindow = window
+        let center = NotificationCenter.default
+        for name in [
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.didExitFullScreenNotification,
+            NSWindow.didBecomeMainNotification
+        ] {
+            center.addObserver(self, selector: #selector(windowChanged), name: name, object: window)
+        }
+    }
+
+    private func removeWindowObservers() {
+        NotificationCenter.default.removeObserver(self)
+        observedWindow = nil
+    }
+
+    @objc private func windowChanged() {
+        suppressSystemMaterial()
+        scheduleSuppression()
+    }
+
+    private func nearestSplitItemWrapper() -> NSView? {
+        var ancestor = superview
+        while let view = ancestor {
+            let name = NSStringFromClass(type(of: view))
+            if name.contains("SplitViewItemViewWrapper") {
+                return view
+            }
+            ancestor = view.superview
+        }
+        return nil
+    }
+
+    private func hideSystemMaterial(in wrapper: NSView) {
+        func visit(_ view: NSView) {
+            for subview in view.subviews {
+                // Only the pure material view. The concentric glass
+                // container HOSTS the sidebar content (measured hierarchy:
+                // NSContainerConcentricGlassEffectView > ContentHolderView >
+                // NSHostingView), so hiding it removes the sidebar itself.
+                let name = NSStringFromClass(type(of: subview))
+                if name.contains("BlurryAlleyway") {
+                    subview.isHidden = true
+                    continue
+                }
+                visit(subview)
+            }
+        }
+        visit(wrapper)
     }
 }
 

@@ -645,10 +645,17 @@ final class AppModel {
         )
     }
 
-    /// Toggles raw source presentation while preserving the reader island.
+    /// Toggles raw source presentation immediately while preserving the reader
+    /// island. The source body is fetched after the presentation state changes
+    /// so the reader can show its already-loaded envelope without waiting.
     func toggleRawSource() {
-        withAnimation(MailMotion.settle) {
-            isShowingRawSource.toggle()
+        let shouldShow = !isShowingRawSource
+        withAnimation(MailMotion.sourceMorph) {
+            isShowingRawSource = shouldShow
+        }
+        guard shouldShow, rawSource == nil else { return }
+        Task { [weak self] in
+            await self?.loadRawSource()
         }
     }
 
@@ -705,11 +712,12 @@ final class AppModel {
     func loadRawSource() async {
         guard let id = selectedMessageID else { return }
         do {
-            rawSource = try await facade.rawSource(id)
-            if !isShowingRawSource {
-                toggleRawSource()
-            }
+            let source = try await facade.rawSource(id)
+            guard selectedMessageID == id,
+                  selectedMessageIDs == Set([id]) else { return }
+            rawSource = source
         } catch {
+            guard !Task.isCancelled else { return }
             toasts.post(title: "Couldn’t load source", detail: error.localizedDescription)
         }
     }

@@ -60,7 +60,20 @@ final class PartSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable
                     remoteAllowed: remoteAllowed
                 )
                 if Task.isCancelled { return }
-                let response = URLResponse(
+                // Consent reloads the same token URL; never let a blocked
+                // placeholder satisfy the subsequent allowed request.
+                let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: [
+                        "Cache-Control": "no-store, no-cache, must-revalidate",
+                        "Pragma": "no-cache",
+                        "Expires": "0",
+                        "Content-Type": mime,
+                        "Content-Length": "\(data.count)"
+                    ]
+                ) ?? URLResponse(
                     url: url,
                     mimeType: mime,
                     expectedContentLength: data.count,

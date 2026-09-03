@@ -2,14 +2,32 @@ import AppKit
 import SwiftUI
 import MailternalInterfaces
 
+#if DEBUG
+private extension String {
+    func append(toFile path: String) throws {
+        if let handle = FileHandle(forWritingAtPath: path) {
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(utf8))
+        } else {
+            try write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+}
+#endif
+
 struct MessageListPane: View {
     @Bindable var model: AppModel
     @Environment(ActionSettings.self) private var actions
     @State private var titleShowsAccount = false
-    @State private var titleHeight: CGFloat = 0
+    @State private var titleBottom: CGFloat = 0
 
     private var listDissolvePolicy: MailWindowDissolvePolicy {
-        .messageList
+        // The H1 sits on the shared header baseline (titlebar band + air).
+        // Everything above the H1's measured bottom edge is masked out; the
+        // ramp begins at that edge and rows emerge from under the title as
+        // they scroll up. The first row rests at the ramp's end.
+        .messageList.withTopOrigin(max(titleBottom, MailWindowTopDissolvePolicy.titlebarDepth))
     }
 
     private var listTitle: String {
@@ -32,7 +50,7 @@ struct MessageListPane: View {
                 accent: model.appearance.accent,
                 leading: actions.leadingSwipe,
                 trailing: actions.trailingSwipe,
-                topRestDepth: max(titleHeight, PaneHeaderInsetPolicy.messageListTopInset),
+                topRestDepth: listDissolvePolicy.restDepth(safeAreaTop: 0),
                 onSelect: { ids, anchor in model.selectMessages(ids, anchor: anchor) },
                 onSelectAll: { model.selectAllMessages() },
                 onPrefetch: { model.loadMoreIfNeeded(near: $0) },
@@ -47,6 +65,9 @@ struct MessageListPane: View {
             .mailWindowDissolve(listDissolvePolicy)
 
             Button {
+                #if DEBUG
+                try? "h1-click showsAccount=\(!titleShowsAccount) account=\(model.listTitleAccountName)\n".append(toFile: "/Users/Shared/mailternal-diag.log")
+                #endif
                 withAnimation(MailMotion.disclosure) {
                     titleShowsAccount.toggle()
                 }
@@ -63,14 +84,25 @@ struct MessageListPane: View {
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 16)
-            .padding(.top, PaneHeaderInsetPolicy.messageListTopInset)
-            .padding(.bottom, 12)
+            .padding(.top, PaneHeaderInsetPolicy.headerTopPadding)
+            .padding(.bottom, PaneHeaderInsetPolicy.listTitleBottomPadding)
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityAddTraits(.isHeader)
             .accessibilityIdentifier(UIIdentifier.messageListTitle)
             .onGeometryChange(for: CGFloat.self) { proxy in
-                proxy.size.height
-            } action: { titleHeight = $0 }
+                // The H1's bottom edge measured from the physical window top,
+                // which is exactly the depth the pane's mask and rest inset
+                // are expressed in. `size.height` alone would be wrong
+                // whenever the button's own top does not sit at the window
+                // top (safe-area handling differs between AppKit host states).
+                proxy.frame(in: .global).maxY - PaneHeaderInsetPolicy.listTitleBottomPadding
+            } action: { titleBottom = $0
+                #if DEBUG
+                if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
+                    QALaunch.log("list-title bottom=\($0) rest=\(listDissolvePolicy.restDepth(safeAreaTop: 0))")
+                }
+                #endif
+            }
         }
         .overlay {
             if model.isLoadingList, model.listRows.isEmpty {
@@ -80,8 +112,10 @@ struct MessageListPane: View {
                 EmptyMailboxState(title: "No Messages", detail: "This folder is empty.")
             }
         }
-        // The list ignores the container safe area, while its fixed header and
-        // row rest depth are measured from the physical window top.
+        // No chrome sits above this column, so its rows own the whole height:
+        // they travel to the window's physical top edge and dissolve at it.
+        // The measured title height moves that origin below the title while
+        // keeping the title itself outside the scrolling mask.
         .ignoresSafeArea(.container, edges: .top)
 }
 }
@@ -134,6 +168,8 @@ struct MessageTableRepresentable: NSViewRepresentable {
             self.parent = parent
             self.container = container
             tableView = container.tableView
+            lineCount = MessageListLayout.normalizedLineCount(parent.lineCount)
+            container.tableView.rowHeight = MessageListLayout.rowHeight(for: lineCount)
             container.updateAccent(parent.accent)
             container.tableView.delegate = self
             container.tableView.dataSource = self
@@ -191,6 +227,11 @@ struct MessageTableRepresentable: NSViewRepresentable {
 
             if lineCountChanged {
                 let origin = table.enclosingScrollView?.contentView.bounds.origin
+                // `rowHeight` is the table's fallback geometry and is also
+                // used while AppKit is rebuilding reused cells. Keep it in
+                // lockstep with the delegate's answer so a live line-count
+                // change cannot leave a row at the previous setting's height.
+                table.rowHeight = MessageListLayout.rowHeight(for: lineCount)
                 if table.numberOfRows > 0 {
                     table.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<table.numberOfRows))
                 }
@@ -749,6 +790,7 @@ final class MessageCellView: NSTableCellView {
     private var accentColor: NSColor?
     private var isSelectedRow = false
     private var isHovered = false
+    private var lineCount = MessageListLayout.defaultLineCount
     private var subjectTopFromConstraint: NSLayoutConstraint!
     private var subjectTopRowConstraint: NSLayoutConstraint!
 
@@ -822,7 +864,12 @@ final class MessageCellView: NSTableCellView {
             previewLabel.topAnchor.constraint(equalTo: subjectLabel.bottomAnchor, constant: 2),
         ])
     }
-
+    override var intrinsicContentSize: NSSize {
+        NSSize(
+            width: NSView.noIntrinsicMetric,
+            height: MessageListLayout.rowHeight(for: lineCount)
+        )
+    }
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
@@ -861,7 +908,12 @@ final class MessageCellView: NSTableCellView {
     }
 
     private func updateChromeGeometry() {
-        let height = max(bounds.height - 6, 0)
+        // During a live preference update AppKit can lay out a reused cell
+        // once with its old bounds. Capping to the policy height keeps the
+        // selection and hover layers from drawing into the next row during
+        // that transient layout.
+        let contentHeight = MessageListLayout.rowHeight(for: lineCount)
+        let height = max(min(bounds.height, contentHeight) - 6, 0)
         // Keep the capsule within the cell while swiping so both continuous
         // corners remain visible as the row moves with its content.
         let horizontalInset: CGFloat = 8
@@ -891,11 +943,17 @@ final class MessageCellView: NSTableCellView {
     }
 
     func apply(_ row: MessageRow, lineCount: Int) {
-        let visibility = MessageListLayout.fieldVisibility(for: lineCount)
+        let normalizedLineCount = MessageListLayout.normalizedLineCount(lineCount)
+        if self.lineCount != normalizedLineCount {
+            self.lineCount = normalizedLineCount
+            invalidateIntrinsicContentSize()
+            needsLayout = true
+        }
+        let visibility = MessageListLayout.fieldVisibility(for: normalizedLineCount)
         fromLabel.isHidden = !visibility.sender
         dateLabel.isHidden = !visibility.date
         previewLabel.isHidden = !visibility.preview
-        previewLabel.maximumNumberOfLines = MessageListLayout.previewLineCount(for: lineCount)
+        previewLabel.maximumNumberOfLines = MessageListLayout.previewLineCount(for: normalizedLineCount)
         previewLabel.lineBreakMode = visibility.preview ? .byWordWrapping : .byTruncatingTail
         NSLayoutConstraint.deactivate([subjectTopFromConstraint, subjectTopRowConstraint])
         NSLayoutConstraint.activate([

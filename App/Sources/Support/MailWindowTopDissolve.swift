@@ -15,20 +15,10 @@ private struct MailWindowDissolveMask: View {
 
     var body: some View {
         GeometryReader { geometry in
-            // Never read GeometryProxy.safeAreaInsets here. AppKit changes
-            // that value when any scroll view crosses the unified toolbar's
-            // edge, which would move every pane's dissolve and rest depth.
-            // The masked view's distance from the window top is a layout
-            // fact instead: panes that ignore the top safe area sit at 0,
-            // the reader sits one titlebar down. The mask is extended by that
-            // distance so every policy depth is measured from the window top.
-            let topOffset = max(geometry.frame(in: .global).minY, 0)
-            let height = max(geometry.size.height + topOffset, 1)
+            let insets = geometry.safeAreaInsets
+            let height = max(geometry.size.height + insets.top + insets.bottom, 1)
             let gradient = Gradient(
-                stops: policy.stops(
-                    for: height,
-                    safeAreaTop: MailWindowTopDissolvePolicy.titlebarDepth
-                ).map { stop in
+                stops: policy.stops(for: height, safeAreaTop: insets.top).map { stop in
                     .init(
                         color: stop.alpha == 0
                             ? .clear
@@ -43,7 +33,10 @@ private struct MailWindowDissolveMask: View {
                 endPoint: .bottom
             )
             .frame(width: geometry.size.width, height: height, alignment: .top)
-            .offset(y: -topOffset)
+            // Extend only the mask through the safe-area inset, so its own top
+            // edge is the physical window top and every policy depth is
+            // measured from there. Resting content keeps its own layout.
+            .offset(y: -insets.top)
             .allowsHitTesting(false)
         }
         .allowsHitTesting(false)
