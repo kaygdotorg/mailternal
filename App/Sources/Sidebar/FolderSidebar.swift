@@ -71,21 +71,6 @@ struct FolderSidebar: View {
                 )
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if let accountLabel {
-                HStack(spacing: 8) {
-                    Image(systemName: "person.crop.circle")
-                        .foregroundStyle(.secondary)
-                    Text(accountLabel)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-            }
-        }
     }
 
     @ViewBuilder
@@ -142,15 +127,6 @@ struct FolderSidebar: View {
         )
     }
 
-    private var accountLabel: String? {
-        switch model.accountState {
-        case .none: nil
-        case .validating: "Signing in…"
-        case .active: "IMAP account"
-        case .authFailed: "Sign-in failed"
-        case .connectionFailed: "Offline"
-        }
-    }
 }
 
 private struct SidebarSystemMaterialSuppressor: NSViewRepresentable {
