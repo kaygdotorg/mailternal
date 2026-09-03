@@ -5,16 +5,26 @@ enum Schema {
     static let ftsTable = "messages_fts"
 
     static var migrator: DatabaseMigrator {
+        makeMigrator()
+    }
+
+    static func makeMigrator(
+        progress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in }
+    ) -> DatabaseMigrator {
+        let total = 13
         var migrator = DatabaseMigrator()
         migrator.registerMigration("v1_initial") { db in
+            progress(1, total, "v1_initial")
             try createV1(db)
         }
         migrator.registerMigration("v2_folder_separator") { db in
+            progress(2, total, "v2_folder_separator")
             try db.alter(table: "folders") { t in
                 t.add(column: "separator", .text)
             }
         }
         migrator.registerMigration("v3_account_link_id") { db in
+            progress(3, total, "v3_account_link_id")
             try db.alter(table: "accounts") { t in
                 t.add(column: "account_link_id", .text)
             }
@@ -37,6 +47,7 @@ enum Schema {
             )
         }
         migrator.registerMigration("v4_archive_queue") { db in
+            progress(4, total, "v4_archive_queue")
             try db.create(table: "archive_queue") { t in
                 t.autoIncrementedPrimaryKey("id")
                 t.column("account_id", .text).notNull()
@@ -50,16 +61,19 @@ enum Schema {
             try db.execute(sql: "CREATE INDEX archive_queue_send_idx ON archive_queue(enqueued_at, id)")
         }
         migrator.registerMigration("v5_archive_copied") { db in
+            progress(5, total, "v5_archive_copied")
             try db.alter(table: "archive_queue") { t in
                 t.add(column: "copied", .boolean).notNull().defaults(to: false)
             }
         }
         migrator.registerMigration("v6_move_destination") { db in
+            progress(6, total, "v6_move_destination")
             try db.alter(table: "archive_queue") { t in
                 t.add(column: "destination", .text).notNull().defaults(to: FolderRole.archive.rawValue)
             }
         }
         migrator.registerMigration("v7_flag_queue") { db in
+            progress(7, total, "v7_flag_queue")
             // The original seen queue was unique per message. Rebuild it so
             // independent \Seen and \Flagged mutations can coexist while
             // retaining every existing operation as a pending read.
@@ -89,6 +103,7 @@ enum Schema {
             try db.execute(sql: "CREATE INDEX seen_queue_send_idx ON seen_queue(enqueued_at, id)")
         }
         migrator.registerMigration("v8_remote_image_references") { db in
+            progress(8, total, "v8_remote_image_references")
             // Existing rows are left NULL so detail() can derive the value
             // from their already-sanitized token stream and backfill lazily.
             try db.alter(table: "messages") { t in
@@ -96,11 +111,13 @@ enum Schema {
             }
         }
         migrator.registerMigration("v9_move_destination_folder_id") { db in
+            progress(9, total, "v9_move_destination_folder_id")
             try db.alter(table: "archive_queue") { t in
                 t.add(column: "destination_folder_id", .integer)
             }
         }
         migrator.registerMigration("v10_unread_index") { db in
+            progress(10, total, "v10_unread_index")
             // Folder unread counts run at launch and after every write. Without
             // this partial index the count visits every row of the generation
             // (107 ms warm, 1.3 s cold on a 1 GB store); with it the count is
@@ -111,6 +128,7 @@ enum Schema {
                 """)
         }
         migrator.registerMigration("v11_keep_locally") { db in
+            progress(11, total, "v11_keep_locally")
             try db.alter(table: "folders") { t in
                 // Keep system mailboxes useful by default; custom folders opt
                 // into local history only when the user asks for it.
@@ -133,11 +151,13 @@ enum Schema {
                 """)
         }
         migrator.registerMigration("v12_account_enabled") { db in
+            progress(12, total, "v12_account_enabled")
             try db.alter(table: "accounts") { t in
                 t.add(column: "is_enabled", .integer).notNull().defaults(to: 1)
             }
         }
         migrator.registerMigration("v13_folder_rename_queue") { db in
+            progress(13, total, "v13_folder_rename_queue")
             try db.create(table: "folder_rename_queue") { t in
                 t.autoIncrementedPrimaryKey("id")
                 t.column("account_id", .text).notNull()

@@ -24,12 +24,15 @@ public final class MailStore: Sendable {
     let pins: PinTracker
     private let observationQueue = DispatchQueue(label: "mailternal.store.observation")
 
-    /// Opens (or creates) the store at `databaseURL` with attachment files under `cachesDirectory`.
+    /// Opens (or creates) the store at `databaseURL` with attachment files under
+    /// `cachesDirectory`. `migrationProgress` is called before each migration
+    /// body with its one-based position, total count, and identifier.
     public convenience init(
         databaseURL: URL,
         cachesDirectory: URL,
         attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes,
-        observationDebounce: Duration = MailStore.defaultObservationDebounce
+        observationDebounce: Duration = MailStore.defaultObservationDebounce,
+        migrationProgress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in }
     ) throws {
         try self.init(
             databaseURL: databaseURL,
@@ -38,7 +41,8 @@ public final class MailStore: Sendable {
             observationDebounce: observationDebounce,
             observationSleep: { duration in
                 try await Task.sleep(for: duration)
-            }
+            },
+            migrationProgress: migrationProgress
         )
     }
 
@@ -47,7 +51,8 @@ public final class MailStore: Sendable {
         cachesDirectory: URL,
         attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes,
         observationDebounce: Duration = MailStore.defaultObservationDebounce,
-        observationSleep: @escaping @Sendable (Duration) async throws -> Void
+        observationSleep: @escaping @Sendable (Duration) async throws -> Void,
+        migrationProgress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in }
     ) throws {
         var config = Configuration()
         config.foreignKeysEnabled = true
@@ -58,7 +63,7 @@ public final class MailStore: Sendable {
         }
 
         let pool = try DatabasePool(path: databaseURL.path, configuration: config)
-        try Schema.migrator.migrate(pool)
+        try Schema.makeMigrator(progress: migrationProgress).migrate(pool)
 
         self.dbPool = pool
         self.cachesDirectory = cachesDirectory

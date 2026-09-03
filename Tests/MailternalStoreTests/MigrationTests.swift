@@ -52,6 +52,52 @@ import GRDB
     }
 }
 
+@Test func reportsMigrationProgressWhileOpeningANewStore() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailternal-store-progress-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let progress = MigrationProgressCapture()
+    _ = try MailStore(
+        databaseURL: root.appendingPathComponent("mail.sqlite"),
+        cachesDirectory: root.appendingPathComponent("Caches", isDirectory: true),
+        migrationProgress: { completed, total, identifier in
+            progress.append(completed: completed, total: total, identifier: identifier)
+        }
+    )
+
+    let events = progress.values
+    #expect(events.count == 13)
+    #expect(events.first?.completed == 1)
+    #expect(events.last?.completed == 13)
+    #expect(events.allSatisfy { $0.total == 13 })
+    #expect(events.map(\.identifier).contains("v10_unread_index"))
+}
+
+private final class MigrationProgressCapture: @unchecked Sendable {
+    struct Event: Sendable {
+        let completed: Int
+        let total: Int
+        let identifier: String
+    }
+
+    private let lock = NSLock()
+    private var events: [Event] = []
+
+    func append(completed: Int, total: Int, identifier: String) {
+        lock.lock()
+        events.append(Event(completed: completed, total: total, identifier: identifier))
+        lock.unlock()
+    }
+
+    var values: [Event] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+}
+
 @Test func folderSeparatorColumnIsNullableAndPersistsDiscoveryMetadata() async throws {
     try await withStore { store, _ in
         let columns = try await store.read { db in
