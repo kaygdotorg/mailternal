@@ -332,7 +332,7 @@ private func nextMailEvent(
             }
         }
         #expect(quarantined == [poisonedUID])
-        #expect(world.snapshotFetchCount() <= 40)
+        #expect(world.snapshotMetadataFetchRanges().count <= 40)
         await engine.stop()
     }
 }
@@ -869,8 +869,10 @@ private func nextMailEvent(
         )
         // Window 5...6 commits; the next metadata FETCH throws CancellationError
         // mid-window 3...4. Cursor must stay at 5 so resume cannot skip 3...4.
+        // Each message's bounded body sections share one FETCH, so the first
+        // window consumes three requests before the second metadata FETCH.
         world.fetchError = CancellationError()
-        world.fetchErrorAfter = 2
+        world.fetchErrorAfter = 4
 
         let disk = FixedDisk(
             freeBytes: 50 * 1024 * 1024 * 1024,

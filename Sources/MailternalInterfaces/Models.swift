@@ -58,12 +58,48 @@ public struct FolderSummary: Identifiable, Hashable, Sendable {
     /// Discovery and STATUS counts continue while this is disabled.
     public var keepLocally: Bool
     public var backfill: BackfillState
+    /// Ephemeral work currently being performed for this folder. The store
+    /// derives the initial value from `backfill`; sync engines may refine it
+    /// while a batch is being fetched or committed.
+    public var activity: FolderActivity
     public init(id: FolderID, name: String, path: String, separator: Character?, role: FolderRole,
                 unreadCount: Int, totalCount: Int, keepLocally: Bool = true,
-                backfill: BackfillState, accountID: AccountID = AccountID(rawValue: "")) {
+                backfill: BackfillState, activity: FolderActivity? = nil,
+                accountID: AccountID = AccountID(rawValue: "")) {
         self.id = id; self.accountID = accountID; self.name = name; self.path = path; self.separator = separator; self.role = role
         self.unreadCount = unreadCount; self.totalCount = totalCount; self.keepLocally = keepLocally
         self.backfill = backfill
+        self.activity = activity ?? FolderActivity(backfill: backfill)
+    }
+}
+
+/// The mutually exclusive phases shown by a folder's sidebar accessory.
+public enum FolderActivity: Hashable, Sendable {
+    case downloading
+    case indexing
+    case idle
+    case halted
+    case quarantinedStall
+
+    public init(backfill: BackfillState) {
+        switch backfill {
+        case .syncing:
+            self = .downloading
+        case .halted:
+            self = .halted
+        case .idle, .complete:
+            self = .idle
+        }
+    }
+}
+
+public struct FolderActivityUpdate: Hashable, Sendable {
+    public var folder: FolderID
+    public var activity: FolderActivity
+
+    public init(folder: FolderID, activity: FolderActivity) {
+        self.folder = folder
+        self.activity = activity
     }
 }
 

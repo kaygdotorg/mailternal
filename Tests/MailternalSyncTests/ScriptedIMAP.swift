@@ -47,6 +47,7 @@ final class ScriptedWorld: @unchecked Sendable {
     /// Follow-up body peeks and bounded flag sweeps are intentionally omitted.
     var metadataFetchRanges: [[ClosedRange<UInt32>]] = []
     var metadataFetchPaths: [String] = []
+    var peekRequests: [[IMAPPeekSection]] = []
     var flagFetchRanges: [[ClosedRange<UInt32>]] = []
     /// Pauses the first metadata FETCH after capturing its mailbox snapshot.
     /// Tests use this to interleave a deterministic expunge revision.
@@ -325,9 +326,17 @@ final class ScriptedWorld: @unchecked Sendable {
             metadataFetchRanges.append(request.uids.ranges)
             metadataFetchPaths.append(path)
         }
+        if !request.peek.isEmpty {
+            peekRequests.append(request.peek)
+        }
         if request.flags && !request.envelope && !request.bodyStructure && request.peek.isEmpty {
             flagFetchRanges.append(request.uids.ranges)
         }
+    }
+    func peekRequestSnapshot() -> [[IMAPPeekSection]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return peekRequests
     }
     func metadataFetchSnapshotIfPaused(
         path: String
@@ -837,7 +846,13 @@ actor ScriptedIMAPClient: IMAPClient {
             for peek in request.peek {
                 let spec = peek.specifier
                 if spec.uppercased() == "HEADER" {
-                    parts.append(IMAPPeekedPart(specifier: "HEADER", binary: false, data: message.header))
+                    let data: Data
+                    if let origin = peek.origin, let length = peek.length {
+                        data = Data(message.header.dropFirst(min(origin, message.header.count)).prefix(length))
+                    } else {
+                        data = message.header
+                    }
+                    parts.append(IMAPPeekedPart(specifier: "HEADER", binary: false, data: data))
                 } else if spec.isEmpty {
                     let body = message.parts["1"] ?? Data()
                     var full = message.header
@@ -854,7 +869,13 @@ actor ScriptedIMAPClient: IMAPClient {
                     }
                     parts.append(IMAPPeekedPart(specifier: "", binary: false, data: capped))
                 } else if let data = message.parts[spec] ?? (spec == "1" ? message.parts["TEXT"] : nil) {
-                    parts.append(IMAPPeekedPart(specifier: spec, binary: false, data: data))
+                    let capped: Data
+                    if let origin = peek.origin, let length = peek.length {
+                        capped = Data(data.dropFirst(min(origin, data.count)).prefix(length))
+                    } else {
+                        capped = data
+                    }
+                    parts.append(IMAPPeekedPart(specifier: spec, binary: false, data: capped))
                 }
             }
             results.append(IMAPFetchedMessage(

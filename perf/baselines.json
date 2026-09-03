@@ -1,0 +1,18 @@
+{
+  "sync_resources": {
+    "fixture": "mailternal-qa-ResourceProfileLarge copied to mailternal-qa-SyncResources (1,636,773,888-byte store)",
+    "scope": "single-account headless backfill",
+    "measured_on": "2026-09-03",
+    "command": "MAILTERNAL_QA=1 .../Mailternal -qa-account 127.0.0.1 1143 startTLS -qa-container ...; ps -p <pid> -o rss=,pcpu= every 5s for 300s",
+    "peak_rss_kb": 119728,
+    "peak_rss_mb": 116.921875,
+    "average_cpu_percent": 55.733,
+    "dual_account_analytical_bound": {
+      "global_backfill_connections": 4,
+      "window_peek_bytes": 33554432,
+      "write_batch_rows": 64,
+      "write_batch_decoded_bytes": 1048576,
+      "basis": "two engines receive permits from one BackfillConnectionBudget; each window releases body parts before the next message and commits bounded batches"
+    }
+  }
+}

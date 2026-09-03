@@ -3,6 +3,140 @@ import MailternalIMAP
 import MailternalInterfaces
 import MailternalMIME
 import MailternalStore
+/// Process-wide FIFO permit pool for connections that participate in
+/// backfill. A single pool is shared by every `SyncEngine` owned by the
+/// application, so account count cannot multiply the connection budget.
+public actor BackfillConnectionBudget {
+    package struct Lease: Hashable, Sendable {
+        fileprivate let id: UUID
+        fileprivate let owner: AccountID
+    }
+
+    public struct Snapshot: Sendable, Equatable {
+        public let active: Int
+        public let peak: Int
+        public let waiting: Int
+        public let activeByOwner: [AccountID: Int]
+
+        fileprivate init(
+            active: Int,
+            peak: Int,
+            waiting: Int,
+            activeByOwner: [AccountID: Int]
+        ) {
+            self.active = active
+            self.peak = peak
+            self.waiting = waiting
+            self.activeByOwner = activeByOwner
+        }
+    }
+
+    public static let shared = BackfillConnectionBudget(
+        capacity: SyncPolicy.globalBackfillConnections
+    )
+
+    private struct Waiter {
+        let id: UUID
+        let owner: AccountID
+        let continuation: CheckedContinuation<Lease?, Never>
+    }
+
+    private let capacity: Int
+    private var active = 0
+    private var peak = 0
+    private var activeLeases: Set<UUID> = []
+    private var activeByOwner: [AccountID: Int] = [:]
+    private var lastGrantedOwner: AccountID?
+    private var waiters: [Waiter] = []
+    /// Keep one permit available for an account that joins after another
+    /// account has started its workers. `maxBackfillConnections` is three.
+    private var ownerLimit: Int { max(1, capacity - 1) }
+
+    public init(capacity: Int = 4) {
+        self.capacity = max(1, capacity)
+    }
+
+    /// Acquires permits in FIFO order. When several accounts are queued, the
+    /// next permit prefers an owner different from the owner most recently
+    /// granted, preventing one account's reconnect loop from monopolizing the
+    /// shared pool.
+    package func acquire(owner: AccountID) async -> Lease? {
+        let requestID = UUID()
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                if waiters.isEmpty,
+                   active < capacity,
+                   activeByOwner[owner, default: 0] < ownerLimit {
+                    continuation.resume(returning: issueLease(owner: owner))
+                } else {
+                    waiters.append(Waiter(
+                        id: requestID,
+                        owner: owner,
+                        continuation: continuation
+                    ))
+                    drainWaiters()
+                }
+            }
+        }, onCancel: {
+            Task { await self.cancel(requestID) }
+        })
+    }
+
+    package func release(_ lease: Lease) {
+        guard activeLeases.remove(lease.id) != nil else { return }
+        active = max(0, active - 1)
+        activeByOwner[lease.owner] = max(0, (activeByOwner[lease.owner] ?? 1) - 1)
+        if activeByOwner[lease.owner] == 0 {
+            activeByOwner[lease.owner] = nil
+        }
+        drainWaiters()
+    }
+
+    package func snapshot() -> Snapshot {
+        Snapshot(
+            active: active,
+            peak: peak,
+            waiting: waiters.count,
+            activeByOwner: activeByOwner
+        )
+    }
+
+    private func issueLease(owner: AccountID) -> Lease {
+        let lease = Lease(id: UUID(), owner: owner)
+        activeLeases.insert(lease.id)
+        active += 1
+        peak = max(peak, active)
+        activeByOwner[owner, default: 0] += 1
+        lastGrantedOwner = owner
+        return lease
+    }
+
+    private func drainWaiters() {
+        while active < capacity, !waiters.isEmpty {
+            let alternate = waiters.firstIndex {
+                $0.owner != lastGrantedOwner
+                    && activeByOwner[$0.owner, default: 0] < ownerLimit
+            }
+            let eligible = waiters.firstIndex {
+                activeByOwner[$0.owner, default: 0] < ownerLimit
+            }
+            guard let index = alternate ?? eligible else { break }
+            let waiter = waiters.remove(at: index)
+            waiter.continuation.resume(returning: issueLease(owner: waiter.owner))
+        }
+    }
+
+    private func cancel(_ requestID: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == requestID }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(returning: nil)
+    }
+}
+
 struct BackfillJob: Sendable {
     let id: FolderID
     let path: String
@@ -166,12 +300,6 @@ private struct BackfillAttempt {
     let channel: SyncChannel
 }
 
-
-/// Sync orchestration (spec: docs/spec/sync.md).
-///
-/// Topology: dedicated INBOX IDLE connection plus a serialized sync/fetch
-/// connection; falls back to one multiplexed connection on `NO`/`BYE` when
-/// opening the second. `start()` launches background work and returns.
 public actor SyncEngine {
     private let store: MailStore
     private let config: AccountConfig
@@ -180,6 +308,7 @@ public actor SyncEngine {
     private let disk: any DiskSpaceProviding
     private let clock: @Sendable () -> Date
     private let settings: SyncSettings
+    private let backfillBudget: BackfillConnectionBudget
 
     private var runTask: Task<Void, Never>?
     private var stopping = false
@@ -191,6 +320,8 @@ public actor SyncEngine {
     private var syncChannel: SyncChannel?
     private var idleChannel: SyncChannel?
     private var backfillChannels: [SyncChannel] = []
+    private var syncLease: BackfillConnectionBudget.Lease?
+    private var backfillLeases: [ObjectIdentifier: BackfillConnectionBudget.Lease] = [:]
     private var backfillScheduler: FolderBackfillScheduler?
     /// Learned per session after a provider rejects a new connection.
     private var backfillConnectionCap: Int?
@@ -201,6 +332,8 @@ public actor SyncEngine {
     private var windowedSince: Date?
     private var notified: Set<NotificationKey> = []
     private var statusWaiters: [UUID: AsyncStream<SyncStatus>.Continuation] = [:]
+    private var activityWaiters: [UUID: AsyncStream<FolderActivityUpdate>.Continuation] = [:]
+    private var currentActivities: [FolderID: FolderActivity] = [:]
     private var mailWaiters: [UUID: AsyncStream<NewMailEvent>.Continuation] = [:]
     private var failureWaiters: [UUID: AsyncStream<SyncFailure>.Continuation] = [:]
     private var lastFailure: SyncFailure?
@@ -218,14 +351,8 @@ public actor SyncEngine {
     /// for a retired folder.
     private var discoveryReady = false
 
-    /// HEADER for threading fields; `1` covers the common single-part body.
-    /// Nested text parts are follow-up PEEKed in small UID chunks so a mixed
-    /// specifier FETCH cannot kill NIOIMAP's decoder.
-    /// Never `TEXT` — that is the whole body including attachments.
-    private static let speculativePeeks: [IMAPPeekSection] = [
-        .header, .part("1"),
-    ]
-    private static let followUpPeekChunk = 32
+    /// Backfill PEEK bodies are fetched one UID/section at a time. The request
+    /// limits and aggregate window budget live in `SyncPolicy`.
 
     /// - Parameter qaAmpleDisk: QA/testing only. When `true`, disk policy sees a
     ///   spacious synthetic volume so a nearly-full host cannot halt INBOX
@@ -234,7 +361,10 @@ public actor SyncEngine {
         store: MailStore,
         config: AccountConfig,
         credentials: any IMAPCredentialProvider,
-        qaAmpleDisk: Bool = false
+        qaAmpleDisk: Bool = false,
+        backfillBudget: BackfillConnectionBudget = BackfillConnectionBudget(
+            capacity: 4
+        )
     ) {
         self.init(
             store: store,
@@ -243,7 +373,8 @@ public actor SyncEngine {
             clientFactory: LiveIMAPClientFactory(),
             disk: qaAmpleDisk ? AmpleDiskSpace() : FileDiskSpace(),
             clock: { Date() },
-            settings: .production
+            settings: .production,
+            backfillBudget: backfillBudget
         )
     }
 
@@ -253,7 +384,10 @@ public actor SyncEngine {
         config: AccountConfig,
         credentials: any IMAPCredentialProvider,
         clientFactory: any IMAPClientFactory,
-        qaAmpleDisk: Bool = false
+        qaAmpleDisk: Bool = false,
+        backfillBudget: BackfillConnectionBudget = BackfillConnectionBudget(
+            capacity: 4
+        )
     ) {
         self.init(
             store: store,
@@ -261,12 +395,11 @@ public actor SyncEngine {
             credentials: credentials,
             clientFactory: clientFactory,
             disk: qaAmpleDisk ? AmpleDiskSpace() : FileDiskSpace(),
-
             clock: { Date() },
-            settings: .production
+            settings: .production,
+            backfillBudget: backfillBudget
         )
     }
-
     init(
         store: MailStore,
         config: AccountConfig,
@@ -274,7 +407,10 @@ public actor SyncEngine {
         clientFactory: any IMAPClientFactory,
         disk: any DiskSpaceProviding,
         clock: @escaping @Sendable () -> Date,
-        settings: SyncSettings
+        settings: SyncSettings,
+        backfillBudget: BackfillConnectionBudget = BackfillConnectionBudget(
+            capacity: 4
+        )
     ) {
         self.store = store
         self.config = config
@@ -283,8 +419,8 @@ public actor SyncEngine {
         self.disk = disk
         self.clock = clock
         self.settings = settings
+        self.backfillBudget = backfillBudget
     }
-
     public func start() async {
         guard runTask == nil else { return }
         stopping = false
@@ -368,6 +504,18 @@ public actor SyncEngine {
             addStatus(id, continuation)
         }
     }
+    /// Per-folder activity used by the sidebar accessory. A stream is separate
+    /// from `status` because several folders can be downloading concurrently.
+    public var activity: AsyncStream<FolderActivityUpdate> {
+        AsyncStream { continuation in
+            let id = UUID()
+            continuation.onTermination = { _ in
+                Task { await self.dropActivity(id) }
+            }
+            addActivity(id, continuation)
+        }
+    }
+
 
     public var newMail: AsyncStream<NewMailEvent> {
         AsyncStream { continuation in
@@ -509,6 +657,28 @@ public actor SyncEngine {
     }
 
     private func dropStatus(_ id: UUID) { statusWaiters.removeValue(forKey: id) }
+    private func addActivity(
+        _ id: UUID,
+        _ continuation: AsyncStream<FolderActivityUpdate>.Continuation
+    ) {
+        activityWaiters[id] = continuation
+        for (folder, activity) in currentActivities {
+            continuation.yield(FolderActivityUpdate(folder: folder, activity: activity))
+        }
+    }
+
+    private func dropActivity(_ id: UUID) {
+        activityWaiters.removeValue(forKey: id)
+    }
+
+    private func publishActivity(_ activity: FolderActivity, for folder: FolderID) {
+        currentActivities[folder] = activity
+        let update = FolderActivityUpdate(folder: folder, activity: activity)
+        for continuation in activityWaiters.values {
+            continuation.yield(update)
+        }
+    }
+
 
     private func addMail(_ id: UUID, _ continuation: AsyncStream<NewMailEvent>.Continuation) {
         mailWaiters[id] = continuation
@@ -624,6 +794,10 @@ public actor SyncEngine {
         backfillPassFinished = false
         try await store.upsertAccount(config)
         let password = try await credentials.password(for: config.id)
+        guard let lease = await backfillBudget.acquire(owner: config.id) else {
+            throw CancellationError()
+        }
+        syncLease = lease
         let syncClient = clientFactory.makeClient(
             endpoint: config.imap,
             username: config.username,
@@ -634,6 +808,8 @@ public actor SyncEngine {
             try await sync.connect()
         } catch {
             await sync.close()
+            await backfillBudget.release(lease)
+            syncLease = nil
             throw error
         }
         syncChannel = sync
@@ -641,10 +817,10 @@ public actor SyncEngine {
         dualConnection = false
         idleChannel = nil
         backfillChannels = [sync]
+        backfillLeases.removeAll()
         backfillScheduler = nil
         backfillTasks.removeAll()
         backfillConnectionCap = nil
-
         // Reserve the dedicated INBOX IDLE socket before discovery/backfill.
         // A provider cap only reduces the backfill pool; it never delays
         // discovery or makes local retention unavailable.
@@ -679,15 +855,19 @@ public actor SyncEngine {
             }
             group.cancelAll()
         }
-
     }
+
     private func teardown() async {
         let idle = idleChannel
         let sync = syncChannel
         let extras = Array(backfillChannels.dropFirst())
+        let leases = backfillLeases
+        let primaryLease = syncLease
         idleChannel = nil
         syncChannel = nil
         backfillChannels.removeAll()
+        backfillLeases.removeAll()
+        syncLease = nil
         if let scheduler = backfillScheduler {
             await scheduler.stop()
         }
@@ -696,8 +876,16 @@ public actor SyncEngine {
         if let idle { await idle.close() }
         for channel in extras {
             await channel.close()
+            if let lease = leases[ObjectIdentifier(channel)] {
+                await backfillBudget.release(lease)
+            }
         }
-        if let sync { await sync.close() }
+        if let sync {
+            await sync.close()
+            if let primaryLease {
+                await backfillBudget.release(primaryLease)
+            }
+        }
         dualConnection = false
         folderRenameInFlight.removeAll()
         discoveryReady = false
@@ -1027,10 +1215,12 @@ public actor SyncEngine {
               record.keepLocally else {
             return BackfillAttempt(result: .halted, channel: activeChannel)
         }
+        publishActivity(.downloading, for: folderID)
         do {
             var state = try await store.fetchSyncState(for: record.generation)
                 ?? FolderSyncState(generation: record.generation, baselineUID: record.baseline)
             if state.backfillPhase == .complete {
+                publishActivity(.idle, for: folderID)
                 return BackfillAttempt(result: .committed, channel: activeChannel)
             }
             if state.backfillPhase == .halted {
@@ -1050,6 +1240,7 @@ public actor SyncEngine {
                     if windowedSince == nil {
                         windowedSince = since
                     }
+                    publishActivity(.halted, for: folderID)
                 }
             }
 
@@ -1083,6 +1274,7 @@ public actor SyncEngine {
 
             while !stopping && !Task.isCancelled {
                 guard folders[folderID]?.keepLocally == true else {
+                    publishActivity(.idle, for: folderID)
                     return BackfillAttempt(result: .halted, channel: activeChannel)
                 }
                 try Task.checkCancellation()
@@ -1109,6 +1301,7 @@ public actor SyncEngine {
                     if let since = windowedSince {
                         publishStatus(mode: .windowed(since: since))
                     }
+                    publishActivity(.halted, for: folderID)
                     return BackfillAttempt(result: .halted, channel: activeChannel)
                 }
 
@@ -1125,6 +1318,7 @@ public actor SyncEngine {
                     state.progress = 1
                     try await store.saveSyncState(state)
                     await clearWindowedModeIfResolved()
+                    publishActivity(.idle, for: folderID)
                     return BackfillAttempt(result: .committed, channel: activeChannel)
                 }
                 let capturedGeneration = record.generation
@@ -1144,8 +1338,12 @@ public actor SyncEngine {
                 switch result {
                 case .committed:
                     break
-                case .invalidated, .halted:
-                    return BackfillAttempt(result: result, channel: activeChannel)
+                case .invalidated:
+                    publishActivity(.downloading, for: folderID)
+                    return BackfillAttempt(result: .invalidated, channel: activeChannel)
+                case .halted:
+                    publishActivity(.halted, for: folderID)
+                    return BackfillAttempt(result: .halted, channel: activeChannel)
                 }
                 guard stillCurrentGeneration(capturedGeneration, folder: folderID) else {
                     return BackfillAttempt(result: .invalidated, channel: activeChannel)
@@ -1155,17 +1353,21 @@ public actor SyncEngine {
                 try await store.saveSyncState(state)
             }
         } catch is CancellationError {
+            publishActivity(.halted, for: folderID)
             return BackfillAttempt(result: .halted, channel: activeChannel)
         } catch {
             if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
+                publishActivity(.halted, for: folderID)
                 return BackfillAttempt(result: .halted, channel: activeChannel)
             }
             await logSync("backfill \(record.path)", detail: String(describing: error), folder: folderID)
             if SyncPolicy.isTransport(error) {
                 sessionBroken = true
             }
+            publishActivity(.halted, for: folderID)
             return BackfillAttempt(result: .halted, channel: activeChannel)
         }
+        publishActivity(.halted, for: folderID)
         return BackfillAttempt(result: .halted, channel: activeChannel)
     }
 
@@ -1282,8 +1484,20 @@ public actor SyncEngine {
     }
 
     private func openFreshBackfillChannel(replacing old: SyncChannel) async throws -> SyncChannel {
+        let replacedSync = syncChannel === old
+        let oldLease = backfillLeases.removeValue(forKey: ObjectIdentifier(old))
+            ?? (replacedSync ? syncLease : nil)
+        if replacedSync {
+            syncLease = nil
+        }
         await old.close()
+        if let oldLease {
+            await backfillBudget.release(oldLease)
+        }
         let password = try await credentials.password(for: config.id)
+        guard let lease = await backfillBudget.acquire(owner: config.id) else {
+            throw CancellationError()
+        }
         let client = clientFactory.makeClient(
             endpoint: config.imap,
             username: config.username,
@@ -1294,6 +1508,7 @@ public actor SyncEngine {
             try await fresh.connect()
         } catch {
             await fresh.close()
+            await backfillBudget.release(lease)
             throw error
         }
         if let index = backfillChannels.firstIndex(where: { $0 === old }) {
@@ -1301,8 +1516,11 @@ public actor SyncEngine {
         } else {
             backfillChannels.append(fresh)
         }
-        if syncChannel === old {
+        if replacedSync {
             syncChannel = fresh
+            syncLease = lease
+        } else {
+            backfillLeases[ObjectIdentifier(fresh)] = lease
         }
         return fresh
     }
@@ -1320,6 +1538,9 @@ public actor SyncEngine {
         let uidSet = uidSetOverride ?? IMAPUIDSet(window)
         let meta: [IMAPFetchedMessage]
         do {
+            // Metadata contains no literals, so keeping one window of these
+            // small values does not scale with message body size. Bodies are
+            // fetched and committed one message at a time below.
             meta = try await channel.fetch(
                 in: record.path,
                 expectedUIDValidity: capturedGeneration.uidValidity,
@@ -1329,8 +1550,7 @@ public actor SyncEngine {
                     bodyStructure: true,
                     flags: true,
                     internalDate: true,
-                    uid: true,
-                    peek: Self.speculativePeeks
+                    uid: true
                 )
             )
         } catch is CancellationError {
@@ -1360,113 +1580,161 @@ public actor SyncEngine {
             )
         }
 
-
-        var bodies: [UInt32: [IMAPPeekedPart]] = [:]
-        var missingByUID: [UInt32: [String]] = [:]
-        for message in meta {
-            guard let uid = message.uid else { continue }
-            bodies[uid] = message.parts
-            guard let structure = message.bodyStructure else { continue }
-            let needed = MessageAssembler.textNeeds(structure).map(\.specifier)
-            let have = Set(message.parts.map { $0.specifier.uppercased() })
-            let missing = needed.filter { specifier in
-                let upper = specifier.uppercased()
-                if have.contains(upper) { return false }
-                if upper == "1" && (have.contains("TEXT") || have.contains("")) { return false }
-                return true
-            }
-            if !missing.isEmpty {
-                missingByUID[uid] = missing
-            }
-        }
-
-        if !missingByUID.isEmpty {
-            var grouped: [[String]: [UInt32]] = [:]
-            for (uid, specs) in missingByUID {
-                let filtered = specs.filter { spec in
-                    spec.unicodeScalars.allSatisfy { $0 == "." || ("0"..."9").contains($0) }
-                }.sorted()
-                if !filtered.isEmpty {
-                    grouped[filtered, default: []].append(uid)
-                }
-            }
-            for (specifiers, uids) in grouped {
-                let sortedUIDs = uids.sorted()
-                var index = 0
-                while index < sortedUIDs.count {
-                    let end = min(index + Self.followUpPeekChunk, sortedUIDs.count)
-                    let chunk = Array(sortedUIDs[index..<end])
-                    index = end
-                    do {
-                        let fetched = try await channel.fetch(
-                            in: record.path,
-                            expectedUIDValidity: capturedGeneration.uidValidity,
-                            IMAPFetchRequest(
-                                uids: SyncPolicy.uidSet(uids: chunk),
-                                uid: true,
-                                peek: specifiers.map { IMAPPeekSection.part($0) }
-                            )
-                        )
-                        for message in fetched {
-                            guard let uid = message.uid else { continue }
-                            var parts = bodies[uid] ?? []
-                            parts.append(contentsOf: message.parts)
-                            bodies[uid] = parts
-                        }
-                    } catch is CancellationError {
-                        throw CancellationError()
-                    } catch {
-                        if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
-                            return .halted
-                        }
-                        await logSync("body peek \(record.path)", detail: String(describing: error), folder: record.id)
-                        if SyncPolicy.isTransport(error) { throw error }
-                    }
-                }
-            }
-        }
-
         let generation = record.generation
         let now = clock()
-        var built: [IncomingMessage] = []
-        built.reserveCapacity(meta.count)
-        for fetched in meta {
-            guard let uid = fetched.uid else { continue }
-            let incoming = MessageAssembler.incoming(
+        let ordered = meta.sorted { ($0.uid ?? 0) > ($1.uid ?? 0) }
+        var pending: [IncomingMessage] = []
+        pending.reserveCapacity(WriteBudget.backfill.maxRows)
+        var pendingBytes = 0
+        var pendingNotify: [(uid: IMAPUID, sender: String, subject: String)] = []
+        let canNotify = notify && record.role == .inbox && !record.isReplacement
+
+
+        for fetched in ordered {
+            try Task.checkCancellation()
+            guard let uid = fetched.uid, uid > 0 else { continue }
+            guard folders[record.id]?.keepLocally == true else { return .halted }
+            if let expectedExpungeRevision,
+               expectedExpungeRevision != expungeRevision[record.id, default: 0] {
+                return .invalidated
+            }
+
+            var bodyParts: [IMAPPeekedPart] = []
+            var peekedBytes = 0
+            var didHitPeekLimit = false
+            let header = IMAPPeekSection(
+                specifier: "HEADER",
+                origin: 0,
+                length: SyncPolicy.backfillHeaderPeekByteLimit
+            )
+            let structure = fetched.bodyStructure
+            var specifiers = structure.map {
+                MessageAssembler.textNeeds($0).map(\.specifier)
+            } ?? []
+            var seenSpecifiers = Set<String>()
+            specifiers = specifiers.filter { specifier in
+                let upper = specifier.uppercased()
+                guard specifier.unicodeScalars.allSatisfy({
+                    $0 == "." || ("0"..."9").contains($0)
+                }), seenSpecifiers.insert(upper).inserted else {
+                    return false
+                }
+                return true
+            }
+            let peekSections = [header] + specifiers.map {
+                IMAPPeekSection(
+                    specifier: $0,
+                    origin: 0,
+                    length: SyncPolicy.backfillTextPeekByteLimit
+                )
+            }
+
+            var boundedSections: [IMAPPeekSection] = []
+            var requestedLengths: [String: Int] = [:]
+            for section in peekSections {
+                try Task.checkCancellation()
+                let remaining = SyncPolicy.backfillWindowPeekByteBudget - peekedBytes
+                guard remaining > 0 else { break }
+                let length = min(section.length ?? remaining, remaining)
+                let bounded = IMAPPeekSection(
+                    specifier: section.specifier,
+                    binary: section.binary,
+                    origin: 0,
+                    length: length
+                )
+                boundedSections.append(bounded)
+                requestedLengths[section.specifier.uppercased()] = length
+            }
+            if !boundedSections.isEmpty {
+                do {
+                    let fetchedParts = try await channel.fetch(
+                        in: record.path,
+                        expectedUIDValidity: capturedGeneration.uidValidity,
+                        IMAPFetchRequest(
+                            uids: IMAPUIDSet(uid: uid),
+                            uid: true,
+                            peek: boundedSections
+                        )
+                    )
+                    for response in fetchedParts {
+                        for var part in response.parts {
+                            let room = SyncPolicy.backfillWindowPeekByteBudget - peekedBytes
+                            guard room > 0 else { break }
+                            if let length = requestedLengths[part.specifier.uppercased()],
+                               part.data.count >= length {
+                                didHitPeekLimit = true
+                            }
+                            if part.data.count > room {
+                                part.data = Data(part.data.prefix(room))
+                                didHitPeekLimit = true
+                            }
+                            bodyParts.append(part)
+                            peekedBytes += part.data.count
+                        }
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
+                        return .halted
+                    }
+                    await logSync(
+                        "body peek \(record.path)",
+                        detail: String(describing: error),
+                        folder: record.id
+                    )
+                    if SyncPolicy.isTransport(error) { throw error }
+                }
+            }
+
+            var incoming = MessageAssembler.incoming(
                 generation: generation,
                 fetched: fetched,
-                bodyParts: bodies[uid] ?? fetched.parts,
+                bodyParts: bodyParts,
                 now: now
             )
-            built.append(incoming)
-        }
-
-        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return .invalidated }
-        if built.isEmpty { return .committed }
-        built.sort { $0.uid > $1.uid }
-
-        let canNotify = notify && record.role == .inbox && !record.isReplacement
-        var pendingNotify: [IncomingMessage] = []
-        if canNotify {
-            for message in built {
-                if SyncPolicy.isNotifiable(uid: message.uid, baseline: record.baseline) {
-                    let existed = try await store.messageID(generation: generation, uid: message.uid) != nil
-                    if !existed { pendingNotify.append(message) }
+            if didHitPeekLimit {
+                incoming.isTruncated = true
+            }
+            pending.append(incoming)
+            pendingBytes += incoming.decodedBytes
+            if canNotify,
+               SyncPolicy.isNotifiable(uid: incoming.uid, baseline: record.baseline),
+               try await store.messageID(generation: generation, uid: incoming.uid) == nil {
+                pendingNotify.append((
+                    uid: incoming.uid,
+                    sender: MessageAssembler.senderDisplay(incoming.envelope),
+                    subject: incoming.envelope.subject
+                ))
+            }
+            if pending.count >= WriteBudget.backfill.maxRows
+                || pendingBytes >= WriteBudget.backfill.maxDecodedBytes {
+                let batch = pending
+                pending.removeAll(keepingCapacity: true)
+                pendingBytes = 0
+                if let result = try await commitBackfillBatch(
+                    batch,
+                    record: record,
+                    capturedGeneration: capturedGeneration,
+                    expectedExpungeRevision: expectedExpungeRevision
+                ) {
+                    return result
                 }
             }
         }
-
-        if let expectedExpungeRevision,
-           expectedExpungeRevision != expungeRevision[record.id, default: 0] {
-            return .invalidated
+        if !pending.isEmpty {
+            let batch = pending
+            pending.removeAll(keepingCapacity: true)
+            pendingBytes = 0
+            if let result = try await commitBackfillBatch(
+                batch,
+                record: record,
+                capturedGeneration: capturedGeneration,
+                expectedExpungeRevision: expectedExpungeRevision
+            ) {
+                return result
+            }
         }
-        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return .invalidated }
-        guard folders[record.id]?.keepLocally == true else { return .halted }
-        _ = try await store.upsertMessages(built)
-
-        // An expunge can arrive while the upsert is suspended. Reconcile
-        // again after the write so the stale FETCH cannot resurrect rows that
-        // the concurrent delta already removed.
         if let expectedExpungeRevision,
            expectedExpungeRevision != expungeRevision[record.id, default: 0] {
             let latest = try await channel.select(record.path)
@@ -1478,16 +1746,18 @@ public actor SyncEngine {
             )
             return .committed
         }
-
+        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else {
+            return .invalidated
+        }
         if canNotify {
-            for message in pendingNotify {
-                let key = NotificationKey(generation: generation, uid: message.uid)
+            for pending in pendingNotify {
+                let key = NotificationKey(generation: generation, uid: pending.uid)
                 if notified.insert(key).inserted,
-                   let id = try await store.messageID(generation: generation, uid: message.uid) {
+                   let id = try await store.messageID(generation: generation, uid: pending.uid) {
                     emit(NewMailEvent(
                         folder: record.id,
-                        from: MessageAssembler.senderDisplay(message.envelope),
-                        subject: message.envelope.subject,
+                        from: pending.sender,
+                        subject: pending.subject,
                         messageID: id
                     ))
                 }
@@ -1495,6 +1765,34 @@ public actor SyncEngine {
         }
         return .committed
     }
+    private func commitBackfillBatch(
+        _ batch: [IncomingMessage],
+        record: FolderRecord,
+        capturedGeneration: MailboxGeneration,
+        expectedExpungeRevision: UInt64?
+    ) async throws -> BackfillAttemptResult? {
+        guard !batch.isEmpty else { return nil }
+        if let expectedExpungeRevision,
+           expectedExpungeRevision != expungeRevision[record.id, default: 0] {
+            return .invalidated
+        }
+        guard stillCurrentGeneration(capturedGeneration, folder: record.id) else {
+            return .invalidated
+        }
+        guard folders[record.id]?.keepLocally == true else { return .halted }
+        publishActivity(.indexing, for: record.id)
+        beginWriteOperation()
+        do {
+            _ = try await store.upsertMessages(batch)
+            endWriteOperation()
+        } catch {
+            endWriteOperation()
+            throw error
+        }
+        publishActivity(.downloading, for: record.id)
+        return nil
+    }
+
 
     private func ingestNewUIDs(
         record: FolderRecord,
@@ -1593,6 +1891,7 @@ public actor SyncEngine {
         // and expunge repair instead of cancelling it halfway through.
         beginWriteOperation()
         defer { endWriteOperation() }
+        publishActivity(.quarantinedStall, for: record.id)
         _ = try await store.upsertMessages(incoming)
         if let expectedExpungeRevision,
            expectedExpungeRevision != expungeRevision[record.id, default: 0] {
@@ -1937,6 +2236,7 @@ public actor SyncEngine {
         )
         guard backfillChannels.count < requested else { return }
         while backfillChannels.count < requested {
+            guard let lease = await backfillBudget.acquire(owner: config.id) else { return }
             let client = clientFactory.makeClient(
                 endpoint: config.imap,
                 username: config.username,
@@ -1946,8 +2246,10 @@ public actor SyncEngine {
             do {
                 try await channel.connect()
                 backfillChannels.append(channel)
+                backfillLeases[ObjectIdentifier(channel)] = lease
             } catch {
                 await channel.close()
+                await backfillBudget.release(lease)
                 if SyncPolicy.isConnectionCap(error) {
                     backfillConnectionCap = backfillChannels.count
                     await logSync(

@@ -6,13 +6,25 @@ import MailternalStore
 /// Pure policy helpers (spec: docs/spec/sync.md). Kept free of I/O so unit tests
 /// can pin window math, the UIDNEXT−1 baseline edge, downgrade, disk, and notify.
 enum SyncPolicy: Sendable {
-    /// Maximum number of concurrent mailbox backfill connections. The primary
-    /// sync connection counts as one; the dedicated INBOX IDLE socket is
-    /// separate and does not consume this budget.
+    /// Maximum number of concurrent mailbox backfill connections per account.
+    /// The process-wide budget below is the authoritative cap when multiple
+    /// account engines are running.
     static let maxBackfillConnections = 3
+    /// Maximum number of connections that may participate in backfill across
+    /// all account engines in one process. The primary sync connection counts
+    /// toward this limit; the dedicated INBOX IDLE socket does not.
+    static let globalBackfillConnections = 4
+    /// Maximum encoded PEEK payload retained for one UID while assembling a
+    /// message. Body requests are partial so a large text part cannot make the
+    /// in-flight ingest state unbounded.
+    static let backfillWindowPeekByteBudget = 32 * 1024 * 1024
+    /// Keep each text-part response small enough that decoded and sanitized
+    /// strings fit beside the encoded PEEK payload under the window budget.
+    static let backfillTextPeekByteLimit = 4 * 1024 * 1024
+    static let backfillHeaderPeekByteLimit = 1 * 1024 * 1024
     static let defaultWindowSize: UInt32 = 1_000
-    /// A small newest-first first commit makes the visible folder useful
-    /// before the throughput-oriented history walk begins.
+    /// Small newest-first first commit makes the visible folder useful before
+    /// the throughput-oriented history walk begins.
     static let initialWindowSize: UInt32 = 80
     static let minReserveBytes: Int64 = 5 * 1024 * 1024 * 1024
     static let maxReserveBytes: Int64 = 20 * 1024 * 1024 * 1024

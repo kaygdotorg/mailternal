@@ -28,17 +28,19 @@ extension MailStore {
                 byteCount += extra
                 end += 1
             }
-            let slice = Array(messages[index..<end])
+            let batchStart = index
+            let batchEnd = end
+            let batchRange = batchStart..<batchEnd
             try await write { db in
-                for message in slice {
-                    try MailStore.upsertMessage(db, message)
+                for messageIndex in batchRange {
+                    try MailStore.upsertMessage(db, messages[messageIndex])
                 }
             }
-            index = end
+            index = batchEnd
             committed += rowCount
             bytes += byteCount
             txs += 1
-            lastUID = slice.last?.uid
+            lastUID = messages[batchRange].last?.uid
         }
         return BatchWriteResult(
             committedCount: committed,
@@ -61,21 +63,23 @@ extension MailStore {
         while index < uids.count {
             try Task.checkCancellation()
             let end = min(index + budget.maxRows, uids.count)
-            let slice = Array(uids[index..<end])
+            let batchStart = index
+            let batchEnd = end
+            let batchRange = batchStart..<batchEnd
             let gen = generation
             try await write { db in
                 let genID = try MailStore.requireGenerationID(db, gen)
-                for uid in slice {
+                for uidIndex in batchRange {
                     try db.execute(
                         sql: "DELETE FROM messages WHERE generation_id = ? AND uid = ?",
-                        arguments: [genID, Int64(uid.rawValue)]
+                        arguments: [genID, Int64(uids[uidIndex].rawValue)]
                     )
                 }
             }
-            index = end
-            committed += slice.count
+            index = batchEnd
+            committed += batchRange.count
             txs += 1
-            lastUID = slice.last
+            lastUID = uids[batchRange].last
         }
         return BatchWriteResult(
             committedCount: committed,

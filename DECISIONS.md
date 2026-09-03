@@ -101,3 +101,15 @@ rationale → revisit-when.
     windows remain focused, simple, and tab-less instead of creating a second
     tab state to synchronize. Revisit: only if a future multi-window reader
     model can preserve one unambiguous tab owner.
+27. **Process-wide backfill resource budgets are bounded and shared.** All account
+    engines acquire connection permits from one `BackfillConnectionBudget`, capped at
+    four backfill connections total; the primary sync channel counts while the
+    dedicated IDLE channel does not. Each backfill window fetches metadata without
+    literals, then requests one UID/section at a time with a 1 MiB header limit, a
+    4 MiB text-part limit, and a 32 MiB aggregate PEEK-body budget. Store writes
+    commit bounded batches of at most 64 rows or 1 MiB decoded content, avoiding
+    caller-sized FTS/write arrays. A five-minute single-account headless sample on
+    the 1,636,773,888-byte fixture measured 119,728 KB peak RSS and 55.733% average
+    CPU; the dual-account resource bound is analytical from the shared four-permit
+    pool and bounded window/write budgets. Revisit: only if profiling shows a lower
+    cap preserves acceptable throughput.
