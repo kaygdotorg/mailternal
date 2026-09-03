@@ -2,20 +2,6 @@ import AppKit
 import SwiftUI
 import MailternalInterfaces
 
-#if DEBUG
-private extension String {
-    func append(toFile path: String) throws {
-        if let handle = FileHandle(forWritingAtPath: path) {
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: Data(utf8))
-        } else {
-            try write(toFile: path, atomically: true, encoding: .utf8)
-        }
-    }
-}
-#endif
-
 struct MessageListPane: View {
     @Bindable var model: AppModel
     @Environment(ActionSettings.self) private var actions
@@ -65,13 +51,14 @@ struct MessageListPane: View {
             .mailWindowDissolve(listDissolvePolicy)
 
             Button {
-                #if DEBUG
-                try? "h1-click showsAccount=\(!titleShowsAccount) account=\(model.listTitleAccountName)\n".append(toFile: "/Users/Shared/mailternal-diag.log")
-                #endif
                 withAnimation(MailMotion.disclosure) {
                     titleShowsAccount.toggle()
                 }
             } label: {
+                // One Text whose string changes, not two Texts swapped by
+                // identity: an `.id` swap inside a plain button label left
+                // the old title on screen on macOS 26 (the click fired and
+                // the state flipped; only the label never re-rendered).
                 Text(listTitle)
                     .font(.system(size: 26, weight: .bold))
                     .foregroundStyle(.primary)
@@ -79,8 +66,7 @@ struct MessageListPane: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .id(listTitle)
-                    .transition(.opacity)
+                    .contentTransition(.numericText())
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 16)

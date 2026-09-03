@@ -618,6 +618,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             }
         }
         overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
+        // With nothing selected the reader shows its empty state; a capsule
+        // of disabled actions above it is chrome for nothing. The group hides
+        // as a unit and returns with the first selection.
+        messageActionsGroup.isHidden = model.selectedMessageIDs.isEmpty
     }
 
     private func makeToggleItem() -> NSToolbarItem {

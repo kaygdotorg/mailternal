@@ -200,7 +200,7 @@ final class UILogicTests: XCTestCase {
 
         XCTAssertEqual(settings.backdropStyle, .frostedBlur)
         XCTAssertFalse(settings.showsSenderIcons)
-        XCTAssertEqual(settings.backgroundOpacity, 0.80)
+        XCTAssertEqual(settings.backgroundOpacity, 0.25)
         XCTAssertEqual(
             defaults.string(forKey: "mailternal.appearance.backdropStyle"),
             WindowBackdropStyle.frostedBlur.rawValue
@@ -213,8 +213,8 @@ final class UILogicTests: XCTestCase {
             isFullScreen: false
         )
         XCTAssertEqual(plan.treatment, .blur)
-        XCTAssertEqual(plan.fillOpacity, 0.80, accuracy: 0.0001)
-        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 2)
+        XCTAssertEqual(plan.fillOpacity, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 3)
     }
 
     @MainActor
@@ -225,9 +225,9 @@ final class UILogicTests: XCTestCase {
         defaults.set(1.0, forKey: "mailternal.appearance.opacity")
 
         let migrated = AppearanceSettings(defaults: defaults)
-        XCTAssertEqual(migrated.backgroundOpacity, 0.80)
-        XCTAssertEqual(defaults.double(forKey: "mailternal.appearance.opacity"), 0.80)
-        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 2)
+        XCTAssertEqual(migrated.backgroundOpacity, 0.25)
+        XCTAssertEqual(defaults.double(forKey: "mailternal.appearance.opacity"), 0.25)
+        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 3)
 
         defaults.set(1.0, forKey: "mailternal.appearance.opacity")
         let current = AppearanceSettings(defaults: defaults)
@@ -250,7 +250,7 @@ final class UILogicTests: XCTestCase {
                 expectedStyle.rawValue
             )
             XCTAssertNil(defaults.object(forKey: "mailternal.appearance.usesLiquidGlass"))
-            XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 2)
+            XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 3)
 
             // A stale legacy value written after migration cannot change the
             // already migrated choice: version 2 and the new key win.
@@ -291,7 +291,7 @@ final class UILogicTests: XCTestCase {
             defaults.string(forKey: "mailternal.appearance.backdropStyle"),
             WindowBackdropStyle.frostedBlur.rawValue
         )
-        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 2)
+        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 3)
     }
 
     @MainActor
