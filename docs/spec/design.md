@@ -105,6 +105,66 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   timingCurve(0.23,1,0.32,1) 0.20; restack 0.34/0.10; expand 0.30/0; settle
   0.32/0.22; fling 0.16; RM: enter 0.16, exit 0.12, restack easeInOut 0.18.
 
+## Reader tab strip
+
+The reader tab strip MUST be Craft-like in finish and browser-like in
+mechanics. It MUST occupy one measured row at the top of the rightmost reader
+pane and MUST NOT be part of the window titlebar. The row MUST be 40 pt high
+with 12 pt leading and 8 pt trailing content insets. It MUST be present
+whenever a message is open, including with one tab, and MUST be absent in the
+empty-reader state.
+
+### Tabs and actions
+
+- The tab viewport and the trailing action cluster MUST share this one row.
+  Archive, Trash, and More MUST be fixed 32 × 32 pt controls with a 4 pt gap;
+  the cluster MUST have an 8 pt trailing inset. The sidebar toggle MUST remain
+  in the titlebar.
+- Each tab MUST be 120–220 pt wide, with 10 pt horizontal and 7 pt vertical
+  internal padding. Tabs MUST be separated by 4 pt. They MUST compress toward
+  120 pt before the viewport becomes horizontally scrollable; tabs MUST NOT
+  become narrower than 120 pt. Scrolling MUST occur beneath a fixed 28 pt
+  right-edge fade immediately before the action cluster.
+- Its title MUST contain only the subject, MUST use semantic `.subheadline`,
+  and MUST truncate in the middle. The active tab MUST use semantic selection
+  treatment and label color; inactive tabs MUST have no fill and MUST use
+  secondary label color. The active treatment MUST remain legible in light,
+  dark, and increased-contrast appearances.
+- A transient title MUST be italic. A tab title or accessory MUST NEVER show
+  unread or flag indicators.
+- Tab backgrounds MUST use a continuous `AppShapeScale.row` (12 pt) corner
+  radius. The right-edge fade MUST be a 28 pt gradient from transparent over
+  the tab viewport to the reader-pane backdrop, drawn above scrolling tabs and
+  below the fixed action cluster. It MUST NOT capture tab input.
+- More MUST contain Flag, Raw Source, Email Reading mode, and every other
+  action not named Archive or Trash. Archive and Trash MUST remain directly
+  reachable in the fixed cluster.
+
+### Hover preview card
+
+- After 0.35 s of pointer dwell on a tab, a floating card MUST appear beneath
+  that tab. Leaving the tab MUST dismiss it; moving directly to another tab
+  restarts the dwell timer for the new tab.
+- The card MUST be 320 pt wide, at most 360 pt wide, and at most 220 pt high.
+  It MUST use 14 pt horizontal and 12 pt vertical padding, a continuous
+  `AppShapeScale.card` (18 pt) corner radius, semantic control/window colors,
+  and the standard card shadow: black at 0.28 opacity, 28 pt blur radius,
+  14 pt downward offset.
+- The card MUST show a local rendered or plain-text preview, clipped to six
+  body lines using the reader's body typography. If sender and received time
+  are already available locally, the card MUST include them in a compact
+  metadata line; otherwise it MUST omit them and MUST NOT fetch them. It MUST
+  NEVER fetch remote content, mark the message read, alter selection or either
+  scroll position, or reflow the reader; it MUST overlay the reader.
+- The reveal and dismissal MUST use `MailMotion.hover` (ease-out 0.12 s). With
+  Reduce Motion enabled, the card MUST use an opacity-only
+  `MailMotion.disclosure` transition and no translation or scale.
+
+References: [Craft Tab Management](https://support.craft.do/en/introduction/navigation/tabs)
+(tab-layout image and tab-preview description); [Chrome keyboard shortcuts](https://support.google.com/chrome/answer/157179)
+(browser tab-strip switching description); [W3C Content on Hover or Focus](https://www.w3.org/WAI/WCAG22/Understanding/content-on-hover-or-focus.html)
+(hover-card interaction guidance).
+
 ## Polish checklist
 - Keyboard: ⌘F in-message find, ⌘K global search, ⌘, settings, ⌘R reload/refresh;
   full focus scopes + `defaultFocus`; Escape dismisses transient surfaces.
