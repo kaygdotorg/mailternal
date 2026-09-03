@@ -22,3 +22,4 @@
 - Use the deployed bundle or your own chunk build; own QA container per agent
   (`cp -R ~/mailternal-qa-ReaderIslands ~/mailternal-qa-<agent>`); announce server mutations on
   hub; restore what you move.
+- **Launch timing**: `MAILTERNAL_QA=1 Mailternal -qa-account … -qa-gui` prints `launch phase=<name> t=<ms since exec>` for app-init, store-open, did-finish-launching, window-front, folders-snapshot, first-rows. The older `first-page ready` line is a 2 s poller and is not a launch metric. Cold DB file without sudo: `sqlite3 store.sqlite "VACUUM INTO 'copy.sqlite'"` into a fresh container.

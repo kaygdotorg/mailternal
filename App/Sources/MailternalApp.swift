@@ -10,9 +10,15 @@ struct MailternalApp: App {
     @State private var actions: ActionSettings
 
     init() {
+        #if DEBUG
+        QALaunch.launchPhase("app-init")
+        #endif
         let appearance = AppearanceSettings()
         let actions = ActionSettings()
         let model = AppModel(facade: Self.makeFacade(), appearance: appearance, actions: actions)
+        #if DEBUG
+        QALaunch.launchPhase("store-open")
+        #endif
         _appearance = State(initialValue: appearance)
         _actions = State(initialValue: actions)
         _model = State(initialValue: model)
@@ -116,7 +122,9 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
-        if let qa = QALaunch.parse(), qa.openWindowLink == nil {
+        QALaunch.launchPhase("did-finish-launching")
+        if let qa = QALaunch.parse(), qa.openWindowLink == nil,
+           !ProcessInfo.processInfo.arguments.contains("-qa-gui") {
             // SwiftUI `.task` on MainSplitRoot may never fire without a rendered
             // window. Drive restore/engine from the delegate instead.
             QALaunch.log(

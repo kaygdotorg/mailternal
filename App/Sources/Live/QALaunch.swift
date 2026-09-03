@@ -130,6 +130,25 @@ enum QALaunch: Sendable {
         }
     }
 
+    /// Milliseconds since the kernel started this process (exec time from
+    /// `kinfo_proc`), so launch phases are measured from the real start, not
+    /// from whichever object first observed the clock.
+    static func millisecondsSinceProcessStart() -> Double {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, ProcessInfo.processInfo.processIdentifier]
+        guard sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0) == 0 else { return -1 }
+        let start = info.kp_proc.p_starttime
+        let startSeconds = Double(start.tv_sec) + Double(start.tv_usec) / 1_000_000
+        return (Date().timeIntervalSince1970 - startSeconds) * 1000
+    }
+
+    /// Launch phase marker; QA-only, no cost outside `MAILTERNAL_QA=1`.
+    static func launchPhase(_ name: String) {
+        guard ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" else { return }
+        log(String(format: "launch phase=%@ t=%.1fms footprint=%lld", name, millisecondsSinceProcessStart(), footprintBytes()))
+    }
+
     /// Activity Monitor "memory footprint" (`phys_footprint`), or -1 if unavailable.
     static func footprintBytes() -> Int64 {
         var info = task_vm_info_data_t()
