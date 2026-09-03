@@ -10,11 +10,7 @@ struct MessageViewer: View {
     @State private var findBackwards = false
     @State private var findTick: UInt64 = 0
     @State private var headersStore: MessageHeadersStore
-    /// Titlebar depth measured where the pane still has a safe area, i.e.
-    /// outside the scrolling surface's own `ignoresSafeArea`.
-    @State private var safeAreaTop: CGFloat = 0
     @State private var htmlContentHeight: CGFloat = 0
-    @State private var isDetailsExpanded = false
 
     init(model: AppModel) {
         self.model = model
@@ -55,13 +51,6 @@ struct MessageViewer: View {
                 .zIndex(1)
             }
         }
-        // Read here, not on the scrolling surface: the reader deliberately
-        // ignores the container safe area so its dissolve can start at the
-        // physical window top, which leaves this the only place the titlebar
-        // depth is still measurable.
-        .onGeometryChange(for: CGFloat.self) { proxy in
-            proxy.safeAreaInsets.top
-        } action: { safeAreaTop = $0 }
         .animation(MailMotion.disclosure, value: model.isFindPresented)
         .focusScope(viewerFocus)
         .accessibilityIdentifier(UIIdentifier.messageViewer)
@@ -73,13 +62,11 @@ struct MessageViewer: View {
         .onChange(of: model.findQuery) { _, _ in
             restartFind()
         }
-        .onChange(of: model.detail?.id) { _, _ in
-            isDetailsExpanded = false
-            htmlContentHeight = 0
+        .onChange(of: model.isShowingRawSource) { _, showing in
             restartFind()
-        }
-        .onChange(of: model.isShowingRawSource) { _, _ in
-            restartFind()
+            if showing, model.rawSource == nil {
+                Task { await model.loadRawSource() }
+            }
         }
         .onChange(of: model.isFindPresented) { _, presented in
             if presented { restartFind() }
@@ -112,9 +99,9 @@ struct MessageViewer: View {
     }
 
     /// One scroll owner, two disjoint floating islands: a continuous header
-    /// surface (subject, envelope, and details) followed by the body. The web
-    /// view reports its document height and does not own a scrolling viewport,
-    /// so the reader scrolls the whole message as one page.
+    /// surface (subject, envelope, and source headers) followed by the body.
+    /// The web view reports its document height and does not own a scrolling
+    /// viewport, so the reader scrolls the whole message as one page.
     private func reader(_ detail: MessageDetail) -> some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.islandSpacing) {
@@ -123,9 +110,11 @@ struct MessageViewer: View {
                     envelope: detail.envelope,
                     attachments: detail.attachments,
                     messageID: detail.id,
-                    isDetailsExpanded: $isDetailsExpanded,
                     headersStore: headersStore,
-                    backdropKind: model.appearance.backdropKind
+                    backdropKind: model.appearance.backdropKind,
+                    showsSenderIcons: model.appearance.showsSenderIcons,
+                    isShowingRawSource: model.isShowingRawSource,
+                    accent: model.appearance.accent.color
                 )
                 bodyRegion(detail)
             }
@@ -135,7 +124,7 @@ struct MessageViewer: View {
             .padding(
                 .top,
                 max(
-                    MessageViewerLayoutPolicy.readerTopInset(safeAreaTop: safeAreaTop)
+                    MessageViewerLayoutPolicy.readerTopInset()
                         - MessageViewerLayoutPolicy.islandVerticalPadding,
                     0
                 )
@@ -143,8 +132,8 @@ struct MessageViewer: View {
             .padding(.bottom, MessageViewerLayoutPolicy.bottomPadding)
             .frame(maxWidth: .infinity, alignment: .leading)
             .animation(
-                reduceMotion ? .easeOut(duration: 0.01) : MailMotion.disclosure,
-                value: isDetailsExpanded
+                reduceMotion ? .easeOut(duration: 0.01) : MailMotion.settle,
+                value: model.isShowingRawSource
             )
         }
         .background {
@@ -239,7 +228,7 @@ struct MessageViewer: View {
                     }
                 },
                 allowRemoteImages: model.allowRemoteImages,
-                emailReadingMode: model.appearance.emailReadingMode,
+                emailReadingMode: model.effectiveEmailReadingMode,
                 findQuery: activeFindQuery,
                 findTick: findTick,
                 findBackwards: findBackwards
@@ -366,17 +355,18 @@ private extension View {
 
 /// Reading anchor: the strongest contrast in the reader, wrapping without
 /// limit, resting below the window's dissolve rather than inside its ramp.
-/// The envelope and Details rows deliberately live inside this same surface,
-/// so the reader has two islands rather than a subject island plus a headers
-/// island.
+/// The envelope and its source representation live inside this same surface,
+/// so changing source mode animates one island rather than replacing a card.
 struct MessageSubjectRegion: View {
     let subject: String
     let envelope: Envelope
     let attachments: [AttachmentInfo]
     let messageID: MessageID
-    @Binding var isDetailsExpanded: Bool
     let headersStore: MessageHeadersStore
     let backdropKind: WindowBackdropKind
+    let showsSenderIcons: Bool
+    let isShowingRawSource: Bool
+    let accent: Color
 
     var body: some View {
         let display = MessageHeaderPolicy.subject(subject)
@@ -398,8 +388,10 @@ struct MessageSubjectRegion: View {
                 envelope: envelope,
                 attachments: attachments,
                 messageID: messageID,
-                isDetailsExpanded: $isDetailsExpanded,
-                headersStore: headersStore
+                headersStore: headersStore,
+                showsSenderIcons: showsSenderIcons,
+                isShowingRawSource: isShowingRawSource,
+                accent: accent
             )
         }
         .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
@@ -408,129 +400,162 @@ struct MessageSubjectRegion: View {
     }
 }
 
-/// Envelope: who sent it, who received it, when, what came attached — and a
-/// disclosure for the complete raw header block.
+/// The ordinary envelope is deliberately icon-led: the upward arrow means the
+/// sender and the downward arrow means the recipient. This avoids repeating
+/// the words “From” and “To” while preserving a consistent spatial pair.
 struct MessageEnvelopeRegion: View {
     let envelope: Envelope
     let attachments: [AttachmentInfo]
     let messageID: MessageID
-    @Binding var isDetailsExpanded: Bool
     let headersStore: MessageHeadersStore
+    let showsSenderIcons: Bool
+    let isShowingRawSource: Bool
+    let accent: Color
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            senderRow
-            if !recipientGroups.isEmpty {
-                recipients
-                    .padding(.top, MessageViewerLayoutPolicy.envelopeRowSpacing)
+            if isShowingRawSource {
+                rawHeaderContent
+            } else {
+                prettyEnvelope
+                if !attachments.isEmpty {
+                    attachmentRows
+                        .padding(.top, MessageViewerLayoutPolicy.attachmentSpacing)
+                }
             }
-            if !attachments.isEmpty {
-                attachmentRows
-                    .padding(.top, MessageViewerLayoutPolicy.attachmentSpacing)
-            }
-            details
-                .padding(.top, MessageViewerLayoutPolicy.envelopeRowSpacing)
         }
         .font(.subheadline)
         .padding(.top, MessageViewerLayoutPolicy.envelopeTopPadding)
         .padding(.bottom, MessageViewerLayoutPolicy.envelopeBottomPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Text survives the source-mode switch in the same island and lets
+        // numeric values roll rather than blink as a remove/insert.
+        .contentTransition(.numericText())
+        .task(id: messageID) {
+            // Delivery time is useful in the ordinary envelope too. The store
+            // still caches the result, so this remains one fetch per message.
+            headersStore.loadIfNeeded(for: messageID)
+        }
     }
 
-    /// Sender and date share a line until the line no longer fits — at a narrow
-    /// pane or a large text size the date drops below instead of squeezing the
-    /// identity.
-    private var senderRow: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .firstTextBaseline, spacing: 16) {
-                senderIdentity
-                Spacer(minLength: 16)
-                dateText
-            }
+    private var prettyEnvelope: some View {
+        HStack(alignment: .top, spacing: 20) {
             VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.envelopePairSpacing) {
-                senderIdentity
-                dateText
+                senderItem
+                receiverItem
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Spacer(minLength: 8)
+
+            VStack(alignment: .trailing, spacing: MessageViewerLayoutPolicy.envelopePairSpacing) {
+                sentItem
+                if let deliveredDate {
+                    deliveredItem(deliveredDate)
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(minWidth: 156, alignment: .trailing)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var senderItem: some View {
+        if let sender = envelope.from.first {
+            EnvelopeCopyItem(
+                symbol: "arrow.up.right.circle",
+                payload: MessageHeaderPolicy.copyPayload(for: sender),
+                accessibilityLabel: "Sender, \(MessageHeaderPolicy.full(sender))",
+                accent: accent
+            ) {
+                HStack(alignment: .top, spacing: 8) {
+                    if showsSenderIcons {
+                        MonogramView(
+                            initials: MessageHeaderPolicy.initials(for: sender),
+                            accent: accent
+                        )
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(MessageHeaderPolicy.name(of: sender))
+                            .font(.headline)
+                            .lineLimit(1)
+                        Text(sender.address)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+        } else {
+            Label("Unknown sender", systemImage: "arrow.up.right.circle")
+                .foregroundStyle(.secondary)
         }
     }
 
     @ViewBuilder
-    private var senderIdentity: some View {
-        if envelope.from.isEmpty {
-            Text("Unknown sender")
-                .font(.headline)
-                .foregroundStyle(.secondary)
-        } else if envelope.from.count == 1, let sender = envelope.from.first {
-            // Name and address are separate runs, both in the primary text
-            // role: an address a recipient may need to check is never dimmed
-            // into a caption.
-            VStack(alignment: .leading, spacing: 2) {
-                Text(MessageHeaderPolicy.name(of: sender))
-                    .font(.headline)
-                if MessageHeaderPolicy.name(of: sender) != sender.address {
-                    Text(sender.address)
-                        .fixedSize(horizontal: false, vertical: true)
+    private var receiverItem: some View {
+        if let recipients = MessageHeaderPolicy.collapseRecipients(envelope.to) {
+            EnvelopeCopyItem(
+                symbol: "arrow.down.left.circle",
+                payload: MessageHeaderPolicy.copyPayload(for: recipients.first),
+                accessibilityLabel: "Recipient, \(MessageHeaderPolicy.full(recipients.first))",
+                accent: accent
+            ) {
+                HStack(alignment: .top, spacing: 8) {
+                    if showsSenderIcons {
+                        MonogramView(
+                            initials: MessageHeaderPolicy.initials(for: recipients.first),
+                            accent: accent
+                        )
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(recipients.summary)
+                            .font(.headline)
+                            .lineLimit(1)
+                        Text(recipients.first.address)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
             }
-            .textSelection(.enabled)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("From, \(MessageHeaderPolicy.full(sender))")
         } else {
-            Text(MessageHeaderPolicy.list(envelope.from))
-                .font(.headline)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
+            Label("No recipient", systemImage: "arrow.down.left.circle")
+                .foregroundStyle(.secondary)
         }
     }
 
-    private var dateText: some View {
-        Text(MailDateFormat.envelope(envelope.internalDate))
-            .foregroundStyle(.secondary)
-            .textSelection(.enabled)
-    }
-
-    /// A recipient group the message actually carries. Absent groups never
-    /// reach the grid, so the reader stays silent about what it does not know.
-    private struct RecipientGroup: Identifiable {
-        let id: String
-        let summary: String
-        let spoken: String
-    }
-
-    private var recipientGroups: [RecipientGroup] {
-        let groups = [
-            (label: "To", addresses: envelope.to),
-            (label: "Cc", addresses: envelope.cc),
-        ]
-        return groups.compactMap { group in
-            guard let summary = MessageHeaderPolicy.summary(group.addresses),
-                  let spoken = MessageHeaderPolicy.spokenSummary(group.addresses)
-            else { return nil }
-            return RecipientGroup(id: group.label, summary: summary, spoken: spoken)
-        }
-    }
-
-    /// Label and value stay separate grid cells so the columns align at every
-    /// text size; the value carries the spoken form, because "+2" is a visual
-    /// abbreviation rather than something to read aloud.
-    private var recipients: some View {
-        Grid(
-            alignment: .leadingFirstTextBaseline,
-            horizontalSpacing: 10,
-            verticalSpacing: MessageViewerLayoutPolicy.envelopePairSpacing
+    private var sentItem: some View {
+        let date = envelope.headerDate ?? envelope.internalDate
+        return EnvelopeCopyItem(
+            symbol: "paperplane",
+            payload: MailDateFormat.envelope(date),
+            accessibilityLabel: "Sent, \(MailDateFormat.envelope(date))",
+            accent: accent
         ) {
-            ForEach(recipientGroups) { group in
-                GridRow {
-                    Text(group.id)
-                        .foregroundStyle(.secondary)
-                        .gridColumnAlignment(.leading)
-                    Text(group.summary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-                        .accessibilityLabel(group.spoken)
-                }
-            }
+            Text(MailDateFormat.envelope(date))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
+    }
+
+    private func deliveredItem(_ date: Date) -> some View {
+        EnvelopeCopyItem(
+            symbol: "tray.and.arrow.down",
+            payload: MailDateFormat.envelope(date),
+            accessibilityLabel: "Delivered, \(MailDateFormat.envelope(date))",
+            accent: accent
+        ) {
+            Text(MailDateFormat.envelope(date))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var deliveredDate: Date? {
+        guard case .loaded(let headers, _) = headersStore.state(for: messageID) else {
+            return nil
+        }
+        return MessageHeaderPolicy.deliveredDate(from: headers)
     }
 
     private var attachmentRows: some View {
@@ -553,58 +578,15 @@ struct MessageEnvelopeRegion: View {
         }
     }
 
-    /// Details keeps the structured envelope rows above the complete raw
-    /// block. The latter is fetched only when this disclosure opens.
-    private var details: some View {
-        DisclosureGroup(isExpanded: $isDetailsExpanded) {
-            VStack(alignment: .leading, spacing: 0) {
-                Grid(
-                    alignment: .leadingFirstTextBaseline,
-                    horizontalSpacing: 10,
-                    verticalSpacing: MessageViewerLayoutPolicy.envelopePairSpacing
-                ) {
-                    ForEach(MessageHeaderPolicy.detailRows(for: envelope)) { row in
-                        GridRow {
-                            Text(row.label)
-                                .foregroundStyle(.secondary)
-                                .gridColumnAlignment(.leading)
-                            Text(row.value)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                rawHeaderContent
-            }
-            .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        } label: {
-            // The label names the control; keeping the accessibility label here
-            // leaves the expanded rows as their own elements.
-            Text("Details")
-                .font(.subheadline)
-                .accessibilityLabel("Message details")
-        }
-        .accessibilityIdentifier(UIIdentifier.messageDetails)
-        .onChange(of: isDetailsExpanded) { _, expanded in
-            if expanded {
-                headersStore.loadIfNeeded(for: messageID)
-            }
-        }
-    }
-
     @ViewBuilder
     private var rawHeaderContent: some View {
         switch headersStore.state(for: messageID) {
         case .idle:
-            EmptyView()
+            ProgressView("Loading headers…")
+                .controlSize(.small)
         case .loading:
             ProgressView("Loading headers…")
                 .controlSize(.small)
-                .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
         case .failed(let message):
             VStack(alignment: .leading, spacing: 6) {
                 Label("Couldn’t load headers", systemImage: "exclamationmark.triangle")
@@ -618,27 +600,115 @@ struct MessageEnvelopeRegion: View {
                 }
                 .buttonStyle(.link)
             }
-            .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
             .accessibilityIdentifier("message-headers-error")
         case .loaded(let headers, let text):
             if headers.isEmpty {
                 Text("No raw headers found.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                    .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
             } else {
                 RawHeadersBlock(headers: headers, text: text)
-                    .padding(.top, MessageViewerLayoutPolicy.envelopePairSpacing)
             }
         }
     }
 }
 
-/// The complete unfolded header block uses SF Mono, with one copy action for
-/// the whole block. The action remains keyboard-focusable and subtly visible
-/// at rest, then becomes fully opaque while the block is hovered or focused.
+/// A small accent wash keeps the monogram legible without fetching an avatar.
+private struct MonogramView: View {
+    let initials: String
+    let accent: Color
+
+    var body: some View {
+        Text(initials)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(accent)
+            .frame(width: 26, height: 26)
+            .background(accent.opacity(0.15), in: Circle())
+            .accessibilityHidden(true)
+    }
+}
+
+/// A copy target presents the same interaction for identities and dates:
+/// rounded hover wash, pointer cursor, and a spring-driven checkmark for one
+/// second after the payload reaches the pasteboard.
+private struct EnvelopeCopyItem<Label: View>: View {
+    let symbol: String
+    let payload: String
+    let accessibilityLabel: String
+    let accent: Color
+    let label: Label
+    @State private var isHovered = false
+    @State private var didCopy = false
+
+    init(
+        symbol: String,
+        payload: String,
+        accessibilityLabel: String,
+        accent: Color,
+        @ViewBuilder label: () -> Label
+    ) {
+        self.symbol = symbol
+        self.payload = payload
+        self.accessibilityLabel = accessibilityLabel
+        self.accent = accent
+        self.label = label()
+    }
+
+    var body: some View {
+        Button(action: copy) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: didCopy ? "checkmark" : symbol)
+                    .foregroundStyle(accent)
+                    .frame(width: 18, alignment: .center)
+                    .contentTransition(.symbolEffect(.replace))
+                label
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 5)
+            .background {
+                if isHovered {
+                    RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
+                        .fill(Color.primary.opacity(0.08))
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+        .onHover { hovered in
+            isHovered = hovered
+            if hovered {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .animation(MailMotion.hover, value: isHovered)
+    }
+
+    private func copy() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(payload, forType: .string)
+        withAnimation(MailMotion.searchPanel) {
+            didCopy = true
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            withAnimation(MailMotion.searchPanel) {
+                didCopy = false
+            }
+        }
+    }
+}
+
+/// The complete unfolded header block uses SF Mono. The whole-block action
+/// remains keyboard-focusable and subtly visible at rest, while every
+/// individual line gets a trailing copy action on hover.
 private struct RawHeadersBlock: View {
-    let headers: [(name: String, value: String)]
+    let headers: [MessageHeaderPolicy.HeaderItem]
     let text: String
     @State private var isHovered = false
     @State private var didCopy = false
@@ -655,36 +725,29 @@ private struct RawHeadersBlock: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.envelopePairSpacing) {
-            ForEach(Array(headers.enumerated()), id: \.offset) { _, header in
-                HStack(alignment: .firstTextBaseline, spacing: 0) {
-                    Text("\(header.name): ")
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: true, vertical: false)
-                    Text(header.value)
-                        .foregroundStyle(.primary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .font(.system(.callout, design: .monospaced))
-                .textSelection(.enabled)
+            ForEach(headers) { header in
+                RawHeaderRow(header: header)
             }
         }
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .focusable()
+        .focusEffectDisabled()
         .focused($blockFocused)
         .overlay(alignment: .topTrailing) {
             Button {
                 copyHeaders()
             } label: {
                 Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                    .contentTransition(.symbolEffect(.replace))
             }
             .buttonStyle(.borderless)
             .controlSize(.small)
             .opacity(copyButtonOpacity)
             .animation(MailMotion.hover, value: copyButtonVisible)
             .focused($copyButtonFocused)
+            .focusEffectDisabled()
             .accessibilityLabel("Copy Headers")
             .accessibilityIdentifier(UIIdentifier.messageHeadersCopy)
         }
@@ -694,19 +757,84 @@ private struct RawHeadersBlock: View {
     private func copyHeaders() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        withAnimation(MailMotion.hover) {
+        withAnimation(MailMotion.searchPanel) {
             didCopy = true
         }
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(1))
             guard !Task.isCancelled else { return }
-            withAnimation(MailMotion.hover) {
+            withAnimation(MailMotion.searchPanel) {
                 didCopy = false
             }
         }
     }
 }
 
+private struct RawHeaderRow: View {
+    let header: MessageHeaderPolicy.HeaderItem
+    @State private var isHovered = false
+    @State private var didCopy = false
+    @FocusState private var copyButtonFocused: Bool
+
+    private var copyButtonOpacity: Double {
+        isHovered || copyButtonFocused ? 1 : 0.35
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
+                Text("\(header.name): ")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: true, vertical: false)
+                Text(header.value)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                copyHeader()
+            } label: {
+                Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .opacity(copyButtonOpacity)
+            .animation(MailMotion.hover, value: copyButtonOpacity)
+            .focused($copyButtonFocused)
+            .focusEffectDisabled()
+            .accessibilityLabel("Copy \(header.name)")
+        }
+        .font(.system(.callout, design: .monospaced))
+        .textSelection(.enabled)
+        .contentShape(Rectangle())
+        .onHover { hovered in
+            isHovered = hovered
+            if hovered {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+    }
+
+    private func copyHeader() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(header.copyText, forType: .string)
+        withAnimation(MailMotion.searchPanel) {
+            didCopy = true
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            withAnimation(MailMotion.searchPanel) {
+                didCopy = false
+            }
+        }
+    }
+}
 
 /// Blocked remote content is a body state the reader discloses before the
 /// message is read, not a permanently disabled control after it.

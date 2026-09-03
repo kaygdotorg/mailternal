@@ -14,6 +14,8 @@ enum UIIdentifier {
     static let messageDetails = "message-details"
     static let messageHeadersCopy = "message-headers-copy"
     static let messageBody = "message-body"
+    static let messageSource = "message-source"
+    static let messageColorScheme = "message-color-scheme"
     static let searchPanel = "search-panel"
     static let searchField = "search-field"
     static let searchCoverage = "search-coverage"
@@ -83,6 +85,41 @@ enum SidebarVisibilityPolicy {
 
 
 
+/// Fixed anchors for pane headers that extend beneath the unified titlebar.
+/// AppKit can change a scroll view's reported safe area as its scroll-edge
+/// pocket changes; header geometry must not follow that value.
+enum PaneHeaderInsetPolicy {
+    enum Pane: Sendable {
+        case sidebar
+        case messageList
+    }
+
+    /// Standard toolbar/titlebar depth, with the documented 52pt fallback.
+    static let windowTitlebarHeight: CGFloat = 52
+    static let sidebarTopInset: CGFloat = windowTitlebarHeight
+    static let messageListTopInset: CGFloat = windowTitlebarHeight
+
+    /// The whole sidebar inset is carried by the header itself. The list's
+    /// scroll view gets no inset: SwiftUI rewrites a `.sidebar` List's
+    /// content insets from its safe area on every layout, so any inset set
+    /// there (contentMargins or AppKit contentInsets) is overwritten and the
+    /// title jumps by that amount.
+    static let sidebarHeaderPadding: CGFloat = sidebarTopInset
+
+    /// The short sidebar ramp ends before the account title cap-height band.
+    static let sidebarDissolveGuard: CGFloat = 8
+    static let sidebarDissolveReach: CGFloat = 32
+
+    static func topInset(for pane: Pane, safeAreaTop _: CGFloat = 0) -> CGFloat {
+        switch pane {
+        case .sidebar:
+            sidebarTopInset
+        case .messageList:
+            messageListTopInset
+        }
+    }
+}
+
 /// Geometry shared by the detail viewer and its focused layout tests.
 ///
 /// The reader is one scrolling surface holding two floating islands: one
@@ -122,12 +159,10 @@ enum MessageViewerLayoutPolicy {
     static let plainTextMeasureCharacters = 72
 
     /// Depth, below the physical window top, at which the reader's first
-    /// readable glyph may rest: past the viewer dissolve's reach — or past a
-    /// deeper measured titlebar — plus a guard. With no measured geometry this
-    /// is the documented 52 + 12 fallback.
-    static func readerTopInset(safeAreaTop: CGFloat) -> CGFloat {
-        let fadeReach = MailWindowDissolvePolicy.viewer.restDepth(safeAreaTop: 0)
-        return max(fadeReach, max(safeAreaTop, 0)) + fadeGuard
+    /// readable glyph may rest. This is fixed to the titlebar band and does
+    /// not follow a scroll-dependent safe-area report.
+    static func readerTopInset(safeAreaTop _: CGFloat = 0) -> CGFloat {
+        MailWindowDissolvePolicy.viewer.restDepth(safeAreaTop: 0) + fadeGuard
     }
 
     /// Height of the HTML page island from its document measurement. Invalid
@@ -169,12 +204,10 @@ struct MailWindowTopDissolveStop: Equatable, Sendable {
 /// Surfaces reuse this curve and differ only in where the ramp starts and how
 /// far it reaches.
 enum MailWindowTopDissolvePolicy {
-    /// Depth of the titlebar/traffic-light band. Used only as the documented
-    /// fallback when a surface reports no measured top safe-area inset: a
-    /// probe on macOS 26 measures 52pt while the window has toolbar items and
-    /// 32pt when it has none, and the larger is the state with controls to
-    /// protect.
-    static let titlebarDepth: CGFloat = 52
+    /// Fixed depth of the titlebar/traffic-light band. It is derived from the
+    /// standard unified-toolbar geometry and remains stable when a scroll view
+    /// reports a different safe area.
+    static let titlebarDepth: CGFloat = PaneHeaderInsetPolicy.windowTitlebarHeight
     static let stops: [MailWindowTopDissolveStop] = [
         .init(location: 0, alpha: 0),
         .init(location: 1 / 8, alpha: 0.06),
@@ -248,11 +281,11 @@ struct MailWindowDissolvePolicy: Equatable, Sendable {
         bottomReach: nil,
         bottomReservedHeight: 0
     )
-    /// The traffic lights live in this column's band, so the ramp spends its
-    /// ink in the open air below the safe area instead of behind them.
+    /// The sidebar title is anchored at the fixed window top inset. Its short
+    /// ramp is fully opaque before the account title's cap-height band.
     static let sidebar = Self(
-        topOrigin: .titlebarSafeArea,
-        topReach: 32,
+        topOrigin: .windowTop,
+        topReach: PaneHeaderInsetPolicy.sidebarDissolveReach,
         bottomReach: 48,
         bottomReservedHeight: 0
     )
