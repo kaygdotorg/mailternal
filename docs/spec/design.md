@@ -60,15 +60,19 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
 - One compositing mask per pane, no material overlay: the exposed window backdrop
   supplies the blur. Shape is Hermternal's smoothstep sampled at eighths; panes
   share it and differ only in where the top ramp starts.
-- **Sidebar**: the top ramp starts at the *measured* titlebar safe area (documented
-  fallback 52 pt) and is opaque 32 pt below it, so rows are gone before they reach
-  the traffic lights and no ink lands behind them; the `List` carries a matching
-  32 pt top scroll-content margin so the first section rests at the ramp's end.
+- **Sidebar**: the top ramp is anchored at the fixed 52 pt window titlebar
+  depth and is opaque 32 pt below it, leaving the account title's cap-height
+  band clear; the `List` ignores the container top safe area and carries a
+  fixed 40 pt scroll-content inset plus the header's 12 pt optical padding.
+  The system scroll-edge pocket is suppressed on this list.
   Bottom ramp 48 pt, ending above the fixed account inset.
-- **Message list**: the pane ignores the top safe area, so its ramp is anchored at
-  the physical window top and is opaque at 52 pt; the table's top scroll-content
-  inset is that same depth. Bottom ramp 48 pt at the pane edge. The column carries
-  **no top chrome** — windowed-mode coverage is disclosed in the ⌘K panel.
+- **Message list**: the pane ignores the top safe area, its large title is
+  anchored at the same fixed 52 pt window depth, and the table reserves the
+  title's measured frame below that anchor. Its top dissolve is independent
+  of safe-area changes; the system scroll-edge pocket is suppressed on the
+  AppKit table scroll view. Bottom ramp 48 pt at the pane edge. The column
+  carries **no top chrome** — windowed-mode coverage is disclosed in the ⌘K
+  panel.
 
 ## Component vocabulary (reuse the pattern, adapt to mail)
 - **Sidebar rows**: native `List` label rows with context menus, swipes, drag/drop

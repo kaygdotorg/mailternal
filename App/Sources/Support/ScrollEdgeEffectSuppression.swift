@@ -25,6 +25,12 @@ struct ScrollEdgeEffectSuppressor: NSViewRepresentable {
 
     func updateNSView(_ nsView: ScrollEdgeEffectSuppressingView, context: Context) {
         nsView.suppressAttachedScrollViews()
+        // SwiftUI may finish constructing ListCoreScrollView after the
+        // representable's update pass. Reapply once on the next run loop so
+        // the sidebar cannot regain a titlebar pocket after a body update.
+        DispatchQueue.main.async { [weak nsView] in
+            nsView?.suppressAttachedScrollViews()
+        }
     }
 }
 

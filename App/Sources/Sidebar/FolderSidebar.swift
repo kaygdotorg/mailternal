@@ -23,7 +23,7 @@ struct FolderSidebar: View {
                         folderNode(node)
                     }
                 } header: {
-                    sectionHeader("Mailboxes", includeAccountTitle: true)
+                    sectionHeader(nil, includeAccountTitle: true)
                 }
             }
             if !customRoots.isEmpty {
@@ -37,13 +37,15 @@ struct FolderSidebar: View {
             }
         }
         .listStyle(.sidebar)
-        // The column's own content rests at the titlebar safe area, which is
-        // exactly where this pane's ramp starts. The margin moves the first
-        // section down to the ramp's end, so rows dissolve on their way up to
-        // the traffic lights instead of resting half-erased under them.
-        .contentMargins(.top, MailWindowDissolvePolicy.sidebar.topReach, for: .scrollContent)
+        // The sidebar reaches under the titlebar and its list starts at the
+        // window top; the account header carries the fixed inset itself.
+        // Never inset the scroll view: SwiftUI rewrites a `.sidebar` List's
+        // content insets from the safe area on every layout, and any inset
+        // placed there flips in and out (measured: title jumping by 40pt).
+        .ignoresSafeArea(.container, edges: .top)
         .background {
             ScrollEdgeEffectSuppressor()
+                .allowsHitTesting(false)
         }
         .mailWindowDissolve(.sidebar)
         .popover(item: $inspectorFolder, arrowEdge: .trailing) { folder in
@@ -79,7 +81,7 @@ struct FolderSidebar: View {
     }
 
     @ViewBuilder
-    private func sectionHeader(_ title: String, includeAccountTitle: Bool) -> some View {
+    private func sectionHeader(_ title: String?, includeAccountTitle: Bool) -> some View {
         if includeAccountTitle, model.hasAccount {
             VStack(alignment: .leading, spacing: 4) {
                 Text(AccountTitlePolicy.title(for: model.accountConfig) ?? model.listTitleAccountName)
@@ -89,10 +91,12 @@ struct FolderSidebar: View {
                     .truncationMode(.middle)
                     .accessibilityAddTraits(.isHeader)
                     .accessibilityIdentifier(UIIdentifier.sidebarAccountTitle)
-                Text(title)
+                if let title {
+                    Text(title)
+                }
             }
-            .padding(.top, 12)
-        } else {
+            .padding(.top, PaneHeaderInsetPolicy.sidebarHeaderPadding)
+        } else if let title {
             Text(title)
         }
     }
