@@ -354,12 +354,18 @@ struct AppearanceSettingsForm: View {
                         Text(mode.label).tag(mode)
                     }
                 } label: {
-                    Text("Email Reading")
+                    Text("Email Colour Scheme")
                     Text("Original keeps each message's colors; Dark keeps the reading canvas dark.")
                 }
                 .accessibilityIdentifier(UIIdentifier.emailReadingMode)
             }
             Section("Messages") {
+                Toggle(isOn: $appearance.showsSenderIcons) {
+                    Text("Sender icons")
+                    Text("Show a sender icon beside each message in the list.")
+                }
+                .accessibilityIdentifier("appearance-sender-icons")
+
                 Picker(selection: $appearance.messageListLines) {
                     ForEach(Array(MessageListLayout.lineRange), id: \.self) { lines in
                         Text("\(lines) \(lines == 1 ? "line" : "lines")").tag(lines)
@@ -376,11 +382,13 @@ struct AppearanceSettingsForm: View {
                         Slider(
                             value: $appearance.backgroundOpacity,
                             in: AppearanceSettings.backgroundOpacityRange,
-                            step: 0.01
+                            step: 0.01,
+                            onEditingChanged: { isEditing in
+                                if !isEditing {
+                                    appearance.persistOpacity()
+                                }
+                            }
                         )
-                        .onChange(of: appearance.backgroundOpacity) { _, _ in
-                            appearance.persistOpacity()
-                        }
                         // Proportional text, in a fixed trailing slot: the
                         // readout keeps its place without monospaced digits.
                         Text(AppearanceSettings.formattedOpacityPercentage(appearance.backgroundOpacity))
@@ -393,7 +401,7 @@ struct AppearanceSettingsForm: View {
                 }
                 Toggle(isOn: $appearance.usesLiquidGlass) {
                     Text("Liquid Glass")
-                    Text("Refracts the desktop behind the window instead of softly blurring it. No visible effect at 100% opacity.")
+                    Text("Use a refractive glass surface instead of the frosted blur.")
                 }
             } header: {
                 Text("Window")
@@ -436,6 +444,7 @@ struct AppearanceSettingsForm: View {
         .scrollContentBackground(.hidden)
     }
 }
+
 
 @MainActor
 final class SettingsSplitController: NSSplitViewController {
