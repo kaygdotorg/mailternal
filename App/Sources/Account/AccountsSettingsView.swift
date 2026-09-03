@@ -71,35 +71,45 @@ struct AccountsSettingsView: View {
     }
 
     private var accountList: some View {
-        List {
-            ForEach(accounts, id: \.id) { account in
-                accountSection(account)
-                    .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                        Button {
-                            Task { await model.setAccountEnabled(account.id, !account.isEnabled) }
-                        } label: {
-                            Label(
-                                account.isEnabled ? "Disable" : "Enable",
-                                systemImage: account.isEnabled ? "pause.circle" : "play.circle"
-                            )
+        ScrollViewReader { proxy in
+            List {
+                ForEach(accounts, id: \.id) { account in
+                    accountSection(account)
+                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                            Button {
+                                Task { await model.setAccountEnabled(account.id, !account.isEnabled) }
+                            } label: {
+                                Label(
+                                    account.isEnabled ? "Disable" : "Enable",
+                                    systemImage: account.isEnabled ? "pause.circle" : "play.circle"
+                                )
+                            }
+                            .tint(account.isEnabled ? .orange : .green)
                         }
-                        .tint(account.isEnabled ? .orange : .green)
-                    }
-                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        Button(role: .destructive) {
-                            requestRemoval(account.id)
-                        } label: {
-                            Label("Remove", systemImage: "trash")
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) {
+                                requestRemoval(account.id)
+                            } label: {
+                                Label("Remove", systemImage: "trash")
+                            }
                         }
-                    }
+                }
+                if isAdding {
+                    accountSection(nil)
+                }
             }
-            if isAdding {
-                accountSection(nil)
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .safeAreaPadding(.vertical, 8)
+            .onChange(of: expandedRowID) { _, rowID in
+                guard let rowID else { return }
+                DispatchQueue.main.async {
+                    withAnimation(MailMotion.expand) {
+                        proxy.scrollTo(rowID, anchor: .top)
+                    }
+                }
             }
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .safeAreaPadding(.vertical, 8)
     }
 
     @ViewBuilder
@@ -158,6 +168,7 @@ struct AccountsSettingsView: View {
         .opacity(account.map { $0.isEnabled ? 1 : 0.55 } ?? 1)
         .listRowSeparator(.hidden)
         .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
+        .id(rowID)
     }
 
     private var emptyState: some View {

@@ -82,10 +82,11 @@ final class SettingsToolbarCoordinator: NSObject {
 
     private func makeAddAccountItem() -> NSToolbarItem {
         let item = NSToolbarItem(itemIdentifier: Self.addAccountIdentifier)
-        item.image = NSImage(
+        let image = NSImage(
             systemSymbolName: "plus",
             accessibilityDescription: "Add Account"
         )
+        item.image = image
         item.label = "Add Account"
         item.paletteLabel = "Add Account"
         item.toolTip = "Add Account"
@@ -93,7 +94,16 @@ final class SettingsToolbarCoordinator: NSObject {
         item.target = self
         item.action = #selector(addAccount(_:))
         item.autovalidates = false
+        let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(addAccountButton(_:)))
+        button.isBordered = true
+        button.setAccessibilityIdentifier(UIIdentifier.accountsAdd)
+        item.view = button
         return item
+    }
+
+    @objc
+    private func addAccountButton(_ sender: NSButton) {
+        requestAddAccount()
     }
 
     private func updateAddAccountItem() {
