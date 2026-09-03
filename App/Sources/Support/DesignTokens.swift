@@ -49,6 +49,7 @@ enum MailMotion {
     static let searchPanel = Animation.spring(response: 0.36, dampingFraction: 1)
     static let searchPanelReduced = Animation.easeOut(duration: 0.18)
     static let composer = Animation.smooth(duration: 0.18)
+    static let settle = Animation.spring(duration: 0.32, bounce: 0.22)
 
     static func searchPanel(reduceMotion: Bool) -> Animation {
         reduceMotion ? searchPanelReduced : searchPanel

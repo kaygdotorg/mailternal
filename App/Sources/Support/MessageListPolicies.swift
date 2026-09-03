@@ -1,6 +1,17 @@
 import Foundation
 import MailternalInterfaces
 
+/// Pure transition rules for the per-message email reading override.
+enum EmailReadingOverridePolicy {
+    static func next(effective: EmailReadingMode) -> EmailReadingMode {
+        effective == .original ? .dark : .original
+    }
+
+    static func resetsOverride(oldID: MessageID?, newID: MessageID?) -> Bool {
+        oldID != newID
+    }
+}
+
 /// The menu's value model is deliberately independent of AppKit. This keeps
 /// the Mail-style ordering, state-aware labels, and folder-tree construction
 /// deterministic and directly testable.
@@ -21,6 +32,7 @@ enum MessageContextMenuPolicy {
         case copyLink
         case copySubject
         case viewRawSource
+        case toggleEmailReadingOverride
     }
 
     struct Item: Equatable, Sendable {
@@ -197,6 +209,8 @@ enum MessageToolbarPolicy {
         case archive = "Mailternal.message.archive"
         case trash = "Mailternal.message.trash"
         case flag = "Mailternal.message.flag"
+        case source = "Mailternal.message.source"
+        case colorScheme = "Mailternal.message.colorScheme"
         case overflow = "Mailternal.message.overflow"
     }
 
@@ -205,12 +219,29 @@ enum MessageToolbarPolicy {
         let title: String
         let imageName: String
         let isEnabled: Bool
+        let isOn: Bool
+
+        init(
+            identifier: Identifier,
+            title: String,
+            imageName: String,
+            isEnabled: Bool,
+            isOn: Bool = false
+        ) {
+            self.identifier = identifier
+            self.title = title
+            self.imageName = imageName
+            self.isEnabled = isEnabled
+            self.isOn = isOn
+        }
     }
 
     static let defaultItemIdentifiers: [Identifier] = [
         .archive,
         .trash,
         .flag,
+        .source,
+        .colorScheme,
         .overflow,
     ]
 
@@ -218,12 +249,15 @@ enum MessageToolbarPolicy {
 
     static func visibleItems(
         selection: Set<MessageID>,
-        flagStates: [MessageID: Bool]
+        flagStates: [MessageID: Bool],
+        effectiveEmailReadingMode: EmailReadingMode = .original,
+        isShowingRawSource: Bool = false
     ) -> [VisibleItem] {
         let count = selection.count
         let plural = count > 1 ? " \(count.formatted(.number)) Messages" : ""
         let shouldFlag = selection.contains { !(flagStates[$0] ?? false) }
         let enabled = !selection.isEmpty
+        let singleSelection = count == 1
         return [
             VisibleItem(
                 identifier: .archive,
@@ -242,6 +276,19 @@ enum MessageToolbarPolicy {
                 title: "\(shouldFlag ? "Flag" : "Unflag")\(plural)",
                 imageName: shouldFlag ? "flag" : "flag.slash",
                 isEnabled: enabled
+            ),
+            VisibleItem(
+                identifier: .source,
+                title: "Source",
+                imageName: "chevron.left.forwardslash.chevron.right",
+                isEnabled: singleSelection,
+                isOn: isShowingRawSource
+            ),
+            VisibleItem(
+                identifier: .colorScheme,
+                title: "Email Colour Scheme",
+                imageName: effectiveEmailReadingMode == .original ? "sun.max" : "moon",
+                isEnabled: singleSelection
             ),
         ]
     }
@@ -304,12 +351,17 @@ enum MessageToolbarPolicy {
             isEnabled: false
         )
         let raw = MessageContextMenuPolicy.Item(
-            title: "View Raw Source",
+            title: "Source",
             action: .viewRawSource,
             isEnabled: selection.count == 1
         )
+        let colorScheme = MessageContextMenuPolicy.Item(
+            title: "Email Colour Scheme",
+            action: .toggleEmailReadingOverride,
+            isEnabled: selection.count == 1
+        )
         return [mark, junk, move, open, MessageContextMenuPolicy.Item(title: ""),
-                copyLink, copySubject, raw]
+                copyLink, copySubject, raw, colorScheme]
     }
 }
 
