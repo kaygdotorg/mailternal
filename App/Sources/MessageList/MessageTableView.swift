@@ -9,10 +9,7 @@ struct MessageListPane: View {
     @State private var titleHeight: CGFloat = 0
 
     private var listDissolvePolicy: MailWindowDissolvePolicy {
-        // The button measurement includes its 12pt bottom padding and the
-        // font's descent. Starting the mask here puts its clear stop at the
-        // H1 baseline; the 52pt ramp then reaches opaque content below it.
-        .messageList.withTopOrigin(max(titleHeight - 18, 0))
+        .messageList
     }
 
     private var listTitle: String {
@@ -35,7 +32,7 @@ struct MessageListPane: View {
                 accent: model.appearance.accent,
                 leading: actions.leadingSwipe,
                 trailing: actions.trailingSwipe,
-                topRestDepth: listDissolvePolicy.restDepth(safeAreaTop: 0),
+                topRestDepth: max(titleHeight, PaneHeaderInsetPolicy.messageListTopInset),
                 onSelect: { ids, anchor in model.selectMessages(ids, anchor: anchor) },
                 onSelectAll: { model.selectAllMessages() },
                 onPrefetch: { model.loadMoreIfNeeded(near: $0) },
@@ -66,7 +63,7 @@ struct MessageListPane: View {
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 16)
-            .padding(.top, 18)
+            .padding(.top, PaneHeaderInsetPolicy.messageListTopInset)
             .padding(.bottom, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityAddTraits(.isHeader)
@@ -83,10 +80,8 @@ struct MessageListPane: View {
                 EmptyMailboxState(title: "No Messages", detail: "This folder is empty.")
             }
         }
-        // No chrome sits above this column, so its rows own the whole height:
-        // they travel to the window's physical top edge and dissolve at it.
-        // The measured title height moves that origin below the title while
-        // keeping the title itself outside the scrolling mask.
+        // The list ignores the container safe area, while its fixed header and
+        // row rest depth are measured from the physical window top.
         .ignoresSafeArea(.container, edges: .top)
 }
 }
@@ -131,7 +126,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
         var parent: MessageTableRepresentable?
         private var lineCount = MessageListLayout.defaultLineCount
         weak var container: MessageTableContainer?
-        weak var tableView: NSTableView?
+        fileprivate weak var tableView: MessageTableKeyView?
         private var epoch: UInt64 = 0
         private var rowIDs: [MessageID] = []
 
@@ -356,6 +351,25 @@ struct MessageTableRepresentable: NSViewRepresentable {
 
         func menuDidClose(_ menu: NSMenu) {
             menuSelection = nil
+            tableView?.resetContextMenuTracking()
+        }
+
+        private var clickedMessageID: MessageID? {
+            guard let tableView else { return nil }
+            let row: Int
+            if let contextMenuRow = tableView.contextMenuRow {
+                row = contextMenuRow
+            } else if tableView.receivedContextMenuEvent {
+                // A mouse menu opened outside a row has no target. Do not
+                // fall through to a stale clicked or selected row.
+                return nil
+            } else {
+                // Keyboard-invoked menus do not call menu(for:), so target
+                // the current table selection.
+                row = tableView.selectedRow
+            }
+            guard row >= 0, let message = parent?.rows[safe: row] else { return nil }
+            return message.id
         }
 
         func menuNeedsUpdate(_ menu: NSMenu) {
@@ -423,13 +437,6 @@ struct MessageTableRepresentable: NSViewRepresentable {
             menu.addItem(menuItem)
         }
 
-        private var clickedMessageID: MessageID? {
-            guard let tableView,
-                  tableView.clickedRow >= 0,
-                  let row = parent?.rows[safe: tableView.clickedRow] else { return nil }
-            return row.id
-        }
-
         @objc private func performMenuAction(_ sender: NSMenuItem) {
             guard let action = sender.representedObject as? MessageContextMenuPolicy.Action,
                   let parent else { return }
@@ -441,7 +448,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
             case .openInNewWindow:
                 guard selection.count == 1, let id = selection.first else { return }
                 parent.onOpenMessageWindow(id)
-            case .reply, .replyAll, .forward, .viewRawSource:
+            case .reply, .replyAll, .forward, .viewRawSource, .toggleEmailReadingOverride:
                 break
             case .markRead, .markUnread:
                 parent.onAction(.toggleRead, selection)
@@ -501,6 +508,25 @@ fileprivate enum MessageTableKeyCommand {
 @MainActor
 fileprivate final class MessageTableKeyView: NSTableView {
     var onKeyCommand: ((MessageTableKeyCommand) -> Void)?
+    fileprivate private(set) var contextMenuRow: Int?
+    fileprivate private(set) var receivedContextMenuEvent = false
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = row(at: point)
+        contextMenuRow = row >= 0 ? row : nil
+        receivedContextMenuEvent = true
+
+        // NSTableView's implementation draws its contextual clicked-row
+        // highlight before presenting the menu. Returning the configured menu
+        // directly keeps clicked-row targeting without that extra ring.
+        return self.menu
+    }
+
+    fileprivate func resetContextMenuTracking() {
+        contextMenuRow = nil
+        receivedContextMenuEvent = false
+    }
 
     override func keyDown(with event: NSEvent) {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
