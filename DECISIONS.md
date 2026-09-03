@@ -79,3 +79,25 @@ rationale → revisit-when.
 24. **UI performance is tested with XCUITest + signposts on the mbp runner** under the
     `agents` user (dedicated automation Mac arrives October). Wall-clock asserts do
     not belong in the unit suite (load flakes under parallel builds).
+25. **Bound IMAP parser and line buffering to 1 MiB via a temporary NIOIMAP fork.** The upstream
+    `IMAPClientHandler` hardcodes NIO's single-step decoder buffer to the much smaller
+    `IMAPDefaults.lineLengthLimit`, and does not expose that setting. Mailternal therefore
+    uses `kaygdotorg/swift-nio-imap`, branch `mailternal/line-buffer`, revision
+    `0c03790b44b95ae1d57de17a6518a3f77bf10088`, and applies one 1 MiB limit to the
+    decoder buffer, response-parser buffer, and response literals. This bounds memory while
+    allowing legitimate large FETCH responses; an oversized response remains a
+    non-transport parse error for per-UID isolation. The upstream PR
+    https://github.com/apple/swift-nio-imap/pull/849 proposes the small
+    `IMAPClientHandler` initializer parameter so this fork can be retired once the API is
+    accepted and released. Revisit: replace the fork with the upstream release.
+26. **Reader tabs are one row in the main reader pane; the transient persists.**
+    A single row keeps reader height stable while a browser-like strip supplies
+    familiar compression, scrolling, and keyboard mechanics; the fixed
+    trailing actions stay reachable. Persisting the transient preserves the
+    user's open reading context and its scroll position across launches rather
+    than silently discarding a real tab. Tabs deliberately show no unread or
+    flag marks: those states belong to message-list triage, while tab titles
+    stay quiet and scannable. Tabs are main-window-only so detached message
+    windows remain focused, simple, and tab-less instead of creating a second
+    tab state to synchronize. Revisit: only if a future multi-window reader
+    model can preserve one unambiguous tab owner.

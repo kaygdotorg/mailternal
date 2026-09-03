@@ -5,6 +5,10 @@ import NIOIMAP
 import NIOSSL
 import NIOTLS
 
+private enum IMAPLimits {
+    static let maxBytes = 1 << 20
+}
+
 /// Byte-level IMAP connection: a NIO `Channel` with `IMAPClientHandler` plus a
 /// response stream. Production uses TCP + NIOSSL; tests inject an
 /// `NIOAsyncTestingChannel`.
@@ -203,7 +207,15 @@ enum IMAPNetwork {
                             try channel.pipeline.syncOperations.addHandler(handshake)
                         }
                     }
-                    try channel.pipeline.syncOperations.addHandler(IMAPClientHandler())
+                    try channel.pipeline.syncOperations.addHandler(
+                        IMAPClientHandler(
+                            parserOptions: ResponseParser.Options(
+                                bufferLimit: IMAPLimits.maxBytes,
+                                literalSizeLimit: IMAPLimits.maxBytes
+                            ),
+                            maximumBufferSize: IMAPLimits.maxBytes
+                        )
+                    )
                     try channel.pipeline.syncOperations.addHandler(collector)
                 }
             }

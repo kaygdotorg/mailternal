@@ -14,7 +14,7 @@ let package = Package(
         .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
         .package(url: "https://github.com/apple/swift-nio", from: "2.70.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl", from: "2.27.0"),
-        .package(url: "https://github.com/apple/swift-nio-imap", branch: "main"),
+        .package(url: "https://github.com/kaygdotorg/swift-nio-imap", branch: "mailternal/line-buffer"),
         .package(url: "https://github.com/scinfu/SwiftSoup", from: "2.7.0"),
     ],
     targets: [

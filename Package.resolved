@@ -1,5 +1,5 @@
 {
-  "originHash" : "756edfd8235644a42e9b2ac8db05f1fb98237a2b5bc189813be3cb468218da13",
+  "originHash" : "1701029003fa3f80bba10edd91a85b2e1eb3adf8cc39c1bb18e2d1762652dd84",
   "pins" : [
     {
       "identity" : "grdb.swift",
@@ -40,10 +40,10 @@
     {
       "identity" : "swift-nio-imap",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/swift-nio-imap",
+      "location" : "https://github.com/kaygdotorg/swift-nio-imap",
       "state" : {
-        "branch" : "main",
-        "revision" : "e536be599e53bb5efe0b709eabf38ce22bd11691"
+        "branch" : "mailternal/line-buffer",
+        "revision" : "0c03790b44b95ae1d57de17a6518a3f77bf10088"
       }
     },
     {
