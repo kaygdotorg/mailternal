@@ -150,6 +150,22 @@ private enum BackfillAttemptResult: Equatable {
     case halted
 }
 
+private struct MetadataWindowFetchFailure: Error {
+    let underlying: Error
+
+    var reason: String { String(describing: underlying) }
+}
+
+private struct WindowIngestResult {
+    let result: BackfillAttemptResult
+    let channel: SyncChannel
+}
+
+private struct BackfillAttempt {
+    let result: BackfillAttemptResult
+    let channel: SyncChannel
+}
+
 
 /// Sync orchestration (spec: docs/spec/sync.md).
 ///
@@ -168,6 +184,7 @@ public actor SyncEngine {
     private var runTask: Task<Void, Never>?
     private var stopping = false
     private var connected = false
+    private var backfillTasks: [FolderID: Task<BackfillAttempt, Never>] = [:]
     private var sessionBroken = false
     private var backfillPassFinished = false
     private var dualConnection = false
@@ -175,7 +192,6 @@ public actor SyncEngine {
     private var idleChannel: SyncChannel?
     private var backfillChannels: [SyncChannel] = []
     private var backfillScheduler: FolderBackfillScheduler?
-    private var backfillTasks: [FolderID: Task<BackfillAttemptResult, Never>] = [:]
     /// Learned per session after a provider rejects a new connection.
     private var backfillConnectionCap: Int?
     private var visibleFolderID: FolderID?
@@ -320,6 +336,9 @@ public actor SyncEngine {
         state.backfillPhase = .idle
         try? await store.saveSyncState(state)
     }
+    /// Runs the durable mutation drain immediately, then reconciles the
+    /// affected folders. User moves must not wait for `seenPoll` or the
+    /// periodic mailbox tick.
     public func refreshNow() async {
         refreshPulse &+= 1
         guard connected, discoveryReady, let channel = syncChannel else { return }
@@ -327,6 +346,12 @@ public actor SyncEngine {
             let renamed = try await drainFolderRenames(channel: channel)
             if renamed {
                 try await discover(channel: channel)
+            }
+            try await drainFlags(channel: channel)
+            let movedFolders = try await drainMove(channel: channel)
+            for folderID in movedFolders.sorted(by: { $0.rawValue < $1.rawValue }) {
+                if stopping { return }
+                try await delta(folderID: folderID, channel: channel, notify: true)
             }
             try await deltaAll(channel: channel, notify: true)
         } catch {
@@ -878,21 +903,22 @@ public actor SyncEngine {
         channel: SyncChannel,
         scheduler: FolderBackfillScheduler
     ) async {
+        var activeChannel = channel
         while !stopping && !sessionBroken && !Task.isCancelled {
             guard let folderID = await scheduler.next() else { return }
-            guard !stopping, !sessionBroken, folders[folderID]?.keepLocally == true else {
-                await scheduler.finish(folderID, completed: false)
-                continue
+            let taskChannel = activeChannel
+            let task = Task {
+                await self.runBackfillWithRetries(folderID: folderID, channel: taskChannel)
             }
 
-            let task = Task { await self.runBackfillWithRetries(folderID: folderID, channel: channel) }
             backfillTasks[folderID] = task
-            let result = await task.value
+            let attempt = await task.value
+            activeChannel = attempt.channel
             if backfillTasks[folderID] != nil {
                 backfillTasks.removeValue(forKey: folderID)
             }
             var complete = false
-            if result == .committed, let record = folders[folderID], record.keepLocally,
+            if attempt.result == .committed, let record = folders[folderID], record.keepLocally,
                let state = try? await store.fetchSyncState(for: record.generation) {
                 complete = state.backfillPhase == .complete
             }
@@ -906,11 +932,13 @@ public actor SyncEngine {
     private func runBackfillWithRetries(
         folderID: FolderID,
         channel: SyncChannel
-    ) async -> BackfillAttemptResult {
+    ) async -> BackfillAttempt {
         var retries = 0
+        var activeChannel = channel
         while !stopping && !Task.isCancelled {
             let before = expungeRevision[folderID, default: 0]
-            let result = await syncFolderHistory(folderID: folderID, channel: channel)
+            let attempt = await syncFolderHistory(folderID: folderID, channel: activeChannel)
+            activeChannel = attempt.channel
             let after = expungeRevision[folderID, default: 0]
             let state: FolderSyncState?
             if let current = folders[folderID] {
@@ -918,7 +946,7 @@ public actor SyncEngine {
             } else {
                 state = nil
             }
-            let retry = result == .invalidated
+            let retry = attempt.result == .invalidated
                 && !stopping
                 && !Task.isCancelled
                 && !sessionBroken
@@ -926,10 +954,10 @@ public actor SyncEngine {
                 && state?.backfillPhase == .walking
                 && after != before
                 && retries < 3
-            guard retry else { return result }
+            guard retry else { return attempt }
             retries += 1
         }
-        return .halted
+        return BackfillAttempt(result: .halted, channel: activeChannel)
     }
     /// Older builds advanced the durable cursor across messages rejected by
     /// the setup-time cutoff. A completed generation with fewer local rows than
@@ -976,10 +1004,10 @@ public actor SyncEngine {
     private func syncFolderHistory(
         folderID: FolderID,
         channel: SyncChannel
-    ) async -> BackfillAttemptResult {
-        let result = await backfill(folderID: folderID, channel: channel)
+    ) async -> BackfillAttempt {
+        let attempt = await backfill(folderID: folderID, channel: channel)
         await activateIfReplacementComplete(folderID: folderID)
-        return result
+        return attempt
     }
 
     private func activateIfReplacementComplete(folderID: FolderID) async {
@@ -993,13 +1021,18 @@ public actor SyncEngine {
     private func backfill(
         folderID: FolderID,
         channel: SyncChannel
-    ) async -> BackfillAttemptResult {
+    ) async -> BackfillAttempt {
+        var activeChannel = channel
         guard var record = folders[folderID],
-              record.keepLocally else { return .halted }
+              record.keepLocally else {
+            return BackfillAttempt(result: .halted, channel: activeChannel)
+        }
         do {
             var state = try await store.fetchSyncState(for: record.generation)
                 ?? FolderSyncState(generation: record.generation, baselineUID: record.baseline)
-            if state.backfillPhase == .complete { return .committed }
+            if state.backfillPhase == .complete {
+                return BackfillAttempt(result: .committed, channel: activeChannel)
+            }
             if state.backfillPhase == .halted {
                 let snap = disk.snapshot(for: settings.diskURL)
                 let reserve = SyncPolicy.reserveBytes(volumeBytes: snap.volumeBytes)
@@ -1020,8 +1053,10 @@ public actor SyncEngine {
                 }
             }
 
-            let selected = try await channel.select(record.path)
-            guard folders[folderID]?.keepLocally == true else { return .halted }
+            let selected = try await activeChannel.select(record.path)
+            guard folders[folderID]?.keepLocally == true else {
+                return BackfillAttempt(result: .halted, channel: activeChannel)
+            }
             try await store.updateServerMessageCount(selected.exists, for: folderID)
             let previousGeneration = record.generation
             try await maybeReplace(selected: selected, record: &record)
@@ -1029,7 +1064,9 @@ public actor SyncEngine {
             if record.generation != previousGeneration {
                 state = try await store.fetchSyncState(for: record.generation)
                     ?? FolderSyncState(generation: record.generation, baselineUID: record.baseline)
-                if state.backfillPhase == .complete { return .committed }
+                if state.backfillPhase == .complete {
+                    return BackfillAttempt(result: .committed, channel: activeChannel)
+                }
             }
             let uidNext = selected.uidNext ?? record.lastUidNext
 
@@ -1045,7 +1082,9 @@ public actor SyncEngine {
             try await store.saveSyncState(state)
 
             while !stopping && !Task.isCancelled {
-                guard folders[folderID]?.keepLocally == true else { return .halted }
+                guard folders[folderID]?.keepLocally == true else {
+                    return BackfillAttempt(result: .halted, channel: activeChannel)
+                }
                 try Task.checkCancellation()
                 let snap = disk.snapshot(for: settings.diskURL)
                 let reserve = SyncPolicy.reserveBytes(volumeBytes: snap.volumeBytes)
@@ -1070,7 +1109,7 @@ public actor SyncEngine {
                     if let since = windowedSince {
                         publishStatus(mode: .windowed(since: since))
                     }
-                    return .halted
+                    return BackfillAttempt(result: .halted, channel: activeChannel)
                 }
 
                 let windowSize = SyncPolicy.backfillWindowSize(
@@ -1086,16 +1125,18 @@ public actor SyncEngine {
                     state.progress = 1
                     try await store.saveSyncState(state)
                     await clearWindowedModeIfResolved()
-                    return .committed
+                    return BackfillAttempt(result: .committed, channel: activeChannel)
                 }
                 let capturedGeneration = record.generation
-                let result = try await ingestWindow(
+                let windowAttempt = try await ingestWindowResilient(
                     record: record,
                     window: window,
-                    channel: channel,
+                    channel: activeChannel,
                     notify: false,
                     expectedExpungeRevision: expungeRevision[folderID] ?? 0
                 )
+                activeChannel = windowAttempt.channel
+                let result = windowAttempt.result
 
                 // Cursor advances only after a committed window. Cancellation
                 // mid-ingest must not persist low-water (spec: sync.md backfill).
@@ -1104,26 +1145,166 @@ public actor SyncEngine {
                 case .committed:
                     break
                 case .invalidated, .halted:
-                    return result
+                    return BackfillAttempt(result: result, channel: activeChannel)
                 }
-                guard stillCurrentGeneration(capturedGeneration, folder: folderID) else { return .invalidated }
+                guard stillCurrentGeneration(capturedGeneration, folder: folderID) else {
+                    return BackfillAttempt(result: .invalidated, channel: activeChannel)
+                }
                 state.lowWaterUID = IMAPUID(rawValue: window.lowerBound)
                 state.progress = SyncPolicy.backfillProgress(uidNext: uidNext, lowWater: state.lowWaterUID?.rawValue)
                 try await store.saveSyncState(state)
             }
         } catch is CancellationError {
-            return .halted
+            return BackfillAttempt(result: .halted, channel: activeChannel)
         } catch {
             if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
-                return .halted
+                return BackfillAttempt(result: .halted, channel: activeChannel)
             }
             await logSync("backfill \(record.path)", detail: String(describing: error), folder: folderID)
             if SyncPolicy.isTransport(error) {
                 sessionBroken = true
             }
-            return .halted
+            return BackfillAttempt(result: .halted, channel: activeChannel)
         }
-        return .halted
+        return BackfillAttempt(result: .halted, channel: activeChannel)
+    }
+
+    private func ingestWindowResilient(
+        record: FolderRecord,
+        window: ClosedRange<UInt32>,
+        channel: SyncChannel,
+        notify: Bool,
+        expectedExpungeRevision: UInt64? = nil
+    ) async throws -> WindowIngestResult {
+        do {
+            let result = try await ingestWindow(
+                record: record,
+                window: window,
+                channel: channel,
+                notify: notify,
+                expectedExpungeRevision: expectedExpungeRevision
+            )
+            return WindowIngestResult(result: result, channel: channel)
+        } catch let failure as MetadataWindowFetchFailure {
+            await logSync(
+                "bisect window \(record.path)",
+                detail: "range=\(window.lowerBound)...\(window.upperBound) depth=0 reason=\(failure.reason)",
+                folder: record.id
+            )
+            return try await bisectWindow(
+                record: record,
+                window: window,
+                replacing: channel,
+                notify: notify,
+                expectedExpungeRevision: expectedExpungeRevision,
+                failure: failure,
+                depth: 0,
+                maxDepth: SyncPolicy.maxBisectionDepth(for: window)
+            )
+        }
+    }
+
+    private func bisectWindow(
+        record: FolderRecord,
+        window: ClosedRange<UInt32>,
+        replacing channel: SyncChannel,
+        notify: Bool,
+        expectedExpungeRevision: UInt64?,
+        failure: MetadataWindowFetchFailure,
+        depth: Int,
+        maxDepth: Int
+    ) async throws -> WindowIngestResult {
+        try Task.checkCancellation()
+        guard let (lower, upper) = SyncPolicy.bisectWindow(window) else {
+            let fresh = try await openFreshBackfillChannel(replacing: channel)
+            do {
+                let result = try await quarantineUnknown(
+                    record: record,
+                    window: window,
+                    channel: fresh,
+                    reason: failure.reason,
+                    expectedExpungeRevision: expectedExpungeRevision
+                )
+                return WindowIngestResult(result: result, channel: fresh)
+            } catch {
+                await fresh.close()
+                throw error
+            }
+        }
+        guard depth < maxDepth else {
+            throw failure.underlying
+        }
+
+        var currentChannel = channel
+        for half in [lower, upper] {
+            let candidate = try await openFreshBackfillChannel(replacing: currentChannel)
+            currentChannel = candidate
+            do {
+                let result = try await ingestWindow(
+                    record: record,
+                    window: half,
+                    channel: candidate,
+                    notify: notify,
+                    expectedExpungeRevision: expectedExpungeRevision
+                )
+                switch result {
+                case .committed:
+                    continue
+                case .invalidated, .halted:
+                    return WindowIngestResult(result: result, channel: candidate)
+                }
+            } catch let childFailure as MetadataWindowFetchFailure {
+                await logSync(
+                    "bisect window \(record.path)",
+                    detail: "range=\(half.lowerBound)...\(half.upperBound) depth=\(depth + 1) reason=\(childFailure.reason)",
+                    folder: record.id
+                )
+                let child = try await bisectWindow(
+                    record: record,
+                    window: half,
+                    replacing: candidate,
+                    notify: notify,
+                    expectedExpungeRevision: expectedExpungeRevision,
+                    failure: childFailure,
+                    depth: depth + 1,
+                    maxDepth: maxDepth
+                )
+                currentChannel = child.channel
+                if child.result != .committed {
+                    return child
+                }
+            } catch {
+                await candidate.close()
+                throw error
+            }
+        }
+        return WindowIngestResult(result: .committed, channel: currentChannel)
+    }
+
+    private func openFreshBackfillChannel(replacing old: SyncChannel) async throws -> SyncChannel {
+        await old.close()
+        let password = try await credentials.password(for: config.id)
+        let client = clientFactory.makeClient(
+            endpoint: config.imap,
+            username: config.username,
+            password: password
+        )
+        let fresh = SyncChannel(client: client)
+        do {
+            try await fresh.connect()
+        } catch {
+            await fresh.close()
+            throw error
+        }
+        if let index = backfillChannels.firstIndex(where: { $0 === old }) {
+            backfillChannels[index] = fresh
+        } else {
+            backfillChannels.append(fresh)
+        }
+        if syncChannel === old {
+            syncChannel = fresh
+        }
+        return fresh
     }
 
     private func ingestWindow(
@@ -1164,6 +1345,12 @@ public actor SyncEngine {
             }
             await logSync("window fetch \(record.path)", detail: String(describing: error), folder: record.id)
             if SyncPolicy.isTransport(error) { throw error }
+            // Live IMAP failures are typed. Legacy test-only errors retain the
+            // direct FLAGS fallback so those tests continue to exercise its
+            // revision race; typed non-transport failures need a fresh channel.
+            if error is IMAPError {
+                throw MetadataWindowFetchFailure(underlying: error)
+            }
             return try await quarantineUnknown(
                 record: record,
                 window: window,
@@ -2001,7 +2188,7 @@ public actor SyncEngine {
 
             do {
                 try await channel.renameMailbox(from: summary.path, to: op.targetPath)
-                try await store.dequeueFolderRename(op)
+                try await store.applyFolderRename(op)
                 didRename = true
             } catch let error as IMAPError {
                 if error.isTaggedNO || error.isTaggedBAD {

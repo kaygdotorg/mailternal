@@ -111,17 +111,19 @@ and destination match.
   and replaces `target_name`, `target_path`, and `enqueued_at`. The queue is
   durable across process restart.
 - `target_path` replaces only the terminal component of the folder's current
-  path, retaining its hierarchy prefix and exact LIST separator. The local
-  folder row is not changed until discovery confirms server state, so a
-  rejected rename never leaves a cosmetic local path.
+  path, retaining its hierarchy prefix and exact LIST separator. On tagged `OK`,
+  the store updates that folder and any descendants sharing the old separator
+  prefix, and dequeues the operation in one local transaction before discovery.
+  A rejected rename never changes the local path.
 - The sync engine drains renames serially on the command channel with IMAP
-  `RENAME`. Tagged `OK` removes the row and immediately refreshes mailbox
-  discovery. Transport errors, `BYE`, and connection loss retain the row for
-  retry. Tagged `NO`/`BAD`, account/folder mismatches, and retired folders
+  `RENAME`. Tagged `OK` applies the local tree update and immediately refreshes
+  mailbox discovery. Transport errors, `BYE`, and connection loss retain the row
+  for retry. Tagged `NO`/`BAD`, account/folder mismatches, and retired folders
   remove the row and record a user-visible store error.
-- Discovery preserves a `FolderID` when the server supplies OBJECTID/MAILBOXID.
-  Path-only servers conservatively retire the old identity and create a new
-  folder generation after a successful rename.
+- Discovery preserves a `FolderID` and its generation after a successful queued
+  rename, including on path-only servers, because the local path is applied
+  before LIST reconciliation. An unsolicited external rename on a path-only
+  server remains conservative delete + new mailbox behavior.
 
 ### Backfill algorithm (bounded, resumable)
 - Per folder: walk **descending fixed-size UID windows** from `UIDNEXT-1` (never
@@ -135,6 +137,7 @@ and destination match.
   reconnect, or kill.
 - A message that fails to parse/fetch is **quarantined** (stored with error state,
   envelope-only) and never blocks its folder.
+
 - Priority queue: INBOX first, then the currently visible folder, then
   SPECIAL-USE folders, then custom folders; within a folder, newest first.
   `FolderBackfillScheduler` owns this ordering and wakes workers when a folder
@@ -155,6 +158,12 @@ and destination match.
   Dovecot ~10, iCloud ~5, or Gmail ~15), the scheduler falls back to the
   number of connections accepted and remembers that cap for the session. A
   cap never disables discovery or the already-open workers.
+
+**IMAP protocol bounds:** IMAP line buffering and individual literals are capped
+at 1 MiB. A larger server response is surfaced as a non-transport parse error
+and handled by per-UID quarantine/bisection, so one malformed message cannot
+stall a folder.
+
 ### Disk policy (no up-front full scan)
 - Start syncing the newest INBOX window immediately — never block startup on a
   mailbox-wide size scan or an age-based cutoff.

@@ -70,6 +70,32 @@ enum SyncPolicy: Sendable {
         return min(1, max(0, Double(done) / Double(top)))
     }
 
+    /// Splits a failed inclusive window into two non-empty ranges. Keeping the
+    /// split policy pure makes the retry bound and range coverage testable
+    /// without opening a channel.
+    static func bisectWindow(
+        _ window: ClosedRange<UInt32>
+    ) -> (ClosedRange<UInt32>, ClosedRange<UInt32>)? {
+        guard window.lowerBound < window.upperBound else { return nil }
+        let midpoint = window.lowerBound
+            &+ (window.upperBound &- window.lowerBound) / 2
+        return (window.lowerBound...midpoint, (midpoint &+ 1)...window.upperBound)
+    }
+
+    /// Maximum recursive split depth needed to reach one UID. The power-of-two
+    /// ceiling bounds a one-poisoned-window walk at roughly `2 * depth + 1`
+    /// metadata FETCHes.
+    static func maxBisectionDepth(for window: ClosedRange<UInt32>) -> Int {
+        let count = UInt64(window.upperBound) - UInt64(window.lowerBound) + 1
+        var leaves: UInt64 = 1
+        var depth = 0
+        while leaves < count {
+            leaves <<= 1
+            depth += 1
+        }
+        return depth
+    }
+
     // MARK: Paths
 
     static func advertisedPath(_ advertised: IMAPDeltaPath) -> DeltaPath {
@@ -226,10 +252,12 @@ enum SyncPolicy: Sendable {
         }
     }
 
+    /// Transport failures are retryable at the session level. Parser failures
+    /// are intentionally non-transport so the engine can isolate their UID.
     static func isTransport(_ error: Error) -> Bool {
         guard let error = error as? IMAPError else { return false }
         switch error {
-        case .transport, .tls, .parse: return true
+        case .transport, .tls: return true
         default: return false
         }
     }

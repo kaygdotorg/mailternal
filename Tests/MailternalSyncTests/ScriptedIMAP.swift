@@ -30,6 +30,9 @@ final class ScriptedWorld: @unchecked Sendable {
     var connectAttempts = 0
     var fetchError: Error?
     var fetchErrorAfter: Int?
+    /// Metadata FETCHes containing one of these UIDs fail with a parse error
+    /// and poison the scripted session, matching the real parser behavior.
+    var parseFailingUIDs: Set<UInt32> = []
     var fetchCount = 0
     private var completedFetchCount = 0
     private var fetchCompletionWaiters: [
@@ -572,6 +575,17 @@ final class ScriptedWorld: @unchecked Sendable {
         connectError = error
         lock.unlock()
     }
+    func metadataParseFailure(_ request: IMAPFetchRequest) -> Error? {
+        guard request.envelope || request.bodyStructure else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let uid = parseFailingUIDs.first(where: { failing in
+            request.uids.ranges.contains { $0.contains(failing) }
+        }) else {
+            return nil
+        }
+        return IMAPError.parse("scripted payload too large for UID \(uid)")
+    }
 
     func beginFetch() -> Error? {
         lock.lock()
@@ -730,13 +744,20 @@ actor ScriptedIMAPClient: IMAPClient {
         closed = false
     }
     func selectedMailbox() async -> IMAPSelectedMailbox? {
-        guard let selectedPath else { return nil }
+        guard !closed, connected, let selectedPath else { return nil }
         return makeSelected(world.mailbox(selectedPath), name: selectedPath)
     }
 
     private var closed = false
 
+    private func ensureOpen() throws {
+        guard connected, !closed else {
+            throw IMAPError.transport("Session is closed")
+        }
+    }
+
     func wasClosed() -> Bool { closed }
+
 
     func close() async {
         // Closing a client must not strand a fetch or archive phase paused by
@@ -751,11 +772,13 @@ actor ScriptedIMAPClient: IMAPClient {
         eventContinuation.finish()
     }
     func listFolders() async throws -> IMAPFolderDiscovery {
+        try ensureOpen()
         let discovery = world.discovery()
         return IMAPFolderDiscovery(folders: discovery.folders, isGmail: discovery.isGmail)
     }
 
     func select(_ mailbox: String, qresync: IMAPQResyncSelect?) async throws -> IMAPSelectedMailbox {
+        try ensureOpen()
         world.noteSelect()
         if let fail = world.selectFailure() { throw fail }
         if qresync != nil, world.qresyncShouldFail() {
@@ -767,14 +790,21 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func enableQResync() async throws {
+        try ensureOpen()
         if world.qresyncShouldFail() {
             throw IMAPError.taggedBAD(tag: "t", message: "ENABLE QRESYNC failed", code: nil)
         }
     }
 
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
+        try ensureOpen()
         if let error = world.beginFetch() { throw error }
         world.noteFetch(request, path: selectedPath ?? "")
+        if let error = world.metadataParseFailure(request) {
+            world.noteFetchCompleted()
+            closed = true
+            throw error
+        }
         let pausedMetadataSnapshot: (snapshot: ScriptedMailbox, alreadyReleased: Bool)?
         if (request.envelope || request.bodyStructure), let selectedPath {
             pausedMetadataSnapshot = world.metadataFetchSnapshotIfPaused(path: selectedPath)
@@ -844,6 +874,7 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func storeFlags(uids: IMAPUIDSet, flag: FlagKind, set: Bool) async throws {
+        try ensureOpen()
         if let error = world.flagsError() { throw error }
         guard let selectedPath else { return }
         world.applyStoreFlags(path: selectedPath, flag: flag, set: set, uids: uids)
@@ -854,11 +885,13 @@ actor ScriptedIMAPClient: IMAPClient {
     }
  
     func move(uids: IMAPUIDSet, to mailbox: String) async throws {
+        try ensureOpen()
         if let error = world.mutationError("MOVE") { throw error }
         guard let selectedPath else { return }
         world.applyArchiveMove(path: selectedPath, destination: mailbox, uids: uids)
     }
     func renameMailbox(from source: String, to destination: String) async throws {
+        try ensureOpen()
         if let error = world.mutationError("RENAME") { throw error }
         world.applyRename(from: source, to: destination)
         if selectedPath == source {
@@ -867,12 +900,13 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
+        try ensureOpen()
         if let error = world.mutationError("COPY") { throw error }
         guard let selectedPath else { return }
         world.applyArchiveCopy(path: selectedPath, destination: mailbox, uids: uids)
     }
-
     func storeDeleted(uids: IMAPUIDSet) async throws {
+        try ensureOpen()
         try await world.archiveStorePauseIfNeeded()
         if let error = world.mutationError("STORE") { throw error }
         guard let selectedPath else { return }
@@ -880,12 +914,14 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func expunge(uids: IMAPUIDSet) async throws {
+        try ensureOpen()
         if let error = world.mutationError("EXPUNGE") { throw error }
         guard let selectedPath else { return }
         world.applyExpunge(path: selectedPath, uids: uids)
     }
 
     func beginIdle() async throws -> IMAPIdle {
+        try ensureOpen()
         var continuation: AsyncStream<IMAPMailboxEvent>.Continuation!
         let stream = AsyncStream<IMAPMailboxEvent> { continuation = $0 }
         idleContinuation = continuation
@@ -894,6 +930,7 @@ actor ScriptedIMAPClient: IMAPClient {
     }
 
     func endIdle() async throws {
+        try ensureOpen()
         idleContinuation?.finish()
         idleContinuation = nil
     }

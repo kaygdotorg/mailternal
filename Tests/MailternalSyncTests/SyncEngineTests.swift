@@ -286,6 +286,57 @@ private func nextMailEvent(
     }
 }
 
+@Test func engineBisectsPoisonedMetadataWindowAndAdvancesCursor() async throws {
+    try await withSyncStore { store, dir in
+        let poisonedUID: UInt32 = 40
+        let box = populatedInbox(uidValidity: 1, count: 1_000, prefix: "bisect")
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        world.parseFailingUIDs = [poisonedUID]
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(
+                dir: dir,
+                window: 1_000,
+                seenPoll: .seconds(3_600),
+                periodicTick: .seconds(3_600),
+                cleanupTick: .seconds(3_600)
+            )
+        )
+
+        await engine.start()
+        try await waitUntil(timeout: .seconds(15)) {
+            let folders = try await store.fetchFolders(account: sampleConfig().id)
+            return folders.contains {
+                $0.role == .inbox && $0.backfill == .complete && $0.totalCount == 1_000
+            }
+        }
+
+        let inbox = try #require(await inboxFolder(store))
+        let generation = try #require(await store.liveGeneration(for: inbox.id))
+        let uids = try await store.uids(in: generation)
+        #expect(uids.count == 1_000)
+        var quarantined: [UInt32] = []
+        for uid in uids {
+            let id = try #require(await store.messageID(generation: generation, uid: uid))
+            if try await store.detail(id).isQuarantined {
+                quarantined.append(uid.rawValue)
+            }
+        }
+        #expect(quarantined == [poisonedUID])
+        #expect(world.snapshotFetchCount() <= 40)
+        await engine.stop()
+    }
+}
+
 @Test func engineDowngradesQresyncFailureAndPersistsBasicOrCondstore() async throws {
     try await withSyncStore { store, dir in
         var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 2, highestModSeq: 9)
