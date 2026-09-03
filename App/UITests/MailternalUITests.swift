@@ -78,7 +78,7 @@ final class MailternalUITests: XCTestCase {
         activateMainWindow()
         app.typeKey(",", modifierFlags: .command)
         XCTAssertTrue(settingsWindow.waitForExistence(timeout: 8), "cmd-, should open settings")
-        XCTAssertTrue(settingsWindow.textFields[UIIdentifier.setupHost].waitForExistence(timeout: 5))
+        XCTAssertTrue(settingsWindow.otherElements[UIIdentifier.accountsList].waitForExistence(timeout: 5))
     }
 
     func testMessageListHasNoSearchChromeWhileSearchStaysReachable() {
@@ -318,14 +318,18 @@ final class MailternalUITests: XCTestCase {
     private func signInToMock() {
         XCTAssertTrue(mainWindow.waitForExistence(timeout: 8))
         XCTAssertTrue(settingsWindow.waitForExistence(timeout: 8), "setup window should appear for a mock account")
-        if settingsWindow.staticTexts["Account is active."].exists {
+        if settingsWindow.otherElements[UIIdentifier.accountsList].exists,
+           !settingsWindow.buttons[UIIdentifier.accountsEmptyAdd].exists {
             closeSettingsIfOpen()
             XCTAssertTrue(element(UIIdentifier.sidebarFolder("INBOX")).waitForExistence(timeout: 10))
             return
         }
-        let host = settingsWindow.textFields[UIIdentifier.setupHost]
-        let username = settingsWindow.textFields[UIIdentifier.setupUsername]
-        let password = settingsWindow.secureTextFields[UIIdentifier.setupPassword]
+        let add = settingsWindow.buttons[UIIdentifier.accountsEmptyAdd]
+        XCTAssertTrue(add.waitForExistence(timeout: 5))
+        add.click()
+        let host = settingsWindow.textFields[UIIdentifier.accountEditorHost]
+        let username = settingsWindow.textFields[UIIdentifier.accountEditorUsername]
+        let password = settingsWindow.secureTextFields[UIIdentifier.accountEditorPassword]
         XCTAssertTrue(host.waitForExistence(timeout: 5))
         host.click()
         host.typeText("mock.local")
@@ -333,8 +337,8 @@ final class MailternalUITests: XCTestCase {
         username.typeText("qa")
         password.click()
         password.typeText("password")
-        settingsWindow.buttons["Sign In"].click()
-        XCTAssertTrue(settingsWindow.staticTexts["Account is active."].waitForExistence(timeout: 12))
+        settingsWindow.buttons[UIIdentifier.accountEditorSave].click()
+        XCTAssertFalse(settingsWindow.buttons[UIIdentifier.accountEditorSave].waitForExistence(timeout: 12), "editor should dismiss after a successful save")
         closeSettingsIfOpen()
         XCTAssertTrue(element(UIIdentifier.sidebarFolder("INBOX")).waitForExistence(timeout: 12))
     }

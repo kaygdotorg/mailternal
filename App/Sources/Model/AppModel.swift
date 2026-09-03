@@ -108,6 +108,12 @@ final class AppModel {
         facade.accountConfig
     }
 
+    /// Multi-account-shaped view model surface; the facade currently exposes
+    /// only its single active account.
+    var accountConfigs: [AccountConfig] {
+        accountConfig.map { [$0] } ?? []
+    }
+
     var hasAccount: Bool {
         if case .none = accountState { return false }
         return true

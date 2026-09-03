@@ -1388,4 +1388,68 @@ final class UILogicTests: XCTestCase {
             "Choose one message to read it."
         )
     }
+
+    func testAccountsListPolicyUsesTitleFallbackInRowSummary() {
+        let config = AccountConfig(
+            id: AccountID(rawValue: "fallback"),
+            accountLinkID: .random(),
+            displayName: "  ",
+            emailAddress: "ada@example.com",
+            username: "ada@example.com",
+            imap: IMAPEndpoint(host: "imap.example.com", port: 993, security: .implicitTLS)
+        )
+
+        let summary = AccountsListPolicy.rowSummary(for: config)
+        XCTAssertEqual(summary.displayName, "ada@example.com")
+        XCTAssertEqual(summary.email, "ada@example.com")
+        XCTAssertEqual(summary.host, "imap.example.com")
+        XCTAssertEqual(summary.text, "ada@example.com · ada@example.com · imap.example.com")
+    }
+
+    func testAccountsListPolicySortsByDisplayNameWithDeterministicTies() {
+        func config(_ id: String, _ name: String, _ email: String) -> AccountConfig {
+            AccountConfig(
+                id: AccountID(rawValue: id),
+                accountLinkID: .random(),
+                displayName: name,
+                emailAddress: email,
+                username: email,
+                imap: IMAPEndpoint(host: "\(id).example.com", port: 993, security: .implicitTLS)
+            )
+        }
+
+        let sorted = AccountsListPolicy.sorted([
+            config("z", "zeta", "z@example.com"),
+            config("b", "alpha", "b@example.com"),
+            config("a", "alpha", "a@example.com")
+        ])
+        XCTAssertEqual(sorted.map(\.id.rawValue), ["a", "b", "z"])
+    }
+
+    func testAccountsListPolicyMapsStatesToDotStatusesAndErrors() {
+        XCTAssertEqual(AccountsListPolicy.status(for: .active), .active)
+        XCTAssertEqual(AccountsListPolicy.status(for: .validating), .validating)
+        XCTAssertEqual(
+            AccountsListPolicy.status(for: .none),
+            .error(message: "No account configured.")
+        )
+        XCTAssertEqual(
+            AccountsListPolicy.status(for: .authFailed(message: "Bad password")),
+            .error(message: "Bad password")
+        )
+        XCTAssertEqual(
+            AccountsListPolicy.status(for: .connectionFailed(message: "Offline")),
+            .error(message: "Offline")
+        )
+    }
+
+    func testAccountsListPolicyDisablesAddAfterFirstAccount() {
+        XCTAssertTrue(AccountsListPolicy.canAdd(accountCount: 0))
+        XCTAssertFalse(AccountsListPolicy.canAdd(accountCount: 1))
+        XCTAssertEqual(
+            AccountsListPolicy.multipleAccountsCaption,
+            "Multiple accounts arrive in a later release"
+        )
+    }
+
 }
