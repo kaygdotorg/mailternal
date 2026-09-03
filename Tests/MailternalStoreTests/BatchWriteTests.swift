@@ -47,6 +47,45 @@ import Testing
     }
 }
 
+@Test func concurrentWritersKeepFTSAndMessageRowsConsistent() async throws {
+    try await withStore { store, _ in
+        let (_, _, generation) = try await seedInbox(store)
+        let clean = try await withThrowingTaskGroup(of: Bool.self, returning: Bool.self) { group in
+            for worker in 0..<2 {
+                group.addTask {
+                    var allClean = true
+                    for batch in 0..<8 {
+                        let firstUID = UInt32(worker == 0 ? 1 : 51)
+                        let messages = (0..<100).map { offset in
+                            let uid = firstUID + UInt32(offset)
+                            return makeMessage(
+                                generation: generation,
+                                uid: uid,
+                                subject: "worker \(worker) batch \(batch) uid \(uid)",
+                                body: "concurrent body \(uid)"
+                            )
+                        }
+                        _ = try await store.upsertMessages(messages)
+                        let report = try await store.checkInvariants()
+                        allClean = allClean && report.isClean
+                    }
+                    return allClean
+                }
+            }
+            var allClean = true
+            for try await workerClean in group {
+                allClean = allClean && workerClean
+            }
+            return allClean
+        }
+        #expect(clean)
+        let report = try await store.checkInvariants()
+        #expect(report.isClean)
+        #expect(report.messageCount == 150)
+        #expect(report.ftsCount == 150)
+    }
+}
+
 @Test func quarantineStoresParseDefect() async throws {
     try await withStore { store, _ in
         let (_, _, generation) = try await seedInbox(store)

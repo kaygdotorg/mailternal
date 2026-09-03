@@ -471,8 +471,14 @@ extension IMAPSession {
     func runConnectSequence() async throws {
         let greeting = try await waitForGreeting()
         applyPayload(greeting)
-        if case .conditionalState(.bye(let text)) = greeting {
+        let preauthenticated: Bool
+        switch greeting {
+        case .conditionalState(.bye(let text)):
             throw IMAPError.transport(text.text)
+        case .conditionalState(.preauth):
+            preauthenticated = true
+        default:
+            preauthenticated = false
         }
 
         try await refreshCapabilities()
@@ -508,7 +514,9 @@ extension IMAPSession {
             throw IMAPError.tls("Refusing to authenticate without TLS")
         }
 
-        try await authenticate()
+        if !preauthenticated {
+            try await authenticate()
+        }
         try await refreshCapabilities()
     }
 

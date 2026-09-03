@@ -82,3 +82,47 @@ import Testing
         #expect(state?.progress == 0.25)
     }
 }
+
+@Test func syncStateCursorAndModseqDoNotRegressAfterConcurrentWriters() async throws {
+    try await withStore { store, _ in
+        let (_, _, generation) = try await seedInbox(store)
+        try await store.saveSyncState(FolderSyncState(
+            generation: generation,
+            highestModseq: 90,
+            backfillPhase: .walking,
+            lowWaterUID: IMAPUID(rawValue: 80),
+            baselineUID: IMAPUID(rawValue: 1000),
+            progress: 0.25
+        ))
+        try await store.saveSyncState(FolderSyncState(
+            generation: generation,
+            highestModseq: 40,
+            backfillPhase: .walking,
+            lowWaterUID: IMAPUID(rawValue: 90),
+            baselineUID: nil,
+            progress: 0.10
+        ))
+
+        let state = try #require(await store.fetchSyncState(for: generation))
+        #expect(state.highestModseq == 90)
+        #expect(state.lowWaterUID?.rawValue == 80)
+        #expect(state.baselineUID?.rawValue == 1000)
+        #expect(state.progress == 0.25)
+        
+        try await store.saveSyncState(FolderSyncState(
+            generation: generation,
+            backfillPhase: .complete,
+            lowWaterUID: IMAPUID(rawValue: 80),
+            progress: 1
+        ))
+        try await store.saveSyncState(FolderSyncState(
+            generation: generation,
+            backfillPhase: .walking,
+            lowWaterUID: nil,
+            progress: 0
+        ))
+        let reset = try #require(await store.fetchSyncState(for: generation))
+        #expect(reset.lowWaterUID == nil)
+        #expect(reset.progress == 0)
+    }
+}

@@ -54,6 +54,43 @@ import Testing
         #expect(pending.isEmpty)
     }
 }
+@Test func staleFlagAcknowledgementDoesNotDropCoalescedReplacement() async throws {
+    try await withStore { store, _ in
+        let (account, folder, generation) = try await seedInbox(store)
+        _ = try await store.upsertMessages([
+            makeMessage(generation: generation, uid: 21, isRead: false),
+        ])
+        let id = try #require(await store.messageID(
+            generation: generation,
+            uid: IMAPUID(rawValue: 21)
+        ))
+
+        try await store.enqueueFlag(message: id, flag: .seen, set: true)
+        let inFlight = try #require(await store.snapshotFlagQueue().first)
+        try await store.enqueueFlag(
+            account: account.id,
+            folder: folder,
+            uidValidity: generation.uidValidity,
+            uid: inFlight.uid,
+            flag: .seen,
+            set: false
+        )
+
+        try await store.dequeueFlag(inFlight)
+        var pending = try await store.snapshotFlagQueue()
+        #expect(pending.count == 1)
+        #expect(pending[0].set == false)
+
+        try await store.dropFlag(inFlight, reason: "stale NO")
+        pending = try await store.snapshotFlagQueue()
+        #expect(pending.count == 1)
+        #expect(pending[0].set == false)
+        #expect(try await store.fetchErrorLog().isEmpty)
+
+        let row = try #require(try await store.page(in: folder, after: nil, limit: 1).rows.first)
+        #expect(!row.isRead)
+    }
+}
 
 @Test func pendingSeenWinsOverInboundUnseenUpsert() async throws {
     try await withStore { store, _ in

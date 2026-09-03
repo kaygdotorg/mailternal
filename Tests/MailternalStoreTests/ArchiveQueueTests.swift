@@ -182,3 +182,41 @@ import Testing
         #expect(try await store.snapshotMoveQueue().count == 1)
     }
 }
+
+@Test func staleMoveAcknowledgementDoesNotDropCoalescedReplacement() async throws {
+    try await withStore { store, _ in
+        let (account, folder, generation) = try await seedInbox(store)
+        _ = try await store.upsertMessages([
+            makeMessage(generation: generation, uid: 41, subject: "move me"),
+        ])
+        let id = try #require(await store.messageID(
+            generation: generation,
+            uid: IMAPUID(rawValue: 41)
+        ))
+
+        try await store.enqueueMove(message: id, to: .archive)
+        let inFlight = try #require(await store.snapshotMoveQueue().first)
+        try await store.enqueueMove(
+            account: account.id,
+            folder: folder,
+            uidValidity: generation.uidValidity,
+            uid: inFlight.uid,
+            to: .trash
+        )
+
+        try await store.markMoveCopied(inFlight)
+        var pending = try await store.snapshotMoveQueue()
+        #expect(pending.count == 1)
+        #expect(pending[0].destination == .trash)
+        #expect(!pending[0].copied)
+
+        try await store.deleteMoveOp(inFlight)
+        pending = try await store.snapshotMoveQueue()
+        #expect(pending.count == 1)
+        #expect(pending[0].destination == .trash)
+        #expect(!pending[0].copied)
+
+        try await store.deleteMoveOp(pending[0])
+        #expect(try await store.snapshotMoveQueue().isEmpty)
+    }
+}

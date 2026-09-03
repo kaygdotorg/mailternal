@@ -116,16 +116,29 @@ extension MailStore {
     }
 
     /// Tagged `OK`: dequeue a move and clear any row that arrived from a
-    /// concurrent FETCH while this operation was pending.
+    /// concurrent FETCH while this operation was pending. Acknowledgements are
+    /// matched against the complete queued operation so a stale result cannot
+    /// remove a coalesced replacement.
     public func deleteMoveOp(_ op: MoveOp) async throws {
         try await write { db in
-            let present = try Int.fetchOne(
-                db,
-                sql: "SELECT EXISTS(SELECT 1 FROM archive_queue WHERE id = ?)",
-                arguments: [op.id]
-            ) == 1
-            guard present else { return }
-            try db.execute(sql: "DELETE FROM archive_queue WHERE id = ?", arguments: [op.id])
+            try db.execute(
+                sql: """
+                    DELETE FROM archive_queue
+                    WHERE id = ? AND account_id = ? AND folder_id = ?
+                      AND uid_validity = ? AND uid = ? AND destination = ?
+                      AND destination_folder_id IS ?
+                    """,
+                arguments: [
+                    op.id,
+                    op.account.rawValue,
+                    op.folder.rawValue,
+                    Int64(op.uidValidity),
+                    Int64(op.uid.rawValue),
+                    op.destination.rawValue,
+                    op.destinationFolderID?.rawValue,
+                ]
+            )
+            guard db.changesCount == 1 else { return }
             try db.execute(
                 sql: """
                     DELETE FROM messages
@@ -137,16 +150,34 @@ extension MailStore {
                     """,
                 arguments: [Int64(op.uid.rawValue), op.folder.rawValue, Int64(op.uidValidity)]
             )
+        
         }
     }
 
     /// Persists that fallback COPY completed. Remaining STORE and EXPUNGE
-    /// phases are safe to retry after a process restart.
+    /// phases are safe to retry after a process restart. Ignore an operation
+    /// snapshot that was superseded while COPY was in flight.
     public func markMoveCopied(_ op: MoveOp) async throws {
         try await write { db in
             try db.execute(
-                sql: "UPDATE archive_queue SET copied = 1 WHERE id = ?",
-                arguments: [op.id]
+                sql: """
+                    UPDATE archive_queue
+                    SET copied = 1
+                    WHERE id = ? AND account_id = ? AND folder_id = ?
+                      AND uid_validity = ? AND uid = ? AND destination = ?
+                      AND destination_folder_id IS ?
+                      AND copied = ?
+                    """,
+                arguments: [
+                    op.id,
+                    op.account.rawValue,
+                    op.folder.rawValue,
+                    Int64(op.uidValidity),
+                    Int64(op.uid.rawValue),
+                    op.destination.rawValue,
+                    op.destinationFolderID?.rawValue,
+                    op.copied,
+                ]
             )
         }
     }

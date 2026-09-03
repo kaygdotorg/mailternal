@@ -206,3 +206,74 @@ private func deepLinkAccountConfig(_ id: String, linkID: AccountLinkID = deepLin
         #expect(try await store.resolve(link) == nil)
     }
 }
+
+@Test func resolvesDeterministicTenThousandLinksIncludingMalformedInput() async throws {
+    try await withStore { store, _ in
+        let account = deepLinkAccountConfig("stress")
+        try await store.upsertAccount(account)
+        let folder = try await store.upsertFolder(
+            account: account.id,
+            path: "INBOX",
+            name: "INBOX",
+            separator: nil,
+            role: .inbox,
+            objectID: "stress-inbox"
+        )
+        let generation = try await store.openLiveGeneration(
+            folder: folder,
+            uidValidity: 17,
+            baselineUID: IMAPUID(rawValue: 100)
+        )
+        try await store.upsertMessages((1...100).map {
+            makeMessage(generation: generation, uid: UInt32($0), subject: "message \($0)")
+        })
+
+        var state: UInt64 = 0xD1B54A32D192ED03
+        func nextRandom() -> UInt64 {
+            state = state &* 6_364_136_223_846_793_005 &+ 1
+            return state
+        }
+
+        for index in 0..<10_000 {
+            let uid = UInt32(nextRandom() % 100) + 1
+            let valid = MailternalDeepLink.message(
+                accountLinkID: deepLinkAccount,
+                folderLocator: FolderLocator(kind: .object, value: "stress-inbox"),
+                uidValidity: generation.uidValidity,
+                uid: IMAPUID(rawValue: uid)
+            ).formattedString!
+            let raw: String
+            let shouldResolve: Bool
+            switch index % 4 {
+            case 0, 1:
+                raw = valid
+                shouldResolve = true
+            case 2:
+                raw = valid.replacingOccurrences(of: "mailternal://", with: "MAILTERNAL://")
+                shouldResolve = false
+            default:
+                raw = valid.replacingOccurrences(
+                    of: "/message/\(generation.uidValidity)/\(uid)",
+                    with: "/message/0/\(uid)"
+                )
+                shouldResolve = false
+            }
+
+            guard let parsed = MailternalDeepLink(string: raw) else {
+                #expect(!shouldResolve)
+                continue
+            }
+            #expect(shouldResolve)
+            let resolution = try await store.resolve(parsed)
+            if shouldResolve {
+                guard case .message(let resolvedFolder, _, _) = resolution else {
+                    Issue.record("valid stress link did not resolve to a message")
+                    continue
+                }
+                #expect(resolvedFolder == folder)
+            } else {
+                #expect(resolution == nil)
+            }
+        }
+    }
+}

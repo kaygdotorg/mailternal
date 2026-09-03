@@ -64,18 +64,53 @@ extension MailStore {
         }
     }
 
-    /// Tagged `OK`: dequeue a flag operation.
+    /// Tagged `OK`: dequeue a flag operation. An acknowledgement for an older
+    /// coalesced operation must not remove a newer replacement.
     public func dequeueFlag(_ op: FlagOp) async throws {
         try await write { db in
-            try db.execute(sql: "DELETE FROM seen_queue WHERE id = ?", arguments: [op.id])
+            try db.execute(
+                sql: """
+                    DELETE FROM seen_queue
+                    WHERE id = ? AND account_id = ? AND folder_id = ?
+                      AND uid_validity = ? AND uid = ? AND flag = ? AND "set" = ?
+                    """,
+                arguments: [
+                    op.id,
+                    op.account.rawValue,
+                    op.folder.rawValue,
+                    Int64(op.uidValidity),
+                    Int64(op.uid.rawValue),
+                    op.flag.rawValue,
+                    op.set,
+                ]
+            )
         }
     }
 
     /// Tagged `NO`/`BAD`: drop the op, clear its local optimistic override, and
     /// record the failure. The next remote delta then supplies server truth.
+    ///
+    /// If the queue row was coalesced after this operation was sent, this
+    /// acknowledgement is stale and must leave the replacement untouched.
     public func dropFlag(_ op: FlagOp, reason: String) async throws {
         try await write { db in
-            try db.execute(sql: "DELETE FROM seen_queue WHERE id = ?", arguments: [op.id])
+            try db.execute(
+                sql: """
+                    DELETE FROM seen_queue
+                    WHERE id = ? AND account_id = ? AND folder_id = ?
+                      AND uid_validity = ? AND uid = ? AND flag = ? AND "set" = ?
+                    """,
+                arguments: [
+                    op.id,
+                    op.account.rawValue,
+                    op.folder.rawValue,
+                    Int64(op.uidValidity),
+                    Int64(op.uid.rawValue),
+                    op.flag.rawValue,
+                    op.set,
+                ]
+            )
+            guard db.changesCount == 1 else { return }
             let column = op.flag == .seen ? "is_read" : "is_flagged"
             try db.execute(
                 sql: """
@@ -100,6 +135,7 @@ extension MailStore {
             )
         }
     }
+
 
     /// Discards all flag ops whose UIDVALIDITY no longer matches the live generation.
     public func dropStaleFlag(folder: FolderID) async throws {

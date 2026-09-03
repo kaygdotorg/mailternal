@@ -146,7 +146,8 @@ extension MailStore {
     }
 
     /// Tagged IMAP NO/BAD or a retired/mismatched folder: remove the operation
-    /// and record a user-visible error in the same transaction.
+    /// and record a user-visible error in the same transaction. A terminal
+    /// response for an older coalesced operation is ignored.
     public func dropFolderRename(_ op: FolderRenameOp, reason: String) async throws {
         try await write { db in
             try db.execute(
@@ -156,6 +157,7 @@ extension MailStore {
                     """,
                 arguments: [op.id, op.targetName, op.targetPath]
             )
+            guard db.changesCount == 1 else { return }
             try MailStore.insertError(
                 db,
                 StoreLogEntry(

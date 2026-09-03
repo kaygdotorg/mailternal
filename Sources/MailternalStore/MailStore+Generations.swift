@@ -200,11 +200,47 @@ extension MailStore {
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(generation_id) DO UPDATE SET
                         delta_path = excluded.delta_path,
-                        highest_modseq = excluded.highest_modseq,
+                        highest_modseq = CASE
+                            WHEN sync_state.highest_modseq IS NULL
+                                THEN excluded.highest_modseq
+                            WHEN excluded.highest_modseq IS NULL
+                                THEN sync_state.highest_modseq
+                            ELSE MAX(sync_state.highest_modseq, excluded.highest_modseq)
+                        END,
                         backfill_phase = excluded.backfill_phase,
-                        low_water_uid = excluded.low_water_uid,
-                        baseline_uid = excluded.baseline_uid,
-                        progress = excluded.progress,
+                        low_water_uid = CASE
+                            -- A complete state is an authoritative terminal
+                            -- cursor (and is also used by invariant tests to
+                            -- model corruption), so accept it directly.
+                            WHEN excluded.backfill_phase = 'complete'
+                                THEN excluded.low_water_uid
+                            -- A complete -> walking + empty cursor is the
+                            -- explicit full-backfill reset. Every other empty
+                            -- cursor update must retain a committed cursor.
+                            WHEN excluded.low_water_uid IS NULL
+                                 AND sync_state.backfill_phase = 'complete'
+                                 AND excluded.backfill_phase = 'walking'
+                                THEN NULL
+                            WHEN excluded.low_water_uid IS NULL
+                                THEN sync_state.low_water_uid
+                            WHEN sync_state.low_water_uid IS NULL
+                                THEN excluded.low_water_uid
+                            ELSE MIN(sync_state.low_water_uid, excluded.low_water_uid)
+                        END,
+                        baseline_uid = COALESCE(sync_state.baseline_uid, excluded.baseline_uid),
+                        progress = CASE
+                            WHEN excluded.backfill_phase = 'complete'
+                                THEN excluded.progress
+                            WHEN sync_state.progress IS NULL
+                                THEN excluded.progress
+                            WHEN excluded.progress IS NULL
+                                THEN sync_state.progress
+                            WHEN sync_state.backfill_phase = 'complete'
+                                 AND excluded.backfill_phase = 'walking'
+                                 AND excluded.low_water_uid IS NULL
+                                THEN excluded.progress
+                            ELSE MAX(sync_state.progress, excluded.progress)
+                        END,
                         halted_through = excluded.halted_through
                     """,
                 arguments: [

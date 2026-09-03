@@ -41,6 +41,23 @@ import Testing
     }
 }
 
+@Test func preauthGreetingSkipsAuthentication() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        let connecting = Task { try await imap.session.connect() }
+        try await imap.writeServer("* PREAUTH IMAP4rev1 already authenticated")
+
+        var (tag, _) = try await imap.expectCommand(containing: "CAPABILITY")
+        try await imap.capability(tag, ScriptedIMAP.postTLSCaps)
+        (tag, _) = try await imap.expectCommand(containing: "CAPABILITY")
+        try await imap.capability(tag, ScriptedIMAP.postTLSCaps)
+        try await connecting.value
+
+        let commands = imap.recordedClientLines.value.joined(separator: "\n").uppercased()
+        #expect(!commands.contains("LOGIN"))
+        #expect(!commands.contains("AUTHENTICATE"))
+    }
+}
+
 @Test func listRoleMappingSkipsNoselect() async throws {
     try await ScriptedIMAP.run(security: .startTLS) { imap in
         try await imap.connectStartTLS()

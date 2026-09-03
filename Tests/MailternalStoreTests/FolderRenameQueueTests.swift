@@ -28,6 +28,30 @@ import Testing
     }
 }
 
+@Test func staleFolderRenameRejectionDoesNotDropCoalescedReplacement() async throws {
+    try await withStore { store, _ in
+        let account = sampleAccount()
+        try await store.upsertAccount(account)
+        let folder = try await store.upsertFolder(
+            account: account.id,
+            path: "Projects/Old",
+            name: "Old",
+            separator: "/",
+            role: .none,
+            objectID: nil
+        )
+
+        try await store.enqueueFolderRename(folder: folder, to: "New")
+        let inFlight = try #require(await store.snapshotFolderRenameQueue().first)
+        try await store.enqueueFolderRename(folder: folder, to: "Newest")
+
+        try await store.dropFolderRename(inFlight, reason: "stale NO")
+        let pending = try #require(await store.snapshotFolderRenameQueue().first)
+        #expect(pending.targetName == "Newest")
+        #expect(try await store.fetchErrorLog().isEmpty)
+    }
+}
+
 @Test func applyingFolderRenameRewritesNestedChildPaths() async throws {
     try await withStore { store, _ in
         let account = sampleAccount()

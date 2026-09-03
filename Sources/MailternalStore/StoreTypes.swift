@@ -136,7 +136,9 @@ public enum DeltaPath: String, Sendable, Codable, Hashable {
     case basic
 }
 
-/// Per-generation backfill cursor phase. The cursor only advances after commit.
+/// Per-generation backfill cursor phase. The cursor only advances after commit;
+/// persisted cursor and change-token values never regress when stale workers
+/// commit after a newer worker.
 public enum BackfillPhase: String, Sendable, Codable, Hashable {
     case idle
     case walking
