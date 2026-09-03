@@ -31,7 +31,16 @@ final class AppModel {
     /// anchor so a single-message reader survives ordinary list updates.
     var selectedMessageIDs: Set<MessageID> = []
     var selectedMessageID: MessageID?
-    var detail: MessageDetail?
+    var detail: MessageDetail? {
+        didSet {
+            guard EmailReadingOverridePolicy.resetsOverride(
+                oldID: oldValue?.id,
+                newID: detail?.id
+            ) else { return }
+            emailReadingOverride = nil
+        }
+    }
+    var emailReadingOverride: EmailReadingMode?
     var rawSource: String?
     var isShowingRawSource = false
     var syncStatus = SyncStatus(mode: .fullHistory, isOnline: true)
@@ -52,11 +61,18 @@ final class AppModel {
     /// source can place canonical deep-link strings on its pasteboard.
     var messageDeepLinks: [MessageID: String] = [:]
 
+    /// The effective reading mode for the current message. A per-message
+    /// override never changes the persisted appearance setting.
+    var effectiveEmailReadingMode: EmailReadingMode {
+        emailReadingOverride ?? appearance.emailReadingMode
+    }
+
     /// Whether the sanitized message contains an app-controlled remote-image
     /// token. The sanitizer computes this once when the detail is ingested.
     var hasRemoteImageReferences: Bool {
         detail?.hasRemoteImageReferences ?? false
     }
+
 
     @ObservationIgnored private var pageTask: Task<Void, Never>?
     @ObservationIgnored private var observeTask: Task<Void, Never>?
@@ -622,6 +638,20 @@ final class AppModel {
         }
     }
 
+    /// Toggles the current message's reading mode without changing Settings.
+    func toggleEmailReadingOverride() {
+        emailReadingOverride = EmailReadingOverridePolicy.next(
+            effective: effectiveEmailReadingMode
+        )
+    }
+
+    /// Toggles raw source presentation while preserving the reader island.
+    func toggleRawSource() {
+        withAnimation(MailMotion.settle) {
+            isShowingRawSource.toggle()
+        }
+    }
+
     func toggleFind() {
         guard detail != nil else { return }
         isFindPresented.toggle()
@@ -676,7 +706,9 @@ final class AppModel {
         guard let id = selectedMessageID else { return }
         do {
             rawSource = try await facade.rawSource(id)
-            isShowingRawSource = true
+            if !isShowingRawSource {
+                toggleRawSource()
+            }
         } catch {
             toasts.post(title: "Couldn’t load source", detail: error.localizedDescription)
         }

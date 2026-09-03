@@ -74,6 +74,22 @@ struct MailternalApp: App {
                 }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(!model.isAccountActive)
+                Button("Source") {
+                    appDelegate.showMainWindow()
+                    if model.rawSource == nil {
+                        Task { await model.loadRawSource() }
+                    } else {
+                        model.toggleRawSource()
+                    }
+                }
+                .keyboardShortcut("u", modifiers: [.command, .option])
+                .disabled(model.selectedMessageIDs.count != 1)
+                Button("Email Colour Scheme") {
+                    appDelegate.showMainWindow()
+                    model.toggleEmailReadingOverride()
+                }
+                .keyboardShortcut("d", modifiers: [.command, .option])
+                .disabled(model.selectedMessageIDs.count != 1)
             }
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") {

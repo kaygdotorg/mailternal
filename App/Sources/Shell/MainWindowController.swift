@@ -316,6 +316,8 @@ private extension NSToolbarItem.Identifier {
     static let messageArchive = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.archive.rawValue)
     static let messageTrash = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.trash.rawValue)
     static let messageFlag = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.flag.rawValue)
+    static let messageSource = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.source.rawValue)
+    static let messageColorScheme = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.colorScheme.rawValue)
     static let messageOverflow = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.overflow.rawValue)
 }
 
@@ -338,6 +340,14 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     private lazy var flagItem = makeMessageItem(
         identifier: .messageFlag,
         action: #selector(flagSelected(_:))
+    )
+    private lazy var sourceItem = makeMessageItem(
+        identifier: .messageSource,
+        action: #selector(toggleRawSource(_:))
+    )
+    private lazy var colorSchemeItem = makeMessageItem(
+        identifier: .messageColorScheme,
+        action: #selector(toggleEmailReadingOverride(_:))
     )
     private lazy var overflowItem = makeOverflowItem()
     private lazy var overflowMenu: NSMenu = {
@@ -369,7 +379,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
 
     /// AppKit's toolbar validation is not driven by SwiftUI's observation
     /// updates. Keep the native items in step with selection changes while
-    /// leaving per-menu-item validation to `validateMenuItem(_:)`.
+    /// leaving per-menu-item validation to `validateMenuItem(_:).`
     private func observeModelChanges() {
         let generation = modelObservationGeneration
         withObservationTracking {
@@ -377,6 +387,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             _ = model.listRows
             _ = model.folders
             _ = model.selectedFolderID
+            _ = model.isShowingRawSource
+            _ = model.emailReadingOverride
+            _ = model.appearance.emailReadingMode
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.modelObservationGeneration == generation else { return }
@@ -424,6 +437,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         identifiers += MessageToolbarPolicy.allowedItemIdentifiers.map(toolbarIdentifier)
         return identifiers
     }
+    func toolbarSelectableItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.messageSource]
+    }
 
     func toolbar(
         _ toolbar: NSToolbar,
@@ -439,6 +455,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             return trashItem
         case .messageFlag:
             return flagItem
+        case .messageSource:
+            return sourceItem
+        case .messageColorScheme:
+            return colorSchemeItem
         case .messageOverflow:
             return overflowItem
         default:
@@ -450,7 +470,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         switch item.itemIdentifier {
         case .sidebarToggle:
             item.isEnabled = includesSidebarToggle
-        case .messageArchive, .messageTrash, .messageFlag, .messageOverflow:
+        case .messageArchive, .messageTrash, .messageFlag,
+             .messageSource, .messageColorScheme:
+            configureMessageItems()
+        case .messageOverflow:
             configureMessageItems()
             // NSMenuToolbarItem is a shell for a menu, not an action item;
             // its own enablement follows selection while its children are
@@ -511,7 +534,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     private func configureMessageItems() {
         let visibleItems = MessageToolbarPolicy.visibleItems(
             selection: model.selectedMessageIDs,
-            flagStates: flagStates
+            flagStates: flagStates,
+            effectiveEmailReadingMode: model.effectiveEmailReadingMode,
+            isShowingRawSource: model.isShowingRawSource
         )
         for visible in visibleItems {
             let item: NSToolbarItem
@@ -519,6 +544,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             case .archive: item = archiveItem
             case .trash: item = trashItem
             case .flag: item = flagItem
+            case .source: item = sourceItem
+            case .colorScheme: item = colorSchemeItem
             case .overflow: continue
             }
             item.image = NSImage(
@@ -530,6 +557,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             item.toolTip = visible.title
             item.isEnabled = visible.isEnabled
         }
+        toolbar?.selectedItemIdentifier = model.isShowingRawSource ? .messageSource : nil
         overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
     }
 
@@ -585,15 +613,18 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         _ policyItem: MessageContextMenuPolicy.Item,
         to menu: NSMenu
     ) {
-        if policyItem.isSeparator {
-            menu.addItem(.separator())
-            return
-        }
         let item = NSMenuItem(
             title: policyItem.title,
             action: policyItem.action == nil ? nil : #selector(performOverflowAction(_:)),
             keyEquivalent: ""
         )
+        item.target = self
+        item.representedObject = policyItem.action
+        item.toolTip = policyItem.toolTip
+        item.isEnabled = policyItem.isEnabled
+        if policyItem.action == .viewRawSource {
+            item.state = model.isShowingRawSource ? .on : .off
+        }
         item.target = self
         item.representedObject = policyItem.action
         item.toolTip = policyItem.toolTip
@@ -620,6 +651,13 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         return nil
     }
 
+    @objc private func trashSelected(_ sender: Any?) {
+        model.perform(.trash, on: model.selectedMessageIDs)
+    }
+
+    @objc private func flagSelected(_ sender: Any?) {
+        model.perform(.toggleFlag, on: model.selectedMessageIDs)
+    }
     @objc private func toggleSidebar(_ sender: Any?) {
         toggleAction()
     }
@@ -628,12 +666,18 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         model.perform(.archive, on: model.selectedMessageIDs)
     }
 
-    @objc private func trashSelected(_ sender: Any?) {
-        model.perform(.trash, on: model.selectedMessageIDs)
+    @objc private func toggleRawSource(_ sender: Any?) {
+        guard model.selectedMessageIDs.count == 1 else { return }
+        if model.rawSource != nil {
+            model.toggleRawSource()
+        } else {
+            Task { await model.loadRawSource() }
+        }
     }
 
-    @objc private func flagSelected(_ sender: Any?) {
-        model.perform(.toggleFlag, on: model.selectedMessageIDs)
+    @objc private func toggleEmailReadingOverride(_ sender: Any?) {
+        guard model.selectedMessageIDs.count == 1 else { return }
+        model.toggleEmailReadingOverride()
     }
 
     @objc private func performOverflowAction(_ sender: NSMenuItem) {
@@ -658,8 +702,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         case .copySubject:
             model.copySubjects(for: selection)
         case .viewRawSource:
-            guard selection.count == 1 else { return }
-            Task { await model.loadRawSource() }
+            toggleRawSource(nil)
+        case .toggleEmailReadingOverride:
+            toggleEmailReadingOverride(nil)
         case .flag, .unflag, .delete, .archive, .reply, .replyAll, .forward:
             break
         }
