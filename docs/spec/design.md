@@ -181,3 +181,16 @@ References: [Craft Tab Management](https://support.craft.do/en/introduction/navi
 | Global search | Command-K panel, verbatim geometry; carries the windowed-mode coverage line |
 | Account setup | Settings-style grouped form in a floating utility window |
 | Sync/auth errors | Toast stack |
+
+### Sidebar sync activity indicators
+
+Folder rows use one compact trailing accessory for the current activity. While a
+backfill window is downloading, show an accent-tinted `arrow.down` at badge
+height with a continuous `.bounce.down` effect; while its fetched rows are
+indexed/committed, show `arrow.triangle.2.circlepath` with a continuous rotate
+effect.
+Disk-policy halts show the existing `pause.circle` glyph. Idle folders and
+quarantine stalls do not add a glyph, so a row never becomes visually noisy.
+Reduce Motion disables both symbol effects while retaining their static glyphs.
+Hovering the downloading glyph exposes the exact local progress when available,
+for example “Downloading 12,372 of 15,365”.
