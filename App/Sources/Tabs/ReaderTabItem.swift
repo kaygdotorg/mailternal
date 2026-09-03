@@ -127,10 +127,19 @@ struct ReaderTabItem: View {
 
             }
             Button("Close Others", systemImage: "rectangle.on.rectangle") {
+                let wasActive = model.tabs.activeID == tab.id
                 model.tabs.closeOthers(tab.id)
+                if !wasActive {
+                    model.activateTab(tab.id)
+                }
             }
             Button("Close to the Right", systemImage: "rectangle.rightthird.inset.filled") {
+                let previousActiveID = model.tabs.activeID
                 model.tabs.closeToRight(tab.id)
+                if model.tabs.activeID != previousActiveID,
+                   let activeID = model.tabs.activeID {
+                    model.activateTab(activeID)
+                }
             }
             if isTransient {
                 Button("Keep", systemImage: "pin") {

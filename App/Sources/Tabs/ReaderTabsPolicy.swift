@@ -40,9 +40,31 @@ enum ReaderTabsPolicy {
         return Array(tabs.prefix(index + 1))
     }
 
+    /// The last reader-tab close also closes the main window on the same
+    /// command invocation. An empty reader reached by any other route may
+    /// leave the window open, so callers evaluate this after removing a tab.
+    static func shouldCloseWindow(afterClosingTabsRemaining count: Int) -> Bool {
+        count == 0
+    }
+
     static func movedIndex(from oldIndex: Int, to requestedIndex: Int, count: Int) -> Int {
         guard count > 0 else { return 0 }
         return min(max(requestedIndex, 0), count - 1)
+    }
+
+    /// Converts a tab-bar drop on `targetIndex` into the destination index
+    /// after removing the source. Removing an earlier source shifts the target
+    /// left by one; doing this at the policy seam keeps drag geometry thin.
+    static func dropDestination(
+        sourceIndex: Int,
+        targetIndex: Int,
+        afterTarget: Bool,
+        count: Int
+    ) -> Int {
+        guard sourceIndex != targetIndex else { return sourceIndex }
+        let requested = afterTarget ? targetIndex + 1 : targetIndex
+        let adjusted = sourceIndex < targetIndex ? requested - 1 : requested
+        return movedIndex(from: sourceIndex, to: adjusted, count: count)
     }
 
     static func adjacentID<T>(in tabs: [T], activeID: UUID?, forward: Bool, id: (T) -> UUID) -> UUID? {

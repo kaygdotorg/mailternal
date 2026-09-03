@@ -12,6 +12,29 @@ enum EmailReadingOverridePolicy {
     }
 }
 
+/// Chooses the list's next anchor after an optimistic removal. An open reader
+/// tab owns its message independently of list membership, so that anchor wins
+/// over the remaining list selection when the message is moved or archived.
+enum ReaderSelectionPolicy {
+    static func anchorAfterRemoving(
+        selectedMessageID: MessageID?,
+        remainingSelection: Set<MessageID>,
+        removedIDs: Set<MessageID>,
+        openTabMessages: Set<MessageID>
+    ) -> MessageID? {
+        guard let selectedMessageID else {
+            return remainingSelection.first
+        }
+        guard removedIDs.contains(selectedMessageID) else {
+            return selectedMessageID
+        }
+        if openTabMessages.contains(selectedMessageID) {
+            return selectedMessageID
+        }
+        return remainingSelection.first
+    }
+}
+
 /// The menu's value model is deliberately independent of AppKit. This keeps
 /// the Mail-style ordering, state-aware labels, and folder-tree construction
 /// deterministic and directly testable.

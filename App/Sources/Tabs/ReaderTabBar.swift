@@ -142,7 +142,13 @@ struct ReaderTabBar: View {
                                   let sourceID = UUID(uuidString: source),
                                   let target = model.tabs.tabs.firstIndex(where: { $0.id == tab.id }),
                                   sourceID != tab.id else { return false }
-                            let destination = location.x > tabWidth / 2 ? target + 1 : target
+                            let sourceIndex = model.tabs.tabs.firstIndex { $0.id == sourceID } ?? target
+                            let destination = ReaderTabsPolicy.dropDestination(
+                                sourceIndex: sourceIndex,
+                                targetIndex: target,
+                                afterTarget: location.x > tabWidth / 2,
+                                count: model.tabs.tabs.count
+                            )
                             model.tabs.move(sourceID, to: destination)
                             return true
                         }
@@ -272,10 +278,10 @@ struct ReaderTabBar: View {
         let wasActive = model.tabs.activeID == id
         if wasActive {
             model.closeActiveTabOrWindow()
+            readerHasFocus = model.tabs.activeID != nil
         } else {
             model.tabs.close(id)
         }
-        readerHasFocus = model.tabs.activeID != nil
     }
 
 

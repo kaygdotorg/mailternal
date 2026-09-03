@@ -84,4 +84,91 @@ final class ReaderTabsPolicyTests: XCTestCase {
         XCTAssertEqual(restored.activeID, first.id)
         XCTAssertEqual(restored.scrollOffset(for: first.id), 42)
     }
+    func testRemovingMessageKeepsReaderAnchorWhenItsTabIsOpen() {
+        let messageID = message(42)
+        let tab = ReaderTab(message: messageID, isTransient: false)
+        XCTAssertEqual(
+            ReaderSelectionPolicy.anchorAfterRemoving(
+                selectedMessageID: messageID,
+                remainingSelection: [],
+                removedIDs: [messageID],
+                openTabMessages: [messageID]
+            ),
+            messageID
+        )
+        XCTAssertNil(
+            ReaderSelectionPolicy.anchorAfterRemoving(
+                selectedMessageID: messageID,
+                remainingSelection: [],
+                removedIDs: [messageID],
+                openTabMessages: []
+            )
+        )
+        XCTAssertEqual(tab.message, messageID)
+    }
+
+    func testClosingLastReaderTabRequestsWindowClose() {
+        XCTAssertTrue(
+            ReaderTabsPolicy.shouldCloseWindow(afterClosingTabsRemaining: 0)
+        )
+        XCTAssertFalse(
+            ReaderTabsPolicy.shouldCloseWindow(afterClosingTabsRemaining: 1)
+        )
+    }
+
+    func testDropDestinationAdjustsForSourceBeforeTarget() {
+        XCTAssertEqual(
+            ReaderTabsPolicy.dropDestination(
+                sourceIndex: 0,
+                targetIndex: 2,
+                afterTarget: false,
+                count: 4
+            ),
+            1
+        )
+        XCTAssertEqual(
+            ReaderTabsPolicy.dropDestination(
+                sourceIndex: 0,
+                targetIndex: 2,
+                afterTarget: true,
+                count: 4
+            ),
+            2
+        )
+        XCTAssertEqual(
+            ReaderTabsPolicy.dropDestination(
+                sourceIndex: 3,
+                targetIndex: 1,
+                afterTarget: false,
+                count: 4
+            ),
+            1
+        )
+        XCTAssertEqual(
+            ReaderTabsPolicy.dropDestination(
+                sourceIndex: 3,
+                targetIndex: 1,
+                afterTarget: true,
+                count: 4
+            ),
+            2
+        )
+    }
+    func testRemovingMessageClosesItsReaderTab() {
+        let removedID = message(7)
+        let removed = ReaderTab(message: removedID, isTransient: false)
+        let retained = ReaderTab(message: message(8), isTransient: false)
+        let tabs = ReaderTabs(
+            tabs: [
+                removed,
+                retained
+            ],
+            activeID: removed.id
+        )
+
+        XCTAssertTrue(tabs.messageRemoved(removedID))
+        let remainingMessages: [MessageID] = tabs.tabs.map { $0.message }
+        XCTAssertEqual(remainingMessages, [retained.message])
+        XCTAssertFalse(tabs.messageRemoved(removedID))
+    }
 }

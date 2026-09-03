@@ -624,11 +624,11 @@ final class AppModel {
         let orderedIDs = ids.sorted { $0.rawValue < $1.rawValue }
         switch kind {
         case .archive:
-            removeListRows(ids)
-            Task { [weak self] in await self?.facade.archive(orderedIDs) }
+            guard let destination = destinationFolder(for: .archive) else { return }
+            move(ids: ids, to: destination)
         case .trash:
-            removeListRows(ids)
-            Task { [weak self] in await self?.facade.trash(orderedIDs) }
+            guard let destination = destinationFolder(for: .trash) else { return }
+            move(ids: ids, to: destination)
         case .toggleRead:
             let shouldRead = visibleIDs.isEmpty || visibleIDs.contains { id in
                 !(listRows.first(where: { $0.id == id })?.isRead ?? false)
@@ -656,19 +656,42 @@ final class AppModel {
         }
     }
 
-    /// Optimistically removes rows, preserving a still-selected reader anchor
-    /// when one exists.
+    /// Optimistically removes rows while keeping reader content for any
+    /// message represented by an open tab. A move/archive is a list
+    /// membership change, not a deletion: the tab remains the source of
+    /// truth for its cached detail while the facade updates its folder.
     private func removeListRows(_ ids: Set<MessageID>) {
-        let anchorRemoved = selectedMessageID.map(ids.contains) ?? false
+        let previousAnchor = selectedMessageID
+        let anchorRemoved = previousAnchor.map(ids.contains) ?? false
         listRows.removeAll { ids.contains($0.id) }
         selectedMessageIDs.subtract(ids)
         if anchorRemoved {
-            selectedMessageID = selectedMessageIDs.first
-            clearReaderSelection()
+            let openTabMessages = Set(tabs.tabs.map(\.message))
+            let nextAnchor = ReaderSelectionPolicy.anchorAfterRemoving(
+                selectedMessageID: previousAnchor,
+                remainingSelection: selectedMessageIDs,
+                removedIDs: ids,
+                openTabMessages: openTabMessages
+            )
+            selectedMessageID = nextAnchor
+            let readerAnchorSurvives = nextAnchor == previousAnchor
+                && nextAnchor.map(openTabMessages.contains) == true
+            if !readerAnchorSurvives {
+                clearReaderSelection()
+            }
         } else if selectedMessageIDs.isEmpty {
             selectedMessageID = nil
             clearReaderSelection()
         }
+    }
+
+    private func destinationFolder(for role: FolderRole) -> FolderID? {
+        if let accountID = selectedFolder?.accountID {
+            return folders.first {
+                $0.accountID == accountID && $0.role == role
+            }?.id
+        }
+        return folders.first { $0.role == role }?.id
     }
 
     func move(ids: Set<MessageID>, to folder: FolderID) {
@@ -678,15 +701,26 @@ final class AppModel {
         let rollbackSelection = selectedMessageIDs
         let rollbackAnchor = selectedMessageID
         removeListRows(ids)
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { return }
+            let tabLinkOverrides = await destinationTabLinks(
+                for: ids,
+                destination: folder
+            )
             do {
                 let outcome = try await facade.move(orderedIDs, to: folder)
                 let acceptedIDs = outcome.acceptedIDs.isEmpty && outcome.movedCount == ids.count
                     ? ids
                     : outcome.acceptedIDs
                 let skippedIDs = ids.subtracting(acceptedIDs)
-                scheduleTabsPersistence()
+                var acceptedTabLinkOverrides: [UUID: String] = [:]
+                for (tabID, link) in tabLinkOverrides {
+                    guard let tab = tabs.tabs.first(where: { $0.id == tabID }),
+                          acceptedIDs.contains(tab.message)
+                    else { continue }
+                    acceptedTabLinkOverrides[tabID] = link
+                }
+                scheduleTabsPersistence(linkOverrides: acceptedTabLinkOverrides)
                 guard !skippedIDs.isEmpty else { return }
                 restoreMovedRows(
                     rollbackRows.filter { skippedIDs.contains($0.id) },
@@ -706,6 +740,43 @@ final class AppModel {
                 )
             }
         }
+    }
+
+    /// Builds destination deep links before an optimistic move removes the
+    /// source rows from the store. The tab keeps its identity and UID while
+    /// only the folder locator changes.
+    private func destinationTabLinks(
+        for ids: Set<MessageID>,
+        destination: FolderID
+    ) async -> [UUID: String] {
+        guard let destinationSummary = folders.first(where: { $0.id == destination }) else {
+            return [:]
+        }
+        let destinationLocator = FolderLocator(
+            kind: .path,
+            value: destinationSummary.path
+        )
+        var overrides: [UUID: String] = [:]
+        for tab in tabs.tabs where ids.contains(tab.message) {
+            var sourceLink = try? await facade.makeDeepLink(for: tab.message)
+            if sourceLink == nil,
+               let cached = messageDeepLinks[tab.message] {
+                sourceLink = MailternalDeepLink(string: cached)
+            }
+            guard let sourceLink,
+                  let messageLocator = sourceLink.messageLocator else {
+                continue
+            }
+            let destinationLink = MailternalDeepLink.message(
+                accountLinkID: sourceLink.accountLinkID,
+                folderLocator: destinationLocator,
+                uidValidity: messageLocator.uidValidity,
+                uid: messageLocator.uid
+            )
+            guard let value = destinationLink.formattedString else { continue }
+            overrides[tab.id] = value
+        }
+        return overrides
     }
 
     /// Restores rows rejected by the facade while retaining their original
@@ -808,7 +879,8 @@ final class AppModel {
     }
 
     /// ⌘W closes a reader tab while one exists; otherwise AppKit closes the
-    /// main window through its normal close-window action.
+    /// main window through its normal close-window action. Closing the final
+    /// tab performs both steps during this same invocation.
     func closeActiveTabOrWindow() {
         if let activeID = tabs.activeID {
             tabs.close(activeID)
@@ -818,6 +890,9 @@ final class AppModel {
                 clearReaderSelection()
                 selectedMessageIDs.removeAll()
                 selectedMessageID = nil
+                if ReaderTabsPolicy.shouldCloseWindow(afterClosingTabsRemaining: tabs.tabs.count) {
+                    NSApp.keyWindow?.performClose(nil)
+                }
             }
         } else {
             NSApp.keyWindow?.performClose(nil)
@@ -867,15 +942,17 @@ final class AppModel {
             .appendingPathComponent("reader-tabs.json", isDirectory: false)
     }
 
-    private func scheduleTabsPersistence() {
+    private func scheduleTabsPersistence(linkOverrides: [UUID: String] = [:]) {
         tabSaveTask?.cancel()
         tabSaveTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
             guard let self, !Task.isCancelled else { return }
             var links: [UUID: String] = [:]
             for tab in self.tabs.tabs {
-                if let link = try? await self.facade.makeDeepLink(for: tab.message),
-                   let value = link.formattedString {
+                if let override = linkOverrides[tab.id] {
+                    links[tab.id] = override
+                } else if let link = try? await self.facade.makeDeepLink(for: tab.message),
+                          let value = link.formattedString {
                     links[tab.id] = value
                 }
             }
@@ -928,10 +1005,11 @@ final class AppModel {
                     if let folder = self.folderContaining(tab.message), !self.canSync(folder: folder) {
                         continue
                     }
-                    guard let link = try? await self.facade.makeDeepLink(for: tab.message) else {
-                        continue
-                    }
                     do {
+                        guard let link = try await self.facade.makeDeepLink(for: tab.message) else {
+                            self.messageRemoved(tab.message)
+                            continue
+                        }
                         guard let destination = try await self.facade.resolve(link) else {
                             self.messageRemoved(tab.message)
                             continue
@@ -948,6 +1026,7 @@ final class AppModel {
 
     func openSearchResult(_ row: MessageRow) {
         isSearchPresented = false
+        toasts.isSuppressed = false
         if let folder = row.folderID ?? folderContaining(row.id), selectedFolderID != folder {
             selectFolder(folder)
         }

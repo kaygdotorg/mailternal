@@ -125,9 +125,9 @@ empty-reader state.
   120 pt before the viewport becomes horizontally scrollable; tabs MUST NOT
   become narrower than 120 pt. Scrolling MUST occur beneath a fixed 28 pt
   right-edge fade immediately before the action cluster.
-- Its title MUST contain only the subject, MUST use semantic `.subheadline`,
-  and MUST truncate in the middle. The active tab MUST use semantic selection
-  treatment and label color; inactive tabs MUST have no fill and MUST use
+- Its title MUST contain only the subject, MUST use semantic `.subheadline`, and
+  MUST use the trailing fade mask when compressed. The active tab MUST use semantic
+  selection treatment and label color; inactive tabs MUST have no fill and MUST use
   secondary label color. The active treatment MUST remain legible in light,
   dark, and increased-contrast appearances.
 - A transient title MUST be italic. A tab title or accessory MUST NEVER show

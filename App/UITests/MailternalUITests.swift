@@ -113,6 +113,33 @@ final class MailternalUITests: XCTestCase {
         )
     }
 
+    func testCommandKEnterOpensReaderTabAndDismissesSearch() {
+        signInToMock()
+        activateMainWindow()
+        app.typeKey("k", modifierFlags: .command)
+        let field = element(UIIdentifier.searchField)
+        XCTAssertTrue(field.waitForExistence(timeout: 8), "cmd-K should open search")
+        field.click()
+        field.typeText("Lunch")
+        XCTAssertTrue(
+            waitUntil(timeout: 8) {
+                self.app.staticTexts.matching(
+                    NSPredicate(format: "label CONTAINS[c] %@", "Lunch")
+                ).firstMatch.exists
+            },
+            "search should produce a Lunch result"
+        )
+        field.typeKey(.enter, modifierFlags: [])
+        XCTAssertTrue(
+            waitUntil(timeout: 5) { !self.element(UIIdentifier.searchPanel).exists },
+            "Enter should dismiss search after opening the result"
+        )
+        XCTAssertTrue(
+            element(UIIdentifier.readerTabBar).waitForExistence(timeout: 8),
+            "Enter should open the result in the reader"
+        )
+    }
+
     func testCommandCommaOpensSettings() {
         signInToMock()
         closeSettingsIfOpen()

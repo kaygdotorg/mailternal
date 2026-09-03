@@ -54,8 +54,7 @@ struct SearchPanel: View {
                     onMove: moveSelection,
                     onActivate: activateSelection,
                     onOpen: { row in
-                        model.openMessage(row.id, permanent: false)
-                        model.toasts.isSuppressed = false
+                        model.openSearchResult(row)
                     },
                     onCopyDeepLink: { messageID in
                         Task { await model.copyDeepLink(for: messageID) }
@@ -129,8 +128,7 @@ struct SearchPanel: View {
     private func activateSelection() {
         let index = selectedIndex ?? 0
         guard results.indices.contains(index) else { return }
-        model.openMessage(results[index].id, permanent: false)
-        model.toasts.isSuppressed = false
+        model.openSearchResult(results[index])
     }
 
     private func runSearch(_ text: String) {
