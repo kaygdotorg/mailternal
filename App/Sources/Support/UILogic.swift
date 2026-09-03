@@ -18,6 +18,14 @@ enum UIIdentifier {
     static let messageBody = "message-body"
     static let messageSource = "message-source"
     static let messageColorScheme = "message-color-scheme"
+    static let readerTabBar = "reader-tab-bar"
+    static let readerHoverCard = "reader-hover-card"
+    static func readerTab(_ id: UUID) -> String {
+        "reader-tab-\(id.uuidString.lowercased())"
+    }
+    static func readerTabClose(_ id: UUID) -> String {
+        "reader-tab-close-\(id.uuidString.lowercased())"
+    }
     static let searchPanel = "search-panel"
     static let searchField = "search-field"
     static let searchCoverage = "search-coverage"
@@ -80,7 +88,49 @@ enum UIIdentifier {
     static func sidebarFolderRenameField(_ id: FolderID) -> String {
         "sidebar-folder-rename-field-\(id.rawValue)"
     }
+
 }
+/// Pure geometry decisions for the reader's fixed-height tab strip. Tabs first
+/// compress toward the minimum width; once the minimum is reached the scroll
+/// viewport can expose more tabs without ever shrinking them below 120 pt.
+enum ReaderTabLayoutPolicy {
+    static let rowHeight: CGFloat = 40
+    static let minimumTabWidth: CGFloat = 120
+    static let maximumTabWidth: CGFloat = 220
+    static let tabSpacing: CGFloat = 4
+    static let actionControlSize: CGFloat = 32
+    static let actionSpacing: CGFloat = 4
+    static let actionsTrailingInset: CGFloat = 8
+    static let rightFadeWidth: CGFloat = 28
+    static let actionsClusterWidth: CGFloat =
+        actionControlSize * 3 + actionSpacing * 2 + actionsTrailingInset
+
+    /// The width assigned to each tab before horizontal scrolling is needed.
+    /// The returned value is always within the documented tab bounds.
+    static func tabWidth(availableWidth: CGFloat, tabCount: Int) -> CGFloat {
+        guard tabCount > 0, availableWidth.isFinite, availableWidth > 0 else {
+            return minimumTabWidth
+        }
+        let spacing = CGFloat(max(0, tabCount - 1)) * tabSpacing
+        let perTab = (availableWidth - spacing) / CGFloat(tabCount)
+        return min(maximumTabWidth, max(minimumTabWidth, perTab))
+    }
+
+    static func widths(availableWidth: CGFloat, tabCount: Int) -> [CGFloat] {
+        Array(repeating: tabWidth(availableWidth: availableWidth, tabCount: tabCount), count: max(0, tabCount))
+    }
+
+    static func contentWidth(availableWidth: CGFloat, tabCount: Int) -> CGFloat {
+        guard tabCount > 0 else { return 0 }
+        let width = tabWidth(availableWidth: availableWidth, tabCount: tabCount)
+        return CGFloat(tabCount) * width + CGFloat(tabCount - 1) * tabSpacing
+    }
+
+    static func showsFade(contentWidth: CGFloat, viewportWidth: CGFloat) -> Bool {
+        contentWidth.isFinite && viewportWidth.isFinite && contentWidth > viewportWidth + 0.5
+    }
+}
+
 
 enum FolderRenamePolicy {
     /// IMAP special-use folders are server-managed destinations and remain fixed.
@@ -92,6 +142,45 @@ enum FolderRenamePolicy {
         UIIdentifier.sidebarFolderRenameField(id)
     }
 }
+/// Presentation policy for the folder activity accessory. Keeping the symbol
+/// names here makes the mapping testable without constructing a SwiftUI view.
+enum FolderActivityPolicy {
+    static func symbolName(for activity: FolderActivity) -> String? {
+        switch activity {
+        case .downloading:
+            "arrow.down"
+        case .indexing:
+            "arrow.triangle.2.circlepath"
+        case .halted:
+            "pause.circle"
+        case .idle, .quarantinedStall:
+            nil
+        }
+    }
+
+    static func tooltip(for folder: FolderSummary) -> String? {
+        guard folder.activity == .downloading else { return nil }
+        guard case .syncing(let progress) = folder.backfill,
+              let progress,
+              folder.totalCount > 0 else {
+            return "Downloading…"
+        }
+        let clamped = min(1, max(0, progress))
+        let completed = Int((Double(folder.totalCount) * clamped).rounded())
+        return "Downloading \(completed.formatted()) of \(folder.totalCount.formatted())"
+    }
+
+    static func accessibilityLabel(for activity: FolderActivity) -> String? {
+        switch activity {
+        case .downloading: "Syncing"
+        case .indexing: "Indexing"
+        case .halted: "Sync halted"
+        case .quarantinedStall: "Sync stalled on quarantined message"
+        case .idle: nil
+        }
+    }
+}
+
 
 /// The sidebar toggle treats `detailOnly` as a temporary hidden state. Any
 /// visible split arrangement is retained so showing the sidebar restores the

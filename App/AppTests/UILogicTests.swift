@@ -41,6 +41,38 @@ final class UILogicTests: XCTestCase {
             )
         }
     }
+    func testFolderActivityPolicyMapsToBouncingDownloadArrow() {
+        XCTAssertEqual(
+            FolderActivityPolicy.symbolName(for: .downloading),
+            "arrow.down"
+        )
+        XCTAssertEqual(
+            FolderActivityPolicy.symbolName(for: .indexing),
+            "arrow.triangle.2.circlepath"
+        )
+        XCTAssertEqual(FolderActivityPolicy.symbolName(for: .halted), "pause.circle")
+        XCTAssertNil(FolderActivityPolicy.symbolName(for: .idle))
+        XCTAssertNil(FolderActivityPolicy.symbolName(for: .quarantinedStall))
+    }
+
+    func testFolderActivityTooltipUsesBackfillProgress() {
+        let folder = FolderSummary(
+            id: FolderID(rawValue: 1),
+            name: "Inbox",
+            path: "INBOX",
+            separator: nil,
+            role: .inbox,
+            unreadCount: 0,
+            totalCount: 15_365,
+            backfill: .syncing(progress: 12_372.0 / 15_365.0),
+            activity: .downloading
+        )
+        XCTAssertEqual(
+            FolderActivityPolicy.tooltip(for: folder),
+            "Downloading 12,372 of 15,365"
+        )
+    }
+
 
     func testFolderRenameFieldIdentifierIsStableAcrossPathChanges() {
         let id = FolderID(rawValue: 42)
@@ -1266,6 +1298,34 @@ final class UILogicTests: XCTestCase {
         let projectsItem = try XCTUnwrap(move.children.first { $0.title == "Projects" })
         XCTAssertEqual(projectsItem.children.map(\.title), ["Invoices"])
         XCTAssertEqual(projectsItem.children[0].action, .moveTo(invoices.id))
+    }
+
+    func testReaderTabLayoutCompressesBeforeScrolling() {
+        XCTAssertEqual(
+            ReaderTabLayoutPolicy.tabWidth(availableWidth: 900, tabCount: 3),
+            220
+        )
+        XCTAssertEqual(
+            ReaderTabLayoutPolicy.tabWidth(availableWidth: 500, tabCount: 6),
+            120
+        )
+        XCTAssertEqual(
+            ReaderTabLayoutPolicy.contentWidth(availableWidth: 500, tabCount: 6),
+            740
+        )
+        XCTAssertTrue(ReaderTabLayoutPolicy.showsFade(contentWidth: 740, viewportWidth: 500))
+        XCTAssertFalse(ReaderTabLayoutPolicy.showsFade(contentWidth: 220, viewportWidth: 500))
+    }
+
+    func testReaderTabLayoutKeepsMinimumWidthForNarrowViewports() {
+        XCTAssertEqual(
+            ReaderTabLayoutPolicy.tabWidth(availableWidth: 80, tabCount: 1),
+            ReaderTabLayoutPolicy.minimumTabWidth
+        )
+        XCTAssertEqual(
+            ReaderTabLayoutPolicy.widths(availableWidth: 400, tabCount: 0),
+            []
+        )
     }
 
     func testMessageToolbarPolicyGroupsKeepAllActionsInOneCapsule() {

@@ -28,6 +28,11 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     public var onError: ((any Error) -> Void)?
     /// Reports the rendered document height so an outer reader can own scrolling.
     public var onContentHeightChange: ((CGFloat) -> Void)?
+    /// Reports `window.scrollY` when the HTML document itself has a scroll extent.
+    /// The outer reader remains the scroll owner for the normal full-document
+    /// layout, but this callback also covers documents that retain an internal
+    /// WebKit viewport.
+    public var onDocumentScrollOffset: ((CGFloat) -> Void)?
 
     private let webView: WKWebView
     private let errorLabel: NSTextField
@@ -49,10 +54,12 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     private var lastMeasuredWidth: CGFloat?
     private var contentHeightTask: Task<Void, Never>?
     private var contentHeightMeasurementGeneration: UInt64 = 0
+    private var documentScrollTask: Task<Void, Never>?
+    private var documentScrollGeneration: UInt64 = 0
+    private var pendingDocumentScrollOffset: CGFloat?
     #if DEBUG
     private var qaRenderSequence: UInt64 = 0
     #endif
-
     private static let isolationLog = Logger(
         subsystem: "org.kayg.mailternal",
         category: "HTMLIsolation"
@@ -93,6 +100,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         errorLabel.frame = bounds.insetBy(dx: 24, dy: 24)
         addSubview(webView)
         addSubview(errorLabel)
+        observeDocumentScroll()
         installNetworkBlockList()
     }
 
@@ -101,6 +109,9 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         fatalError("init(coder:) is unavailable")
     }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
     public override func layout() {
         super.layout()
         webView.frame = bounds
@@ -153,6 +164,16 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         lastHTMLIdentity = next
         requestLoad()
     }
+    /// Requests restoration of the HTML document's vertical position. A
+    /// request made while a navigation is in flight is held until
+    /// ``webView(_:didFinish:)`` so the document is never visibly reset to
+    /// its top after a tab switch.
+    public func restoreScrollOffset(_ y: CGFloat, animated: Bool = false) {
+        let offset = y.isFinite ? max(y, 0) : 0
+        pendingDocumentScrollOffset = offset
+        guard documentDidFinish else { return }
+        applyDocumentScrollOffset(animated: animated)
+    }
 
     /// In-page find via `WKWebView.find`. JavaScript stays off.
     /// Empty `query` clears the highlight. Always case-insensitive and wrapping.
@@ -179,6 +200,101 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
+    private func observeDocumentScroll() {
+        guard let documentScrollView = documentScrollView() else { return }
+        let clip = documentScrollView.contentView
+        clip.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(documentScrollBoundsChanged),
+            name: NSView.boundsDidChangeNotification,
+            object: clip
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(documentScrollEnded),
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: documentScrollView
+        )
+    }
+
+    private func documentScrollView() -> NSScrollView? {
+        var pending = webView.subviews
+        while let view = pending.popLast() {
+            if let scrollView = view as? NSScrollView {
+                return scrollView
+            }
+            pending.append(contentsOf: view.subviews)
+        }
+        return nil
+    }
+
+    @objc private func documentScrollBoundsChanged() {
+        captureDocumentScroll(after: .milliseconds(90))
+    }
+
+    @objc private func documentScrollEnded() {
+        captureDocumentScroll(after: .zero)
+    }
+
+    private func captureDocumentScroll(after delay: Duration) {
+        documentScrollGeneration &+= 1
+        let generation = documentScrollGeneration
+        documentScrollTask?.cancel()
+        documentScrollTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            if delay != .zero {
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
+            }
+            guard !Task.isCancelled,
+                  generation == self.documentScrollGeneration,
+                  self.documentDidFinish
+            else { return }
+            let script = """
+            (() => {
+              const root = document.documentElement;
+              const body = document.body;
+              const height = Math.max(root ? root.scrollHeight : 0,
+                                      body ? body.scrollHeight : 0);
+              return {
+                y: window.scrollY || 0,
+                max: Math.max(0, height - window.innerHeight)
+              };
+            })()
+            """
+            guard let result = try? await self.webView.evaluateJavaScript(script),
+                  let values = result as? [String: Any],
+                  let y = values["y"] as? NSNumber,
+                  let maximum = values["max"] as? NSNumber,
+                  CGFloat(truncating: maximum) > 0
+            else { return }
+            guard generation == self.documentScrollGeneration else { return }
+            let offset = CGFloat(truncating: y)
+            guard offset.isFinite else { return }
+            self.onDocumentScrollOffset?(max(offset, 0))
+        }
+    }
+
+    private func applyDocumentScrollOffset(animated: Bool) {
+        guard let offset = pendingDocumentScrollOffset else { return }
+        let script: String
+        if animated {
+            script = "window.scrollTo({top: \(offset), left: 0, behavior: 'smooth'})"
+        } else {
+            script = "window.scrollTo(0, \(offset))"
+        }
+        Task { @MainActor [weak self] in
+            guard let self, self.documentDidFinish else { return }
+            _ = try? await self.webView.evaluateJavaScript(script)
+            guard !Task.isCancelled else { return }
+            self.captureDocumentScroll(after: .zero)
+        }
+    }
+
     private func requestLoad() {
         switch HTMLIsolationFence.decision(for: fence) {
         case .waitForFence:
@@ -186,11 +302,11 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         case .loadHTML:
             pendingRender = false
             errorLabel.isHidden = true
-            webView.isHidden = false
             invalidateContentHeightMeasurement()
+            documentScrollGeneration &+= 1
+            documentScrollTask?.cancel()
+            documentScrollTask = nil
             documentDidFinish = false
-            // The host resets its island height when the message changes.
-            // A re-render of the same document (reading mode, remote images)
             // keeps the current height until the new measurement lands, so
             // the island never collapses to its floor mid-toggle and the
             // host's async height application cannot reorder a stale zero
@@ -359,6 +475,9 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         }
         #endif
         documentDidFinish = true
+        // Restore before the first post-load layout pass whenever possible.
+        // `restoreScrollOffset` holds this request across every navigation.
+        applyDocumentScrollOffset(animated: false)
         // WebKit may publish the final content size one run-loop turn after
         // navigation completes. The measurement helper yields once, then
         // coalesces any layout callbacks until this document is stable.
@@ -572,11 +691,12 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     """
 }
 
-/// The message body is sized to its whole document (see the content-height
-/// callback), so it never has anything to scroll vertically itself: the
-/// reader is one scroll surface, like Mail. WKWebView still swallows wheel
-/// events, so vertical scrolling is handed to the enclosing scroll view.
-/// Horizontal deltas stay with the document so wide mail can still be panned.
+/// The message body is normally sized to its whole document (see the
+/// content-height callback), so the outer reader owns the vertical viewport.
+/// For documents that retain an internal scroll extent, the same WebKit
+/// viewport remains usable and ``MessageWebView`` reports its document
+/// `window.scrollY` for per-tab restoration. Horizontal deltas stay with the
+/// document so wide mail can still be panned.
 @MainActor
 private final class DocumentWebView: WKWebView {
     override func scrollWheel(with event: NSEvent) {

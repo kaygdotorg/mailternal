@@ -65,6 +65,9 @@ targets:
       - path: Sources/Support/AccountTitlePolicy.swift
       - path: Sources/Support/CacheTreePolicy.swift
       - path: Sources/Support/ProviderPresets.swift
+      - path: Sources/Tabs/ReaderTabs.swift
+      - path: Sources/Tabs/ReaderTabsPolicy.swift
+      - path: Sources/Tabs/ReaderTabsSnapshot.swift
     dependencies:
       - package: MailternalCore
         product: MailternalCore
@@ -86,6 +89,8 @@ targets:
       - path: Sources/Support/UILogic.swift
     dependencies:
       - target: Mailternal
+      - package: MailternalCore
+        product: MailternalCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal.uitests

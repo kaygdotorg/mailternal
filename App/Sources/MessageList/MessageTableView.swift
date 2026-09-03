@@ -37,7 +37,15 @@ struct MessageListPane: View {
                 leading: actions.leadingSwipe,
                 trailing: actions.trailingSwipe,
                 topRestDepth: listDissolvePolicy.restDepth(safeAreaTop: 0),
-                onSelect: { ids, anchor in model.selectMessages(ids, anchor: anchor) },
+                listScrollOffset: model.selectedFolderID.flatMap {
+                    model.listScrollOffsets[$0]
+                },
+                onSelect: { ids, anchor in
+                    model.selectMessages(ids, anchor: anchor)
+                },
+                onOpenMessage: { id, permanent in
+                    model.openMessage(id, permanent: permanent)
+                },
                 onSelectAll: { model.selectAllMessages() },
                 onPrefetch: { model.loadMoreIfNeeded(near: $0) },
                 onCopySubject: { ids in model.copySubjects(for: ids) },
@@ -46,7 +54,11 @@ struct MessageListPane: View {
                 },
                 onAction: { kind, ids in model.perform(kind, on: ids) },
                 onMove: { ids, folder in model.move(ids: ids, to: folder) },
-                onOpenMessageWindow: { model.openMessageWindow($0) }
+                onOpenMessageWindow: { model.openMessageWindow($0) },
+                onListScroll: { folder, offset in
+                    guard model.selectedFolderID == folder else { return }
+                    model.listScrollOffsets[folder] = offset
+                }
             )
             .mailWindowDissolve(listDissolvePolicy)
 
@@ -119,7 +131,9 @@ struct MessageTableRepresentable: NSViewRepresentable {
     var leading: [SwipeActionKind]
     var trailing: [SwipeActionKind]
     var topRestDepth: CGFloat
+    var listScrollOffset: CGFloat?
     var onSelect: (Set<MessageID>, MessageID?) -> Void
+    var onOpenMessage: (MessageID, Bool) -> Void
     var onSelectAll: () -> Void
     var onPrefetch: (Int) -> Void
     var onCopySubject: (Set<MessageID>) -> Void
@@ -127,6 +141,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
     var onAction: (SwipeActionKind, Set<MessageID>) -> Void
     var onMove: (Set<MessageID>, FolderID) -> Void
     var onOpenMessageWindow: (MessageID) -> Void
+    var onListScroll: (FolderID, CGFloat) -> Void
 
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -149,6 +164,9 @@ struct MessageTableRepresentable: NSViewRepresentable {
         fileprivate weak var tableView: MessageTableKeyView?
         private var epoch: UInt64 = 0
         private var rowIDs: [MessageID] = []
+        private var renderedFolder: FolderID?
+        private var pendingScrollOffset: CGFloat?
+        private var canPersistScroll = false
 
         func bind(container: MessageTableContainer, parent: MessageTableRepresentable) {
             self.parent = parent
@@ -161,6 +179,13 @@ struct MessageTableRepresentable: NSViewRepresentable {
             container.tableView.dataSource = self
             container.onVisibleRow = { [weak self] row in
                 self?.parent?.onPrefetch(row)
+            }
+            container.onScrollOffset = { [weak self] offset in
+                guard let self, self.canPersistScroll,
+                      let parent = self.parent,
+                      let folder = parent.currentFolder
+                else { return }
+                parent.onListScroll(folder, offset)
             }
             container.onKeyCommand = { [weak self] command in
                 self?.handleKeyCommand(command)
@@ -177,13 +202,20 @@ struct MessageTableRepresentable: NSViewRepresentable {
             guard let parent else { return }
             let row = sender.clickedRow >= 0 ? sender.clickedRow : sender.selectedRow
             guard let messageID = parent.rows[safe: row]?.id else { return }
-            parent.onOpenMessageWindow(messageID)
+            parent.onOpenMessage(messageID, true)
         }
 
         func update(container: MessageTableContainer, parent: MessageTableRepresentable) {
             self.parent = parent
+            canPersistScroll = false
             container.updateTopRestDepth(parent.topRestDepth)
             let table = container.tableView
+            let folderChanged = renderedFolder != parent.currentFolder
+            let epochChanged = parent.epoch != epoch
+            if folderChanged || epochChanged {
+                pendingScrollOffset = parent.listScrollOffset.map { max($0, 0) }
+            }
+            renderedFolder = parent.currentFolder
             // SwiftUI observes AccentSource; resolve it at this AppKit bridge
             // and refresh rows only when the canonical color actually changes.
             let accentChanged = container.updateAccent(parent.accent)
@@ -193,13 +225,10 @@ struct MessageTableRepresentable: NSViewRepresentable {
             let lineCountChanged = newLineCount != lineCount
             lineCount = newLineCount
 
-            if parent.epoch != epoch {
+            if epochChanged {
                 epoch = parent.epoch
                 rowIDs = newIDs
                 table.reloadData()
-                if table.numberOfRows > 0 {
-                    table.scrollRowToVisible(0)
-                }
             } else if newIDs.count > oldCount, newIDs.starts(with: rowIDs) {
                 rowIDs = newIDs
                 let added = IndexSet(integersIn: oldCount..<newIDs.count)
@@ -214,8 +243,8 @@ struct MessageTableRepresentable: NSViewRepresentable {
             if lineCountChanged {
                 let origin = table.enclosingScrollView?.contentView.bounds.origin
                 // `rowHeight` is the table's fallback geometry and is also
-                // used while AppKit is rebuilding reused cells. Keep it in
-                // lockstep with the delegate's answer so a live line-count
+                // used while the delegate is rebuilding reused cells. Keep it
+                // in lockstep with the delegate's answer so a live line-count
                 // change cannot leave a row at the previous setting's height.
                 table.rowHeight = MessageListLayout.rowHeight(for: lineCount)
                 if table.numberOfRows > 0 {
@@ -227,7 +256,17 @@ struct MessageTableRepresentable: NSViewRepresentable {
                     scrollView.reflectScrolledClipView(scrollView.contentView)
                 }
             }
+            restorePendingScrollOffset(in: container)
             syncSelection(in: table)
+            canPersistScroll = pendingScrollOffset == nil
+        }
+
+        private func restorePendingScrollOffset(in container: MessageTableContainer) {
+            guard let offset = pendingScrollOffset,
+                  container.tableView.numberOfRows > 0
+            else { return }
+            container.restoreScrollOffset(offset)
+            pendingScrollOffset = nil
         }
 
         private func reloadVisibleRows(in table: NSTableView) {
@@ -302,7 +341,12 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 parent.rows[safe: index]?.id
             })
             let clickedID = parent.rows[safe: tableView.clickedRow]?.id
-            let modifiers = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
+            let event = NSApp.currentEvent
+            let modifiers = event?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
+            let isUserSelectionEvent = event?.type == .leftMouseDown
+                || event?.type == .leftMouseUp
+                || event?.type == .keyDown
+            let opensReader = isUserSelectionEvent && modifiers.isDisjoint(with: [.command, .shift])
             if modifiers.contains(.command), let clickedID {
                 var selection = parent.selectedIDs
                 if ids.contains(clickedID) {
@@ -318,7 +362,11 @@ struct MessageTableRepresentable: NSViewRepresentable {
             let anchor = clickedID.flatMap { ids.contains($0) ? $0 : nil }
                 ?? parent.rows[safe: tableView.selectedRow]?.id
             guard ids != parent.selectedIDs || anchor != parent.selectedID else { return }
-            parent.onSelect(ids, anchor)
+            if opensReader, ids.count == 1, let id = ids.first {
+                parent.onOpenMessage(id, false)
+            } else {
+                parent.onSelect(ids, anchor)
+            }
         }
 
         private var lastScrolledSelectionID: MessageID?
@@ -589,7 +637,9 @@ final class MessageTableContainer: NSView {
     fileprivate var onSelectAll: (() -> Void)?
     private(set) var accentColor: NSColor?
     var onVisibleRow: ((Int) -> Void)?
+    var onScrollOffset: ((CGFloat) -> Void)?
     fileprivate var onKeyCommand: ((MessageTableKeyCommand) -> Void)?
+    private var suppressScrollPersistence = false
 
     init(topRestDepth: CGFloat = MailWindowDissolvePolicy.messageList.restDepth(safeAreaTop: 0)) {
         let frameRect = NSRect(origin: .zero, size: .zero)
@@ -670,6 +720,18 @@ final class MessageTableContainer: NSView {
         if visible.length > 0 {
             onVisibleRow?(visible.location + visible.length - 1)
         }
+        guard !suppressScrollPersistence else { return }
+        onScrollOffset?(max(scrollView.contentView.bounds.origin.y, 0))
+    }
+
+    func restoreScrollOffset(_ offset: CGFloat) {
+        let clip = scrollView.contentView
+        let target = max(offset, 0)
+        guard abs(clip.bounds.origin.y - target) > .ulpOfOne else { return }
+        suppressScrollPersistence = true
+        clip.setBoundsOrigin(NSPoint(x: clip.bounds.origin.x, y: target))
+        scrollView.reflectScrolledClipView(clip)
+        suppressScrollPersistence = false
     }
 
     func updateTopRestDepth(_ depth: CGFloat) {
@@ -900,8 +962,9 @@ final class MessageCellView: NSTableCellView {
         // that transient layout.
         let contentHeight = MessageListLayout.rowHeight(for: lineCount)
         let height = max(min(bounds.height, contentHeight) - 6, 0)
-        // Keep the capsule within the cell while swiping so both continuous
-        // corners remain visible as the row moves with its content.
+        // The chrome keeps the row's continuous corner radius while swiping;
+        // the inset keeps both corners visible as the row moves with its
+        // content. Never restyle the shape mid-gesture.
         let horizontalInset: CGFloat = 8
         let chromeFrame = CGRect(
             x: horizontalInset,
@@ -909,24 +972,15 @@ final class MessageCellView: NSTableCellView {
             width: max(bounds.width - horizontalInset * 2, 0),
             height: height
         )
-        let radius = min(height / 2, chromeFrame.width / 2)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         hoverLayer.frame = chromeFrame
         selectionLayer.frame = chromeFrame
-        hoverLayer.cornerRadius = isSwiped ? radius : AppShapeScale.row
-        selectionLayer.cornerRadius = isSwiped ? radius : AppShapeScale.row
+        hoverLayer.cornerRadius = AppShapeScale.row
+        selectionLayer.cornerRadius = AppShapeScale.row
         CATransaction.commit()
     }
 
-    private var isSwiped: Bool {
-        let frameOffset = frame.minX
-        let modelTransform = layer?.affineTransform().tx ?? 0
-        let presentationTransform = layer?.presentation()?.affineTransform().tx ?? 0
-        return abs(frameOffset) > 0.5
-            || abs(modelTransform) > 0.5
-            || abs(presentationTransform) > 0.5
-    }
 
     func apply(_ row: MessageRow, lineCount: Int) {
         let normalizedLineCount = MessageListLayout.normalizedLineCount(lineCount)

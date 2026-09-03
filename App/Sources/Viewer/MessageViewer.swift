@@ -34,22 +34,28 @@ struct MessageViewer: View {
     }
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            content
-            if model.isFindPresented {
-                FindBar(
-                    query: $model.findQuery,
-                    matchCount: findSnapshot.count,
-                    selectedMatchNumber: findSnapshot.selectedMatchNumber,
-                    next: { stepFind(.next) },
-                    previous: { stepFind(.previous) },
-                    close: { model.isFindPresented = false }
-                )
-                .padding(.top, 12)
-                .padding(.trailing, 16)
-                .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
-                .zIndex(1)
+        VStack(spacing: 0) {
+            if model.tabs.active != nil {
+                ReaderTabBar(model: model)
             }
+            ZStack(alignment: .topTrailing) {
+                content
+                if model.isFindPresented {
+                    FindBar(
+                        query: $model.findQuery,
+                        matchCount: findSnapshot.count,
+                        selectedMatchNumber: findSnapshot.selectedMatchNumber,
+                        next: { stepFind(.next) },
+                        previous: { stepFind(.previous) },
+                        close: { model.isFindPresented = false }
+                    )
+                    .padding(.top, 12)
+                    .padding(.trailing, 16)
+                    .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+                    .zIndex(1)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .animation(MailMotion.disclosure, value: model.isFindPresented)
         .focusScope(viewerFocus)
@@ -72,9 +78,10 @@ struct MessageViewer: View {
 
     @ViewBuilder
     private var content: some View {
-        if let title = MessageReaderStatePolicy.emptyStateTitle(
-            selectionCount: model.selectedMessageIDs.count
-        ) {
+        if model.tabs.active == nil,
+           let title = MessageReaderStatePolicy.emptyStateTitle(
+               selectionCount: model.selectedMessageIDs.count
+           ) {
             EmptyMailboxState(
                 title: title,
                 detail: MessageReaderStatePolicy.emptyStateDetail(
@@ -83,7 +90,7 @@ struct MessageViewer: View {
             )
         } else if let detail = model.detail {
             reader(detail)
-        } else if model.isLoadingDetail {
+        } else if model.isLoadingDetail || model.tabs.active != nil {
             ProgressView()
                 .controlSize(.small)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -100,7 +107,11 @@ struct MessageViewer: View {
     /// The web view reports its document height and does not own a scrolling
     /// viewport, so the reader scrolls the whole message as one page.
     private func reader(_ detail: MessageDetail) -> some View {
-        ScrollView(.vertical) {
+        let activeTabID = model.tabs.activeID
+        let savedScrollOffset = activeTabID.map {
+            model.tabs.scrollOffset(for: $0)
+        } ?? 0
+        return ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.islandSpacing) {
                 MessageSubjectRegion(
                     subject: detail.envelope.subject,
@@ -131,6 +142,18 @@ struct MessageViewer: View {
         }
         .background {
             ScrollEdgeEffectSuppressor()
+        }
+        .background {
+            ReaderScrollHost(
+                tabID: activeTabID,
+                messageID: detail.id,
+                restoreOffset: savedScrollOffset
+            ) { id, offset in
+                guard model.tabs.activeID == id,
+                      model.detail?.id == detail.id
+                else { return }
+                model.tabs.setScrollOffset(offset, for: id)
+            }
         }
         .ignoresSafeArea(.container, edges: .top)
         .mailWindowDissolve(.viewer)
@@ -165,7 +188,7 @@ struct MessageViewer: View {
                     text: raw,
                     query: activeFindQuery,
                     selectedMatchIndex: findSnapshot.index,
-                    findTick: findTick
+                    findTick: findTick,
                 )
                 .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
                 .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
@@ -189,7 +212,7 @@ struct MessageViewer: View {
                 text: text,
                 query: activeFindQuery,
                 selectedMatchIndex: findSnapshot.index,
-                findTick: findTick
+                findTick: findTick,
             )
             .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
             .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
@@ -225,6 +248,11 @@ struct MessageViewer: View {
                 showRemoteImageNotice ? MessageViewerLayoutPolicy.bodyContentSpacing : 0
             )
             MessageHTMLView(
+                messageID: detail.id,
+                tabID: model.tabs.activeID,
+                restoreScrollOffset: model.tabs.activeID.map {
+                    model.tabs.scrollOffset(for: $0)
+                } ?? 0,
                 html: html,
                 partProvider: model.partProvider(for: detail.id),
                 onExternalLink: { url in
@@ -239,6 +267,12 @@ struct MessageViewer: View {
                         guard abs(htmlContentHeight - measured) > 0.5 else { return }
                         htmlContentHeight = measured
                     }
+                },
+                onDocumentScrollOffset: { tabID, offset in
+                    guard model.tabs.activeID == tabID,
+                          model.detail?.id == detail.id
+                    else { return }
+                    model.tabs.setScrollOffset(offset, for: tabID)
                 },
                 allowRemoteImages: model.allowRemoteImages,
                 emailReadingMode: model.effectiveEmailReadingMode,
@@ -271,6 +305,254 @@ struct MessageViewer: View {
             step: step
         )
         findTick += 1
+    }
+}
+
+/// Bridges the SwiftUI reader's AppKit scroll host to the active tab's
+/// persisted position. The bridge is intentionally zero-sized: it observes
+/// the scroll view SwiftUI creates instead of introducing a second viewport.
+private struct ReaderScrollHost: NSViewRepresentable {
+    let tabID: UUID?
+    let messageID: MessageID
+    let restoreOffset: CGFloat
+    let onScrollEnd: (UUID, CGFloat) -> Void
+
+    func makeNSView(context: Context) -> ReaderScrollTrackingView {
+        let view = ReaderScrollTrackingView()
+        view.update(
+            tabID: tabID,
+            messageID: messageID,
+            restoreOffset: restoreOffset,
+            onScrollEnd: onScrollEnd
+        )
+        return view
+    }
+
+    func updateNSView(_ nsView: ReaderScrollTrackingView, context: Context) {
+        nsView.update(
+            tabID: tabID,
+            messageID: messageID,
+            restoreOffset: restoreOffset,
+            onScrollEnd: onScrollEnd
+        )
+    }
+}
+
+@MainActor
+private final class ReaderScrollTrackingView: NSView {
+    private var tabID: UUID?
+    private var messageID: MessageID?
+    private var restoreOffset: CGFloat = 0
+    private var onScrollEnd: ((UUID, CGFloat) -> Void)?
+    private weak var scrollView: NSScrollView?
+    private var didApplyRestore = false
+    private var restoreGeneration: UInt64 = 0
+    private var captureTask: Task<Void, Never>?
+    private var isRestoring = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentHuggingPriority(.defaultLow, for: .vertical)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is unavailable")
+    }
+
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        scheduleAttach()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        scheduleAttach()
+    }
+
+    func update(
+        tabID: UUID?,
+        messageID: MessageID,
+        restoreOffset: CGFloat,
+        onScrollEnd: @escaping (UUID, CGFloat) -> Void
+    ) {
+        let contentChanged = self.tabID != tabID || self.messageID != messageID
+        self.tabID = tabID
+        self.messageID = messageID
+        self.onScrollEnd = onScrollEnd
+        if contentChanged {
+            captureTask?.cancel()
+            captureTask = nil
+            self.restoreOffset = restoreOffset.isFinite ? max(restoreOffset, 0) : 0
+            didApplyRestore = false
+            restoreGeneration &+= 1
+        }
+        attach()
+        if contentChanged {
+            scheduleRestore(generation: restoreGeneration)
+        }
+    }
+
+    private func scheduleAttach() {
+        DispatchQueue.main.async { [weak self] in
+            self?.attach()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+            self?.attach()
+        }
+    }
+
+    private func attach() {
+        guard tabID != nil else {
+            detach()
+            return
+        }
+        guard let enclosing = attachedScrollView() else { return }
+        if scrollView !== enclosing {
+            detach()
+            scrollView = enclosing
+            let clip = enclosing.contentView
+            clip.postsBoundsChangedNotifications = true
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(boundsChanged),
+                name: NSView.boundsDidChangeNotification,
+                object: clip
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(scrollEnded),
+                name: NSScrollView.didEndLiveScrollNotification,
+                object: enclosing
+            )
+            if let documentView = enclosing.documentView {
+                documentView.postsBoundsChangedNotifications = true
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(documentBoundsChanged),
+                    name: NSView.boundsDidChangeNotification,
+                    object: documentView
+                )
+            }
+        }
+        applyRestoreIfPossible()
+    }
+
+    private func attachedScrollView() -> NSScrollView? {
+        if let enclosingScrollView {
+            return enclosingScrollView
+        }
+
+        var root: NSView = self
+        while let superview = root.superview {
+            if superview is NSSplitView { break }
+            root = superview
+            if root === window?.contentView { break }
+        }
+        var result: [NSScrollView] = []
+        func visit(_ view: NSView) {
+            if let scrollView = view as? NSScrollView {
+                result.append(scrollView)
+                return
+            }
+            for subview in view.subviews {
+                visit(subview)
+            }
+
+        }
+        visit(root)
+        return result.first(where: { $0.hasVerticalScroller }) ?? result.first
+    }
+
+    @objc private func documentBoundsChanged() {
+        applyRestoreIfPossible()
+    }
+
+    private func detach() {
+        guard scrollView != nil else { return }
+        NotificationCenter.default.removeObserver(self)
+        scrollView = nil
+        captureTask?.cancel()
+        captureTask = nil
+    }
+
+    @objc private func boundsChanged() {
+        scheduleCapture()
+    }
+
+    @objc private func scrollEnded() {
+        captureOffset()
+    }
+
+    private func scheduleCapture() {
+        captureTask?.cancel()
+        captureTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(90))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.captureOffset()
+        }
+    }
+
+    private func captureOffset() {
+        guard didApplyRestore,
+              !isRestoring,
+              let tabID,
+              let scrollView
+        else { return }
+        onScrollEnd?(tabID, max(scrollView.contentView.bounds.origin.y, 0))
+    }
+
+    private func scheduleRestore(generation: UInt64) {
+        let delays: [Duration] = [
+            .zero,
+            .milliseconds(100),
+            .milliseconds(300),
+            .milliseconds(1000),
+            .milliseconds(2000),
+        ]
+        for delay in delays {
+            Task { @MainActor [weak self] in
+                if delay != .zero {
+                    try? await Task.sleep(for: delay)
+                }
+                guard let self,
+                      generation == self.restoreGeneration,
+                      !self.didApplyRestore
+                else { return }
+                self.applyRestoreIfPossible()
+            }
+        }
+    }
+
+    private func applyRestoreIfPossible() {
+        guard !didApplyRestore,
+              !isRestoring,
+              let scrollView,
+              tabID != nil
+        else { return }
+        let clip = scrollView.contentView
+        let target = restoreOffset
+        if abs(clip.bounds.origin.y - target) <= .ulpOfOne {
+            didApplyRestore = true
+            return
+        }
+        isRestoring = true
+        clip.setBoundsOrigin(NSPoint(x: clip.bounds.origin.x, y: target))
+        scrollView.reflectScrolledClipView(clip)
+        isRestoring = false
+        // AppKit clamps when the document is not laid out yet. Keep the
+        // restore pending so a later content-height pass can apply the full
+        // saved offset without visibly animating from the top.
+        if abs(clip.bounds.origin.y - target) <= .ulpOfOne {
+            didApplyRestore = true
+        }
     }
 }
 

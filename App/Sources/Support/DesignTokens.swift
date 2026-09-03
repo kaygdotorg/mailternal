@@ -75,6 +75,19 @@ enum MailMotion {
     /// Wall time until both have finished; the overlay is removed then.
     static let searchDismissDuration: TimeInterval = searchCardExitDuration + 0.22
 }
+/// Geometry and timing for the main-window reader tab surface. Structural tab
+/// sizing lives in `ReaderTabLayoutPolicy`; these values describe the visual
+/// surfaces that policy intentionally does not decide.
+enum ReaderTabTokens {
+    static let hoverDelay: Duration = .milliseconds(350)
+    static let previewWidth: CGFloat = 320
+    static let previewCornerRadius: CGFloat = 18
+    static let previewMaximumWidth: CGFloat = 360
+    static let previewMaximumHeight: CGFloat = 220
+    static let previewHorizontalPadding: CGFloat = 14
+    static let previewVerticalPadding: CGFloat = 12
+}
+
 
 enum OutgoingForegroundPolicy {
     static let crossoverLuminance: CGFloat = 0.179128784747792

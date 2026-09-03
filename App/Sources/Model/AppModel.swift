@@ -28,6 +28,8 @@ final class AppModel {
     var accountStates: [AccountID: AccountState] = [:]
     var selectedFolderID: FolderID?
     var folders: [FolderSummary] = []
+    var listScrollOffsets: [FolderID: CGFloat] = [:]
+    var tabs: ReaderTabs
     /// The list's full selection. `selectedMessageID` remains the reader
     /// anchor so a single-message reader survives ordinary list updates.
     var selectedMessageIDs: Set<MessageID> = []
@@ -82,6 +84,11 @@ final class AppModel {
     @ObservationIgnored private var streamsStarted = false
     @ObservationIgnored private var markedRead: Set<MessageID> = []
     @ObservationIgnored private var qaSelectionSequence: UInt64 = 0
+    @ObservationIgnored private var tabSaveTask: Task<Void, Never>?
+    @ObservationIgnored private var tabRestoreTask: Task<Void, Never>?
+    @ObservationIgnored private var tabExistenceTask: Task<Void, Never>?
+    @ObservationIgnored private var tabsRestored = false
+    @ObservationIgnored private var isSyncingTabSelection = false
 #if DEBUG
     @ObservationIgnored private var qaContextMenuDumped = false
 #endif
@@ -124,9 +131,13 @@ final class AppModel {
         self.facade = facade
         self.appearance = appearance
         self.actions = actions
+        self.tabs = ReaderTabs()
         accountState = facade.accountState
         accountStates = facade.accountStates
         accountConfigs = facade.accounts
+        tabs.onChange = { [weak self] in
+            self?.scheduleTabsPersistence()
+        }
     }
     /// malformed URLs can never reach account or folder selection.
     func openURL(_ url: URL) {
@@ -269,7 +280,7 @@ final class AppModel {
                 prepareFolderForRoute(folderID)
                 listRows = loaded
                 listCursor = page.next
-                selectMessage(messageID)
+                openMessage(messageID, permanent: false)
                 return
             }
             cursor = page.next
@@ -286,6 +297,7 @@ final class AppModel {
         Task { [weak self] in
             guard let self else { return }
             if let live = facade as? LiveMailFacade {
+                await live.waitUntilStoreReady()
                 await live.restorePersistedAccounts()
             }
             accountConfigs = facade.accounts
@@ -320,6 +332,7 @@ final class AppModel {
                     } else if selectedFolderID != nil {
                         selectFolder(nil)
                     }
+                    self.restoreTabsIfNeeded()
                 }
             }
             Task { [weak self] in
@@ -328,6 +341,7 @@ final class AppModel {
                     syncStatus = status
                 }
             }
+            startTabExistenceObservation()
             if accountConfigs.isEmpty {
                 #if DEBUG
                 if QALaunch.parse() != nil { return }
@@ -435,21 +449,19 @@ final class AppModel {
         }
     }
 
-    /// Updates the list selection and keeps a single anchor for the reader.
-    /// Multi-selection deliberately clears detail: there is no ambiguous
-    /// "current message" in the reader while several rows are selected.
+    /// Updates list selection without disturbing the active reader tab when
+    /// several rows are selected. The reader remains a single-message surface;
+    /// list actions continue to consume the complete selectedMessageIDs set.
     func selectMessages(_ ids: Set<MessageID>, anchor: MessageID? = nil) {
         guard !ids.isEmpty else {
             selectMessage(nil)
             return
         }
         selectedMessageIDs = ids
+        guard ids.count == 1 else { return }
         let retainedAnchor = selectedMessageID.flatMap { ids.contains($0) ? $0 : nil }
         selectedMessageID = anchor.flatMap { ids.contains($0) ? $0 : nil } ?? retainedAnchor ?? ids.first
-        guard ids.count == 1, let selectedMessageID else {
-            clearReaderSelection()
-            return
-        }
+        guard let selectedMessageID else { return }
         loadMessageDetail(selectedMessageID)
     }
 
@@ -662,9 +674,57 @@ final class AppModel {
     func move(ids: Set<MessageID>, to folder: FolderID) {
         guard !ids.isEmpty, folder != selectedFolderID else { return }
         let orderedIDs = ids.sorted { $0.rawValue < $1.rawValue }
+        let rollbackRows = listRows.filter { ids.contains($0.id) }
+        let rollbackSelection = selectedMessageIDs
+        let rollbackAnchor = selectedMessageID
         removeListRows(ids)
         Task { [weak self] in
-            await self?.facade.move(orderedIDs, to: folder)
+            guard let self else { return }
+            do {
+                let outcome = try await facade.move(orderedIDs, to: folder)
+                let acceptedIDs = outcome.acceptedIDs.isEmpty && outcome.movedCount == ids.count
+                    ? ids
+                    : outcome.acceptedIDs
+                let skippedIDs = ids.subtracting(acceptedIDs)
+                scheduleTabsPersistence()
+                guard !skippedIDs.isEmpty else { return }
+                restoreMovedRows(
+                    rollbackRows.filter { skippedIDs.contains($0.id) },
+                    selectedIDs: rollbackSelection.intersection(skippedIDs),
+                    anchor: rollbackAnchor.flatMap { skippedIDs.contains($0) ? $0 : nil }
+                )
+                toasts.post(title: "Messages can only be moved within the same account")
+            } catch {
+                restoreMovedRows(
+                    rollbackRows,
+                    selectedIDs: rollbackSelection,
+                    anchor: rollbackAnchor
+                )
+                toasts.post(
+                    title: "Couldn't move \(ids.count) messages",
+                    detail: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    /// Restores rows rejected by the facade while retaining their original
+    /// selection. Live page observations may race this call, so existing IDs
+    /// are never inserted twice.
+    private func restoreMovedRows(
+        _ rows: [MessageRow],
+        selectedIDs: Set<MessageID>,
+        anchor: MessageID?
+    ) {
+        let existing = Set(listRows.map(\.id))
+        listRows.append(contentsOf: rows.filter { !existing.contains($0.id) })
+        listRows.sort {
+            if $0.date != $1.date { return $0.date > $1.date }
+            return $0.id.rawValue > $1.id.rawValue
+        }
+        selectedMessageIDs.formUnion(selectedIDs)
+        if let anchor, selectedMessageIDs.contains(anchor) {
+            selectedMessageID = anchor
         }
     }
     func moveDroppedLinks(_ links: [String], to folder: FolderID) async {
@@ -683,18 +743,220 @@ final class AppModel {
         move(ids: ids, to: folder)
     }
 
-    func openSearchResult(_ row: MessageRow) {
-        isSearchPresented = false
-        if let folder = row.folderID ?? folderContaining(row.id) {
-            if selectedFolderID != folder {
-                selectFolder(folder)
+    func openMessage(_ id: MessageID, permanent: Bool) {
+        // A permanent open is an explicit double-click action. It must not be
+        // swallowed when AppKit reports it while a programmatic selection sync
+        // is still unwinding; the tab state is authoritative and the sync can
+        // safely observe the promoted tab afterward.
+        guard !isSyncingTabSelection || permanent else { return }
+        tabs.open(id, permanent: permanent)
+        if let folder = folderContaining(id), selectedFolderID != folder {
+            selectFolder(folder)
+        }
+        if let folder = folderContaining(id),
+           listRows.contains(where: { $0.id == id }) {
+            syncSelection(to: id, folder: folder)
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  let link = try? await self.facade.makeDeepLink(for: id),
+                  let destination = try? await self.facade.resolve(link),
+                  case .message(let folder, _, let row) = destination else { return }
+            guard !Task.isCancelled else { return }
+            if self.selectedFolderID != folder {
+                self.selectFolder(folder)
+            }
+            if !self.listRows.contains(where: { $0.id == id }) {
+                self.listRows.insert(row, at: 0)
+            }
+            guard self.tabs.active?.message == id else { return }
+            self.syncSelection(to: id, folder: folder)
+        }
+    }
+
+    func activateTab(_ id: UUID) {
+        guard let tab = tabs.tabs.first(where: { $0.id == id }) else { return }
+        tabs.activate(id)
+        if let folder = folderContaining(tab.message),
+           listRows.contains(where: { $0.id == tab.message }),
+           canSync(folder: folder) {
+            syncSelection(to: tab.message, folder: folder)
+            return
+        }
+        guard folderContaining(tab.message) == nil || canSync(folder: folderContaining(tab.message)!) else {
+            // A disabled account may retain cached detail, but activating its
+            // tab must not force account/folder selection or a network fetch.
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  let link = try? await self.facade.makeDeepLink(for: tab.message),
+                  let destination = try? await self.facade.resolve(link),
+                  case .message(let folder, _, _) = destination,
+                  self.canSync(folder: folder) else { return }
+            self.syncSelection(to: tab.message, folder: folder)
+        }
+    }
+
+    private func canSync(folder: FolderID) -> Bool {
+        guard let summary = folders.first(where: { $0.id == folder }),
+              let account = accountConfigs.first(where: { $0.id == summary.accountID }) else {
+            return true
+        }
+        return account.isEnabled
+    }
+
+    /// ⌘W closes a reader tab while one exists; otherwise AppKit closes the
+    /// main window through its normal close-window action.
+    func closeActiveTabOrWindow() {
+        if let activeID = tabs.activeID {
+            tabs.close(activeID)
+            if let active = tabs.active {
+                activateTab(active.id)
+            } else {
+                clearReaderSelection()
+                selectedMessageIDs.removeAll()
+                selectedMessageID = nil
+            }
+        } else {
+            NSApp.keyWindow?.performClose(nil)
+        }
+    }
+
+    @discardableResult
+    func messageRemoved(_ id: MessageID) -> Bool {
+        guard tabs.messageRemoved(id) else { return false }
+        toasts.post(title: "Message was deleted")
+        if selectedMessageID == id {
+            if let active = tabs.active {
+                activateTab(active.id)
+            } else {
+                clearReaderSelection()
+                selectedMessageIDs.removeAll()
+                selectedMessageID = nil
             }
         }
-        selectMessage(row.id)
+        return true
+    }
+
+    private func syncSelection(to id: MessageID, folder: FolderID?) {
+        guard !isSyncingTabSelection else { return }
+        isSyncingTabSelection = true
+        defer { isSyncingTabSelection = false }
+        if let folder, selectedFolderID != folder {
+            selectFolder(folder)
+        }
+        selectedMessageIDs = [id]
+        selectedMessageID = id
+        loadMessageDetail(id)
+    }
+
+    private var tabsPersistenceURL: URL {
+        #if DEBUG
+        if let root = QALaunch.parse()?.containerRoot {
+            return root.appendingPathComponent("reader-tabs.json", isDirectory: false)
+        }
+        #endif
+        let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSHomeDirectory())
+        return base
+            .appendingPathComponent("Mailternal", isDirectory: true)
+            .appendingPathComponent("reader-tabs.json", isDirectory: false)
+    }
+
+    private func scheduleTabsPersistence() {
+        tabSaveTask?.cancel()
+        tabSaveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard let self, !Task.isCancelled else { return }
+            var links: [UUID: String] = [:]
+            for tab in self.tabs.tabs {
+                if let link = try? await self.facade.makeDeepLink(for: tab.message),
+                   let value = link.formattedString {
+                    links[tab.id] = value
+                }
+            }
+            guard !Task.isCancelled else { return }
+            let snapshot = self.tabs.snapshot(links: links)
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? FileManager.default.createDirectory(
+                at: self.tabsPersistenceURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? data.write(to: self.tabsPersistenceURL, options: .atomic)
+        }
+    }
+
+    private func restoreTabsIfNeeded() {
+        guard !tabsRestored, isAccountActive, foldersSnapshotReady else { return }
+        tabsRestored = true
+        tabRestoreTask?.cancel()
+        tabRestoreTask = Task { @MainActor [weak self] in
+            guard let self,
+                  let data = try? Data(contentsOf: self.tabsPersistenceURL),
+                  let snapshot = try? JSONDecoder().decode(ReaderTabsSnapshot.self, from: data)
+            else { return }
+            var resolved: [UUID: MessageID] = [:]
+            for entry in snapshot.tabs {
+                guard let link = MailternalDeepLink(string: entry.link),
+                      let destination = try? await self.facade.resolve(link),
+                      case .message(_, let id, _) = destination else { continue }
+                resolved[entry.id] = id
+            }
+            guard !Task.isCancelled else { return }
+            self.tabs.restore(snapshot, messagesByTabID: resolved)
+            if let activeID = self.tabs.activeID {
+                self.activateTab(activeID)
+            }
+        }
+    }
+
+    /// No facade-wide existence stream exists, so this bounded poll checks only
+    /// the small set of open-tab messages every 30 seconds. It catches
+    /// expunge/delete events outside the visible folder; a move continues to
+    /// resolve normally and therefore keeps its tab.
+    private func startTabExistenceObservation() {
+        guard tabExistenceTask == nil else { return }
+        tabExistenceTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                guard let self, !Task.isCancelled else { return }
+                for tab in self.tabs.tabs {
+                    if let folder = self.folderContaining(tab.message), !self.canSync(folder: folder) {
+                        continue
+                    }
+                    guard let link = try? await self.facade.makeDeepLink(for: tab.message) else {
+                        continue
+                    }
+                    do {
+                        guard let destination = try await self.facade.resolve(link) else {
+                            self.messageRemoved(tab.message)
+                            continue
+                        }
+                        guard case .message(_, _, _) = destination else { continue }
+                    } catch {
+                        // A transient store/network failure is not deletion.
+                        continue
+                    }
+                }
+            }
+        }
+    }
+
+    func openSearchResult(_ row: MessageRow) {
+        isSearchPresented = false
+        if let folder = row.folderID ?? folderContaining(row.id), selectedFolderID != folder {
+            selectFolder(folder)
+        }
         if !listRows.contains(where: { $0.id == row.id }) {
             listRows.insert(row, at: 0)
         }
+        openMessage(row.id, permanent: false)
     }
+
 
     func refresh() async {
         if !syncStatus.isOnline {
@@ -969,6 +1231,9 @@ final class AppModel {
 #endif
 
     private func folderContaining(_ id: MessageID) -> FolderID? {
+        if let row = listRows.first(where: { $0.id == id }), let folder = row.folderID {
+            return folder
+        }
         if let mock = facade as? MockMailFacade {
             return mock.folderID(for: id)
         }
