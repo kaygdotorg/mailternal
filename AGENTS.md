@@ -23,3 +23,11 @@
   (`cp -R ~/mailternal-qa-ReaderIslands ~/mailternal-qa-<agent>`); announce server mutations on
   hub; restore what you move.
 - **Launch timing**: `MAILTERNAL_QA=1 Mailternal -qa-account … -qa-gui` prints `launch phase=<name> t=<ms since exec>` for app-init, store-open, did-finish-launching, window-front, folders-snapshot, first-rows. The older `first-page ready` line is a 2 s poller and is not a launch metric. Cold DB file without sudo: `sqlite3 store.sqlite "VACUUM INTO 'copy.sqlite'"` into a fresh container.
+- **QA IMAP server** is the Dovecot on mbp itself: `-qa-account 127.0.0.1 1143 startTLS`
+  (user `qa@mailternal.test`, `MAILTERNAL_QA_PASSWORD=qa-password`). `10.69.69.155:1025` is
+  dead; a container seeded for a different `qa-<host>-<port>` account id is wiped by the QA
+  seed, so copy fixtures only with a matching endpoint.
+- **XCUITest under `agents` works**: automation mode is enabled on mbp
+  (`sudo automationmodetool enable-automationmode-without-authentication`, re-run by kayg
+  after a reboot). Prefer `xcodebuild … test -only-testing:MailternalUITests/…` in your own
+  build dir over synthetic CuaDriver clicks for gesture/keyboard verification.

@@ -8,7 +8,8 @@ MODE="${2:-package}"
 REMOTE="agents@mbp"
 DEST="~/mailternal-build/$DIR"
 ssh "$REMOTE" "mkdir -p $DEST"
-rsync -a --delete --exclude .git --exclude .build --exclude 'App/Mailternal.xcodeproj' \
+rsync -a --delete --exclude .git --exclude .build --exclude 'App/build' \
+  --exclude .code-review-graph --exclude 'App/Mailternal.xcodeproj' \
   "$(git rev-parse --show-toplevel)/" "$REMOTE:$DEST/"
 case "$MODE" in
   package)

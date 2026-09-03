@@ -87,6 +87,42 @@ struct MailternalApp: App {
                 .keyboardShortcut("d", modifiers: [.command, .option])
                 .disabled(model.selectedMessageIDs.count != 1)
             }
+            CommandGroup(after: .windowArrangement) {
+                Button("Close Tab") {
+                    appDelegate.showMainWindow()
+                    model.closeActiveTabOrWindow()
+                }
+                .keyboardShortcut("w", modifiers: .command)
+                .disabled(model.tabs.tabs.isEmpty && NSApp.keyWindow == nil)
+                Button("Next Tab") {
+                    appDelegate.showMainWindow()
+                    model.tabs.activateNext()
+                    if let id = model.tabs.activeID { model.activateTab(id) }
+                }
+                .keyboardShortcut(.tab, modifiers: .control)
+                .disabled(model.tabs.tabs.count < 2)
+                Button("Previous Tab") {
+                    appDelegate.showMainWindow()
+                    model.tabs.activatePrevious()
+                    if let id = model.tabs.activeID { model.activateTab(id) }
+                }
+                .keyboardShortcut(.tab, modifiers: [.control, .shift])
+                .disabled(model.tabs.tabs.count < 2)
+                Button("Previous Tab") {
+                    appDelegate.showMainWindow()
+                    model.tabs.activatePrevious()
+                    if let id = model.tabs.activeID { model.activateTab(id) }
+                }
+                .keyboardShortcut("[", modifiers: [.command, .shift])
+                .disabled(model.tabs.tabs.count < 2)
+                Button("Next Tab") {
+                    appDelegate.showMainWindow()
+                    model.tabs.activateNext()
+                    if let id = model.tabs.activeID { model.activateTab(id) }
+                }
+                .keyboardShortcut("]", modifiers: [.command, .shift])
+                .disabled(model.tabs.tabs.count < 2)
+            }
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") {
                     model.showSettings()
