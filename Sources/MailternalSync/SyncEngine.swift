@@ -353,6 +353,13 @@ public actor SyncEngine {
 
     /// Backfill PEEK bodies are fetched one UID/section at a time. The request
     /// limits and aggregate window budget live in `SyncPolicy`.
+    /// Speculative sections keep the common single-part message on the
+    /// metadata round trip. Any text parts not present in that response are
+    /// fetched in bounded grouped requests below.
+    private static let speculativePeeks: [IMAPPeekSection] = [
+        .header,
+        .part("1"),
+    ]
 
     /// - Parameter qaAmpleDisk: QA/testing only. When `true`, disk policy sees a
     ///   spacious synthetic volume so a nearly-full host cannot halt INBOX
@@ -1538,9 +1545,8 @@ public actor SyncEngine {
         let uidSet = uidSetOverride ?? IMAPUIDSet(window)
         let meta: [IMAPFetchedMessage]
         do {
-            // Metadata contains no literals, so keeping one window of these
-            // small values does not scale with message body size. Bodies are
-            // fetched and committed one message at a time below.
+            // Keep the common single-part message on this metadata round
+            // trip. Missing nested text parts are fetched below in chunks.
             meta = try await channel.fetch(
                 in: record.path,
                 expectedUIDValidity: capturedGeneration.uidValidity,
@@ -1550,7 +1556,8 @@ public actor SyncEngine {
                     bodyStructure: true,
                     flags: true,
                     internalDate: true,
-                    uid: true
+                    uid: true,
+                    peek: qresyncEnabled ? Self.speculativePeeks : []
                 )
             )
         } catch is CancellationError {
@@ -1590,137 +1597,166 @@ public actor SyncEngine {
         let canNotify = notify && record.role == .inbox && !record.isReplacement
 
 
-        for fetched in ordered {
-            try Task.checkCancellation()
-            guard let uid = fetched.uid, uid > 0 else { continue }
-            guard folders[record.id]?.keepLocally == true else { return .halted }
-            if let expectedExpungeRevision,
-               expectedExpungeRevision != expungeRevision[record.id, default: 0] {
-                return .invalidated
+        func textSpecifiers(_ fetched: IMAPFetchedMessage) -> [String] {
+            var seen = Set<String>()
+            return (fetched.bodyStructure.map {
+                MessageAssembler.textNeeds($0).map(\.specifier)
+            } ?? []).filter { specifier in
+                let upper = specifier.uppercased()
+                guard specifier.unicodeScalars.allSatisfy({
+                    $0 == "." || ("0"..."9").contains($0)
+                }), seen.insert(upper).inserted else {
+                    return false
+                }
+                return true
             }
+        }
 
-            var bodyParts: [IMAPPeekedPart] = []
-            var peekedBytes = 0
-            var didHitPeekLimit = false
+        // Keep body responses batched to avoid one round trip per UID, while
+        // bounding the retained response set by the same aggregate peek budget
+        // used for each message. Messages with the same text-part shape share
+        // one FETCH; the metadata window remains the durable batching unit.
+        var index = 0
+        while index < ordered.count {
+            try Task.checkCancellation()
+            let first = ordered[index]
+            guard let firstUID = first.uid, firstUID > 0 else {
+                index += 1
+                continue
+            }
+            let firstSpecifiers = textSpecifiers(first)
+            // Batch body FETCHes to avoid one network round trip per UID.
+            // Every returned UID remains capped by the per-message budget.
+            let chunkLimit = 32
+            var end = index + 1
+            while end < ordered.count, end - index < chunkLimit,
+                  textSpecifiers(ordered[end]) == firstSpecifiers {
+                end += 1
+            }
+            let group = Array(ordered[index..<end])
+            let uids = group.compactMap(\.uid).filter { $0 > 0 }
+            var bodyByUID: [UInt32: [IMAPPeekedPart]] = Dictionary(
+                uniqueKeysWithValues: group.compactMap { fetched in
+                    guard let uid = fetched.uid else { return nil }
+                    return (uid, fetched.parts)
+                }
+            )
+            let needsBody = group.contains { fetched in
+                let have = Set(fetched.parts.map { $0.specifier.uppercased() })
+                return textSpecifiers(fetched).contains { specifier in
+                    let upper = specifier.uppercased()
+                    return !have.contains(upper)
+                        && !(upper == "1" && (have.contains("TEXT") || have.contains("")))
+                }
+            }
+            var didHitPeekLimit: Set<UInt32> = []
             let header = IMAPPeekSection(
                 specifier: "HEADER",
                 origin: 0,
                 length: SyncPolicy.backfillHeaderPeekByteLimit
             )
-            let structure = fetched.bodyStructure
-            var specifiers = structure.map {
-                MessageAssembler.textNeeds($0).map(\.specifier)
-            } ?? []
-            var seenSpecifiers = Set<String>()
-            specifiers = specifiers.filter { specifier in
-                let upper = specifier.uppercased()
-                guard specifier.unicodeScalars.allSatisfy({
-                    $0 == "." || ("0"..."9").contains($0)
-                }), seenSpecifiers.insert(upper).inserted else {
-                    return false
-                }
-                return true
-            }
-            let peekSections = [header] + specifiers.map {
+            let peekSections = [header] + firstSpecifiers.map {
                 IMAPPeekSection(
                     specifier: $0,
                     origin: 0,
                     length: SyncPolicy.backfillTextPeekByteLimit
                 )
             }
-
-            var boundedSections: [IMAPPeekSection] = []
-            var requestedLengths: [String: Int] = [:]
-            for section in peekSections {
-                try Task.checkCancellation()
-                let remaining = SyncPolicy.backfillWindowPeekByteBudget - peekedBytes
-                guard remaining > 0 else { break }
-                let length = min(section.length ?? remaining, remaining)
-                let bounded = IMAPPeekSection(
-                    specifier: section.specifier,
-                    binary: section.binary,
-                    origin: 0,
-                    length: length
-                )
-                boundedSections.append(bounded)
-                requestedLengths[section.specifier.uppercased()] = length
-            }
-            if !boundedSections.isEmpty {
-                do {
-                    let fetchedParts = try await channel.fetch(
-                        in: record.path,
-                        expectedUIDValidity: capturedGeneration.uidValidity,
-                        IMAPFetchRequest(
-                            uids: IMAPUIDSet(uid: uid),
-                            uid: true,
-                            peek: boundedSections
-                        )
-                    )
-                    for response in fetchedParts {
-                        for var part in response.parts {
-                            let room = SyncPolicy.backfillWindowPeekByteBudget - peekedBytes
-                            guard room > 0 else { break }
-                            if let length = requestedLengths[part.specifier.uppercased()],
-                               part.data.count >= length {
-                                didHitPeekLimit = true
-                            }
-                            if part.data.count > room {
-                                part.data = Data(part.data.prefix(room))
-                                didHitPeekLimit = true
-                            }
-                            bodyParts.append(part)
-                            peekedBytes += part.data.count
-                        }
-                    }
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
-                        return .halted
-                    }
-                    await logSync(
-                        "body peek \(record.path)",
-                        detail: String(describing: error),
-                        folder: record.id
-                    )
-                    if SyncPolicy.isTransport(error) { throw error }
+            let requestedLengths = Dictionary(
+                uniqueKeysWithValues: peekSections.map {
+                    ($0.specifier.uppercased(), $0.length ?? 0)
                 }
-            }
-
-            var incoming = MessageAssembler.incoming(
-                generation: generation,
-                fetched: fetched,
-                bodyParts: bodyParts,
-                now: now
             )
-            if didHitPeekLimit {
-                incoming.isTruncated = true
+            if needsBody {
+                do {
+                let fetchedParts = try await channel.fetch(
+                    in: record.path,
+                    expectedUIDValidity: capturedGeneration.uidValidity,
+                    IMAPFetchRequest(
+                        uids: SyncPolicy.uidSet(uids: uids),
+                        uid: true,
+                        peek: peekSections
+                    )
+                )
+                for response in fetchedParts {
+                    guard let uid = response.uid, uid > 0 else { continue }
+                    for var part in response.parts {
+                        if let length = requestedLengths[part.specifier.uppercased()],
+                           part.data.count >= length {
+                            didHitPeekLimit.insert(uid)
+                        }
+                        let used = bodyByUID[uid]?.reduce(0) { $0 + $1.data.count } ?? 0
+                        let room = max(0, SyncPolicy.backfillWindowPeekByteBudget - used)
+                        guard room > 0 else {
+                            didHitPeekLimit.insert(uid)
+                            break
+                        }
+                        if part.data.count > room {
+                            part.data = Data(part.data.prefix(room))
+                            didHitPeekLimit.insert(uid)
+                        }
+                        bodyByUID[uid, default: []].append(part)
+                    }
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
+                    return .halted
+                }
+                await logSync(
+                    "body peek \(record.path)",
+                    detail: String(describing: error),
+                    folder: record.id
+                )
+                if SyncPolicy.isTransport(error) { throw error }
             }
-            pending.append(incoming)
-            pendingBytes += incoming.decodedBytes
-            if canNotify,
-               SyncPolicy.isNotifiable(uid: incoming.uid, baseline: record.baseline),
-               try await store.messageID(generation: generation, uid: incoming.uid) == nil {
-                pendingNotify.append((
-                    uid: incoming.uid,
-                    sender: MessageAssembler.senderDisplay(incoming.envelope),
-                    subject: incoming.envelope.subject
-                ))
             }
-            if pending.count >= WriteBudget.backfill.maxRows
-                || pendingBytes >= WriteBudget.backfill.maxDecodedBytes {
-                let batch = pending
-                pending.removeAll(keepingCapacity: true)
-                pendingBytes = 0
-                if let result = try await commitBackfillBatch(
-                    batch,
-                    record: record,
-                    capturedGeneration: capturedGeneration,
-                    expectedExpungeRevision: expectedExpungeRevision
-                ) {
-                    return result
+
+            for fetched in group {
+                try Task.checkCancellation()
+                guard let uid = fetched.uid, uid > 0 else { continue }
+                guard folders[record.id]?.keepLocally == true else { return .halted }
+                if let expectedExpungeRevision,
+                   expectedExpungeRevision != expungeRevision[record.id, default: 0] {
+                    return .invalidated
+                }
+                var incoming = MessageAssembler.incoming(
+                    generation: generation,
+                    fetched: fetched,
+                    bodyParts: bodyByUID[uid] ?? [],
+                    now: now
+                )
+                if didHitPeekLimit.contains(uid) {
+                    incoming.isTruncated = true
+                }
+                pending.append(incoming)
+                pendingBytes += incoming.decodedBytes
+                if canNotify,
+                   SyncPolicy.isNotifiable(uid: incoming.uid, baseline: record.baseline),
+                   try await store.messageID(generation: generation, uid: incoming.uid) == nil {
+                    pendingNotify.append((
+                        uid: incoming.uid,
+                        sender: MessageAssembler.senderDisplay(incoming.envelope),
+                        subject: incoming.envelope.subject
+                    ))
+                }
+                if pending.count >= WriteBudget.backfill.maxRows
+                    || pendingBytes >= WriteBudget.backfill.maxDecodedBytes {
+                    let batch = pending
+                    pending.removeAll(keepingCapacity: true)
+                    pendingBytes = 0
+                    if let result = try await commitBackfillBatch(
+                        batch,
+                        record: record,
+                        capturedGeneration: capturedGeneration,
+                        expectedExpungeRevision: expectedExpungeRevision
+                    ) {
+                        return result
+                    }
                 }
             }
+            index = end
         }
         if !pending.isEmpty {
             let batch = pending
