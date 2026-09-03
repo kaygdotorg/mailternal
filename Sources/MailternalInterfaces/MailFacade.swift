@@ -56,7 +56,7 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     /// Enqueues an archive move; the sync engine drains it. No-op toast-level failure is surfaced via error log.
     func archive(_ ids: [MessageID]) async
     /// Enqueues a move to an arbitrary folder.
-    func move(_ ids: [MessageID], to folder: FolderID) async
+    func move(_ ids: [MessageID], to folder: FolderID) async throws -> MoveOutcome
     func rawSource(_ id: MessageID) async throws -> String
     /// On-demand attachment/inline-part fetch → file URL in the attachment cache.
     func fetchAttachment(_ message: MessageID, part: String) async throws -> URL
@@ -67,7 +67,7 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     func trash(_ id: MessageID) async
     func setFlagged(_ id: MessageID, _ flagged: Bool) async
     func archive(_ id: MessageID) async
-    func move(_ id: MessageID, to folder: FolderID) async
+    func move(_ id: MessageID, to folder: FolderID) async throws -> MoveOutcome
 
     // Search (FTS5 over synced history)
     func search(_ query: String, limit: Int) async throws -> [MessageRow]
@@ -128,7 +128,7 @@ public extension MailFacade {
         await archive([id])
     }
 
-    func move(_ id: MessageID, to folder: FolderID) async {
-        await move([id], to: folder)
+    func move(_ id: MessageID, to folder: FolderID) async throws -> MoveOutcome {
+        try await move([id], to: folder)
     }
 }

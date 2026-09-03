@@ -418,22 +418,44 @@ final class MockMailFacade: MailFacade {
         }
     }
 
-    func move(_ ids: [MessageID], to destination: FolderID) async {
-        for id in Set(ids) {
-            moveOne(id, to: destination)
+    func move(_ ids: [MessageID], to destination: FolderID) async throws -> MoveOutcome {
+        guard let destinationSummary = folders.first(where: { $0.id == destination }) else {
+            throw MailAccountError("That destination folder is no longer available.")
         }
+        var acceptedIDs = Set<MessageID>()
+        var skippedCrossAccount = 0
+        for id in ids {
+            guard let stored = byID[id],
+                  let sourceSummary = folders.first(where: { $0.id == stored.folder })
+            else {
+                throw MailAccountError("That message is no longer available.")
+            }
+            guard sourceSummary.accountID == destinationSummary.accountID else {
+                skippedCrossAccount += 1
+                continue
+            }
+            if moveOne(id, to: destination) {
+                acceptedIDs.insert(id)
+            }
+        }
+        return MoveOutcome(
+            movedCount: acceptedIDs.count,
+            skippedCrossAccountCount: skippedCrossAccount,
+            acceptedIDs: acceptedIDs
+        )
     }
 
-    private func moveOne(_ id: MessageID, to destination: FolderID) {
+    @discardableResult
+    private func moveOne(_ id: MessageID, to destination: FolderID) -> Bool {
         guard let stored = byID[id],
               let sourceSummary = folders.first(where: { $0.id == stored.folder }),
               let destinationSummary = folders.first(where: { $0.id == destination }),
               sourceSummary.accountID == destinationSummary.accountID
-        else { return }
+        else { return false }
         let source = stored.folder
         guard var sourceList = messages[source],
               let sourceIndex = sourceList.firstIndex(where: { $0.row.id == id })
-        else { return }
+        else { return false }
         sourceList.remove(at: sourceIndex)
         messages[source] = sourceList
 
@@ -470,6 +492,7 @@ final class MockMailFacade: MailFacade {
         if source != destination {
             publishObservers(in: destination)
         }
+        return true
     }
 
     func rawSource(_ id: MessageID) async throws -> String {
@@ -579,6 +602,7 @@ final class MockMailFacade: MailFacade {
             (id: FolderID(rawValue: 5), name: "Junk", path: "Junk", separator: nil, role: .junk, backfill: .complete, count: 80, unreadRate: 0.55),
             (id: FolderID(rawValue: 6), name: "Trash", path: "Trash", separator: nil, role: .trash, backfill: .complete, count: 40, unreadRate: 0.1),
             (id: FolderID(rawValue: 7), name: "Projects", path: "Projects", separator: nil, role: .none, backfill: .halted(syncedThrough: now.addingTimeInterval(-45 * 24 * 3600)), count: 150, unreadRate: 0.18),
+            (id: FolderID(rawValue: 17), name: "Horrors", path: "Horrors", separator: nil, role: .none, backfill: .complete, count: 0, unreadRate: 0),
             (id: FolderID(rawValue: 8), name: "旅行", path: "旅行", separator: nil, role: .none, backfill: .complete, count: 40, unreadRate: 0.22),
             (id: FolderID(rawValue: 9), name: "Newsletters", path: "Newsletters", separator: nil, role: .none, backfill: .syncing(progress: nil), count: 48, unreadRate: 0.7),
             // These folders deliberately carry their server-reported separators. The slash and

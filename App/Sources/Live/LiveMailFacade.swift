@@ -426,38 +426,130 @@ final class LiveMailFacade: MailFacade {
         let destinations = await roleDestinations(role)
         var grouped: [FolderID: [MessageID]] = [:]
         for id in ids {
-            guard let accountID = try? await store.accountID(for: id),
-                  let destination = destinations[accountID] else { continue }
-            grouped[destination, default: []].append(id)
+            do {
+                guard let accountID = try await store.accountID(for: id),
+                      let destination = destinations[accountID] else { continue }
+                grouped[destination, default: []].append(id)
+            } catch {
+                await logMoveError(error)
+            }
         }
         for (destination, messageIDs) in grouped {
-            try? await store.enqueueMove(messages: messageIDs, to: destination)
+            do {
+                try await store.enqueueMove(messages: messageIDs, to: destination)
+                if let accountID = destinations.first(where: { $0.value == destination })?.key {
+                    await engines[accountID]?.refreshNow()
+                }
+            } catch {
+                await logMoveError(error, folder: destination)
+            }
         }
     }
 
-    func move(_ ids: [MessageID], to folder: FolderID) async {
-        guard let destinationAccount = folderAccountID(folder) else { return }
-        var eligible: [MessageID] = []
-        for id in ids where (try? await store.accountID(for: id)) == destinationAccount {
-            eligible.append(id)
+    func move(_ ids: [MessageID], to folder: FolderID) async throws -> MoveOutcome {
+        let destinationAccount: AccountID
+        do {
+            guard let account = try await store.accountID(for: folder) else {
+                throw LiveMailError("That destination folder is no longer available.")
+            }
+            destinationAccount = account
+        } catch {
+            throw await loggedMoveError(error, folder: folder)
         }
-        try? await store.enqueueMove(messages: eligible, to: folder)
+
+        var eligible: [MessageID] = []
+        var skippedCrossAccount = 0
+        for id in ids {
+            do {
+                guard let messageAccount = try await store.accountID(for: id) else {
+                    throw LiveMailError("That message is no longer available.")
+                }
+                if messageAccount == destinationAccount {
+                    eligible.append(id)
+                } else {
+                    skippedCrossAccount += 1
+                }
+            } catch {
+                throw await loggedMoveError(error, account: destinationAccount, folder: folder)
+            }
+        }
+
+        if skippedCrossAccount > 0 {
+            try await store.recordError(
+                StoreLogEntry(
+                    kind: .archive,
+                    account: destinationAccount,
+                    folder: folder,
+                    message: "Messages can only be moved within the same account",
+                    detail: "\(skippedCrossAccount) message(s) skipped"
+                )
+            )
+        }
+        guard !eligible.isEmpty else {
+            return MoveOutcome(
+                movedCount: 0,
+                skippedCrossAccountCount: skippedCrossAccount
+            )
+        }
+
+        do {
+            try await store.enqueueMove(messages: eligible, to: folder)
+        } catch {
+            throw await loggedMoveError(error, account: destinationAccount, folder: folder)
+        }
+        await engines[destinationAccount]?.refreshNow()
+        return MoveOutcome(
+            movedCount: eligible.count,
+            skippedCrossAccountCount: skippedCrossAccount,
+            acceptedIDs: Set(eligible)
+        )
+    }
+
+    private func logMoveError(
+        _ error: Error,
+        account: AccountID? = nil,
+        folder: FolderID? = nil
+    ) async {
+        do {
+            try await store.recordError(
+                StoreLogEntry(
+                    kind: .archive,
+                    account: account,
+                    folder: folder,
+                    message: "move failed",
+                    detail: String(describing: error)
+                )
+            )
+        } catch {
+            QALaunch.log("move error log failed: \(error)")
+        }
+    }
+
+    private func loggedMoveError(
+        _ error: Error,
+        account: AccountID? = nil,
+        folder: FolderID? = nil
+    ) async -> Error {
+        await logMoveError(error, account: account, folder: folder)
+        return error
     }
 
     private func roleDestinations(_ role: FolderRole) async -> [AccountID: FolderID] {
         var result: [AccountID: FolderID] = [:]
         for account in accounts {
-            if let folder = try? await store.fetchFolders(account: account.id).first(where: { $0.role == role }) {
+            do {
+                guard let folder = try await store.fetchFolders(account: account.id)
+                    .first(where: { $0.role == role }) else { continue }
                 result[account.id] = folder.id
+            } catch {
+                await logMoveError(error, account: account.id)
             }
         }
         return result
     }
-
     private func folderAccountID(_ folder: FolderID) -> AccountID? {
         observedFolders.values.lazy.flatMap { $0 }.first(where: { $0.id == folder })?.accountID
     }
-
     func rawSource(_ id: MessageID) async throws -> String {
         guard let accountID = try await store.accountID(for: id),
               let engine = engines[accountID] else {
