@@ -135,6 +135,28 @@ public struct MessageRow: Identifiable, Hashable, Sendable {
     }
 
 }
+/// Result of an explicit-folder move request.
+///
+/// `movedCount` is the number of message IDs accepted and durably queued by
+/// the facade. IDs from another account are not accepted because IMAP cannot
+/// move them in the destination account; those are counted separately.
+public struct MoveOutcome: Hashable, Sendable {
+    public let movedCount: Int
+    public let skippedCrossAccountCount: Int
+    /// The accepted IDs let optimistic callers restore only IDs rejected by
+    /// account validation when a mixed-account selection is submitted.
+    public let acceptedIDs: Set<MessageID>
+
+    public init(
+        movedCount: Int,
+        skippedCrossAccountCount: Int,
+        acceptedIDs: Set<MessageID> = []
+    ) {
+        self.movedCount = movedCount
+        self.skippedCrossAccountCount = skippedCrossAccountCount
+        self.acceptedIDs = acceptedIDs
+    }
+}
 /// The two user-visible IMAP system flags supported by the mutation queue.
 public enum FlagKind: String, Sendable, Codable, Hashable, CaseIterable {
     case seen
