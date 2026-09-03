@@ -44,6 +44,7 @@ final class MockMailFacade: MailFacade {
     private var messages: [FolderID: [StoredMessage]] = [:]
     private var byID: [MessageID: StoredMessage] = [:]
     private var syncStatus = SyncStatus(mode: .fullHistory, isOnline: true)
+    private var activityCycleTask: Task<Void, Never>?
     private var nextMessageID: Int64 = 1
     private var nextFolderID: Int64 = 1
     private var passwords: [AccountID: String] = [:]
@@ -183,8 +184,8 @@ final class MockMailFacade: MailFacade {
             throw MailAccountError(message)
         }
     }
-
     func removeAccount(_ id: AccountID) async throws {
+        activityCycleTask?.cancel()
         let removedFolders = folders.filter { $0.accountID == id }.map(\.id)
         folders.removeAll { $0.accountID == id }
         for folder in removedFolders {
@@ -664,7 +665,33 @@ final class MockMailFacade: MailFacade {
         }
         folders.append(contentsOf: allFolders)
         syncStatus = SyncStatus(mode: .windowed(since: windowStart), isOnline: true)
+        startActivityCycle()
     }
+    private func startActivityCycle() {
+        activityCycleTask?.cancel()
+        activityCycleTask = Task { [weak self] in
+            let cycle: [FolderActivity] = [
+                .downloading, .indexing, .idle, .halted, .quarantinedStall,
+            ]
+            var index = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(900))
+                guard !Task.isCancelled, let self else { return }
+                let activity = cycle[index % cycle.count]
+                index += 1
+                guard let folder = self.folders.first(where: {
+                    if case .syncing = $0.backfill { return true }
+                    return false
+                }) else { continue }
+                guard let folderIndex = self.folders.firstIndex(where: { $0.id == folder.id }) else {
+                    continue
+                }
+                self.folders[folderIndex].activity = activity
+                self.publishFolders()
+            }
+        }
+    }
+
 
     private func makeMessage(
         folder: FolderID,

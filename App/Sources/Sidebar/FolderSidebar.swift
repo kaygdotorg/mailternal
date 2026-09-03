@@ -356,6 +356,7 @@ struct FolderRow: View {
     let selected: Bool
     let onRename: ((String) async -> Bool)?
     @Environment(AccentSource.self) private var accent
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isEditing = false
 
     init(
@@ -409,10 +410,34 @@ struct FolderRow: View {
 
     @ViewBuilder
     private var backfillAccessory: some View {
-        if case .syncing = folder.backfill {
-            ProgressView()
-                .controlSize(.small)
-                .accessibilityLabel("Syncing")
+        switch folder.activity {
+        case .downloading:
+            if let symbol = FolderActivityPolicy.symbolName(for: .downloading) {
+                Image(systemName: symbol)
+                    .font(.caption2)
+                    .symbolEffect(.bounce.down, options: .repeat(.continuous), isActive: !reduceMotion)
+                    .foregroundStyle(accent.color.opacity(0.8))
+                    .help(FolderActivityPolicy.tooltip(for: folder) ?? "Downloading…")
+                    .accessibilityLabel(FolderActivityPolicy.accessibilityLabel(for: .downloading) ?? "Syncing")
+            }
+        case .indexing:
+            if let symbol = FolderActivityPolicy.symbolName(for: .indexing) {
+                Image(systemName: symbol)
+                    .font(.caption2)
+                    .symbolEffect(.rotate, options: .repeat(.continuous), isActive: !reduceMotion)
+                    .foregroundStyle(accent.color.opacity(0.8))
+                    .help("Indexing")
+                    .accessibilityLabel(FolderActivityPolicy.accessibilityLabel(for: .indexing) ?? "Indexing")
+            }
+        case .halted:
+            if let symbol = FolderActivityPolicy.symbolName(for: .halted) {
+                Image(systemName: symbol)
+                    .foregroundStyle(.secondary)
+                    .help("Sync halted")
+                    .accessibilityLabel(FolderActivityPolicy.accessibilityLabel(for: .halted) ?? "Sync halted")
+            }
+        case .idle, .quarantinedStall:
+            EmptyView()
         }
     }
 
@@ -456,26 +481,26 @@ private struct SidebarInline: View {
                 .truncationMode(.middle)
                 .opacity(isEditing ? 0 : 1)
             if isEditing {
-                TextField("Folder name", text: $draft)
-                    .textFieldStyle(.plain)
-                    .font(font)
-                    .lineLimit(1)
-                    .background(.clear)
-                    .focusEffectDisabled()
-                    .focused($isFocused)
-                    .onSubmit(commit)
-                    .onExitCommand(perform: cancel)
-                    .onChange(of: isFocused) { _, focused in
-                        if !focused, isEditing {
-                            commit()
-                        }
-                    }
-                    .accessibilityLabel("Folder name")
-                    .accessibilityIdentifier(fieldIdentifier)
+                SidebarInlineTextField(
+                    text: $draft,
+                    identifier: fieldIdentifier,
+                    font: .preferredFont(forTextStyle: .body),
+                    commitOnFocusLoss: true,
+                    onCommit: commit,
+                    onCancel: cancel
+                )
+                .frame(minWidth: 40)
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture(count: 2, perform: beginEditing)
+        .overlay {
+            if !isEditing {
+                SidebarDoubleClickCapture {
+                    beginEditing()
+                }
+                .accessibilityHidden(true)
+            }
+        }
     }
 
     private func beginEditing() {
@@ -500,6 +525,153 @@ private struct SidebarInline: View {
         isEditing = false
         isFocused = false
         draft = ""
+    }
+}
+
+private struct SidebarInlineTextField: NSViewRepresentable {
+    @Binding var text: String
+    let identifier: String
+    let font: NSFont
+    let commitOnFocusLoss: Bool
+    let onCommit: () -> Void
+    let onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeNSView(context: Context) -> InlineTextFieldView {
+        let field = InlineTextFieldView()
+        field.isEditable = true
+        field.isSelectable = true
+        field.delegate = context.coordinator
+        field.stringValue = text
+        field.font = font
+        field.setAccessibilityIdentifier(identifier)
+        field.onAppear = {
+            field.window?.makeFirstResponder(field)
+            field.selectText(nil)
+        }
+        return field
+    }
+
+    func updateNSView(_ nsView: InlineTextFieldView, context: Context) {
+        context.coordinator.parent = self
+        if nsView.stringValue != text {
+            nsView.stringValue = text
+        }
+        nsView.font = font
+        nsView.setAccessibilityIdentifier(identifier)
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: SidebarInlineTextField
+        private var finished = false
+
+        init(_ parent: SidebarInlineTextField) {
+            self.parent = parent
+        }
+
+        func controlTextDidChange(_ obj: Notification) {
+            guard let field = obj.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func controlTextDidEndEditing(_ obj: Notification) {
+            guard !finished else { return }
+            if parent.commitOnFocusLoss {
+                finish(commit: true)
+            } else {
+                finish(commit: false)
+            }
+        }
+
+        func control(
+            _ control: NSControl,
+            textView: NSTextView,
+            doCommandBy commandSelector: Selector
+        ) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                finish(commit: true)
+                return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                finish(commit: false)
+                return true
+            }
+            return false
+        }
+
+        private func finish(commit: Bool) {
+            guard !finished else { return }
+            finished = true
+            if commit {
+                parent.onCommit()
+            } else {
+                parent.onCancel()
+            }
+        }
+    }
+}
+
+private final class InlineTextFieldView: NSTextField {
+    var onAppear: (() -> Void)?
+
+    override var intrinsicContentSize: NSSize {
+        var size = super.intrinsicContentSize
+        size.width = max(size.width, 40)
+        return size
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else { return }
+        isBezeled = false
+        isBordered = false
+        drawsBackground = false
+        backgroundColor = .clear
+        focusRingType = .none
+        cell?.usesSingleLineMode = true
+        cell?.lineBreakMode = .byClipping
+        textColor = .labelColor
+        onAppear?()
+        onAppear = nil
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became, let editor = currentEditor() as? NSTextView {
+            editor.drawsBackground = false
+            editor.backgroundColor = .clear
+            editor.insertionPointColor = .labelColor
+        }
+        return became
+    }
+}
+
+private struct SidebarDoubleClickCapture: NSViewRepresentable {
+    let onDoubleClick: () -> Void
+
+    func makeNSView(context: Context) -> DoubleClickCaptureView {
+        let view = DoubleClickCaptureView()
+        view.onDoubleClick = onDoubleClick
+        return view
+    }
+
+    func updateNSView(_ nsView: DoubleClickCaptureView, context: Context) {
+        nsView.onDoubleClick = onDoubleClick
+    }
+}
+
+private final class DoubleClickCaptureView: NSView {
+    var onDoubleClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            onDoubleClick?()
+        } else {
+            super.mouseDown(with: event)
+        }
     }
 }
 
@@ -579,22 +751,20 @@ private struct SidebarAccountTitle: View {
     var body: some View {
         Group {
             if isEditing {
-                TextField("Account name", text: $draft)
-                    .textFieldStyle(.plain)
-                    .font(font)
-                    .lineLimit(1)
-                    .background(.clear)
-                    .focusEffectDisabled()
-                    .focused($isFieldFocused)
-                    .onSubmit {
+                SidebarInlineTextField(
+                    text: $draft,
+                    identifier: UIIdentifier.sidebarAccountTitleField,
+                    font: .systemFont(ofSize: 20, weight: .semibold),
+                    commitOnFocusLoss: false,
+                    onCommit: {
                         onRename?(draft)
                         isEditing = false
+                    },
+                    onCancel: {
+                        isEditing = false
                     }
-                    .onExitCommand { isEditing = false }
-                    .onChange(of: isFieldFocused) { _, focused in
-                        if !focused { isEditing = false }
-                    }
-                    .accessibilityIdentifier(UIIdentifier.sidebarAccountTitleField)
+                )
+                .frame(minWidth: 40)
             } else {
                 Text(title)
                     .font(font)
@@ -602,11 +772,14 @@ private struct SidebarAccountTitle: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .contentShape(Rectangle())
-                    .onTapGesture(count: 2) {
-                        guard onRename != nil else { return }
-                        draft = title
-                        isEditing = true
-                        isFieldFocused = true
+                    .overlay {
+                        SidebarDoubleClickCapture {
+                            guard onRename != nil else { return }
+                            draft = title
+                            isEditing = true
+                            isFieldFocused = true
+                        }
+                        .accessibilityHidden(true)
                     }
                     .accessibilityAddTraits(.isHeader)
                     .accessibilityIdentifier(UIIdentifier.sidebarAccountTitle)

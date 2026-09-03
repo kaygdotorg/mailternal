@@ -20,6 +20,47 @@ final class MailternalUITests: XCTestCase {
         XCTAssertTrue(mainWindow.waitForExistence(timeout: 8), "main window should appear on launch")
     }
 
+
+    func testDoubleClickingAccountTitleEntersRename() {
+        signInToMock()
+        let title = element(UIIdentifier.sidebarAccountTitle)
+        XCTAssertTrue(title.waitForExistence(timeout: 8), "account title")
+
+        title.doubleClick()
+
+        let field = element(UIIdentifier.sidebarAccountTitleField)
+        XCTAssertTrue(field.waitForExistence(timeout: 5), "account title rename field")
+        field.click()
+        field.typeText("Renamed")
+        field.typeKey(.enter, modifierFlags: [])
+        XCTAssertTrue(
+            waitUntil(timeout: 8) { self.element(UIIdentifier.sidebarAccountTitle).label.contains("Renamed") },
+            "account title should update after Return"
+        )
+    }
+
+    func testDoubleClickingCustomFolderEntersAndEscapesRename() {
+        signInToMock()
+        let folder = element(UIIdentifier.sidebarFolder("Horrors"))
+        XCTAssertTrue(folder.waitForExistence(timeout: 10), "Horrors sidebar row")
+
+        folder.doubleClick()
+
+        let field = app.textFields.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "sidebar-folder-rename-field-")
+        ).firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 5), "custom folder rename field")
+        field.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+        XCTAssertTrue(
+            waitUntil(timeout: 5) {
+                !self.app.textFields.matching(
+                    NSPredicate(format: "identifier BEGINSWITH %@", "sidebar-folder-rename-field-")
+                ).firstMatch.exists
+            },
+            "Escape should cancel folder rename"
+        )
+        XCTAssertEqual(folder.label, "Horrors")
+    }
     func testSidebarFolderSelectionChangesList() {
         signInToMock()
         let table = messageTable()
@@ -317,28 +358,62 @@ final class MailternalUITests: XCTestCase {
 
     private func signInToMock() {
         XCTAssertTrue(mainWindow.waitForExistence(timeout: 8))
-        XCTAssertTrue(settingsWindow.waitForExistence(timeout: 8), "setup window should appear for a mock account")
-        if settingsWindow.otherElements[UIIdentifier.accountsList].exists,
-           !settingsWindow.buttons[UIIdentifier.accountsEmptyAdd].exists {
-            closeSettingsIfOpen()
+        guard settingsWindow.waitForExistence(timeout: 8) else {
             XCTAssertTrue(element(UIIdentifier.sidebarFolder("INBOX")).waitForExistence(timeout: 10))
             return
         }
-        let add = settingsWindow.buttons[UIIdentifier.accountsEmptyAdd]
-        XCTAssertTrue(add.waitForExistence(timeout: 5))
-        add.click()
+        let emptyAdd = app.descendants(matching: .any)[UIIdentifier.accountsEmptyAdd]
+        if emptyAdd.waitForExistence(timeout: 8) {
+            emptyAdd.click()
+        } else if element(UIIdentifier.sidebarFolder("INBOX")).waitForExistence(timeout: 2) {
+            closeSettingsIfOpen()
+            XCTAssertTrue(element(UIIdentifier.sidebarFolder("INBOX")).waitForExistence(timeout: 10))
+            return
+        } else {
+            let toolbarAdd = app.buttons[UIIdentifier.accountsAdd]
+            XCTAssertTrue(toolbarAdd.waitForExistence(timeout: 5))
+            toolbarAdd.click()
+        }
+        app.activate()
+        let table = settingsWindow.tables.firstMatch
+        for _ in 0..<4 where table.exists && table.isHittable {
+            table.swipeUp()
+        }
         let host = settingsWindow.textFields[UIIdentifier.accountEditorHost]
         let username = settingsWindow.textFields[UIIdentifier.accountEditorUsername]
         let password = settingsWindow.secureTextFields[UIIdentifier.accountEditorPassword]
-        XCTAssertTrue(host.waitForExistence(timeout: 5))
+        let newAccountRow = settingsWindow.descendants(matching: .any)[UIIdentifier.accountsRow("new-account")]
+        if newAccountRow.waitForExistence(timeout: 3) {
+            let disclosure = newAccountRow.descendants(matching: .any)[UIIdentifier.accountsRowDisclosure]
+            if disclosure.exists {
+                for _ in 0..<2 {
+                    guard !host.isHittable else { break }
+                    disclosure.click()
+                    _ = waitUntil(timeout: 2) { host.exists && host.isHittable }
+                }
+            }
+        }
+        let accountList = settingsWindow.descendants(matching: .any)[UIIdentifier.accountsList]
+        if host.exists && !host.isHittable, accountList.exists {
+            accountList.scroll(byDeltaX: 0, deltaY: -400)
+        }
+        XCTAssertTrue(
+            waitUntil(timeout: 8) { host.exists && host.isHittable },
+            "account editor should expand before interaction"
+        )
         host.click()
-        host.typeText("mock.local")
         username.click()
         username.typeText("qa")
         password.click()
         password.typeText("password")
-        settingsWindow.buttons[UIIdentifier.accountEditorSave].click()
-        XCTAssertFalse(settingsWindow.buttons[UIIdentifier.accountEditorSave].waitForExistence(timeout: 12), "editor should dismiss after a successful save")
+        let editor = settingsWindow.descendants(matching: .any)[UIIdentifier.accountEditorSheet]
+        let save = editor.buttons["Add Account"]
+        XCTAssertTrue(save.waitForExistence(timeout: 8))
+        save.click()
+        XCTAssertTrue(
+            waitUntil(timeout: 12) { !self.settingsWindow.exists || self.element(UIIdentifier.sidebarFolder("INBOX")).exists },
+            "account editor should save"
+        )
         closeSettingsIfOpen()
         XCTAssertTrue(element(UIIdentifier.sidebarFolder("INBOX")).waitForExistence(timeout: 12))
     }
