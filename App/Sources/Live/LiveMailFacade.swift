@@ -1,8 +1,40 @@
 import Foundation
+import Observation
 import MailternalIMAP
 import MailternalInterfaces
 import MailternalStore
 import MailternalSync
+
+/// Progress for the detached SQLite open and migration operation.
+///
+/// `.opening` keeps the normal empty/loading shell visible. `.migrating`
+/// drives the in-window migration card until the store becomes `.ready`.
+enum StoreLoadState: Sendable, Equatable {
+    case opening
+    case migrating(completed: Int, total: Int, identifier: String)
+    case ready
+    case failed(message: String)
+}
+
+private struct StoreMigrationProgress: Sendable {
+    let completed: Int
+    let total: Int
+    let identifier: String
+}
+
+private final class StoreOpenProgress: @unchecked Sendable {
+    let stream: AsyncStream<StoreMigrationProgress>
+    let continuation: AsyncStream<StoreMigrationProgress>.Continuation
+
+    init() {
+        let values = AsyncStream.makeStream(
+            of: StoreMigrationProgress.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        stream = values.stream
+        continuation = values.continuation
+    }
+}
 
 struct LiveMailError: LocalizedError, Sendable {
     var errorDescription: String?
@@ -18,6 +50,7 @@ struct KeychainCredentialProvider: IMAPCredentialProvider {
 }
 
 @MainActor
+@Observable
 final class LiveMailFacade: MailFacade {
     private(set) var accounts: [AccountConfig] = [] {
         didSet { accountsContinuation.yield(accounts) }
@@ -52,8 +85,16 @@ final class LiveMailFacade: MailFacade {
     private let container: MailternalContainer
     private let keychain: KeychainStore
     private let notifications: LiveNotificationService
-    private var store: MailStore
+    private var store: MailStore!
+    private let storeTask: Task<MailStore, Error>
+    private let storeProgress: StoreOpenProgress
+    @ObservationIgnored private var storeProgressTask: Task<Void, Never>?
+    /// Observable store-opening state used by the launch shell.
+    var storeLoadState: StoreLoadState = .opening
     private var engines: [AccountID: SyncEngine] = [:]
+    /// One process-wide permit pool keeps account engines from multiplying
+    /// their backfill connections and gives queued accounts a fair turn.
+    private let backfillBudget = BackfillConnectionBudget.shared
     private var configsByID: [AccountID: AccountConfig] = [:]
     private var observedFolders: [AccountID: [FolderSummary]] = [:]
     private var engineTasks: [AccountID: [Task<Void, Never>]] = [:]
@@ -98,16 +139,31 @@ final class LiveMailFacade: MailFacade {
         clientFactory: (any Sendable)? = nil
     ) throws {
         QAIMAPTrust.installIfRequested()
-        try container.prepare()
         self.container = container
         self.keychain = keychain
         self.testClientFactory = clientFactory
         self.notifications = LiveNotificationService(enabled: enableNotifications)
-        self.store = try MailStore(
-            databaseURL: container.databaseURL,
-            cachesDirectory: container.attachmentsDirectory,
-            attachmentCacheCapBytes: attachmentCacheCapBytes
-        )
+
+        let storeProgress = StoreOpenProgress()
+        self.storeProgress = storeProgress
+        self.storeTask = Task.detached(priority: .userInitiated) {
+            defer { storeProgress.continuation.finish() }
+            try container.prepare()
+            return try MailStore(
+                databaseURL: container.databaseURL,
+                cachesDirectory: container.attachmentsDirectory,
+                attachmentCacheCapBytes: attachmentCacheCapBytes,
+                migrationProgress: { completed, total, identifier in
+                    storeProgress.continuation.yield(
+                        StoreMigrationProgress(
+                            completed: completed,
+                            total: total,
+                            identifier: identifier
+                        )
+                    )
+                }
+            )
+        }
 
         let accountsStreamValue = AsyncStream.makeStream(
             of: [AccountConfig].self,
@@ -135,13 +191,24 @@ final class LiveMailFacade: MailFacade {
         account.continuation.yield(.none)
         folders.continuation.yield([])
         sync.continuation.yield(SyncStatus(mode: .fullHistory, isOnline: false))
-    }
 
+        self.storeProgressTask = Task { @MainActor [weak self, stream = storeProgress.stream] in
+            for await progress in stream {
+                guard let self, self.store == nil else { return }
+                self.storeLoadState = .migrating(
+                    completed: progress.completed,
+                    total: progress.total,
+                    identifier: progress.identifier
+                )
+            }
+        }
+    }
     /// Loads every persisted account and starts each enabled engine independently.
     func restorePersistedAccounts() async {
         guard !didRestore else { return }
         didRestore = true
         do {
+            store = try await readyStore()
             if let qa = QALaunch.parse() {
                 try await seedQAAccount(qa)
             }
@@ -170,6 +237,31 @@ final class LiveMailFacade: MailFacade {
         }
     }
 
+    /// Waits for the detached database open and migration task.
+    ///
+    /// The launch shell uses this before restoring accounts so account reads
+    /// cannot race the migration. Store work remains off the main actor.
+    func waitUntilStoreReady() async {
+        _ = try? await readyStore()
+    }
+
+    private func readyStore() async throws -> MailStore {
+        if let store { return store }
+        do {
+            let opened = try await storeTask.value
+            store = opened
+            storeProgressTask?.cancel()
+            storeLoadState = .ready
+            #if DEBUG
+            QALaunch.launchPhase("store-open")
+            #endif
+            return opened
+        } catch {
+            storeLoadState = .failed(message: error.localizedDescription)
+            throw error
+        }
+    }
+
     /// Compatibility entry point retained for the QA and launch seams.
     func restorePersistedAccount() async {
         await restorePersistedAccounts()
@@ -189,6 +281,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     func setKeepLocally(_ keep: Bool, for folder: FolderID) async throws {
+        _ = try await readyStore()
         try await store.setKeepLocally(keep, for: folder)
         if let accountID = folderAccountID(folder) {
             await engines[accountID]?.setKeepLocally(keep, for: folder)
@@ -198,6 +291,7 @@ final class LiveMailFacade: MailFacade {
     /// Persists a mailbox rename before waking the owning engine. The facade
     /// never reaches into IMAP directly; SyncEngine drains the durable queue.
     func renameFolder(_ id: FolderID, to name: String) async throws {
+        _ = try await readyStore()
         let targetName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !targetName.isEmpty else {
             throw LiveMailError("A folder name is required.")
@@ -217,6 +311,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     func addAccount(_ config: AccountConfig, password: String) async throws {
+        _ = try await readyStore()
         if config.isEnabled {
             setState(.validating, for: config.id)
             do {
@@ -266,6 +361,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     func updateAccount(_ config: AccountConfig, password: String?) async throws {
+        _ = try await readyStore()
         guard let existing = configsByID[config.id] ?? accounts.first(where: { $0.id == config.id }) else {
             throw LiveMailError("That account is no longer available.")
         }
@@ -325,6 +421,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     func setAccountEnabled(_ id: AccountID, _ enabled: Bool) async throws {
+        _ = try await readyStore()
         guard var config = configsByID[id] ?? accounts.first(where: { $0.id == id }) else {
             throw LiveMailError("That account is no longer available.")
         }
@@ -356,6 +453,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     func removeAccount(_ id: AccountID) async throws {
+        _ = try await readyStore()
         await stopEngine(for: id)
         try keychain.deletePassword(for: id)
         try await store.deleteAccount(id)
@@ -374,39 +472,64 @@ final class LiveMailFacade: MailFacade {
     }
 
     func page(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) async throws -> MessagePage {
-        try await store.page(in: folder, after: cursor, limit: limit)
+        _ = try await readyStore()
+        return try await store.page(in: folder, after: cursor, limit: limit)
     }
 
     func messageIDs(in folder: FolderID) async throws -> [MessageID] {
-        try await store.messageIDs(in: folder)
+        _ = try await readyStore()
+        return try await store.messageIDs(in: folder)
     }
 
     func observePage(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) -> AsyncStream<MessagePage> {
-        store.observePage(in: folder, after: cursor, limit: limit)
+        AsyncStream { continuation in
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
+                do {
+                    let store = try await self.readyStore()
+                    for await page in store.observePage(in: folder, after: cursor, limit: limit) {
+                        guard !Task.isCancelled else { break }
+                        continuation.yield(page)
+                    }
+                } catch {
+                    // Store failures are surfaced through storeLoadState.
+                }
+                continuation.finish()
+            }
+        }
     }
 
     func detail(_ id: MessageID) async throws -> MessageDetail {
-        try await store.detail(id)
+        _ = try await readyStore()
+        return try await store.detail(id)
     }
     func makeDeepLink(for folder: FolderID) async throws -> MailternalDeepLink? {
+        _ = try await readyStore()
         guard let account = try await store.accountID(for: folder) else { return nil }
         return try await store.makeDeepLink(account: account, folder: folder)
     }
 
     func makeDeepLink(for message: MessageID) async throws -> MailternalDeepLink? {
+        _ = try await readyStore()
         guard let account = try await store.accountID(for: message) else { return nil }
         return try await store.makeDeepLink(account: account, message: message)
     }
 
     func resolve(_ link: MailternalDeepLink) async throws -> MailternalDeepLinkResolution? {
-        try await store.resolve(link)
+        _ = try await readyStore()
+        return try await store.resolve(link)
     }
 
     func markRead(_ ids: [MessageID]) async {
+        guard let store = try? await readyStore() else { return }
         try? await store.enqueueFlag(messages: ids, flag: .seen, set: true)
     }
 
     func markUnread(_ ids: [MessageID]) async {
+        guard let store = try? await readyStore() else { return }
         try? await store.enqueueFlag(messages: ids, flag: .seen, set: false)
     }
 
@@ -415,14 +538,15 @@ final class LiveMailFacade: MailFacade {
     }
 
     func setFlagged(_ ids: [MessageID], _ flagged: Bool) async {
+        guard let store = try? await readyStore() else { return }
         try? await store.enqueueFlag(messages: ids, flag: .flagged, set: flagged)
     }
 
     func archive(_ ids: [MessageID]) async {
         await moveToRole(.archive, ids: ids)
     }
-
     private func moveToRole(_ role: FolderRole, ids: [MessageID]) async {
+        guard let store = try? await readyStore() else { return }
         let destinations = await roleDestinations(role)
         var grouped: [FolderID: [MessageID]] = [:]
         for id in ids {
@@ -447,6 +571,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     func move(_ ids: [MessageID], to folder: FolderID) async throws -> MoveOutcome {
+        _ = try await readyStore()
         let destinationAccount: AccountID
         do {
             guard let account = try await store.accountID(for: folder) else {
@@ -510,6 +635,7 @@ final class LiveMailFacade: MailFacade {
         account: AccountID? = nil,
         folder: FolderID? = nil
     ) async {
+        guard let store = try? await readyStore() else { return }
         do {
             try await store.recordError(
                 StoreLogEntry(
@@ -535,6 +661,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     private func roleDestinations(_ role: FolderRole) async -> [AccountID: FolderID] {
+        guard let store = try? await readyStore() else { return [:] }
         var result: [AccountID: FolderID] = [:]
         for account in accounts {
             do {
@@ -551,6 +678,7 @@ final class LiveMailFacade: MailFacade {
         observedFolders.values.lazy.flatMap { $0 }.first(where: { $0.id == folder })?.accountID
     }
     func rawSource(_ id: MessageID) async throws -> String {
+        _ = try await readyStore()
         guard let accountID = try await store.accountID(for: id),
               let engine = engines[accountID] else {
             throw LiveMailError("Mail is not connected.")
@@ -561,6 +689,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     func fetchAttachment(_ message: MessageID, part: String) async throws -> URL {
+        _ = try await readyStore()
         guard let accountID = try await store.accountID(for: message),
               let engine = engines[accountID] else {
             throw LiveMailError("Mail is not connected.")
@@ -587,6 +716,7 @@ final class LiveMailFacade: MailFacade {
 
     /// `cid:` keys from the HTML handler map onto BODYSTRUCTURE part ids.
     private func imapSection(for message: MessageID, part: String) async throws -> String {
+        _ = try await readyStore()
         let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.lowercased().hasPrefix("cid:") else { return trimmed }
         let cid = Self.normalizedCID(String(trimmed.dropFirst(4)))
@@ -609,7 +739,8 @@ final class LiveMailFacade: MailFacade {
     }
 
     func search(_ query: String, limit: Int) async throws -> [MessageRow] {
-        try await store.search(query, limit: limit)
+        _ = try await readyStore()
+        return try await store.search(query, limit: limit)
     }
 
     func refresh() async {
@@ -619,6 +750,7 @@ final class LiveMailFacade: MailFacade {
     }
 
     func snapshotFolders() async throws -> [FolderSummary] {
+        _ = try await readyStore()
         let persisted = try await store.fetchAccounts()
         var result: [FolderSummary] = []
         for account in persisted {
@@ -628,7 +760,8 @@ final class LiveMailFacade: MailFacade {
     }
 
     func snapshotErrorLog(limit: Int = 20) async throws -> [String] {
-        try await store.fetchErrorLog(limit: limit).map { entry in
+        _ = try await readyStore()
+        return try await store.fetchErrorLog(limit: limit).map { entry in
             let detail = entry.detail.map { " \($0)" } ?? ""
             return "\(entry.kind.rawValue): \(entry.message)\(detail)"
         }
@@ -672,14 +805,16 @@ final class LiveMailFacade: MailFacade {
                 config: config,
                 credentials: credentials,
                 clientFactory: factory,
-                qaAmpleDisk: qa
+                qaAmpleDisk: qa,
+                backfillBudget: backfillBudget
             )
         } else {
             engine = SyncEngine(
                 store: store,
                 config: config,
                 credentials: credentials,
-                qaAmpleDisk: qa
+                qaAmpleDisk: qa,
+                backfillBudget: backfillBudget
             )
         }
         #else
@@ -687,7 +822,8 @@ final class LiveMailFacade: MailFacade {
             store: store,
             config: config,
             credentials: credentials,
-            qaAmpleDisk: qa
+            qaAmpleDisk: qa,
+            backfillBudget: backfillBudget
         )
         #endif
         engines[config.id] = engine
@@ -719,6 +855,12 @@ final class LiveMailFacade: MailFacade {
                 }
             }
         }
+        let activityTask = Task { [weak self] in
+            let stream = await engine.activity
+            for await update in stream {
+                self?.applyFolderActivity(update, accountID: accountID)
+            }
+        }
         let mailTask = Task { [weak self] in
             let stream = await engine.newMail
             for await event in stream {
@@ -731,8 +873,17 @@ final class LiveMailFacade: MailFacade {
                 self?.applyEngineFailure(failure, accountID: accountID)
             }
         }
-        engineTasks[accountID] = [statusTask, mailTask, failureTask]
+        engineTasks[accountID] = [statusTask, activityTask, mailTask, failureTask]
     }
+    private func applyFolderActivity(_ update: FolderActivityUpdate, accountID: AccountID) {
+        guard var folders = observedFolders[accountID],
+              let index = folders.firstIndex(where: { $0.id == update.folder })
+        else { return }
+        folders[index].activity = update.activity
+        observedFolders[accountID] = folders
+        publishFolders()
+    }
+
 
     private func markActiveIfValidating(_ accountID: AccountID) {
         guard case .validating = accountState(for: accountID) else { return }
@@ -926,7 +1077,17 @@ final class LiveMailFacade: MailFacade {
             guard let self else { return }
             for await folders in self.store.observeFolders(account: account) {
                 guard !Task.isCancelled else { return }
-                self.observedFolders[account] = folders
+                let prior = Dictionary(
+                    uniqueKeysWithValues: (self.observedFolders[account] ?? []).map { ($0.id, $0.activity) }
+                )
+                let refreshed = folders.map { folder -> FolderSummary in
+                    var folder = folder
+                    if let activity = prior[folder.id] {
+                        folder.activity = activity
+                    }
+                    return folder
+                }
+                self.observedFolders[account] = refreshed
                 self.publishFolders()
                 let unread = folders.first(where: { $0.role == .inbox })?.unreadCount ?? 0
                 if self.accounts.count == 1 {

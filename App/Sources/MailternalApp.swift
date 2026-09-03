@@ -16,9 +16,6 @@ struct MailternalApp: App {
         let appearance = AppearanceSettings()
         let actions = ActionSettings()
         let model = AppModel(facade: Self.makeFacade(), appearance: appearance, actions: actions)
-        #if DEBUG
-        QALaunch.launchPhase("store-open")
-        #endif
         _appearance = State(initialValue: appearance)
         _actions = State(initialValue: actions)
         _model = State(initialValue: model)
