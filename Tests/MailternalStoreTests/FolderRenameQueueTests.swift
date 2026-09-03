@@ -28,6 +28,36 @@ import Testing
     }
 }
 
+@Test func applyingFolderRenameRewritesNestedChildPaths() async throws {
+    try await withStore { store, _ in
+        let account = sampleAccount()
+        try await store.upsertAccount(account)
+        let parent = try await store.upsertFolder(
+            account: account.id,
+            path: "Projects^Old",
+            name: "Old",
+            separator: "^",
+            role: .none,
+            objectID: nil
+        )
+        let child = try await store.upsertFolder(
+            account: account.id,
+            path: "Projects^Old^Child",
+            name: "Child",
+            separator: "^",
+            role: .none,
+            objectID: nil
+        )
+        try await store.enqueueFolderRename(folder: parent, to: "New")
+        let op = try #require(await store.snapshotFolderRenameQueue().first)
+        try await store.applyFolderRename(op)
+
+        #expect(try await store.fetchFolderSummary(parent)?.path == "Projects^New")
+        #expect(try await store.fetchFolderSummary(child)?.path == "Projects^New^Child")
+        #expect(try await store.snapshotFolderRenameQueue().isEmpty)
+    }
+}
+
 @Test func retiredFolderRenameRemainsForTerminalDrainLogging() async throws {
     try await withStore { store, _ in
         let account = sampleAccount()

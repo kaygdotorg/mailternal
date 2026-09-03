@@ -70,6 +70,81 @@ extension MailStore {
         }
     }
 
+    /// Applies a tagged-OK rename to the local folder tree and dequeues it in
+    /// one transaction. Matching the target protects a newer coalesced edit
+    /// from being overwritten by an older in-flight server command.
+    public func applyFolderRename(_ op: FolderRenameOp) async throws {
+        try await write { db in
+            guard try Int64.fetchOne(
+                db,
+                sql: """
+                    SELECT id FROM folder_rename_queue
+                    WHERE id = ? AND target_name = ? AND target_path = ?
+                    """,
+                arguments: [op.id, op.targetName, op.targetPath]
+            ) != nil else {
+                return
+            }
+
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT path, separator FROM folders
+                    WHERE id = ? AND account_id = ? AND retired = 0
+                    """,
+                arguments: [op.folder.rawValue, op.account.rawValue]
+            ) else {
+                try db.execute(
+                    sql: "DELETE FROM folder_rename_queue WHERE id = ?",
+                    arguments: [op.id]
+                )
+                return
+            }
+
+            let oldPath: String = row["path"]
+            let rawSeparator: String? = row["separator"]
+            let separator = rawSeparator?.first ?? "/"
+            try db.execute(
+                sql: """
+                    UPDATE folders
+                    SET path = ?, name = ?
+                    WHERE id = ? AND account_id = ? AND retired = 0
+                    """,
+                arguments: [op.targetPath, op.targetName, op.folder.rawValue, op.account.rawValue]
+            )
+
+            let oldPrefix = oldPath + String(separator)
+            let newPrefix = op.targetPath + String(separator)
+            if oldPrefix != newPrefix {
+                let descendants = try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT id, path FROM folders
+                        WHERE account_id = ? AND retired = 0 AND id != ?
+                        """,
+                    arguments: [op.account.rawValue, op.folder.rawValue]
+                )
+                for descendant in descendants {
+                    let path: String = descendant["path"]
+                    guard path.hasPrefix(oldPrefix) else { continue }
+                    let suffix = String(path.dropFirst(oldPrefix.count))
+                    try db.execute(
+                        sql: "UPDATE folders SET path = ? WHERE id = ?",
+                        arguments: [newPrefix + suffix, descendant["id"]]
+                    )
+                }
+            }
+
+            try db.execute(
+                sql: """
+                    DELETE FROM folder_rename_queue
+                    WHERE id = ? AND target_name = ? AND target_path = ?
+                    """,
+                arguments: [op.id, op.targetName, op.targetPath]
+            )
+        }
+    }
+
     /// Tagged IMAP NO/BAD or a retired/mismatched folder: remove the operation
     /// and record a user-visible error in the same transaction.
     public func dropFolderRename(_ op: FolderRenameOp, reason: String) async throws {
