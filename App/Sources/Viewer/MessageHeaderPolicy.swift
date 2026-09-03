@@ -5,8 +5,8 @@ import MailternalInterfaces
 /// headers.
 ///
 /// `Envelope` stores From, Reply-To, To, Cc, both dates, and the threading
-/// headers. The on-demand raw-source path supplies the complete header block
-/// when the reader's Details disclosure is expanded.
+/// headers. The on-demand raw-source path supplies the complete ordered header
+/// item list when source mode is shown.
 enum MessageHeaderPolicy {
     static let noSubjectPlaceholder = "(No Subject)"
 
@@ -14,17 +14,19 @@ enum MessageHeaderPolicy {
     /// source spelling and values are unfolded, trimmed field bodies. The
     /// sync facade escapes raw bytes for safe source rendering; decode that
     /// transport escaping once here, without touching RFC 2047 encoded words.
-    static func rawHeaders(from rawSource: String) -> [(name: String, value: String)] {
+    static func rawHeaders(from rawSource: String) -> [HeaderItem] {
         let normalized = rawSource
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
-        var headers: [(name: String, value: String)] = []
+        var headers: [HeaderItem] = []
         var currentName: String?
         var currentValue = ""
 
         func appendCurrent() {
             guard let currentName else { return }
-            headers.append((name: currentName, value: currentValue))
+            headers.append(
+                HeaderItem(id: headers.count, name: currentName, value: currentValue)
+            )
         }
 
         for lineSlice in normalized.split(separator: "\n", omittingEmptySubsequences: false) {
@@ -69,6 +71,18 @@ enum MessageHeaderPolicy {
         return headers
     }
 
+    /// One stable, ordered item for every unfolded header. The index is part
+    /// of the identity because fields such as Received may occur repeatedly.
+    struct HeaderItem: Identifiable, Equatable, Sendable {
+        let id: Int
+        let name: String
+        let value: String
+
+        var copyText: String {
+            value.isEmpty ? "\(name):" : "\(name): \(value)"
+        }
+    }
+
     /// `MessageAssembler.escapeRaw` escapes the source before crossing the
     /// facade boundary. Decode only the entities that transport uses, once:
     /// an original literal `&lt;` arrives as `&amp;lt;` and becomes `&lt;`.
@@ -85,19 +99,90 @@ enum MessageHeaderPolicy {
     /// The copy/display representation of the complete unfolded header block.
     static func rawHeaderBlock(from rawSource: String) -> String {
         rawHeaders(from: rawSource)
-            .map { header in
-                header.value.isEmpty
-                    ? "\(header.name):"
-                    : "\(header.name): \(header.value)"
-            }
+            .map(\.copyText)
             .joined(separator: "\n")
     }
 
-    struct DetailRow: Identifiable, Equatable {
-        let label: String
-        let value: String
+    /// The first Received field is the server's topmost delivery hop. Its
+    /// semicolon-delimited trailing date is the only delivery date we expose.
+    static func deliveredDate(from headers: [HeaderItem]) -> Date? {
+        guard let received = headers.first(where: {
+            $0.name.caseInsensitiveCompare("Received") == .orderedSame
+        }) else {
+            return nil
+        }
+        let candidate = received.value
+            .split(separator: ";", omittingEmptySubsequences: true)
+            .last
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? received.value
+        return parseHeaderDate(candidate)
+    }
 
-        var id: String { label }
+    static func deliveredDate(from rawSource: String) -> Date? {
+        deliveredDate(from: rawHeaders(from: rawSource))
+    }
+
+    private static func parseHeaderDate(_ raw: String) -> Date? {
+        var candidate = raw
+        if let commentStart = candidate.firstIndex(of: "(") {
+            candidate = String(candidate[..<commentStart])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let formats = [
+            "EEE, d MMM yyyy HH:mm:ss Z",
+            "EEE, d MMM yyyy HH:mm Z",
+            "d MMM yyyy HH:mm:ss Z",
+            "d MMM yyyy HH:mm Z",
+        ]
+        for format in formats {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = Calendar(identifier: .gregorian)
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = format
+            if let date = formatter.date(from: candidate) {
+                return date
+            }
+        }
+        return nil
+    }
+
+    /// Two-letter monograms use the first two words in a display name. A
+    /// one-word name uses its first two letters; bare addresses use one.
+    static func initials(for address: MailAddress) -> String {
+        guard let rawName = address.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawName.isEmpty
+        else {
+            return String(address.address.first ?? "?").uppercased()
+        }
+        let words = rawName.split { !$0.isLetter && !$0.isNumber }
+        if words.count >= 2,
+           let first = words[0].first,
+           let second = words[1].first {
+            return "\(first)\(second)".uppercased()
+        }
+        return String(rawName.prefix(2)).uppercased()
+    }
+
+    /// Copying an identity always copies its address, never its display name.
+    static func copyPayload(for address: MailAddress) -> String {
+        address.address
+    }
+
+    struct CollapsedRecipients: Equatable, Sendable {
+        let first: MailAddress
+        let additionalCount: Int
+
+        var summary: String {
+            let firstName = name(of: first)
+            return additionalCount > 0 ? "\(firstName) +\(additionalCount)" : firstName
+        }
+    }
+
+    static func collapseRecipients(_ addresses: [MailAddress]) -> CollapsedRecipients? {
+        guard let first = addresses.first else { return nil }
+        return CollapsedRecipients(first: first, additionalCount: max(addresses.count - 1, 0))
     }
 
     /// Subject as shown. An empty subject is a real state, so it gets a marked
@@ -116,8 +201,7 @@ enum MessageHeaderPolicy {
         return name
     }
 
-    /// Name and address together. A reader is where a recipient checks whether
-    /// the two agree, so the address is never dropped for a display name.
+    /// Name and address together for accessibility and identity inspection.
     static func full(_ address: MailAddress) -> String {
         let displayName = name(of: address)
         return displayName == address.address
@@ -125,69 +209,6 @@ enum MessageHeaderPolicy {
             : "\(displayName) <\(address.address)>"
     }
 
-    static func list(_ addresses: [MailAddress]) -> String {
-        addresses.map(full).joined(separator: ", ")
-    }
-
-    /// Compact recipient line: the first recipient plus a count of the rest.
-    /// `nil` for an empty group — an absent group gets no row at all rather
-    /// than an invented "undisclosed recipients".
-    static func summary(_ addresses: [MailAddress]) -> String? {
-        guard let first = addresses.first else { return nil }
-        let rest = addresses.count - 1
-        return rest > 0 ? "\(name(of: first)) +\(rest)" : name(of: first)
-    }
-
-    /// The same summary as speech: "+3" is a visual abbreviation, not a label.
-    static func spokenSummary(_ addresses: [MailAddress]) -> String? {
-        guard let first = addresses.first else { return nil }
-        let rest = addresses.count - 1
-        return rest > 0 ? "\(name(of: first)) and \(rest) more" : name(of: first)
-    }
-
-    /// Every stored envelope field that carries a real value, in reading order.
-    static func detailRows(for envelope: Envelope) -> [DetailRow] {
-        var rows: [DetailRow] = []
-        if !envelope.from.isEmpty {
-            rows.append(DetailRow(label: "From", value: list(envelope.from)))
-        }
-        // A Reply-To that repeats From is noise, not a header the reader needs.
-        if !envelope.replyTo.isEmpty, envelope.replyTo != envelope.from {
-            rows.append(DetailRow(label: "Reply-To", value: list(envelope.replyTo)))
-        }
-        if !envelope.to.isEmpty {
-            rows.append(DetailRow(label: "To", value: list(envelope.to)))
-        }
-        if !envelope.cc.isEmpty {
-            rows.append(DetailRow(label: "Cc", value: list(envelope.cc)))
-        }
-        rows += dateRows(for: envelope)
-        if let messageID = trimmed(envelope.rfcMessageID) {
-            rows.append(DetailRow(label: "Message-ID", value: messageID))
-        }
-        if let inReplyTo = trimmed(envelope.inReplyTo) {
-            rows.append(DetailRow(label: "In-Reply-To", value: inReplyTo))
-        }
-        let references = envelope.references.compactMap(trimmed)
-        if !references.isEmpty {
-            rows.append(DetailRow(label: "References", value: references.joined(separator: "\n")))
-        }
-        return rows
-    }
-
-    /// When the message was written and when the server took delivery are two
-    /// different facts; they collapse into one row only when they agree.
-    private static func dateRows(for envelope: Envelope) -> [DetailRow] {
-        guard let headerDate = envelope.headerDate,
-              abs(headerDate.timeIntervalSince(envelope.internalDate)) >= 1
-        else {
-            return [DetailRow(label: "Date", value: MailDateFormat.envelope(envelope.internalDate))]
-        }
-        return [
-            DetailRow(label: "Sent", value: MailDateFormat.envelope(headerDate)),
-            DetailRow(label: "Received", value: MailDateFormat.envelope(envelope.internalDate)),
-        ]
-    }
 
     /// Attachment name as shown. The IMAP part specifier is the honest fallback
     /// when a part carries no filename.

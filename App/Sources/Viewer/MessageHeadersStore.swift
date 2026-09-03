@@ -2,8 +2,8 @@ import Foundation
 import Observation
 import MailternalInterfaces
 
-/// Lazily loads and caches the unfolded raw header block for each message shown
-/// by a reader. A failed fetch remains visible to the reader until an explicit
+/// Loads and caches the unfolded raw header items for each message shown by a
+/// reader. A failed fetch remains visible to the reader until an explicit
 /// retry, while successful loads are retained for the lifetime of the viewer.
 @MainActor
 @Observable
@@ -11,7 +11,7 @@ final class MessageHeadersStore {
     enum State {
         case idle
         case loading
-        case loaded(headers: [(name: String, value: String)], text: String)
+        case loaded(headers: [MessageHeaderPolicy.HeaderItem], text: String)
         case failed(String)
     }
 
