@@ -189,10 +189,12 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             webView.isHidden = false
             invalidateContentHeightMeasurement()
             documentDidFinish = false
-            // Clear the outer reader's old island height before WebKit starts
-            // laying out the replacement document. A tall previous message
-            // must not become the floor for a short one.
-            onContentHeightChange?(0)
+            // The host resets its island height when the message changes.
+            // A re-render of the same document (reading mode, remote images)
+            // keeps the current height until the new measurement lands, so
+            // the island never collapses to its floor mid-toggle and the
+            // host's async height application cannot reorder a stale zero
+            // after the real measurement.
             #if DEBUG
             qaRenderSequence &+= 1
             if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {

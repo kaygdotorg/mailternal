@@ -28,6 +28,22 @@ final class MessageHeadersStore {
         states[id] ?? .idle
     }
 
+    /// Returns the complete fetched list when available, otherwise the
+    /// envelope fields already present in message detail. Source mode can
+    /// therefore show useful headers in the same render that reveals the mode,
+    /// while the raw body continues loading.
+    func headers(for id: MessageID, fallback envelope: Envelope) -> [MessageHeaderPolicy.HeaderItem]? {
+        switch state(for: id) {
+        case .loaded(let headers, _):
+            return headers
+        case .idle, .loading:
+            let headers = MessageHeaderPolicy.detailHeaders(for: envelope)
+            return headers.isEmpty ? nil : headers
+        case .failed:
+            return nil
+        }
+    }
+
     func loadIfNeeded(for id: MessageID) {
         guard case .idle = state(for: id) else { return }
         load(id, replacing: false)

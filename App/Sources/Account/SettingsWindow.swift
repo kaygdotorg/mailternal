@@ -50,15 +50,18 @@ struct SettingsDetailView: View {
     @Bindable var model: AppModel
     let appearance: AppearanceSettings
     let actions: ActionSettings
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(section.title)
-                .font(.title)
-                .fontWeight(.semibold)
-                .padding(.horizontal, 20)
-                .padding(.top, 20)
-                .accessibilityIdentifier(UIIdentifier.settingsSectionTitle)
+    @State private var titleBottom: CGFloat = 0
 
+    private var settingsDissolvePolicy: MailWindowDissolvePolicy {
+        // The H1 is fixed chrome over the form. Keep the fallback at the
+        // titlebar depth until the first global geometry measurement arrives.
+        .settings.withTopOrigin(
+            max(titleBottom, MailWindowTopDissolvePolicy.titlebarDepth)
+        )
+    }
+
+    var body: some View {
+        ZStack(alignment: .top) {
             Group {
                 switch section {
                 case .account:
@@ -70,10 +73,35 @@ struct SettingsDetailView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // Forms are full-height scroll surfaces beneath the fixed H1.
+            // Extend their safe-area content by the mask's readable depth;
+            // unlike contentMargins, this does not let AppKit rewrite a Form
+            // scroll view's content inset during scroll-edge updates.
+            .safeAreaPadding(
+                .top,
+                settingsDissolvePolicy.restDepth(safeAreaTop: 0)
+            )
+            .mailWindowDissolve(settingsDissolvePolicy)
+
+            Text(section.title)
+                .font(.title)
+                .fontWeight(.semibold)
+                .padding(.horizontal, 20)
+                .padding(.top, PaneHeaderInsetPolicy.settingsHeaderTopPadding)
+                .padding(.bottom, PaneHeaderInsetPolicy.settingsTitleBottomPadding)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier(UIIdentifier.settingsSectionTitle)
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    // Geometry includes the optical bottom padding; remove it
+                    // so the ramp starts at the H1's actual lower edge.
+                    proxy.frame(in: .global).maxY
+                        - PaneHeaderInsetPolicy.settingsTitleBottomPadding
+                } action: { titleBottom = $0 }
         }
         .tint(appearance.accent.color)
         .environment(appearance.accent)
         .environment(actions)
+        .ignoresSafeArea(.container, edges: .top)
     }
 }
 
@@ -399,9 +427,13 @@ struct AppearanceSettingsForm: View {
                     Text("Opacity")
                     Text("How solid the window is. Lower lets more of the desktop show through; 100% is fully solid.")
                 }
-                Toggle(isOn: $appearance.usesLiquidGlass) {
-                    Text("Liquid Glass")
-                    Text("Use a refractive glass surface instead of the frosted blur.")
+                Picker(selection: $appearance.backdropStyle) {
+                    ForEach(WindowBackdropStyle.allCases) { style in
+                        Text(style.label).tag(style)
+                    }
+                } label: {
+                    Text("Blur style")
+                    Text("Choose a clear glass, frosted blur, or regular glass surface.")
                 }
             } header: {
                 Text("Window")

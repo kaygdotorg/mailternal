@@ -76,11 +76,7 @@ struct MailternalApp: App {
                 .disabled(!model.isAccountActive)
                 Button("Source") {
                     appDelegate.showMainWindow()
-                    if model.rawSource == nil {
-                        Task { await model.loadRawSource() }
-                    } else {
-                        model.toggleRawSource()
-                    }
+                    model.toggleRawSource()
                 }
                 .keyboardShortcut("u", modifiers: [.command, .option])
                 .disabled(model.selectedMessageIDs.count != 1)

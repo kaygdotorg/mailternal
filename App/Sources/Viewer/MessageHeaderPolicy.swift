@@ -78,6 +78,16 @@ enum MessageHeaderPolicy {
         let name: String
         let value: String
 
+        /// The independently copyable header-name field.
+        var keyCopyText: String {
+            name
+        }
+
+        /// The independently copyable unfolded header-value field.
+        var valueCopyText: String {
+            value
+        }
+
         var copyText: String {
             value.isEmpty ? "\(name):" : "\(name): \(value)"
         }
@@ -98,10 +108,63 @@ enum MessageHeaderPolicy {
 
     /// The copy/display representation of the complete unfolded header block.
     static func rawHeaderBlock(from rawSource: String) -> String {
-        rawHeaders(from: rawSource)
-            .map(\.copyText)
-            .joined(separator: "\n")
+        rawHeaderBlock(from: rawHeaders(from: rawSource))
     }
+
+    /// The envelope fields already available with message detail. This
+    /// provisional list keeps Source useful while the complete raw source is
+    /// fetched; a loaded raw header list always supersedes it in the viewer.
+    static func detailHeaders(for envelope: Envelope) -> [HeaderItem] {
+        var headers: [HeaderItem] = []
+
+        func append(_ name: String, _ value: String) {
+            guard !value.isEmpty else { return }
+            headers.append(HeaderItem(id: headers.count, name: name, value: value))
+        }
+
+        func addressList(_ addresses: [MailAddress]) -> String {
+            addresses.map(full).joined(separator: ", ")
+        }
+
+        if !envelope.from.isEmpty {
+            append("From", addressList(envelope.from))
+        }
+        if !envelope.replyTo.isEmpty, envelope.replyTo != envelope.from {
+            append("Reply-To", addressList(envelope.replyTo))
+        }
+        if !envelope.to.isEmpty {
+            append("To", addressList(envelope.to))
+        }
+        if !envelope.cc.isEmpty {
+            append("Cc", addressList(envelope.cc))
+        }
+
+        if let headerDate = envelope.headerDate,
+           abs(headerDate.timeIntervalSince(envelope.internalDate)) >= 1 {
+            append("Sent", MailDateFormat.envelope(headerDate))
+            append("Received", MailDateFormat.envelope(envelope.internalDate))
+        } else {
+            append("Date", MailDateFormat.envelope(envelope.internalDate))
+        }
+
+        if let messageID = trimmed(envelope.rfcMessageID) {
+            append("Message-ID", messageID)
+        }
+        if let inReplyTo = trimmed(envelope.inReplyTo) {
+            append("In-Reply-To", inReplyTo)
+        }
+        let references = envelope.references.compactMap(trimmed)
+        if !references.isEmpty {
+            append("References", references.joined(separator: "\n"))
+        }
+        return headers
+    }
+
+    /// The copy/display representation of an already unfolded header list.
+    static func rawHeaderBlock(from headers: [HeaderItem]) -> String {
+        headers.map(\.copyText).joined(separator: "\n")
+    }
+
 
     /// The first Received field is the server's topmost delivery hop. Its
     /// semicolon-delimited trailing date is the only delivery date we expose.

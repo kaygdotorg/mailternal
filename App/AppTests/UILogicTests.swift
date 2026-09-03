@@ -191,26 +191,30 @@ final class UILogicTests: XCTestCase {
     }
 
     @MainActor
-    func testAppearanceDefaultsToBlurAtEightyPercent() {
+    func testAppearanceDefaultsToFrostedBlurAtEightyPercent() {
         let suiteName = "Mailternal.AppearanceDefaultsTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let settings = AppearanceSettings(defaults: defaults)
 
-        XCTAssertEqual(settings.backdropKind, .blur)
-        XCTAssertFalse(settings.usesLiquidGlass)
+        XCTAssertEqual(settings.backdropStyle, .frostedBlur)
         XCTAssertFalse(settings.showsSenderIcons)
         XCTAssertEqual(settings.backgroundOpacity, 0.80)
+        XCTAssertEqual(
+            defaults.string(forKey: "mailternal.appearance.backdropStyle"),
+            WindowBackdropStyle.frostedBlur.rawValue
+        )
+        XCTAssertNil(defaults.object(forKey: "mailternal.appearance.usesLiquidGlass"))
         let plan = WindowBackdropPlan(
-            kind: settings.backdropKind,
+            style: settings.backdropStyle,
             opacity: settings.backgroundOpacity,
             reduceTransparency: false,
             isFullScreen: false
         )
         XCTAssertEqual(plan.treatment, .blur)
-        XCTAssertEqual(plan.fillOpacity, 0.80)
-        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 1)
+        XCTAssertEqual(plan.fillOpacity, 0.80, accuracy: 0.0001)
+        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 2)
     }
 
     @MainActor
@@ -223,11 +227,38 @@ final class UILogicTests: XCTestCase {
         let migrated = AppearanceSettings(defaults: defaults)
         XCTAssertEqual(migrated.backgroundOpacity, 0.80)
         XCTAssertEqual(defaults.double(forKey: "mailternal.appearance.opacity"), 0.80)
-        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 1)
+        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 2)
 
         defaults.set(1.0, forKey: "mailternal.appearance.opacity")
         let current = AppearanceSettings(defaults: defaults)
         XCTAssertEqual(current.backgroundOpacity, 1.0)
+    }
+
+    @MainActor
+    func testAppearanceMigratesLegacyLiquidGlassChoiceExactlyOnce() {
+        for legacyValue in [false, true] {
+            let suiteName = "Mailternal.AppearanceStyleMigrationTests.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suiteName)!
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            defaults.set(legacyValue, forKey: "mailternal.appearance.usesLiquidGlass")
+            let expectedStyle: WindowBackdropStyle = legacyValue ? .regularGlass : .frostedBlur
+
+            let migrated = AppearanceSettings(defaults: defaults)
+            XCTAssertEqual(migrated.backdropStyle, expectedStyle)
+            XCTAssertEqual(
+                defaults.string(forKey: "mailternal.appearance.backdropStyle"),
+                expectedStyle.rawValue
+            )
+            XCTAssertNil(defaults.object(forKey: "mailternal.appearance.usesLiquidGlass"))
+            XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 2)
+
+            // A stale legacy value written after migration cannot change the
+            // already migrated choice: version 2 and the new key win.
+            defaults.set(!legacyValue, forKey: "mailternal.appearance.usesLiquidGlass")
+            let current = AppearanceSettings(defaults: defaults)
+            XCTAssertEqual(current.backdropStyle, expectedStyle)
+            XCTAssertNil(defaults.object(forKey: "mailternal.appearance.usesLiquidGlass"))
+        }
     }
 
     @MainActor
@@ -253,65 +284,39 @@ final class UILogicTests: XCTestCase {
 
         let settings = AppearanceSettings(defaults: defaults)
 
-        XCTAssertEqual(settings.backdropKind, .blur)
-        XCTAssertFalse(settings.usesLiquidGlass)
+        XCTAssertEqual(settings.backdropStyle, .frostedBlur)
         XCTAssertEqual(settings.backgroundOpacity, 0.62)
         XCTAssertNil(defaults.string(forKey: "mailternal.appearance.backdrop"))
-        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 1)
+        XCTAssertEqual(
+            defaults.string(forKey: "mailternal.appearance.backdropStyle"),
+            WindowBackdropStyle.frostedBlur.rawValue
+        )
+        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 2)
     }
 
     @MainActor
-    func testAppearancePreservesExplicitGlassAndOpacity() {
-        let suiteName = "Mailternal.AppearanceGlassTests.\(UUID().uuidString)"
+    func testAppearancePersistsEachBackdropStyleAndOpacity() {
+        let suiteName = "Mailternal.AppearanceStylePersistenceTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        defaults.set("glass", forKey: "mailternal.appearance.backdrop")
-        defaults.set(0.62, forKey: "mailternal.appearance.opacity")
 
         let settings = AppearanceSettings(defaults: defaults)
-        let plan = WindowBackdropPlan(
-            kind: settings.backdropKind,
-            opacity: settings.backgroundOpacity,
-            reduceTransparency: false,
-            isFullScreen: false
-        )
-
-        XCTAssertEqual(settings.backdropKind, .glass)
-        XCTAssertTrue(settings.usesLiquidGlass)
-        XCTAssertEqual(settings.backgroundOpacity, 0.62)
-        XCTAssertEqual(plan.treatment, .glass)
-        XCTAssertEqual(plan.fillOpacity, 0)
-        XCTAssertEqual(plan.glassTintOpacity, 0.62)
-    }
-
-    @MainActor
-    func testAppearancePreservesExplicitBlurAndOpacity() {
-        let suiteName = "Mailternal.AppearanceBlurTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        defaults.set("blur", forKey: "mailternal.appearance.backdrop")
-        defaults.set(0.62, forKey: "mailternal.appearance.opacity")
-
-        let settings = AppearanceSettings(defaults: defaults)
-        let plan = WindowBackdropPlan(
-            kind: settings.backdropKind,
-            opacity: settings.backgroundOpacity,
-            reduceTransparency: false,
-            isFullScreen: false
-        )
-
-        XCTAssertEqual(settings.backdropKind, .blur)
-        XCTAssertFalse(settings.usesLiquidGlass)
-        XCTAssertEqual(settings.backgroundOpacity, 0.62)
-        XCTAssertEqual(plan.treatment, .blur)
+        for style in WindowBackdropStyle.allCases {
+            settings.backdropStyle = style
+            XCTAssertEqual(
+                defaults.string(forKey: "mailternal.appearance.backdropStyle"),
+                style.rawValue
+            )
+            XCTAssertEqual(AppearanceSettings(defaults: defaults).backdropStyle, style)
+        }
     }
 
     func testWindowBackdropPlanMatrixResolvesMutuallyExclusiveTreatments() {
         let opacities = [0.0, 0.5, 0.8, 1.0]
-        for kind in WindowBackdropKind.allCases {
+        for style in WindowBackdropStyle.allCases {
             for opacity in opacities {
                 let plan = WindowBackdropPlan(
-                    kind: kind,
+                    style: style,
                     opacity: opacity,
                     reduceTransparency: false,
                     isFullScreen: false
@@ -319,16 +324,19 @@ final class UILogicTests: XCTestCase {
                 let expectedTreatment: WindowBackdropTreatment =
                     opacity == 1
                         ? .opaque
-                        : kind == .glass ? .glass : .blur
+                        : style == .frostedBlur ? .blur : .glass
+                XCTAssertEqual(plan.style, style)
                 XCTAssertEqual(plan.treatment, expectedTreatment)
                 XCTAssertEqual(plan.opacity, opacity)
                 XCTAssertEqual(
                     plan.fillOpacity,
-                    expectedTreatment == .glass ? 0 : opacity
+                    expectedTreatment == .glass ? 0 : opacity,
+                    accuracy: 0.0001
                 )
                 XCTAssertEqual(
                     plan.glassTintOpacity,
-                    expectedTreatment == .glass ? opacity : 0
+                    expectedTreatment == .glass ? opacity : 0,
+                    accuracy: 0.0001
                 )
             }
         }
@@ -337,14 +345,15 @@ final class UILogicTests: XCTestCase {
     func testWindowBackdropPlanForcesOpaqueForAccessibilityAndFullscreen() {
         let fallbackInputs: [(Bool, Bool)] = [(true, false), (false, true)]
         for (reduceTransparency, isFullScreen) in fallbackInputs {
-            for kind in WindowBackdropKind.allCases {
+            for style in WindowBackdropStyle.allCases {
                 for opacity in [0.0, 0.5, 0.8, 1.0] {
                     let plan = WindowBackdropPlan(
-                        kind: kind,
+                        style: style,
                         opacity: opacity,
                         reduceTransparency: reduceTransparency,
                         isFullScreen: isFullScreen
                     )
+                    XCTAssertEqual(plan.style, style)
                     XCTAssertEqual(plan.opacity, 1)
                     XCTAssertEqual(plan.treatment, .opaque)
                     XCTAssertEqual(plan.fillOpacity, 1)
@@ -372,16 +381,18 @@ final class UILogicTests: XCTestCase {
             window.close()
         }
 
-        for kind in WindowBackdropKind.allCases {
+        // Start with the frosted path so the lazily-created effect view is
+        // present while the glass paths verify that it is hidden.
+        for style in [WindowBackdropStyle.frostedBlur, .clearGlass, .regularGlass] {
             for opacity in [0.0, 0.5, 0.8, 1.0] {
                 let plan = WindowBackdropPlan(
-                    kind: kind,
+                    style: style,
                     opacity: opacity,
                     reduceTransparency: false,
                     isFullScreen: false
                 )
                 backdrop.apply(
-                    kind: kind,
+                    style: style,
                     opacity: opacity,
                     reduceTransparency: false
                 )
@@ -389,21 +400,31 @@ final class UILogicTests: XCTestCase {
                 XCTAssertEqual(window.isOpaque, plan.treatment == .opaque)
                 let effectViews = backdrop.subviews.compactMap { $0 as? NSVisualEffectView }
                 XCTAssertEqual(effectViews.count, 1)
-                XCTAssertEqual(effectViews[0].isHidden, plan.treatment != .blur)
-                let fillAlpha = backdrop.layer?.backgroundColor?.alpha ?? 0
-                XCTAssertEqual(Double(fillAlpha), plan.fillOpacity, accuracy: 0.001)
+                guard let effect = effectViews.first else { continue }
+                XCTAssertEqual(effect.isHidden, plan.treatment != .blur)
+                XCTAssertEqual(effect.subviews.count, 1)
+                guard let tint = effect.subviews.first else {
+                    XCTFail("Expected the blur tint to be nested in the effect view")
+                    continue
+                }
+                XCTAssertTrue(tint.superview === effect)
+                let tintAlpha = tint.layer?.backgroundColor?.alpha ?? 0
+                XCTAssertEqual(Double(tintAlpha), plan.fillOpacity, accuracy: 0.001)
+                if plan.treatment != .opaque {
+                    XCTAssertFalse(backdrop.layer?.isOpaque ?? true)
+                }
             }
         }
     }
 
-    func testAppearanceHasNoUserFacingOpaqueBackdropCase() {
+    func testWindowBackdropStylesAreSortedAndLabeled() {
         XCTAssertEqual(
-            WindowBackdropKind.allCases.map(\.rawValue),
-            ["blur", "glass"]
+            WindowBackdropStyle.allCases.map(\.rawValue),
+            ["clearGlass", "frostedBlur", "regularGlass"]
         )
         XCTAssertEqual(
-            WindowBackdropKind.allCases.map(\.label),
-            ["Blur", "Liquid Glass"]
+            WindowBackdropStyle.allCases.map(\.label),
+            ["Clear glass", "Frosted blur", "Regular glass"]
         )
     }
 
@@ -436,35 +457,37 @@ final class UILogicTests: XCTestCase {
     }
 
     func testWindowBackdropKeepsTreatmentDownToZeroOpacity() {
-        for opacity in [0.0, 0.5, 0.99] {
+        for style in WindowBackdropStyle.allCases {
             XCTAssertEqual(
                 WindowBackdropPlan(
-                    kind: .blur,
-                    opacity: opacity,
+                    style: style,
+                    opacity: 0,
                     reduceTransparency: false,
                     isFullScreen: false
                 ).treatment,
-                .blur
+                style == .frostedBlur ? .blur : .glass
             )
             XCTAssertEqual(
                 WindowBackdropPlan(
-                    kind: .glass,
-                    opacity: opacity,
+                    style: style,
+                    opacity: 0.99,
                     reduceTransparency: false,
                     isFullScreen: false
                 ).treatment,
-                .glass
+                style == .frostedBlur ? .blur : .glass
             )
         }
-        XCTAssertEqual(
-            WindowBackdropPlan(
-                kind: .glass,
-                opacity: 1,
-                reduceTransparency: false,
-                isFullScreen: false
-            ).treatment,
-            .opaque
-        )
+        for style in WindowBackdropStyle.allCases {
+            XCTAssertEqual(
+                WindowBackdropPlan(
+                    style: style,
+                    opacity: 1,
+                    reduceTransparency: false,
+                    isFullScreen: false
+                ).treatment,
+                .opaque
+            )
+        }
     }
 
     func testMessageListFieldVisibilityMatchesLineCount() {
@@ -483,9 +506,12 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(MessageListLayout.previewLineCount(for: 6), 4)
     }
 
-    func testMessageListRowHeightsAreMonotonic() {
+    func testMessageListRowHeightsMatchMeasuredContentAtEveryLineCount() {
         let heights = MessageListLayout.lineRange.map { MessageListLayout.rowHeight(for: $0) }
-        XCTAssertEqual(heights[2], 72)
+        // The cell's fixed 10-point top/bottom insets and 18-point text
+        // baseline step produce these measured heights for one through six
+        // visible lines.
+        XCTAssertEqual(heights, [36, 54, 72, 90, 108, 126])
         XCTAssertEqual(heights, heights.sorted())
         XCTAssertTrue(zip(heights, heights.dropFirst()).allSatisfy { $0.0 < $0.1 })
     }
@@ -641,10 +667,6 @@ final class UILogicTests: XCTestCase {
                 PaneHeaderInsetPolicy.messageListTopInset
             )
             XCTAssertEqual(
-                MailWindowDissolvePolicy.sidebar.restDepth(safeAreaTop: safeAreaTop),
-                MailWindowDissolvePolicy.sidebar.topReach
-            )
-            XCTAssertEqual(
                 MailWindowDissolvePolicy.messageList.restDepth(safeAreaTop: safeAreaTop),
                 MailWindowDissolvePolicy.messageList.topReach
             )
@@ -656,28 +678,52 @@ final class UILogicTests: XCTestCase {
 
         XCTAssertEqual(PaneHeaderInsetPolicy.sidebarTopInset, 52)
         XCTAssertEqual(PaneHeaderInsetPolicy.messageListTopInset, 52)
-        // The header carries the whole inset; the scroll view is never inset.
-        XCTAssertEqual(
-            PaneHeaderInsetPolicy.sidebarHeaderPadding,
-            PaneHeaderInsetPolicy.sidebarTopInset
-        )
+        // The sidebar List keeps its safe-area layout; the header adds air
+        // below the titlebar band and above the first row. The scroll view
+        // itself is never inset.
+        XCTAssertEqual(PaneHeaderInsetPolicy.sidebarHeaderPadding, 12)
+        XCTAssertEqual(PaneHeaderInsetPolicy.sidebarHeaderBottomPadding, 10)
+    }
+
+    func testSettingsDissolvePolicyUsesMeasuredH1OriginAndNoBottomRamp() {
+        let settings = MailWindowDissolvePolicy.settings
+
+        // The settings window has no toolbar: its H1 sits close to the top.
+        XCTAssertEqual(PaneHeaderInsetPolicy.topInset(for: .settings), 46)
+        XCTAssertEqual(PaneHeaderInsetPolicy.settingsHeaderTopPadding, 46)
+        XCTAssertEqual(PaneHeaderInsetPolicy.headerTopPadding, 64)
+        XCTAssertEqual(PaneHeaderInsetPolicy.settingsTitleBottomPadding, 12)
+        XCTAssertEqual(settings.topOrigin, .windowTop)
+        XCTAssertEqual(settings.topReach, 24)
+        XCTAssertNil(settings.bottomReach)
+        XCTAssertEqual(settings.bottomReservedHeight, 0)
+        XCTAssertFalse(settings.hasBottomRamp)
+        XCTAssertEqual(settings.restDepth(safeAreaTop: 52), 24)
+
+        let measured = settings.withTopOrigin(96)
+        XCTAssertEqual(measured.topOrigin, .measured(96))
+        XCTAssertEqual(measured.restDepth(safeAreaTop: 52), 120)
     }
 
     func testSidebarDissolveEndsBeforeAccountHeader() {
         let sidebar = MailWindowDissolvePolicy.sidebar
         let height: CGFloat = 720
-        let stops = sidebar.stops(for: height, safeAreaTop: 80)
-        let topEnd = sidebar.topOrigin.depth(safeAreaTop: 80) + sidebar.topReach
+        let safeAreaTop: CGFloat = 52
+        let stops = sidebar.stops(for: height, safeAreaTop: safeAreaTop)
+        let topEnd = sidebar.topOrigin.depth(safeAreaTop: safeAreaTop) + sidebar.topReach
 
-        XCTAssertEqual(sidebar.topOrigin, .windowTop)
+        // The ramp starts just below the traffic-light band, is short, and is
+        // fully opaque before the account title's cap height (title top =
+        // band + header padding; a 20pt font's cap sits ~5pt lower).
+        XCTAssertEqual(sidebar.topOrigin, .titlebarSafeArea)
+        XCTAssertEqual(sidebar.topReach, PaneHeaderInsetPolicy.sidebarDissolveReach)
         XCTAssertLessThanOrEqual(
             topEnd,
-            PaneHeaderInsetPolicy.sidebarTopInset - PaneHeaderInsetPolicy.sidebarDissolveGuard
+            safeAreaTop + PaneHeaderInsetPolicy.sidebarHeaderPadding + PaneHeaderInsetPolicy.sidebarDissolveGuard
         )
-        XCTAssertEqual(
+        XCTAssertGreaterThan(
             (stops.first { $0.alpha > 0 }?.location ?? 0) * height,
-            sidebar.topReach / 8,
-            accuracy: 0.000_1
+            safeAreaTop
         )
     }
 
@@ -689,23 +735,29 @@ final class UILogicTests: XCTestCase {
         let sidebarStops = sidebar.stops(for: height, safeAreaTop: safeAreaTop)
         let messageStops = messageList.stops(for: height, safeAreaTop: safeAreaTop)
 
-        XCTAssertEqual(sidebar.topReach, 32)
+        XCTAssertEqual(sidebar.topReach, 20)
         XCTAssertEqual(sidebar.bottomReach, 48)
         XCTAssertEqual(sidebar.bottomReservedHeight, 0)
-        XCTAssertEqual(messageList.topReach, 52)
+        XCTAssertEqual(messageList.topReach, MailWindowDissolvePolicy.messageListTopReach)
         XCTAssertEqual(messageList.bottomReach, 48)
         XCTAssertEqual(messageList.bottomReservedHeight, 0)
         XCTAssertTrue(sidebar.hasBottomRamp)
         XCTAssertTrue(messageList.hasBottomRamp)
 
-        XCTAssertEqual(sidebar.topOrigin, .windowTop)
+        // The sidebar holds a clear plateau across the measured band: a stop at
+        // the window top and a second one at the boundary, with the first ink
+        // below it. The message list has one clear stop, at the window top.
+        XCTAssertEqual(sidebar.topOrigin, .titlebarSafeArea)
         XCTAssertEqual(messageList.topOrigin, .windowTop)
+        XCTAssertEqual(
+            sidebarStops.filter { $0.alpha == 0 && $0.location * height <= safeAreaTop }.count,
+            2
+        )
         XCTAssertEqual(sidebarStops.first?.location, 0)
         XCTAssertEqual(sidebarStops.first?.alpha, 0)
-        XCTAssertEqual(
+        XCTAssertGreaterThan(
             (sidebarStops.first { $0.alpha > 0 }?.location ?? 0) * height,
-            sidebar.topReach / 8,
-            accuracy: 0.000_1
+            safeAreaTop
         )
         XCTAssertEqual(messageStops.first?.location, 0)
         XCTAssertEqual(messageStops.first?.alpha, 0)
@@ -817,6 +869,15 @@ final class UILogicTests: XCTestCase {
                 "text/plain; charset=utf-8",
             ]
         )
+        XCTAssertEqual(headers.map(\.keyCopyText), ["Received", "Message-ID", "Content-Type"])
+        XCTAssertEqual(
+            headers.map(\.valueCopyText),
+            [
+                "from mx.example by mail.example; Tue, 2 Sep 2026 12:00:00 +0000",
+                "<abc@example.com>",
+                "text/plain; charset=utf-8",
+            ]
+        )
         XCTAssertEqual(
             MessageHeaderPolicy.rawHeaderBlock(from: raw),
             "Received: from mx.example by mail.example; Tue, 2 Sep 2026 12:00:00 +0000\n"
@@ -824,6 +885,95 @@ final class UILogicTests: XCTestCase {
                 + "Content-Type: text/plain; charset=utf-8"
         )
     }
+
+    func testRawHeaderItemCopyPayloadsSeparateKeyAndValue() {
+        let item = MessageHeaderPolicy.HeaderItem(
+            id: 0,
+            name: "X-Thing",
+            value: "first line second line"
+        )
+        let emptyValue = MessageHeaderPolicy.HeaderItem(
+            id: 1,
+            name: "X-Empty",
+            value: ""
+        )
+
+        XCTAssertEqual(item.keyCopyText, "X-Thing")
+        XCTAssertEqual(item.valueCopyText, "first line second line")
+        XCTAssertEqual(item.copyText, "X-Thing: first line second line")
+        XCTAssertEqual(emptyValue.keyCopyText, "X-Empty")
+        XCTAssertEqual(emptyValue.valueCopyText, "")
+        XCTAssertEqual(emptyValue.copyText, "X-Empty:")
+    }
+    
+    func testQRCodePolicyUsesExactCopyPayloadAndRejectsEmptyText() {
+        XCTAssertEqual(
+            QRCodePolicy.payload(for: "ada@example.com"),
+            "ada@example.com"
+        )
+        XCTAssertEqual(
+            QRCodePolicy.payload(for: " first line second line "),
+            " first line second line "
+        )
+        XCTAssertNil(QRCodePolicy.payload(for: ""))
+        XCTAssertFalse(QRCodePolicy.canEncode(""))
+    }
+
+    func testQRCodePolicyUsesLevelMByteLimit() {
+        XCTAssertEqual(QRCodePolicy.errorCorrectionLevel, "M")
+        XCTAssertEqual(QRCodePolicy.maxPayloadBytes, 2_953)
+        XCTAssertEqual(QRCodePolicy.renderedSide, 176)
+        let maximum = String(repeating: "a", count: QRCodePolicy.maxPayloadBytes)
+        let overLimit = maximum + "b"
+        XCTAssertTrue(QRCodePolicy.canEncode(maximum))
+        XCTAssertFalse(QRCodePolicy.canEncode(overLimit))
+        XCTAssertTrue(QRCodePolicy.canEncode(String(repeating: "é", count: QRCodePolicy.maxPayloadBytes / 2)))
+        XCTAssertFalse(QRCodePolicy.canEncode(String(repeating: "é", count: QRCodePolicy.maxPayloadBytes / 2 + 1)))
+    }
+
+    func testQRCodeGeneratorHandlesAddressAndEmptyPayload() {
+        XCTAssertNotNil(QRCodeRenderer.outputImage(for: "ada@example.com"))
+        XCTAssertNotNil(QRCodeRenderer.image(for: "ada@example.com"))
+        XCTAssertNil(QRCodeRenderer.outputImage(for: ""))
+        XCTAssertNil(QRCodeRenderer.image(for: ""))
+    }
+
+    func testQRCodePolicyExplainsDisabledPayloads() {
+        XCTAssertTrue(QRCodePolicy.menuHelp(for: "").contains("no text"))
+        let overLimit = String(repeating: "a", count: QRCodePolicy.maxPayloadBytes + 1)
+        XCTAssertTrue(QRCodePolicy.menuHelp(for: overLimit).contains("2,953"))
+    }
+
+
+
+    func testDetailHeadersProvideImmediateSourceFallbackFromEnvelope() {
+        let internalDate = Date(timeIntervalSince1970: 1_757_000_000)
+        let envelope = Envelope(
+            subject: "Subject",
+            from: [MailAddress(displayName: "Ada Lovelace", address: "ada@x")],
+            to: [MailAddress(displayName: "Grace Hopper", address: "grace@x")],
+            cc: [],
+            replyTo: [],
+            internalDate: internalDate,
+            headerDate: internalDate,
+            rfcMessageID: "<abc@example.com>",
+            inReplyTo: nil,
+            references: ["<root@example.com>"]
+        )
+
+        let headers = MessageHeaderPolicy.detailHeaders(for: envelope)
+
+        XCTAssertEqual(headers.map(\.name), ["From", "To", "Date", "Message-ID", "References"])
+        XCTAssertEqual(Array(headers.map(\.copyText).prefix(2)), [
+            "From: Ada Lovelace <ada@x>",
+            "To: Grace Hopper <grace@x>",
+        ])
+        XCTAssertEqual(
+            MessageHeaderPolicy.rawHeaderBlock(from: headers),
+            headers.map(\.copyText).joined(separator: "\n")
+        )
+    }
+
 
     func testEnvelopeIdentityPolicyUsesMonogramsAndAddressCopyPayloads() {
         let named = MailAddress(displayName: "Ada Lovelace", address: "ada@x")
@@ -1141,6 +1291,34 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(projectsItem.children.map(\.title), ["Invoices"])
         XCTAssertEqual(projectsItem.children[0].action, .moveTo(invoices.id))
     }
+
+    func testMessageToolbarPolicyGroupsKeepAllActionsInOneCapsule() {
+        XCTAssertEqual(
+            MessageToolbarPolicy.groups,
+            [.messageActions]
+        )
+        XCTAssertEqual(MessageToolbarPolicy.defaultGroupIdentifiers, MessageToolbarPolicy.groups)
+        XCTAssertEqual(MessageToolbarPolicy.allowedGroupIdentifiers, MessageToolbarPolicy.groups)
+        XCTAssertEqual(
+            MessageToolbarPolicy.itemIdentifiers(in: .messageActions),
+            [.archive, .trash, .flag, .source, .colorScheme, .overflow]
+        )
+        XCTAssertEqual(
+            MessageToolbarPolicy.defaultItemIdentifiers,
+            MessageToolbarPolicy.groups.flatMap { $0.itemIdentifiers }
+        )
+    }
+    func testMessageToolbarPolicyKeepsSourceOnStateWithinItsGroup() {
+        let id = MessageID(rawValue: 1)
+        let source = MessageToolbarPolicy.visibleItems(
+            selection: [id],
+            flagStates: [:],
+            isShowingRawSource: true
+        ).first { $0.identifier == .source }
+        XCTAssertTrue(source?.isOn == true)
+        XCTAssertTrue(source?.isEnabled == true)
+    }
+
 
     func testMessageToolbarPolicyOrdersItemsAndTracksSelectionState() {
         let first = MessageID(rawValue: 1)

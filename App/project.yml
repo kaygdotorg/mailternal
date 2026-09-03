@@ -53,6 +53,8 @@ targets:
       - path: Sources/Support/UILogic.swift
       - path: Sources/Support/MessageListPolicies.swift
       - path: Sources/Viewer/MessageHeaderPolicy.swift
+      - path: Sources/Support/QRCodePolicy.swift
+      - path: Sources/Viewer/QRCodeCard.swift
       - path: Sources/Support/AppearanceSettings.swift
       - path: Sources/Support/ActionSettings.swift
       - path: Sources/Shell/WindowBackdrop.swift

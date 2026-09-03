@@ -43,8 +43,13 @@ enum MessageTypography {
 }
 
 enum MailMotion {
-    static let sidebarToggle = Animation.snappy(duration: 0.24, extraBounce: 0)
+    /// A critically damped spring gives NavigationSplitView's sidebar width
+    /// time to settle without the end-of-collapse jump of a short snappy.
+    static let sidebarToggle = Animation.spring(duration: 0.28, bounce: 0.0)
     static let disclosure = Animation.easeOut(duration: 0.12)
+    /// The source island should acknowledge the toggle immediately while its
+    /// height still eases cleanly into the detailed header layout.
+    static let sourceMorph = Animation.easeOut(duration: 0.17)
     static let hover = Animation.easeOut(duration: 0.12)
     static let searchPanel = Animation.spring(response: 0.36, dampingFraction: 1)
     static let searchPanelReduced = Animation.easeOut(duration: 0.18)

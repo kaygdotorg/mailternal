@@ -236,6 +236,7 @@ final class MainShellViewController: NSViewController {
             )
         )
         super.init(nibName: nil, bundle: nil)
+        configureTransparentHostingView(contentHosting.view)
         contentHosting.sizingOptions = []
     }
 
@@ -297,22 +298,26 @@ final class MainShellViewController: NSViewController {
     private func configureWindowIfAttached() {
         guard view.window != nil, backgroundHosting == nil else { return }
         let hosting = NSHostingView(rootView: WindowBackdropRoot(appearance: appearance))
+        configureTransparentHostingView(hosting)
         hosting.safeAreaRegions = []
         hosting.sizingOptions = []
-        hosting.translatesAutoresizingMaskIntoConstraints = false
+        hosting.frame = view.bounds
+        hosting.autoresizingMask = [.width, .height]
         view.addSubview(hosting, positioned: .below, relativeTo: nil)
-        NSLayoutConstraint.activate([
-            hosting.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            hosting.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            hosting.topAnchor.constraint(equalTo: view.topAnchor),
-            hosting.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-        ])
         backgroundHosting = hosting
     }
+
+    private func configureTransparentHostingView(_ hosting: NSView) {
+        hosting.wantsLayer = true
+        hosting.layer?.backgroundColor = nil
+        hosting.layer?.isOpaque = false
+    }
+
 }
 
 private extension NSToolbarItem.Identifier {
     static let sidebarToggle = NSToolbarItem.Identifier("Mailternal.sidebarToggle")
+    static let messageActions = NSToolbarItem.Identifier(MessageToolbarPolicy.Group.messageActions.rawValue)
     static let messageArchive = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.archive.rawValue)
     static let messageTrash = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.trash.rawValue)
     static let messageFlag = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.flag.rawValue)
@@ -350,6 +355,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         action: #selector(toggleEmailReadingOverride(_:))
     )
     private lazy var overflowItem = makeOverflowItem()
+    private lazy var messageActionsGroup = makeMessageGroup(.messageActions)
     private lazy var overflowMenu: NSMenu = {
         let menu = NSMenu()
         menu.delegate = self
@@ -421,7 +427,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             identifiers += [.flexibleSpace, .sidebarToggle, .sidebarTrackingSeparator]
         }
         identifiers += [.flexibleSpace]
-        identifiers += MessageToolbarPolicy.defaultItemIdentifiers.map(toolbarIdentifier)
+        identifiers += MessageToolbarPolicy.defaultGroupIdentifiers.map(toolbarGroupIdentifier)
         return identifiers
     }
 
@@ -434,11 +440,16 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         if includesSidebarToggle {
             identifiers += [.sidebarToggle, .sidebarTrackingSeparator]
         }
-        identifiers += MessageToolbarPolicy.allowedItemIdentifiers.map(toolbarIdentifier)
+        // Keep each group atomic in customization as well as the default
+        // layout; exposing child IDs lets AppKit detach them from the capsule.
+        identifiers += MessageToolbarPolicy.allowedGroupIdentifiers.map(toolbarGroupIdentifier)
         return identifiers
     }
+
     func toolbarSelectableItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.messageSource]
+        // Source is selected by its containing NSToolbarItemGroup. Marking the
+        // child selectable at the toolbar level breaks the group capsule.
+        []
     }
 
     func toolbar(
@@ -449,6 +460,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         switch identifier {
         case .sidebarToggle where includesSidebarToggle:
             return toggleItem
+        case .messageActions:
+            return messageActionsGroup
         case .messageArchive:
             return archiveItem
         case .messageTrash:
@@ -470,7 +483,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         switch item.itemIdentifier {
         case .sidebarToggle:
             item.isEnabled = includesSidebarToggle
-        case .messageArchive, .messageTrash, .messageFlag,
+        case .messageActions,
+             .messageArchive, .messageTrash, .messageFlag,
              .messageSource, .messageColorScheme:
             configureMessageItems()
         case .messageOverflow:
@@ -484,6 +498,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         }
         return item.isEnabled
     }
+
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
@@ -530,6 +545,41 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     ) -> NSToolbarItem.Identifier {
         NSToolbarItem.Identifier(identifier.rawValue)
     }
+    private func toolbarGroupIdentifier(
+        _ group: MessageToolbarPolicy.Group
+    ) -> NSToolbarItem.Identifier {
+        NSToolbarItem.Identifier(group.rawValue)
+    }
+
+    private func messageItem(
+        for identifier: MessageToolbarPolicy.Identifier
+    ) -> NSToolbarItem? {
+        switch identifier {
+        case .archive: return archiveItem
+        case .trash: return trashItem
+        case .flag: return flagItem
+        case .source: return sourceItem
+        case .colorScheme: return colorSchemeItem
+        case .overflow: return overflowItem
+        }
+    }
+
+    private func makeMessageGroup(
+        _ group: MessageToolbarPolicy.Group
+    ) -> NSToolbarItemGroup {
+        let item = NSToolbarItemGroup(itemIdentifier: toolbarGroupIdentifier(group))
+        item.subitems = MessageToolbarPolicy.itemIdentifiers(in: group)
+            .compactMap { messageItem(for: $0) }
+        item.label = "Message Actions"
+        item.paletteLabel = item.label
+        item.isBordered = true
+        item.isEnabled = true
+        item.controlRepresentation = .expanded
+        item.selectionMode = .selectAny
+        item.autovalidates = false
+        return item
+    }
+
 
     private func configureMessageItems() {
         let visibleItems = MessageToolbarPolicy.visibleItems(
@@ -557,7 +607,16 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             item.toolTip = visible.title
             item.isEnabled = visible.isEnabled
         }
-        toolbar?.selectedItemIdentifier = model.isShowingRawSource ? .messageSource : nil
+        let sourceIndex = MessageToolbarPolicy.itemIdentifiers(in: .messageActions)
+            .firstIndex(of: .source)
+        if let sourceIndex {
+            for index in messageActionsGroup.subitems.indices {
+                messageActionsGroup.setSelected(
+                    index == sourceIndex && model.isShowingRawSource,
+                    at: index
+                )
+            }
+        }
         overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
     }
 
@@ -650,29 +709,36 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         }
         return nil
     }
+    private func clearTransientMessageActionSelection() {
+        let identifiers: [MessageToolbarPolicy.Identifier] = [.archive, .trash, .flag]
+        let groupedIdentifiers = MessageToolbarPolicy.itemIdentifiers(in: .messageActions)
+        for identifier in identifiers {
+            guard let index = groupedIdentifiers.firstIndex(of: identifier) else { continue }
+            messageActionsGroup.setSelected(false, at: index)
+        }
+    }
+
 
     @objc private func trashSelected(_ sender: Any?) {
         model.perform(.trash, on: model.selectedMessageIDs)
+        clearTransientMessageActionSelection()
     }
 
     @objc private func flagSelected(_ sender: Any?) {
         model.perform(.toggleFlag, on: model.selectedMessageIDs)
+        clearTransientMessageActionSelection()
     }
     @objc private func toggleSidebar(_ sender: Any?) {
         toggleAction()
     }
-
     @objc private func archiveSelected(_ sender: Any?) {
         model.perform(.archive, on: model.selectedMessageIDs)
+        clearTransientMessageActionSelection()
     }
 
     @objc private func toggleRawSource(_ sender: Any?) {
         guard model.selectedMessageIDs.count == 1 else { return }
-        if model.rawSource != nil {
-            model.toggleRawSource()
-        } else {
-            Task { await model.loadRawSource() }
-        }
+        model.toggleRawSource()
     }
 
     @objc private func toggleEmailReadingOverride(_ sender: Any?) {

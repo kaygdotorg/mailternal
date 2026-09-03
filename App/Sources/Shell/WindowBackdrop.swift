@@ -12,6 +12,7 @@ enum WindowBackdropTreatment: Equatable {
 /// the tint carried by the selected translucent treatment.
 struct WindowBackdropPlan: Equatable {
     let opacity: Double
+    let style: WindowBackdropStyle
     let treatment: WindowBackdropTreatment
     let isFullScreen: Bool
 
@@ -19,8 +20,9 @@ struct WindowBackdropPlan: Equatable {
     /// instead, so it must never be stacked under the glass material.
     var fillOpacity: Double {
         switch treatment {
+        case .opaque: 1
         case .glass: 0
-        case .blur, .opaque: opacity
+        case .blur: opacity
         }
     }
 
@@ -30,11 +32,12 @@ struct WindowBackdropPlan: Equatable {
     }
 
     init(
-        kind: WindowBackdropKind,
+        style: WindowBackdropStyle,
         opacity: Double,
         reduceTransparency: Bool,
         isFullScreen: Bool
     ) {
+        self.style = style
         self.isFullScreen = isFullScreen
         guard !reduceTransparency, !isFullScreen, opacity.isFinite else {
             self.opacity = 1
@@ -47,22 +50,21 @@ struct WindowBackdropPlan: Equatable {
             treatment = .opaque
             return
         }
-        treatment = kind == .glass ? .glass : .blur
+        treatment = style == .frostedBlur ? .blur : .glass
     }
 }
-
 struct WindowBackdropRoot: View {
     let appearance: AppearanceSettings
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var isFullScreen = false
 
-    private var kind: WindowBackdropKind {
-        appearance.usesLiquidGlass ? .glass : .blur
+    private var style: WindowBackdropStyle {
+        appearance.backdropStyle
     }
 
     private var resolvedPlan: WindowBackdropPlan {
         WindowBackdropPlan(
-            kind: kind,
+            style: style,
             opacity: appearance.backgroundOpacity,
             reduceTransparency: reduceTransparency,
             isFullScreen: isFullScreen
@@ -73,7 +75,7 @@ struct WindowBackdropRoot: View {
         let plan = resolvedPlan
         WindowBackdropViewRepresentable(
             plan: plan,
-            kind: kind,
+            style: style,
             opacity: appearance.backgroundOpacity,
             reduceTransparency: reduceTransparency,
             onFullScreenChanged: { isFullScreen = $0 }
@@ -87,7 +89,10 @@ struct WindowBackdropRoot: View {
                 Color(nsColor: .windowBackgroundColor)
                     .opacity(plan.glassTintOpacity)
                     .clipShape(shape)
-                    .glassEffect(.regular, in: shape)
+                    .glassEffect(
+                        style == .clearGlass ? .clear : .regular,
+                        in: shape
+                    )
             }
         }
         .allowsHitTesting(false)
@@ -96,7 +101,7 @@ struct WindowBackdropRoot: View {
 
 private struct WindowBackdropViewRepresentable: NSViewRepresentable {
     let plan: WindowBackdropPlan
-    let kind: WindowBackdropKind
+    let style: WindowBackdropStyle
     let opacity: Double
     let reduceTransparency: Bool
     let onFullScreenChanged: @MainActor (Bool) -> Void
@@ -105,7 +110,7 @@ private struct WindowBackdropViewRepresentable: NSViewRepresentable {
         let view = WindowBackdropView()
         view.apply(
             plan: plan,
-            kind: kind,
+            style: style,
             opacity: opacity,
             reduceTransparency: reduceTransparency,
             onFullScreenChanged: onFullScreenChanged
@@ -116,7 +121,7 @@ private struct WindowBackdropViewRepresentable: NSViewRepresentable {
     func updateNSView(_ nsView: WindowBackdropView, context: Context) {
         nsView.apply(
             plan: plan,
-            kind: kind,
+            style: style,
             opacity: opacity,
             reduceTransparency: reduceTransparency,
             onFullScreenChanged: onFullScreenChanged
@@ -126,11 +131,11 @@ private struct WindowBackdropViewRepresentable: NSViewRepresentable {
 
 @MainActor
 final class WindowBackdropView: NSView {
-    private var kind: WindowBackdropKind = .blur
+    private var style: WindowBackdropStyle = .frostedBlur
     private var opacity: Double = 1
     private var reduceTransparency = false
     private var requestedPlan = WindowBackdropPlan(
-        kind: .blur,
+        style: .frostedBlur,
         opacity: 1,
         reduceTransparency: false,
         isFullScreen: false
@@ -158,13 +163,13 @@ final class WindowBackdropView: NSView {
 
     func apply(
         plan: WindowBackdropPlan,
-        kind: WindowBackdropKind,
+        style: WindowBackdropStyle,
         opacity: Double,
         reduceTransparency: Bool,
         onFullScreenChanged: @escaping @MainActor (Bool) -> Void
     ) {
         requestedPlan = plan
-        self.kind = kind
+        self.style = style
         self.opacity = opacity
         self.reduceTransparency = reduceTransparency
         self.onFullScreenChanged = onFullScreenChanged
@@ -172,16 +177,16 @@ final class WindowBackdropView: NSView {
     }
 
     /// Convenience entry point for AppKit callers and deterministic tests.
-    func apply(kind: WindowBackdropKind, opacity: Double, reduceTransparency: Bool) {
+    func apply(style: WindowBackdropStyle, opacity: Double, reduceTransparency: Bool) {
         let plan = WindowBackdropPlan(
-            kind: kind,
+            style: style,
             opacity: opacity,
             reduceTransparency: reduceTransparency,
             isFullScreen: window?.styleMask.contains(.fullScreen) ?? false
         )
         apply(
             plan: plan,
-            kind: kind,
+            style: style,
             opacity: opacity,
             reduceTransparency: reduceTransparency,
             onFullScreenChanged: { _ in }
@@ -232,7 +237,7 @@ final class WindowBackdropView: NSView {
             return requestedPlan
         }
         return WindowBackdropPlan(
-            kind: kind,
+            style: style,
             opacity: opacity,
             reduceTransparency: reduceTransparency,
             isFullScreen: isFullScreen
@@ -291,7 +296,7 @@ final class WindowBackdropView: NSView {
                 view.wantsLayer = true
                 view.layer?.isOpaque = false
                 view.autoresizingMask = [.width, .height]
-                addSubview(view, positioned: .above, relativeTo: effect)
+                effect.addSubview(view, positioned: .above, relativeTo: nil)
                 tintView = view
                 return view
             }()
