@@ -163,6 +163,13 @@ final class AppearanceSettings {
         }
     }
 
+    var showsSenderIcons: Bool {
+        didSet {
+            guard oldValue != showsSenderIcons else { return }
+            defaults.set(showsSenderIcons, forKey: Keys.showsSenderIcons)
+        }
+    }
+
     var backgroundOpacity: Double {
         didSet {
             let clamped = Self.clampBackgroundOpacity(backgroundOpacity)
@@ -190,6 +197,7 @@ final class AppearanceSettings {
         get { usesLiquidGlass ? .glass : .blur }
         set { usesLiquidGlass = newValue == .glass }
     }
+
     /// Number of visible lines in each message-list row, including the subject.
     ///
     /// One line keeps only the subject; two lines add sender/date; subsequent
@@ -208,7 +216,10 @@ final class AppearanceSettings {
 
     static let defaultMessageListLines = 3
     static let messageListLineRange = 1...6
-    static let defaultBackgroundOpacity = 1.0
+    static let defaultBackgroundOpacity = 0.80
+    /// Incremented when a persisted preference's meaning changes. Values
+    /// written by older builds are migrated exactly once per suite.
+    static let defaultsVersion = 1
     /// The full dial the settings slider offers. 100% resolves to a solid
     /// window; anything below it shows the chosen treatment, down to a window
     /// that adds no fill of its own at 0%.
@@ -228,44 +239,53 @@ final class AppearanceSettings {
         let clamped = clampBackgroundOpacity(value)
         return "\(Int((clamped * 100).rounded()))%"
     }
-
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.accent = AccentSource(defaults: defaults)
+
         let storedBackdrop = defaults.string(forKey: Keys.backdrop)
         let hasStoredGlassChoice = defaults.object(forKey: Keys.usesLiquidGlass) != nil
-        let storedOpacity = defaults.object(forKey: Keys.opacity) as? Double
+        let hasStoredOpacity = defaults.object(forKey: Keys.opacity) != nil
+        let storedOpacity = hasStoredOpacity ? defaults.double(forKey: Keys.opacity) : nil
+        let storedVersion = defaults.object(forKey: Keys.defaultsVersion) == nil
+            ? 0
+            : defaults.integer(forKey: Keys.defaultsVersion)
+        let shouldMigrateLegacyFullOpacity =
+            storedVersion < Self.defaultsVersion
+            && storedOpacity == 1
+            && !defaults.bool(forKey: Keys.opacityUserWritten)
 
         mode = AppearanceMode(rawValue: defaults.string(forKey: Keys.mode) ?? "") ?? .system
         emailReadingMode = EmailReadingMode(
             rawValue: defaults.string(forKey: Keys.emailReadingMode) ?? ""
         ) ?? .original
+        showsSenderIcons = defaults.bool(forKey: Keys.showsSenderIcons)
+
+        let resolvedOpacity = Self.clampBackgroundOpacity(
+            shouldMigrateLegacyFullOpacity
+                ? Self.defaultBackgroundOpacity
+                : (storedOpacity ?? Self.defaultBackgroundOpacity)
+        )
         if hasStoredGlassChoice {
             usesLiquidGlass = defaults.bool(forKey: Keys.usesLiquidGlass)
-            backgroundOpacity = Self.clampBackgroundOpacity(
-                storedOpacity ?? Self.defaultBackgroundOpacity
-            )
+            backgroundOpacity = resolvedOpacity
         } else if let storedKind = WindowBackdropKind(rawValue: storedBackdrop ?? "") {
             let resolvedUsesLiquidGlass = storedKind == .glass
-            let resolvedOpacity = Self.clampBackgroundOpacity(
-                storedOpacity ?? Self.defaultBackgroundOpacity
-            )
             usesLiquidGlass = resolvedUsesLiquidGlass
             backgroundOpacity = resolvedOpacity
             defaults.set(resolvedUsesLiquidGlass, forKey: Keys.usesLiquidGlass)
             defaults.removeObject(forKey: Keys.backdrop)
         } else {
-            // Missing and legacy Opaque settings both become Blur at 100%.
-            // This keeps the old solid appearance without retaining a
-            // user-facing treatment that duplicates the opacity dial.
+            // Missing and legacy opaque settings become the shipping default:
+            // Blur with a solid-enough, but not fully opaque, tint.
             usesLiquidGlass = false
-            backgroundOpacity = Self.defaultBackgroundOpacity
+            backgroundOpacity = resolvedOpacity
             defaults.set(false, forKey: Keys.usesLiquidGlass)
-            defaults.set(Self.defaultBackgroundOpacity, forKey: Keys.opacity)
             defaults.removeObject(forKey: Keys.backdrop)
         }
+
         if let storedLines = defaults.object(forKey: Keys.messageListLines) as? NSNumber {
             let normalizedLines = Self.clampMessageListLines(storedLines.intValue)
             messageListLines = normalizedLines
@@ -275,11 +295,19 @@ final class AppearanceSettings {
         } else {
             messageListLines = Self.defaultMessageListLines
         }
+
+        if shouldMigrateLegacyFullOpacity {
+            defaults.set(resolvedOpacity, forKey: Keys.opacity)
+        } else if !hasStoredOpacity {
+            defaults.set(resolvedOpacity, forKey: Keys.opacity)
+        }
+        defaults.set(max(storedVersion, Self.defaultsVersion), forKey: Keys.defaultsVersion)
         applyAppKitAppearance()
     }
 
     func persistOpacity() {
         defaults.set(backgroundOpacity, forKey: Keys.opacity)
+        defaults.set(true, forKey: Keys.opacityUserWritten)
     }
 
     func applyAppKitAppearance() {
@@ -293,7 +321,10 @@ final class AppearanceSettings {
         static let backdrop = "mailternal.appearance.backdrop"
         static let usesLiquidGlass = "mailternal.appearance.usesLiquidGlass"
         static let opacity = "mailternal.appearance.opacity"
+        static let opacityUserWritten = "mailternal.appearance.opacity-user-written"
+        static let defaultsVersion = "mailternal.appearance.defaultsVersion"
         static let messageListLines = "mailternal.appearance.message-list-lines"
         static let emailReadingMode = "mailternal.appearance.email-reading"
+        static let showsSenderIcons = "mailternal.appearance.showsSenderIcons"
     }
 }

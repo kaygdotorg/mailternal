@@ -7,15 +7,26 @@ enum WindowBackdropTreatment: Equatable {
     case glass
 }
 
+/// The one resolved answer for the window's background. Opaque, blur, and
+/// glass are mutually exclusive treatments; the opacity dial only controls
+/// the tint carried by the selected translucent treatment.
 struct WindowBackdropPlan: Equatable {
-    var opacity: Double
-    var treatment: WindowBackdropTreatment
+    let opacity: Double
+    let treatment: WindowBackdropTreatment
+    let isFullScreen: Bool
 
+    /// Alpha for the AppKit tint layer. Glass carries its tint in SwiftUI
+    /// instead, so it must never be stacked under the glass material.
     var fillOpacity: Double {
         switch treatment {
         case .glass: 0
         case .blur, .opaque: opacity
         }
+    }
+
+    /// Alpha for the tint colour that is passed into `.glassEffect`.
+    var glassTintOpacity: Double {
+        treatment == .glass ? opacity : 0
     }
 
     init(
@@ -24,6 +35,7 @@ struct WindowBackdropPlan: Equatable {
         reduceTransparency: Bool,
         isFullScreen: Bool
     ) {
+        self.isFullScreen = isFullScreen
         guard !reduceTransparency, !isFullScreen, opacity.isFinite else {
             self.opacity = 1
             treatment = .opaque
@@ -42,49 +54,73 @@ struct WindowBackdropPlan: Equatable {
 struct WindowBackdropRoot: View {
     let appearance: AppearanceSettings
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @State private var isFullScreen = false
+
+    private var kind: WindowBackdropKind {
+        appearance.usesLiquidGlass ? .glass : .blur
+    }
+
+    private var resolvedPlan: WindowBackdropPlan {
+        WindowBackdropPlan(
+            kind: kind,
+            opacity: appearance.backgroundOpacity,
+            reduceTransparency: reduceTransparency,
+            isFullScreen: isFullScreen
+        )
+    }
 
     var body: some View {
+        let plan = resolvedPlan
         WindowBackdropViewRepresentable(
-            kind: appearance.usesLiquidGlass ? .glass : .blur,
+            plan: plan,
+            kind: kind,
             opacity: appearance.backgroundOpacity,
-            reduceTransparency: reduceTransparency
+            reduceTransparency: reduceTransparency,
+            onFullScreenChanged: { isFullScreen = $0 }
         )
         .overlay {
-            if shouldShowGlass {
+            if plan.treatment == .glass {
                 let shape = RoundedRectangle(
                     cornerRadius: 0,
                     style: .continuous
                 )
                 Color(nsColor: .windowBackgroundColor)
-                    .opacity(appearance.backgroundOpacity)
+                    .opacity(plan.glassTintOpacity)
                     .clipShape(shape)
                     .glassEffect(.regular, in: shape)
             }
         }
         .allowsHitTesting(false)
     }
-
-    private var shouldShowGlass: Bool {
-        WindowBackdropPlan(
-            kind: appearance.usesLiquidGlass ? .glass : .blur,
-            opacity: appearance.backgroundOpacity,
-            reduceTransparency: reduceTransparency,
-            isFullScreen: NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false
-        ).treatment == .glass
-    }
 }
 
 private struct WindowBackdropViewRepresentable: NSViewRepresentable {
-    var kind: WindowBackdropKind
-    var opacity: Double
-    var reduceTransparency: Bool
+    let plan: WindowBackdropPlan
+    let kind: WindowBackdropKind
+    let opacity: Double
+    let reduceTransparency: Bool
+    let onFullScreenChanged: @MainActor (Bool) -> Void
 
     func makeNSView(context: Context) -> WindowBackdropView {
-        WindowBackdropView()
+        let view = WindowBackdropView()
+        view.apply(
+            plan: plan,
+            kind: kind,
+            opacity: opacity,
+            reduceTransparency: reduceTransparency,
+            onFullScreenChanged: onFullScreenChanged
+        )
+        return view
     }
 
     func updateNSView(_ nsView: WindowBackdropView, context: Context) {
-        nsView.apply(kind: kind, opacity: opacity, reduceTransparency: reduceTransparency)
+        nsView.apply(
+            plan: plan,
+            kind: kind,
+            opacity: opacity,
+            reduceTransparency: reduceTransparency,
+            onFullScreenChanged: onFullScreenChanged
+        )
     }
 }
 
@@ -93,13 +129,23 @@ final class WindowBackdropView: NSView {
     private var kind: WindowBackdropKind = .blur
     private var opacity: Double = 1
     private var reduceTransparency = false
+    private var requestedPlan = WindowBackdropPlan(
+        kind: .blur,
+        opacity: 1,
+        reduceTransparency: false,
+        isFullScreen: false
+    )
+    private var onFullScreenChanged: (@MainActor (Bool) -> Void)?
+    private var lastReportedFullScreen: Bool?
     private var effectView: NSVisualEffectView?
+    private var tintView: NSView?
     private var baselineOpaque: Bool?
     private var baselineColor: NSColor?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        layer?.isOpaque = false
         autoresizingMask = [.width, .height]
     }
 
@@ -110,11 +156,36 @@ final class WindowBackdropView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-    func apply(kind: WindowBackdropKind, opacity: Double, reduceTransparency: Bool) {
+    func apply(
+        plan: WindowBackdropPlan,
+        kind: WindowBackdropKind,
+        opacity: Double,
+        reduceTransparency: Bool,
+        onFullScreenChanged: @escaping @MainActor (Bool) -> Void
+    ) {
+        requestedPlan = plan
         self.kind = kind
         self.opacity = opacity
         self.reduceTransparency = reduceTransparency
+        self.onFullScreenChanged = onFullScreenChanged
         sync()
+    }
+
+    /// Convenience entry point for AppKit callers and deterministic tests.
+    func apply(kind: WindowBackdropKind, opacity: Double, reduceTransparency: Bool) {
+        let plan = WindowBackdropPlan(
+            kind: kind,
+            opacity: opacity,
+            reduceTransparency: reduceTransparency,
+            isFullScreen: window?.styleMask.contains(.fullScreen) ?? false
+        )
+        apply(
+            plan: plan,
+            kind: kind,
+            opacity: opacity,
+            reduceTransparency: reduceTransparency,
+            onFullScreenChanged: { _ in }
+        )
     }
 
     override func viewDidMoveToWindow() {
@@ -127,6 +198,11 @@ final class WindowBackdropView: NSView {
         super.viewWillMove(toWindow: newWindow)
         if newWindow == nil { restore() }
     }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -149,37 +225,48 @@ final class WindowBackdropView: NSView {
     @objc private func windowChanged() { sync() }
 
     private func plan() -> WindowBackdropPlan {
-        WindowBackdropPlan(
+        guard let window else { return requestedPlan }
+        let isFullScreen = window.styleMask.contains(.fullScreen)
+        reportFullScreenChange(isFullScreen)
+        guard isFullScreen != requestedPlan.isFullScreen else {
+            return requestedPlan
+        }
+        return WindowBackdropPlan(
             kind: kind,
             opacity: opacity,
             reduceTransparency: reduceTransparency,
-            isFullScreen: window?.styleMask.contains(.fullScreen) ?? false
+            isFullScreen: isFullScreen
         )
+    }
+
+    private func reportFullScreenChange(_ isFullScreen: Bool) {
+        guard lastReportedFullScreen != isFullScreen else { return }
+        lastReportedFullScreen = isFullScreen
+        guard isFullScreen != requestedPlan.isFullScreen,
+              let onFullScreenChanged
+        else { return }
+        Task { @MainActor in
+            onFullScreenChanged(isFullScreen)
+        }
     }
 
     private func sync() {
         let plan = plan()
-        guard let window else { return }
-        if baselineOpaque == nil {
-            baselineOpaque = window.isOpaque
-            baselineColor = window.backgroundColor
-        }
-        let isOpaque = plan.treatment == .opaque
-        if window.isOpaque != isOpaque {
-            window.isOpaque = isOpaque
-        }
-        let background: NSColor = isOpaque
-            ? .windowBackgroundColor
-            : NSColor.white.withAlphaComponent(0.001)
-        if window.backgroundColor != background {
-            window.backgroundColor = background
-        }
-
-        let fillAlpha = plan.fillOpacity
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = fillAlpha > 0
-                ? NSColor.windowBackgroundColor.withAlphaComponent(fillAlpha).cgColor
-                : nil
+        if let window {
+            if baselineOpaque == nil {
+                baselineOpaque = window.isOpaque
+                baselineColor = window.backgroundColor
+            }
+            let isOpaque = plan.treatment == .opaque
+            if window.isOpaque != isOpaque {
+                window.isOpaque = isOpaque
+            }
+            let background: NSColor = isOpaque
+                ? .windowBackgroundColor
+                : NSColor.white.withAlphaComponent(0.001)
+            if window.backgroundColor != background {
+                window.backgroundColor = background
+            }
         }
 
         let wantsBlur = plan.treatment == .blur
@@ -199,17 +286,44 @@ final class WindowBackdropView: NSView {
             effect.blendingMode = .behindWindow
             effect.state = .active
             effect.isHidden = false
+            let tint = tintView ?? {
+                let view = NSView(frame: bounds)
+                view.wantsLayer = true
+                view.layer?.isOpaque = false
+                view.autoresizingMask = [.width, .height]
+                addSubview(view, positioned: .above, relativeTo: effect)
+                tintView = view
+                return view
+            }()
+            tint.frame = bounds
+            tint.isHidden = plan.fillOpacity <= 0
         } else {
             effectView?.isHidden = true
+            tintView?.isHidden = true
+        }
+        syncFill(plan)
+    }
+
+    private func syncFill(_ plan: WindowBackdropPlan) {
+        let fillAlpha = plan.fillOpacity
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let fill = fillAlpha > 0
+                ? NSColor.windowBackgroundColor.withAlphaComponent(fillAlpha).cgColor
+                : nil
+            layer?.backgroundColor = fill
+            tintView?.layer?.backgroundColor = fill
         }
     }
 
     private func restore() {
-        guard let window else { return }
-        NotificationCenter.default.removeObserver(self, name: nil, object: window)
-        if let baselineOpaque { window.isOpaque = baselineOpaque }
-        if let baselineColor { window.backgroundColor = baselineColor }
+        let center = NotificationCenter.default
+        center.removeObserver(self)
+        if let window {
+            if let baselineOpaque { window.isOpaque = baselineOpaque }
+            if let baselineColor { window.backgroundColor = baselineColor }
+        }
         baselineOpaque = nil
         baselineColor = nil
+        lastReportedFullScreen = nil
     }
 }
