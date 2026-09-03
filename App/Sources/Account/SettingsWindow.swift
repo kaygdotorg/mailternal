@@ -3,13 +3,13 @@ import SwiftUI
 import MailternalInterfaces
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case account, appearance, actions
+    case accounts, appearance, actions
 
     var id: Self { self }
 
     var title: String {
         switch self {
-        case .account: "Account"
+        case .accounts: "Accounts"
         case .appearance: "Appearance"
         case .actions: "Actions"
         }
@@ -17,7 +17,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
-        case .account: "at"
+        case .accounts: "at"
         case .appearance: "paintbrush"
         case .actions: "hand.draw"
         }
@@ -64,8 +64,8 @@ struct SettingsDetailView: View {
         ZStack(alignment: .top) {
             Group {
                 switch section {
-                case .account:
-                    AccountSetupForm(model: model)
+                case .accounts:
+                    AccountsSettingsView(model: model)
                 case .appearance:
                     AppearanceSettingsForm(appearance: appearance)
                 case .actions:
@@ -89,7 +89,7 @@ struct SettingsDetailView: View {
                 .padding(.top, PaneHeaderInsetPolicy.settingsHeaderTopPadding)
                 .padding(.bottom, PaneHeaderInsetPolicy.settingsTitleBottomPadding)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityIdentifier(UIIdentifier.settingsSectionTitle)
+                .accessibilityIdentifier(section == .accounts ? UIIdentifier.accountsSectionTitle : UIIdentifier.settingsSectionTitle)
                 .onGeometryChange(for: CGFloat.self) { proxy in
                     // Geometry includes the optical bottom padding; remove it
                     // so the ramp starts at the H1's actual lower edge.
@@ -162,205 +162,6 @@ struct ActionSettingsForm: View {
     }
 }
 
-struct AccountSetupForm: View {
-    @Bindable var model: AppModel
-    @State private var presetName: String = "Custom"
-    @State private var displayName = ""
-    @State private var email = ""
-    @State private var username = ""
-    @State private var password = ""
-    @State private var host = ""
-    @State private var port = "993"
-    @State private var security: IMAPEndpoint.Security = .implicitTLS
-    @State private var fieldError: String?
-
-    private var editingConfig: AccountConfig? {
-        model.accountConfig
-    }
-
-    private var isEditing: Bool {
-        editingConfig != nil
-    }
-
-    var body: some View {
-        Form {
-            Section("Provider") {
-                Picker("Preset", selection: $presetName) {
-                    Text("Custom IMAP").tag("Custom")
-                    ForEach(ProviderPresets.all) { preset in
-                        Text(preset.name).tag(preset.name)
-                    }
-                }
-                .onChange(of: presetName) { _, name in
-                    applyPreset(named: name)
-                }
-                if let preset = ProviderPresets.all.first(where: { $0.name == presetName }) {
-                    Text(preset.guidance)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            Section("Account") {
-                TextField("Display Name", text: $displayName)
-                    .accessibilityIdentifier(UIIdentifier.setupDisplayName)
-                TextField("Email Address", text: $email)
-                    .textContentType(.username)
-                    .accessibilityIdentifier(UIIdentifier.setupEmail)
-                TextField("Username", text: $username)
-                    .textContentType(.username)
-                    .accessibilityIdentifier(UIIdentifier.setupUsername)
-                SecureField(
-                    "Password",
-                    text: $password,
-                    prompt: isEditing ? Text("unchanged") : nil
-                )
-                .textContentType(.password)
-                .accessibilityIdentifier(UIIdentifier.setupPassword)
-            }
-
-            Section("IMAP") {
-                TextField("Host", text: $host)
-                    .accessibilityIdentifier(UIIdentifier.setupHost)
-                TextField("Port", text: $port)
-                    .accessibilityIdentifier(UIIdentifier.setupPort)
-                Picker("Security", selection: Binding(
-                    get: { security.rawValue },
-                    set: { security = IMAPEndpoint.Security(rawValue: $0) ?? .implicitTLS }
-                )) {
-                    Text("SSL/TLS").tag(IMAPEndpoint.Security.implicitTLS.rawValue)
-                    Text("STARTTLS").tag(IMAPEndpoint.Security.startTLS.rawValue)
-                }
-                Text("Transport is implicit TLS or mandatory STARTTLS. There is no insecure fallback.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section {
-                statusRow
-                HStack {
-                    Button(isEditing ? "Save Changes" : "Sign In") {
-                        Task { await submit() }
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!canSubmit)
-                    .accessibilityIdentifier(isEditing ? UIIdentifier.accountSave : "")
-                    if case .active = model.accountState {
-                        Button("Remove Account", role: .destructive) {
-                            Task { try? await model.facade.removeAccount() }
-                        }
-                    }
-                }
-            }
-        }
-        .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
-        .disabled({
-            if case .validating = model.accountState { return true }
-            return false
-        }())
-        .onAppear(perform: loadFields)
-        .onChange(of: model.accountConfig) { _, _ in
-            loadFields()
-        }
-
-    }
-
-    @ViewBuilder
-    private var statusRow: some View {
-        switch model.accountState {
-        case .none:
-            if let fieldError {
-                Label(fieldError, systemImage: "exclamationmark.circle")
-                    .foregroundStyle(.red)
-            }
-        case .validating:
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Checking the server…")
-                    .foregroundStyle(.secondary)
-            }
-        case .active:
-            Label("Account is active.", systemImage: "checkmark.circle.fill")
-                .foregroundStyle(.green)
-        case .authFailed(let message):
-            Label(message, systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-        case .connectionFailed(let message):
-            Label(message, systemImage: "wifi.slash")
-                .foregroundStyle(.red)
-        }
-    }
-
-    private var canSubmit: Bool {
-        if case .validating = model.accountState { return false }
-        let hasPassword = isEditing || !password.isEmpty
-        return !host.isEmpty && !username.isEmpty && hasPassword && Int(port) != nil
-    }
-
-    private func applyPreset(named name: String) {
-        guard let preset = ProviderPresets.all.first(where: { $0.name == name }) else { return }
-        host = preset.host
-        port = String(preset.port)
-        security = preset.security
-        if username.isEmpty { username = email }
-    }
-
-    private func loadFields() {
-        guard let config = editingConfig else {
-            if displayName.isEmpty { displayName = NSFullUserName() }
-            return
-        }
-        presetName = "Custom"
-        displayName = config.displayName
-        email = config.emailAddress
-        username = config.username
-        host = config.imap.host
-        port = String(config.imap.port)
-        security = config.imap.security
-        password = ""
-        fieldError = nil
-    }
-
-    private func submit() async {
-        fieldError = nil
-        guard let portNumber = Int(port), (1...65_535).contains(portNumber) else {
-            fieldError = "Enter a port between 1 and 65535."
-            return
-        }
-        guard !host.isEmpty else {
-            fieldError = "Enter an IMAP host."
-            return
-        }
-        guard !username.isEmpty else {
-            fieldError = "Enter a username."
-            return
-        }
-        let existing = editingConfig
-        let config = AccountConfig(
-            id: existing?.id ?? AccountID(rawValue: "account-1"),
-            accountLinkID: existing?.accountLinkID ?? .random(),
-            displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
-            emailAddress: email,
-            username: username,
-            imap: IMAPEndpoint(host: host, port: portNumber, security: security)
-        )
-        do {
-            if existing != nil {
-                try await model.updateAccount(
-                    config,
-                    password: password.isEmpty ? nil : password
-                )
-            } else {
-                try await model.facade.addAccount(config, password: password)
-            }
-            password = ""
-        } catch {
-            fieldError = error.localizedDescription
-        }
-    }
-}
 
 struct AppearanceSettingsForm: View {
     @Bindable var appearance: AppearanceSettings
@@ -496,7 +297,7 @@ final class SettingsSplitController: NSSplitViewController {
         )
         detailHosting = NSHostingController(
             rootView: SettingsDetailView(
-                section: selection.wrappedValue ?? .account,
+                section: selection.wrappedValue ?? .accounts,
                 model: model,
                 appearance: appearance,
                 actions: actions
@@ -529,7 +330,7 @@ final class SettingsSplitController: NSSplitViewController {
     ) {
         sidebarHosting.rootView = SettingsSourceList(selection: selection, appearance: appearance, actions: actions)
         detailHosting.rootView = SettingsDetailView(
-            section: selection.wrappedValue ?? .account,
+            section: selection.wrappedValue ?? .accounts,
             model: model,
             appearance: appearance,
             actions: actions
@@ -569,7 +370,7 @@ final class SettingsSplitController: NSSplitViewController {
 final class SettingsWindowController: NSWindowController {
     static let shared = SettingsWindowController()
 
-    private var selection: SettingsSection? = .account {
+    private var selection: SettingsSection? = .accounts {
         didSet {
             guard oldValue != selection else { return }
             refresh()
@@ -591,7 +392,7 @@ final class SettingsWindowController: NSWindowController {
         self.appearance = appearance
         self.actions = actions
         if case .none = model.accountState {
-            selection = .account
+            selection = .accounts
         }
         if let split {
             split.update(
