@@ -233,6 +233,9 @@ final class AppModel {
                 guard let self else { return }
                 for await folders in facade.foldersStream {
                     self.folders = folders
+                    #if DEBUG
+                    if !self.foldersSnapshotReady { QALaunch.launchPhase("folders-snapshot") }
+                    #endif
                     self.foldersSnapshotReady = true
                     if selectedFolderID == nil, let inbox = folders.first(where: { $0.role == .inbox }) {
                         selectFolder(inbox.id)
@@ -777,6 +780,9 @@ final class AppModel {
         dumpQAContextMenuIfRequested(firstRow: page.rows.first)
 #endif
         if listRows.isEmpty {
+            #if DEBUG
+            if !page.rows.isEmpty { QALaunch.launchPhase("first-rows n=\(page.rows.count)") }
+            #endif
             listRows = page.rows
             listCursor = page.next
             return

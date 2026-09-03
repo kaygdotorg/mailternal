@@ -701,6 +701,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        #if DEBUG
+        QALaunch.launchPhase("window-front")
+        #endif
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
