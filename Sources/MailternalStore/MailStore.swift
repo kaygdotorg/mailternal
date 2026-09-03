@@ -212,15 +212,16 @@ extension MailStore {
                 sql: """
                     INSERT INTO accounts (
                         id, account_link_id, display_name, email_address, username,
-                        imap_host, imap_port, imap_security
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        imap_host, imap_port, imap_security, is_enabled
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         display_name = excluded.display_name,
                         email_address = excluded.email_address,
                         username = excluded.username,
                         imap_host = excluded.imap_host,
                         imap_port = excluded.imap_port,
-                        imap_security = excluded.imap_security
+                        imap_security = excluded.imap_security,
+                        is_enabled = excluded.is_enabled
                     """,
                 arguments: [
                     config.id.rawValue,
@@ -231,6 +232,7 @@ extension MailStore {
                     config.imap.host,
                     config.imap.port,
                     config.imap.security.rawValue,
+                    config.isEnabled,
                 ]
             )
         }
@@ -242,9 +244,11 @@ extension MailStore {
         }
     }
 
+    /// Returns accounts in their persisted creation order. SQLite's rowid is
+    /// monotonic for this table and remains stable across upserts.
     public func fetchAccounts() async throws -> [AccountConfig] {
         try await read { db in
-            let rows = try Row.fetchAll(db, sql: "SELECT * FROM accounts ORDER BY id")
+            let rows = try Row.fetchAll(db, sql: "SELECT * FROM accounts ORDER BY rowid")
             return try rows.map { try MailStore.account(from: $0) }
         }
     }
@@ -278,7 +282,8 @@ extension MailStore {
                 host: row["imap_host"],
                 port: row["imap_port"],
                 security: security
-            )
+            ),
+            isEnabled: row["is_enabled"]
         )
     }
 }
@@ -345,6 +350,36 @@ extension MailStore {
             try MailStore.fetchFolders(db, account: account)
         }
     }
+    /// Changes local retention without deleting already indexed messages.
+    /// The sync engine observes this change separately so an ON transition can
+    /// queue work immediately and an OFF transition can cancel its worker.
+    public func setKeepLocally(_ keep: Bool, for folder: FolderID) async throws {
+        try await write { db in
+            guard try Int64.fetchOne(
+                db,
+                sql: "SELECT id FROM folders WHERE id = ? AND retired = 0",
+                arguments: [folder.rawValue]
+            ) != nil else {
+                throw MailStoreError.folderNotFound
+            }
+            try db.execute(
+                sql: "UPDATE folders SET keep_locally = ? WHERE id = ?",
+                arguments: [keep, folder.rawValue]
+            )
+        }
+    }
+
+    /// Persists the latest server-reported EXISTS count independently of
+    /// retained message rows. Disabled folders use this count in summaries.
+    public func updateServerMessageCount(_ count: Int, for folder: FolderID) async throws {
+        try await write { db in
+            try db.execute(
+                sql: "UPDATE folders SET server_message_count = ? WHERE id = ? AND retired = 0",
+                arguments: [max(0, count), folder.rawValue]
+            )
+        }
+    }
+
 
     public func observeCounts(in folder: FolderID) -> AsyncStream<FolderCounts> {
         observe { db in
@@ -389,14 +424,30 @@ extension MailStore {
             )
             return FolderID(rawValue: existing)
         }
+        let keepLocally = defaultKeepLocally(for: role)
         try db.execute(
             sql: """
-                INSERT INTO folders (account_id, path, name, separator, role, object_id, retired)
-                VALUES (?, ?, ?, ?, ?, ?, 0)
+                INSERT INTO folders (
+                    account_id, path, name, separator, role, object_id,
+                    keep_locally, server_message_count, retired
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)
                 """,
-            arguments: [account.rawValue, path, name, separatorValue, role.rawValue, objectID]
+            arguments: [
+                account.rawValue, path, name, separatorValue, role.rawValue,
+                objectID, keepLocally,
+            ]
         )
         return FolderID(rawValue: db.lastInsertedRowID)
+    }
+
+    private static func defaultKeepLocally(for role: FolderRole) -> Bool {
+        switch role {
+        case .inbox, .sent, .drafts, .archive, .trash, .junk:
+            return true
+        case .none:
+            return false
+        }
     }
 
     static func reconcileFolders(
@@ -460,8 +511,10 @@ extension MailStore {
 
     static func fetchFolders(_ db: Database, account: AccountID) throws -> [FolderSummary] {
         let sql = """
-            SELECT f.id, f.name, f.path, f.separator, f.role,
-                   (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id) AS total,
+            SELECT f.id, f.account_id, f.name, f.path, f.separator, f.role, f.keep_locally,
+                   CASE WHEN f.keep_locally = 0 THEN f.server_message_count
+                        ELSE (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id)
+                   END AS total,
                    (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id AND m.is_read = 0) AS unread,
                    s.backfill_phase, s.progress, s.halted_through
             FROM folders f
@@ -475,8 +528,10 @@ extension MailStore {
 
     static func fetchFolderSummary(_ db: Database, folder: FolderID) throws -> FolderSummary? {
         let sql = """
-            SELECT f.id, f.name, f.path, f.separator, f.role,
-                   (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id) AS total,
+            SELECT f.id, f.account_id, f.name, f.path, f.separator, f.role, f.keep_locally,
+                   CASE WHEN f.keep_locally = 0 THEN f.server_message_count
+                        ELSE (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id)
+                   END AS total,
                    (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id AND m.is_read = 0) AS unread,
                    s.backfill_phase, s.progress, s.halted_through
             FROM folders f
@@ -492,7 +547,9 @@ extension MailStore {
     static func fetchCounts(_ db: Database, folder: FolderID) throws -> FolderCounts {
         let sql = """
             SELECT
-              (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id) AS total,
+              CASE WHEN keep_locally = 0 THEN server_message_count
+                   ELSE (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id)
+              END AS total,
               (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id AND m.is_read = 0) AS unread
             FROM folders f
             WHERE f.id = ?
@@ -523,11 +580,13 @@ extension MailStore {
             role: role,
             unreadCount: row["unread"],
             totalCount: row["total"],
+            keepLocally: row["keep_locally"],
             backfill: BackfillState.from(
                 phase: phase,
                 progress: progress,
                 haltedThrough: halted
-            )
+            ),
+            accountID: AccountID(rawValue: row["account_id"])
         )
     }
 

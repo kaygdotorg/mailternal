@@ -80,6 +80,54 @@ import Testing
     }
 }
 
+@Test func searchOmitsDisabledAccounts() async throws {
+    try await withStore { store, _ in
+        let enabled = sampleAccount("enabled")
+        var disabled = sampleAccount("disabled")
+        disabled.accountLinkID = AccountLinkID(
+            uuidString: "00000000-0000-4000-8000-000000000011"
+        )!
+        disabled.isEnabled = false
+        try await store.upsertAccount(enabled)
+        try await store.upsertAccount(disabled)
+
+        let enabledFolder = try await store.upsertFolder(
+            account: enabled.id,
+            path: "INBOX",
+            name: "INBOX",
+            separator: nil,
+            role: .inbox,
+            objectID: nil
+        )
+        let enabledGeneration = try await store.openLiveGeneration(
+            folder: enabledFolder,
+            uidValidity: 1,
+            baselineUID: IMAPUID(rawValue: 1)
+        )
+        let disabledFolder = try await store.upsertFolder(
+            account: disabled.id,
+            path: "INBOX",
+            name: "INBOX",
+            separator: nil,
+            role: .inbox,
+            objectID: nil
+        )
+        let disabledGeneration = try await store.openLiveGeneration(
+            folder: disabledFolder,
+            uidValidity: 1,
+            baselineUID: IMAPUID(rawValue: 1)
+        )
+        _ = try await store.upsertMessages([
+            makeMessage(generation: enabledGeneration, uid: 1, subject: "enabled token"),
+            makeMessage(generation: disabledGeneration, uid: 2, subject: "disabled token"),
+        ])
+
+        let hits = try await store.search("token", limit: 10)
+        #expect(hits.count == 1)
+        #expect(hits.first?.subject == "enabled token")
+    }
+}
+
 @Test func searchEmptyQueryReturnsNothing() async throws {
     try await withStore { store, _ in
         let (_, _, generation) = try await seedInbox(store)

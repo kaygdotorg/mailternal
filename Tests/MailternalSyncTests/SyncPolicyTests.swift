@@ -129,24 +129,55 @@ import Testing
 @Test func inboxRanksAheadOfSpecialUseAndRemainder() {
     let inbox = FolderRecord(
         id: FolderID(rawValue: 1), path: "INBOX", name: "INBOX", role: .inbox,
+        keepLocally: true,
         generation: MailboxGeneration(folder: FolderID(rawValue: 1), uidValidity: 1),
         baseline: nil, deltaPath: .basic, highestModseq: nil, lastUidNext: 1,
         lastDeltaAt: .distantPast, isReplacement: false
     )
     let archive = FolderRecord(
         id: FolderID(rawValue: 2), path: "Archive", name: "Archive", role: .archive,
+        keepLocally: true,
         generation: MailboxGeneration(folder: FolderID(rawValue: 2), uidValidity: 1),
         baseline: nil, deltaPath: .basic, highestModseq: nil, lastUidNext: 1,
         lastDeltaAt: .distantPast, isReplacement: false
     )
     let other = FolderRecord(
         id: FolderID(rawValue: 3), path: "Projects", name: "Projects", role: .none,
+        keepLocally: true,
         generation: MailboxGeneration(folder: FolderID(rawValue: 3), uidValidity: 1),
         baseline: nil, deltaPath: .basic, highestModseq: nil, lastUidNext: 1,
         lastDeltaAt: .distantPast, isReplacement: false
     )
     let ordered = SyncPolicy.sortFolders([other, archive, inbox])
     #expect(ordered.map(\.role) == [.inbox, .archive, .none])
+}
+@Test func archiveRolePrefersGmailAllMailDestination() {
+    func record(_ id: Int64, path: String) -> FolderRecord {
+        FolderRecord(
+            id: FolderID(rawValue: id),
+            path: path,
+            name: path,
+            role: .archive,
+            keepLocally: true,
+            generation: MailboxGeneration(
+                folder: FolderID(rawValue: id),
+                uidValidity: 1
+            ),
+            baseline: nil,
+            deltaPath: .basic,
+            highestModseq: nil,
+            lastUidNext: 1,
+            lastDeltaAt: .distantPast,
+            isReplacement: false
+        )
+    }
+
+    let generic = record(1, path: "Archive")
+    let allMail = record(2, path: "[Gmail]/All Mail")
+    #expect(
+        SyncPolicy.destinationFolder(for: .archive, in: [generic, allMail])?.path
+            == "[Gmail]/All Mail"
+    )
 }
 
 @Test func flagSweepWindowsAreBoundedAscendingChunks() {

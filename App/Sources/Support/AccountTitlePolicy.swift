@@ -8,6 +8,15 @@ enum AccountTitlePolicy {
         let displayName = config.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         return displayName.isEmpty ? config.emailAddress : displayName
     }
+
+    /// Resolves the value committed by the inline account-name field.
+    ///
+    /// A blank name is not a blank title in the UI: it falls back to the
+    /// account's address, just as `title(for:)` does.
+    static func committedName(input: String, email: String) -> String {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? email : trimmed
+    }
 }
 
 /// Pure presentation rules for the account list.
@@ -32,8 +41,6 @@ enum AccountsListPolicy {
         case validating
         case error(message: String)
     }
-
-    static let multipleAccountsCaption = "Multiple accounts arrive in a later release"
 
     static func sorted(_ configs: [AccountConfig]) -> [AccountConfig] {
         configs.sorted {
@@ -67,8 +74,15 @@ enum AccountsListPolicy {
             .error(message: message)
         }
     }
+    static func committedName(input: String, email: String) -> String {
+        AccountTitlePolicy.committedName(input: input, email: email)
+    }
 
-    static func canAdd(accountCount: Int) -> Bool {
-        accountCount == 0
+    static func nextExpandedID(current: AccountID?, requested: AccountID) -> AccountID? {
+        current == requested ? nil : requested
+    }
+
+    static func removesBlankRow(rowID: AccountID, blankID: AccountID) -> Bool {
+        rowID == blankID
     }
 }

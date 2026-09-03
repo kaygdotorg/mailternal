@@ -114,7 +114,8 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         #if DEBUG
-        if let qa = QALaunch.parse(), qa.openWindowLink == nil {
+        if let qa = QALaunch.parse(), qa.openWindowLink == nil,
+           !ProcessInfo.processInfo.arguments.contains("-qa-gui") {
             // SSH/headless: no WindowServer. Don't activate a UI session.
             NSApp.setActivationPolicy(.prohibited)
         } else {

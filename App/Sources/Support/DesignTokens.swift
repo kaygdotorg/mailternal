@@ -47,6 +47,12 @@ enum MailMotion {
     /// time to settle without the end-of-collapse jump of a short snappy.
     static let sidebarToggle = Animation.spring(duration: 0.28, bounce: 0.0)
     static let disclosure = Animation.easeOut(duration: 0.12)
+    /// Row expansion in settings lists: the card grows to fit revealed content
+    /// with no overshoot, so the reveal reads as growth rather than a jump.
+    static let expand = Animation.spring(duration: 0.32, bounce: 0)
+    /// Settings editors grow without overshoot and collapse quickly enough to
+    /// keep the surrounding List's row rhythm feeling immediate.
+    static let accountEditorCollapse = Animation.easeOut(duration: 0.14)
     /// The source island should acknowledge the toggle immediately while its
     /// height still eases cleanly into the detailed header layout.
     static let sourceMorph = Animation.easeOut(duration: 0.17)
@@ -59,6 +65,15 @@ enum MailMotion {
     static func searchPanel(reduceMotion: Bool) -> Animation {
         reduceMotion ? searchPanelReduced : searchPanel
     }
+
+    /// On the way out the card snaps away first and the backdrop clears
+    /// after it: card exit is quick, the backdrop starts fading once the
+    /// card is gone and takes its normal fade.
+    static let searchCardExitDuration: TimeInterval = 0.12
+    static let searchCardExit = Animation.easeIn(duration: searchCardExitDuration)
+    static let searchBackdropExit = Animation.easeOut(duration: 0.22).delay(searchCardExitDuration)
+    /// Wall time until both have finished; the overlay is removed then.
+    static let searchDismissDuration: TimeInterval = searchCardExitDuration + 0.22
 }
 
 enum OutgoingForegroundPolicy {

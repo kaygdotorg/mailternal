@@ -1,14 +1,15 @@
-import AppKit
 import SwiftUI
 import MailternalInterfaces
 
 struct AccountEditorSheet: View {
-    @Environment(\.dismiss) private var dismiss
     @Bindable var model: AppModel
     let configuration: AccountConfig?
+    @Binding var displayName: String
+    let onCancel: () -> Void
+    let onSaved: () -> Void
+    let onRemove: (() -> Void)?
 
     @State private var presetName = "Generic IMAP"
-    @State private var displayName = ""
     @State private var email = ""
     @State private var username = ""
     @State private var password = ""
@@ -37,7 +38,7 @@ struct AccountEditorSheet: View {
                     }
 
                     if let preset = presets.first(where: { $0.name == presetName }), !preset.guidance.isEmpty {
-                        Text(preset.guidance)
+                        guidanceView(for: preset)
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -45,8 +46,6 @@ struct AccountEditorSheet: View {
                 }
 
                 Section("Account") {
-                    TextField("Display Name", text: $displayName)
-                        .accessibilityIdentifier(UIIdentifier.accountEditorDisplayName)
                     TextField("Email Address", text: $email)
                         .textContentType(.username)
                         .accessibilityIdentifier(UIIdentifier.accountEditorEmail)
@@ -92,10 +91,18 @@ struct AccountEditorSheet: View {
             .disabled(isSaving || isValidating)
 
             HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Cancel") { onCancel() }
                     .keyboardShortcut(.cancelAction)
                     .accessibilityIdentifier(UIIdentifier.accountEditorCancel)
+
+                if let onRemove {
+                    Button("Remove", role: .destructive) { onRemove() }
+                        .accessibilityIdentifier(UIIdentifier.accountEditorRemove)
+                        .disabled(isSaving || isValidating)
+                }
+
+                Spacer()
+
                 Button(isEditing ? "Save Changes" : "Add Account") {
                     Task { await submit() }
                 }
@@ -103,10 +110,10 @@ struct AccountEditorSheet: View {
                 .disabled(!canSubmit)
                 .accessibilityIdentifier(UIIdentifier.accountEditorSave)
             }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 16)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 12)
         }
-        .frame(minWidth: 520, minHeight: 520)
+        .onExitCommand(perform: onCancel)
         .accessibilityIdentifier(UIIdentifier.accountEditorSheet)
         .onAppear(perform: loadFields)
     }
@@ -125,6 +132,20 @@ struct AccountEditorSheet: View {
             && Int(port) != nil
     }
 
+    @ViewBuilder
+    private func guidanceView(for preset: IMAPProviderPreset) -> some View {
+        let appPasswordHost = "myaccount.google.com/apppasswords"
+        if preset.guidance.contains(appPasswordHost) {
+            let guidance = preset.guidance.replacingOccurrences(
+                of: appPasswordHost,
+                with: "[\(appPasswordHost)](https://\(appPasswordHost))"
+            )
+            Text(.init(guidance))
+        } else {
+            Text(preset.guidance)
+        }
+    }
+
     private func applyPreset(named name: String) {
         guard let preset = presets.first(where: { $0.name == name }) else { return }
         host = preset.host
@@ -135,13 +156,12 @@ struct AccountEditorSheet: View {
 
     private func loadFields() {
         guard let config = configuration else {
-            if displayName.isEmpty { displayName = NSFullUserName() }
+            applyPreset(named: presetName)
             return
         }
         presetName = presets.first(where: {
             $0.host == config.imap.host && $0.port == config.imap.port && $0.security == config.imap.security
         })?.name ?? "Generic IMAP"
-        displayName = config.displayName
         email = config.emailAddress
         username = config.username
         host = config.imap.host
@@ -171,12 +191,14 @@ struct AccountEditorSheet: View {
             return
         }
 
+        let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        displayName = AccountTitlePolicy.committedName(input: displayName, email: normalizedEmail)
         let config = AccountConfig(
-            id: configuration?.id ?? AccountID(rawValue: "account-1"),
+            id: configuration?.id ?? AccountID(rawValue: UUID().uuidString),
             accountLinkID: configuration?.accountLinkID ?? .random(),
-            displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
-            emailAddress: email,
-            username: username,
+            displayName: displayName,
+            emailAddress: normalizedEmail,
+            username: username.trimmingCharacters(in: .whitespacesAndNewlines),
             imap: IMAPEndpoint(
                 host: host.trimmingCharacters(in: .whitespacesAndNewlines),
                 port: portNumber,
@@ -193,7 +215,7 @@ struct AccountEditorSheet: View {
                 try await model.facade.addAccount(config, password: password)
             }
             password = ""
-            dismiss()
+            onSaved()
         } catch {
             fieldError = error.localizedDescription
         }

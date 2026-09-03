@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import GRDB
 @testable import MailternalStore
 
 @Test func migratesFromEmptyDatabase() async throws {
@@ -14,6 +15,7 @@ import Testing
             "sync_state",
             "seen_queue",
             "archive_queue",
+            "folder_rename_queue",
             "error_log",
             "attachment_cache",
             "grdb_migrations",
@@ -81,6 +83,43 @@ import Testing
     }
 }
 
+@Test func folderKeepLocallyDefaultsByRoleAndRoundTrips() async throws {
+    try await withStore { store, _ in
+        let account = sampleAccount()
+        try await store.upsertAccount(account)
+        let inbox = try await store.upsertFolder(
+            account: account.id,
+            path: "INBOX",
+            name: "INBOX",
+            separator: "/",
+            role: .inbox,
+            objectID: nil
+        )
+        let custom = try await store.upsertFolder(
+            account: account.id,
+            path: "Projects",
+            name: "Projects",
+            separator: "/",
+            role: .none,
+            objectID: nil
+        )
+
+        #expect(try await store.fetchFolderSummary(inbox)?.keepLocally == true)
+        #expect(try await store.fetchFolderSummary(custom)?.keepLocally == false)
+
+        try await store.setKeepLocally(true, for: custom)
+        try await store.updateServerMessageCount(7, for: custom)
+        let enabled = try #require(await store.fetchFolderSummary(custom))
+        #expect(enabled.keepLocally)
+        #expect(enabled.totalCount == 0)
+
+        try await store.setKeepLocally(false, for: custom)
+        let disabled = try #require(await store.fetchFolderSummary(custom))
+        #expect(!disabled.keepLocally)
+        #expect(disabled.totalCount == 7)
+    }
+}
+
 @Test func storesNonSecretAccountConfigOnly() async throws {
     try await withStore { store, _ in
         let config = sampleAccount()
@@ -88,5 +127,52 @@ import Testing
         let fetched = try await store.fetchAccount(config.id)
         #expect(fetched == config)
         #expect(fetched?.username == "test@example.com")
+    }
+}
+
+@Test func accountEnabledFlagRoundTripsAndMigrationDefaultsToEnabled() async throws {
+    try await withStore { store, _ in
+        let columns = try await store.read { db in
+            try Row.fetchAll(db, sql: "PRAGMA table_info(accounts)")
+                .compactMap { row -> (String, Int64, String?)? in
+                    guard let name: String = row["name"], name == "is_enabled" else { return nil }
+                    let notNull: Int64 = row["notnull"]
+                    let defaultValue: String? = row["dflt_value"]
+                    return (name, notNull, defaultValue)
+                }
+        }
+        let enabledColumn = try #require(columns.first)
+        #expect(enabledColumn.0 == "is_enabled")
+        #expect(enabledColumn.1 == 1)
+        #expect(enabledColumn.2 == "1")
+
+        var disabled = sampleAccount("disabled")
+        disabled.isEnabled = false
+        try await store.upsertAccount(disabled)
+        let roundTripped = try #require(await store.fetchAccount(disabled.id))
+        #expect(!roundTripped.isEnabled)
+
+        try await store.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO accounts (
+                        id, account_link_id, display_name, email_address, username,
+                        imap_host, imap_port, imap_security
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                arguments: [
+                    "legacy",
+                    "00000000-0000-4000-8000-000000000011",
+                    "Legacy",
+                    "legacy@example.com",
+                    "legacy@example.com",
+                    "imap.example.com",
+                    993,
+                    "implicitTLS",
+                ]
+            )
+        }
+        let migrated = try #require(await store.fetchAccount(AccountID(rawValue: "legacy")))
+        #expect(migrated.isEnabled)
     }
 }

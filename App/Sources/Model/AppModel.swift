@@ -25,8 +25,9 @@ final class AppModel {
     let toasts = ToastPresenter()
 
     var accountState: AccountState = .none
-    var folders: [FolderSummary] = []
+    var accountStates: [AccountID: AccountState] = [:]
     var selectedFolderID: FolderID?
+    var folders: [FolderSummary] = []
     /// The list's full selection. `selectedMessageID` remains the reader
     /// anchor so a single-message reader survives ordinary list updates.
     var selectedMessageIDs: Set<MessageID> = []
@@ -91,37 +92,32 @@ final class AppModel {
 
     /// Display name shown by the message-list title when it is flipped to the
     /// owning account.
+    /// Display name shown by the message-list title when it is flipped to the
+    /// owning account. Folder identity, not a global active-account pointer,
+    /// determines which title is shown.
     var listTitleAccountName: String {
-        if let accountTitle = AccountTitlePolicy.title(for: accountConfig) {
+        let config = selectedFolder.flatMap { folder in
+            accountConfigs.first(where: { $0.id == folder.accountID })
+        } ?? accountConfig
+        if let accountTitle = AccountTitlePolicy.title(for: config) {
             return accountTitle
-        }
-        if let name = facade.accountDisplayName?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !name.isEmpty {
-            return name
         }
         return "Account"
     }
 
-    /// The persisted non-secret values used to populate the account editor.
+    /// The persisted non-secret values used to populate account editors.
     var accountConfig: AccountConfig? {
-        facade.accountConfig
+        accountConfigs.first
     }
 
-    /// Multi-account-shaped view model surface; the facade currently exposes
-    /// only its single active account.
-    var accountConfigs: [AccountConfig] {
-        accountConfig.map { [$0] } ?? []
-    }
+    var accountConfigs: [AccountConfig] = []
 
     var hasAccount: Bool {
-        if case .none = accountState { return false }
-        return true
+        !accountConfigs.isEmpty
     }
 
     var isAccountActive: Bool {
-        if case .active = accountState { return true }
-        return false
+        accountStates.values.contains(.active) || accountState == .active
     }
 
     init(facade: any MailFacade, appearance: AppearanceSettings, actions: ActionSettings) {
@@ -129,9 +125,9 @@ final class AppModel {
         self.appearance = appearance
         self.actions = actions
         accountState = facade.accountState
+        accountStates = facade.accountStates
+        accountConfigs = facade.accounts
     }
-
-    /// Receives platform open-URL events. Parsing happens at this one seam so
     /// malformed URLs can never reach account or folder selection.
     func openURL(_ url: URL) {
         guard let link = MailternalDeepLink(url: url) else {
@@ -189,6 +185,54 @@ final class AppModel {
         }
     }
 
+    /// Renames an account from any surface (settings row, sidebar title). The
+    /// stored value comes back through `accountsStream`, so callers never
+    /// patch `accountConfigs` themselves. Returns false when nothing changed.
+    @discardableResult
+    func renameAccount(_ id: AccountID, to input: String) async -> Bool {
+        guard let account = accountConfigs.first(where: { $0.id == id }) else { return false }
+        let committed = AccountTitlePolicy.committedName(input: input, email: account.emailAddress)
+        guard account.displayName != committed else { return false }
+        var updated = account
+        updated.displayName = committed
+        do {
+            try await facade.updateAccount(updated, password: nil)
+            return true
+        } catch {
+            toasts.post(
+                title: "Couldn’t rename account",
+                detail: error.localizedDescription,
+                severity: .error
+            )
+            return false
+        }
+    }
+
+    /// Trims and validates a folder rename before handing it to the facade.
+    /// Facades own persistence and server mutation; this model only surfaces
+    /// failures to the transient toast presenter.
+    @discardableResult
+    func renameFolder(_ id: FolderID, to input: String) async -> Bool {
+        let name = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              let folder = folders.first(where: { $0.id == id }),
+              folder.name != name
+        else {
+            return false
+        }
+        do {
+            try await facade.renameFolder(id, to: name)
+            return true
+        } catch {
+            toasts.post(
+                title: "Couldn’t rename folder",
+                detail: error.localizedDescription,
+                severity: .error
+            )
+            return false
+        }
+    }
+
     private func prepareFolderForRoute(_ folderID: FolderID) {
         if selectedFolderID == folderID {
             pageTask?.cancel()
@@ -242,13 +286,21 @@ final class AppModel {
         Task { [weak self] in
             guard let self else { return }
             if let live = facade as? LiveMailFacade {
-                await live.restorePersistedAccount()
+                await live.restorePersistedAccounts()
             }
+            accountConfigs = facade.accounts
+            accountStates = facade.accountStates
             applyAccountState(facade.accountState)
             Task { [weak self] in
                 guard let self else { return }
-                for await state in facade.accountStateStream {
-                    applyAccountState(state)
+                for await accounts in facade.accountsStream {
+                    self.accountConfigs = accounts
+                }
+            }
+            Task { [weak self] in
+                guard let self else { return }
+                for await states in facade.accountStatesStream {
+                    self.applyAccountStates(states)
                 }
             }
             Task { [weak self] in
@@ -265,6 +317,8 @@ final class AppModel {
                         // keep
                     } else if let first = folders.first {
                         selectFolder(first.id)
+                    } else if selectedFolderID != nil {
+                        selectFolder(nil)
                     }
                 }
             }
@@ -274,13 +328,27 @@ final class AppModel {
                     syncStatus = status
                 }
             }
-            if case .none = accountState {
+            if accountConfigs.isEmpty {
                 #if DEBUG
                 if QALaunch.parse() != nil { return }
                 #endif
                 SettingsWindowController.shared.show(model: self, appearance: appearance, actions: actions)
             }
         }
+    }
+
+    func applyAccountStates(_ states: [AccountID: AccountState]) {
+        accountStates = states
+        let aggregate: AccountState
+        if accountConfigs.isEmpty {
+            aggregate = .none
+        } else {
+            let values = accountConfigs.map { states[$0.id] ?? .none }
+            aggregate = values.contains(.active) ? .active
+                : values.contains(.validating) ? .validating
+                : values.first ?? .none
+        }
+        applyAccountState(aggregate)
     }
 
     func applyAccountState(_ state: AccountState) {
@@ -617,7 +685,7 @@ final class AppModel {
 
     func openSearchResult(_ row: MessageRow) {
         isSearchPresented = false
-        if let folder = folderContaining(row.id) {
+        if let folder = row.folderID ?? folderContaining(row.id) {
             if selectedFolderID != folder {
                 selectFolder(folder)
             }
@@ -687,6 +755,20 @@ final class AppModel {
     /// Saves edited account settings through the facade boundary.
     func updateAccount(_ config: AccountConfig, password: String?) async throws {
         try await facade.updateAccount(config, password: password)
+    }
+    func setAccountEnabled(_ id: AccountID, _ enabled: Bool) async {
+        do {
+            try await facade.setAccountEnabled(id, enabled)
+        } catch {
+            toasts.post(
+                title: "Couldn’t update account",
+                detail: error.localizedDescription,
+                severity: .error
+            )
+        }
+        accountConfigs = facade.accounts
+        accountStates = facade.accountStates
+        applyAccountStates(accountStates)
     }
 
     func showSettings() {

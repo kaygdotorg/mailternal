@@ -18,9 +18,11 @@ final class ScriptedWorld: @unchecked Sendable {
     var copyError: Error?
     var storeDeletedError: Error?
     var expungeError: Error?
+    var renameError: Error?
     var storedSeen: [UInt32] = []
     var flagCommands: [String] = []
     var archiveCommands: [String] = []
+    var renameCommands: [String] = []
     var fetchNanos: UInt64 = 0
     /// Sleep `fetchNanos` only on fetches after this count. `nil` sleeps every fetch.
     var stallFetchesAfter: Int?
@@ -34,9 +36,14 @@ final class ScriptedWorld: @unchecked Sendable {
         (after: Int, continuation: CheckedContinuation<Void, Never>)
     ] = []
     var selectCount = 0
+    private var idleStarted = false
+    private var idleStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var activeFetches = 0
+    private var maxConcurrentFetches = 0
     /// UID ranges requested by envelope/bodystructure metadata fetches.
     /// Follow-up body peeks and bounded flag sweeps are intentionally omitted.
     var metadataFetchRanges: [[ClosedRange<UInt32>]] = []
+    var metadataFetchPaths: [String] = []
     var flagFetchRanges: [[ClosedRange<UInt32>]] = []
     /// Pauses the first metadata FETCH after capturing its mailbox snapshot.
     /// Tests use this to interleave a deterministic expunge revision.
@@ -129,12 +136,18 @@ final class ScriptedWorld: @unchecked Sendable {
         defer { lock.unlock() }
         return archiveCommands
     }
+    func renameCommandSnapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return renameCommands
+    }
 
     func mutationError(_ command: String) -> Error? {
         lock.lock()
         defer { lock.unlock() }
         switch command {
         case "MOVE": return moveError
+        case "RENAME": return renameError
         case "COPY": return copyError
         case "STORE": return storeDeletedError
         case "EXPUNGE": return expungeError
@@ -158,6 +171,23 @@ final class ScriptedWorld: @unchecked Sendable {
         target.uidNext = max(target.uidNext, target.messages.keys.max().map { $0 &+ 1 } ?? target.uidNext)
         mailboxes[path] = source
         mailboxes[destination] = target
+    }
+    func applyRename(from source: String, to destination: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var mailbox = mailboxes.removeValue(forKey: source) else { return }
+        mailbox.path = destination
+        mailboxes[destination] = mailbox
+        renameCommands.append("RENAME \(source) \(destination)")
+
+        folders = folders.map { folder in
+            guard folder.path == source else { return folder }
+            var renamed = folder
+            renamed.path = destination
+            let separator = folder.separator ?? "/"
+            renamed.name = destination.split(separator: separator).last.map(String.init) ?? destination
+            return renamed
+        }
     }
 
     func applyArchiveCopy(path: String, destination: String, uids: IMAPUIDSet) {
@@ -285,11 +315,12 @@ final class ScriptedWorld: @unchecked Sendable {
         return fetchNanos
     }
 
-    func noteFetch(_ request: IMAPFetchRequest) {
+    func noteFetch(_ request: IMAPFetchRequest, path: String) {
         lock.lock()
         defer { lock.unlock() }
         if request.envelope || request.bodyStructure {
             metadataFetchRanges.append(request.uids.ranges)
+            metadataFetchPaths.append(path)
         }
         if request.flags && !request.envelope && !request.bodyStructure && request.peek.isEmpty {
             flagFetchRanges.append(request.uids.ranges)
@@ -546,16 +577,26 @@ final class ScriptedWorld: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         fetchCount += 1
+        let error: Error?
         if let after = fetchErrorAfter {
-            guard fetchCount >= after, let error = fetchError else { return nil }
-            fetchErrorAfter = nil
-            fetchError = nil
-            return error
+            if fetchCount >= after, let configured = fetchError {
+                fetchErrorAfter = nil
+                fetchError = nil
+                error = configured
+            } else {
+                error = nil
+            }
+        } else {
+            error = fetchError
         }
-        return fetchError
+        guard error == nil else { return error }
+        activeFetches += 1
+        maxConcurrentFetches = max(maxConcurrentFetches, activeFetches)
+        return nil
     }
     func noteFetchCompleted() {
         lock.lock()
+        activeFetches = max(0, activeFetches - 1)
         completedFetchCount += 1
         let waiters = fetchCompletionWaiters.filter { $0.after < completedFetchCount }
         fetchCompletionWaiters.removeAll { $0.after < completedFetchCount }
@@ -569,6 +610,17 @@ final class ScriptedWorld: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return completedFetchCount
+    }
+    func snapshotMaxConcurrentFetches() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return maxConcurrentFetches
+    }
+
+    func snapshotMetadataFetchPaths() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return metadataFetchPaths
     }
 
     func waitForFetchCompletion(after count: Int) async {
@@ -584,6 +636,30 @@ final class ScriptedWorld: @unchecked Sendable {
         }
     }
 
+
+    func noteIdleStarted() {
+        lock.lock()
+        idleStarted = true
+        let waiters = idleStartWaiters
+        idleStartWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    func waitForIdleStart() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if idleStarted {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                idleStartWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
 
     func noteSelect() {
         lock.lock()
@@ -698,7 +774,7 @@ actor ScriptedIMAPClient: IMAPClient {
 
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
         if let error = world.beginFetch() { throw error }
-        world.noteFetch(request)
+        world.noteFetch(request, path: selectedPath ?? "")
         let pausedMetadataSnapshot: (snapshot: ScriptedMailbox, alreadyReleased: Bool)?
         if (request.envelope || request.bodyStructure), let selectedPath {
             pausedMetadataSnapshot = world.metadataFetchSnapshotIfPaused(path: selectedPath)
@@ -782,6 +858,13 @@ actor ScriptedIMAPClient: IMAPClient {
         guard let selectedPath else { return }
         world.applyArchiveMove(path: selectedPath, destination: mailbox, uids: uids)
     }
+    func renameMailbox(from source: String, to destination: String) async throws {
+        if let error = world.mutationError("RENAME") { throw error }
+        world.applyRename(from: source, to: destination)
+        if selectedPath == source {
+            selectedPath = destination
+        }
+    }
 
     func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
         if let error = world.mutationError("COPY") { throw error }
@@ -806,6 +889,7 @@ actor ScriptedIMAPClient: IMAPClient {
         var continuation: AsyncStream<IMAPMailboxEvent>.Continuation!
         let stream = AsyncStream<IMAPMailboxEvent> { continuation = $0 }
         idleContinuation = continuation
+        world.noteIdleStarted()
         return IMAPIdle(events: stream)
     }
 
@@ -839,20 +923,27 @@ actor ScriptedIMAPClient: IMAPClient {
 final class ScriptedFactory: IMAPClientFactory, @unchecked Sendable {
     let world: ScriptedWorld
     let secondConnectError: Error?
+    let connectErrorFromAttempt: Int?
     private let lock = NSLock()
     private var count = 0
     private(set) var clients: [ScriptedIMAPClient] = []
 
-    init(world: ScriptedWorld, secondConnectError: Error? = nil) {
+    init(
+        world: ScriptedWorld,
+        secondConnectError: Error? = nil,
+        connectErrorFromAttempt: Int? = nil
+    ) {
         self.world = world
         self.secondConnectError = secondConnectError
+        self.connectErrorFromAttempt = connectErrorFromAttempt
     }
 
     func makeClient(endpoint: IMAPEndpoint, username: String, password: String) -> any IMAPClient {
         lock.lock()
         defer { lock.unlock() }
         count += 1
-        let error = count >= 2 ? secondConnectError : nil
+        let threshold = connectErrorFromAttempt ?? 2
+        let error = count >= threshold ? secondConnectError : nil
         let client = ScriptedIMAPClient(world: world, connectError: error)
         clients.append(client)
         return client
@@ -863,6 +954,13 @@ final class ScriptedFactory: IMAPClientFactory, @unchecked Sendable {
         defer { lock.unlock() }
         return clients
     }
+
+    func clientCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return clients.count
+    }
+
 
     func emitAll(_ event: IMAPMailboxEvent) async {
         for client in snapshotClients() {

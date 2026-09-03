@@ -63,6 +63,8 @@ targets:
       - path: Sources/Sidebar/FolderHierarchy.swift
       - path: Sources/Mock/MockMailFacade.swift
       - path: Sources/Support/AccountTitlePolicy.swift
+      - path: Sources/Support/CacheTreePolicy.swift
+      - path: Sources/Support/ProviderPresets.swift
     dependencies:
       - package: MailternalCore
         product: MailternalCore

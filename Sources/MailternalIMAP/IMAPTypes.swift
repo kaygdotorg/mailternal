@@ -182,10 +182,9 @@ public struct IMAPUIDSet: Sendable, Hashable {
 
 /// One selectable mailbox from `LIST` (spec: sync.md Mailbox discovery).
 public struct IMAPMailbox: Sendable, Hashable {
-    /// Wire mailbox name (decoded for display; still usable as a SELECT argument
-    /// for ASCII names including `INBOX`).
+    /// Exact wire mailbox name (decoded for protocol arguments).
     public var path: String
-    /// Last path component, or `path` when there is no separator.
+    /// Sidebar display name, with the `[Gmail]/` system prefix removed when present.
     public var name: String
     /// Hierarchy delimiter, if the server provided one.
     public var separator: Character?
@@ -218,8 +217,8 @@ public struct IMAPMailbox: Sendable, Hashable {
 public struct IMAPFolderDiscovery: Sendable, Hashable {
     /// Selectable folders only (`\\Noselect` / `\\NonExistent` already skipped).
     public var folders: [IMAPMailbox]
-    /// `X-GM-EXT-1` was advertised **or** the endpoint host is a known Gmail IMAP host.
-    /// The engine must warn: Gmail-via-IMAP is unsupported.
+    /// `X-GM-EXT-1` was advertised or the endpoint host is a known Gmail IMAP host.
+    /// This identifies Gmail semantics; Gmail-via-IMAP is supported.
     public var isGmail: Bool
 
     /// Creates a discovery result.

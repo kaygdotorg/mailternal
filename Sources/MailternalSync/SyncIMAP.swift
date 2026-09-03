@@ -20,6 +20,7 @@ package protocol IMAPClient: Sendable {
     func move(uids: IMAPUIDSet, to mailbox: String) async throws
     func copy(uids: IMAPUIDSet, to mailbox: String) async throws
     func storeDeleted(uids: IMAPUIDSet) async throws
+    func renameMailbox(from source: String, to destination: String) async throws
     func expunge(uids: IMAPUIDSet) async throws
     func beginIdle() async throws -> IMAPIdle
     func endIdle() async throws
@@ -59,6 +60,9 @@ struct LiveIMAPClient: IMAPClient {
     }
     func storeDeleted(uids: IMAPUIDSet) async throws {
         try await session.storeDeleted(uids: uids)
+    }
+    func renameMailbox(from source: String, to destination: String) async throws {
+        try await session.renameMailbox(from: source, to: destination)
     }
     func expunge(uids: IMAPUIDSet) async throws {
         try await session.expunge(uids: uids)
@@ -234,9 +238,20 @@ actor SyncChannel {
         expectedUIDValidity: UInt32?,
         uids: IMAPUIDSet
     ) async throws {
+
         try await withCommand {
             try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
             try await self.client.expunge(uids: uids)
+        }
+    }
+    /// Serializes mailbox rename on the command channel and leaves IDLE first.
+    func renameMailbox(from source: String, to destination: String) async throws {
+        try await withCommand {
+            try await self.leaveIdleUnlocked()
+            try await self.client.renameMailbox(from: source, to: destination)
+            if self.selectedPath == source {
+                self.selectedPath = destination
+            }
         }
     }
 

@@ -10,12 +10,27 @@ struct FolderHierarchyNode: Identifiable, Hashable {
 }
 
 enum FolderHierarchy {
+    /// Returns the sidebar label for a persisted folder while keeping its path
+    /// unchanged for SELECT and hierarchy identity.
+    static func displayName(path: String, name: String) -> String {
+        let prefix = "[Gmail]/"
+        guard path.count >= prefix.count,
+              path.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame,
+              name.count >= prefix.count,
+              name.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame
+        else {
+            return name
+        }
+        return String(name.dropFirst(prefix.count))
+    }
+
     /// Builds a forest from mailbox paths using each folder's persisted delimiter.
-    ///
-    /// A parent is found only when the folder's separator is present immediately
-    /// before its terminal display name. Missing or malformed separator metadata
-    /// leaves the folder at the root instead of inventing a parent.
     static func make(from folders: [FolderSummary]) -> [FolderHierarchyNode] {
+        let folders = folders.map { folder -> FolderSummary in
+            var folder = folder
+            folder.name = displayName(path: folder.path, name: folder.name)
+            return folder
+        }
         guard !folders.isEmpty else { return [] }
 
         var pathOwners: [String: FolderID] = [:]
@@ -73,6 +88,33 @@ enum FolderHierarchy {
         }
 
         return roots.sorted(by: folderOrdering).map(makeNode)
+    }
+    /// Groups a global folder snapshot by owning account while preserving the
+    /// persisted account order. Disabled accounts are omitted; unknown accounts
+    /// are retained after known ones in deterministic ID order so a stale
+    /// snapshot cannot disappear.
+    static func groupedByAccount(
+        _ folders: [FolderSummary],
+        accountOrder: [AccountID],
+        disabledAccountIDs: Set<AccountID> = []
+    ) -> [(account: AccountID, folders: [FolderSummary])] {
+        let grouped = Dictionary(
+            grouping: folders.filter { !disabledAccountIDs.contains($0.accountID) },
+            by: \.accountID
+        )
+        let known = accountOrder.compactMap { accountID -> (AccountID, [FolderSummary])? in
+            guard let folders = grouped[accountID], !folders.isEmpty else { return nil }
+            return (accountID, folders)
+        }
+        let knownIDs = Set(accountOrder)
+        let unknown = grouped.keys
+            .filter { !knownIDs.contains($0) }
+            .sorted { $0.rawValue < $1.rawValue }
+            .compactMap { accountID -> (AccountID, [FolderSummary])? in
+                guard let folders = grouped[accountID], !folders.isEmpty else { return nil }
+                return (accountID, folders)
+            }
+        return known + unknown
     }
 
     /// Returns the actual parent path only when the persisted hierarchy

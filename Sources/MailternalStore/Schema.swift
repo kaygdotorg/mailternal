@@ -110,6 +110,49 @@ enum Schema {
                 ON messages(generation_id) WHERE is_read = 0
                 """)
         }
+        migrator.registerMigration("v11_keep_locally") { db in
+            try db.alter(table: "folders") { t in
+                // Keep system mailboxes useful by default; custom folders opt
+                // into local history only when the user asks for it.
+                t.add(column: "keep_locally", .boolean).notNull().defaults(to: true)
+                // STATUS/SELECT counts remain visible while local rows are
+                // disabled. This is deliberately separate from message rows.
+                t.add(column: "server_message_count", .integer).notNull().defaults(to: 0)
+            }
+            try db.execute(sql: """
+                UPDATE folders
+                SET keep_locally = CASE role
+                    WHEN 'inbox' THEN 1
+                    WHEN 'sent' THEN 1
+                    WHEN 'drafts' THEN 1
+                    WHEN 'archive' THEN 1
+                    WHEN 'trash' THEN 1
+                    WHEN 'junk' THEN 1
+                    ELSE 0
+                END
+                """)
+        }
+        migrator.registerMigration("v12_account_enabled") { db in
+            try db.alter(table: "accounts") { t in
+                t.add(column: "is_enabled", .integer).notNull().defaults(to: 1)
+            }
+        }
+        migrator.registerMigration("v13_folder_rename_queue") { db in
+            try db.create(table: "folder_rename_queue") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("account_id", .text).notNull()
+                t.column("folder_id", .integer).notNull()
+                    .references("folders", onDelete: .cascade)
+                t.column("target_name", .text).notNull()
+                t.column("target_path", .text).notNull()
+                t.column("enqueued_at", .double).notNull()
+                t.uniqueKey(["folder_id"])
+            }
+            try db.execute(
+                sql: "CREATE INDEX folder_rename_queue_send_idx ON folder_rename_queue(enqueued_at, id)"
+            )
+        }
+
         return migrator
     }
 

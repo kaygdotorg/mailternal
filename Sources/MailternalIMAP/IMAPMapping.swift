@@ -7,10 +7,11 @@ import NIOIMAP
 
 enum IMAPRoleMapping {
     static func role(path: String, name: String, attributes: [MailboxInfo.Attribute]) -> FolderRole {
-        // SPECIAL-USE wins over name heuristics.
+        // SPECIAL-USE wins over name heuristics. Gmail advertises its All Mail
+        // mailbox as \All rather than the RFC \Archive attribute.
         for attribute in attributes {
             let use = UseAttribute(attribute)
-            if use == .archive { return .archive }
+            if use == .all || use == .archive { return .archive }
             if use == .trash { return .trash }
             if use == .junk { return .junk }
             if use == .sent { return .sent }
@@ -20,6 +21,21 @@ enum IMAPRoleMapping {
         if name.compare("INBOX", options: [.caseInsensitive]) == .orderedSame { return .inbox }
         if path.compare("INBOX", options: [.caseInsensitive]) == .orderedSame { return .inbox }
         return heuristic(name: name, path: path)
+    }
+
+    /// Returns the sidebar label while preserving the exact wire path separately.
+    /// Gmail's system folders are rooted at `[Gmail]/` on the wire but are shown
+    /// as ordinary top-level folders to avoid exposing the implementation prefix.
+    static func displayName(path: String, name: String) -> String {
+        let prefix = "[Gmail]/"
+        guard path.count >= prefix.count,
+              path.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame,
+              name.count >= prefix.count,
+              name.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame
+        else {
+            return name
+        }
+        return String(name.dropFirst(prefix.count))
     }
 
     static func heuristic(name: String, path: String) -> FolderRole {

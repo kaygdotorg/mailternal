@@ -45,17 +45,25 @@ public enum FolderRole: String, Sendable, Codable, CaseIterable {
 
 public struct FolderSummary: Identifiable, Hashable, Sendable {
     public var id: FolderID
+    /// Owning account. Folder IDs are globally unique, but this field lets
+    /// account-aware facades and the sidebar group one store snapshot.
+    public var accountID: AccountID
     public var name: String
     public var path: String
     public var separator: Character?
     public var role: FolderRole
     public var unreadCount: Int
     public var totalCount: Int
+    /// Whether message bodies and metadata are retained locally for this folder.
+    /// Discovery and STATUS counts continue while this is disabled.
+    public var keepLocally: Bool
     public var backfill: BackfillState
     public init(id: FolderID, name: String, path: String, separator: Character?, role: FolderRole,
-                unreadCount: Int, totalCount: Int, backfill: BackfillState) {
-        self.id = id; self.name = name; self.path = path; self.separator = separator; self.role = role
-        self.unreadCount = unreadCount; self.totalCount = totalCount; self.backfill = backfill
+                unreadCount: Int, totalCount: Int, keepLocally: Bool = true,
+                backfill: BackfillState, accountID: AccountID = AccountID(rawValue: "")) {
+        self.id = id; self.accountID = accountID; self.name = name; self.path = path; self.separator = separator; self.role = role
+        self.unreadCount = unreadCount; self.totalCount = totalCount; self.keepLocally = keepLocally
+        self.backfill = backfill
     }
 }
 
@@ -112,15 +120,21 @@ public struct MessageRow: Identifiable, Hashable, Sendable {
     public var isFlagged: Bool
     /// Display name of the containing folder (for example, "INBOX" or "Archive").
     public var folderName: String
+    /// Owning account title for global search results.
+    public var accountName: String?
+    /// Owning folder when this row came from global search.
+    public var folderID: FolderID?
     public init(id: MessageID, from: String, subject: String, preview: String,
                 date: Date, isRead: Bool, hasAttachments: Bool,
-                isFlagged: Bool = false, folderName: String) {
+                isFlagged: Bool = false, folderName: String,
+                accountName: String? = nil, folderID: FolderID? = nil) {
         self.id = id; self.from = from; self.subject = subject; self.preview = preview
         self.date = date; self.isRead = isRead; self.hasAttachments = hasAttachments
         self.isFlagged = isFlagged; self.folderName = folderName
+        self.accountName = accountName; self.folderID = folderID
     }
-}
 
+}
 /// The two user-visible IMAP system flags supported by the mutation queue.
 public enum FlagKind: String, Sendable, Codable, Hashable, CaseIterable {
     case seen
@@ -220,13 +234,20 @@ public struct AccountConfig: Hashable, Sendable, Codable {
     public var emailAddress: String
     public var username: String
     public var imap: IMAPEndpoint
+    public var isEnabled: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case id, accountLinkID, displayName, emailAddress, username, imap, isEnabled
+    }
+
     public init(
         id: AccountID,
         accountLinkID: AccountLinkID,
         displayName: String,
         emailAddress: String,
         username: String,
-        imap: IMAPEndpoint
+        imap: IMAPEndpoint,
+        isEnabled: Bool = true
     ) {
         self.id = id
         self.accountLinkID = accountLinkID
@@ -234,6 +255,18 @@ public struct AccountConfig: Hashable, Sendable, Codable {
         self.emailAddress = emailAddress
         self.username = username
         self.imap = imap
+        self.isEnabled = isEnabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(AccountID.self, forKey: .id)
+        accountLinkID = try container.decode(AccountLinkID.self, forKey: .accountLinkID)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        emailAddress = try container.decode(String.self, forKey: .emailAddress)
+        username = try container.decode(String.self, forKey: .username)
+        imap = try container.decode(IMAPEndpoint.self, forKey: .imap)
+        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
     }
 }
 

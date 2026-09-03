@@ -115,6 +115,135 @@ private func nextMailEvent(
     }
 }
 
+@Test func gmailCondstoreBackfillDeltaAndArchiveAllMail() async throws {
+    try await withSyncStore { store, dir in
+        var inbox = ScriptedMailbox(path: "INBOX", uidValidity: 22, uidNext: 2, highestModSeq: 10)
+        inbox.messages[1] = makePlainMessage(
+            uid: 1,
+            subject: "Gmail archive",
+            body: "first backfill",
+            flags: [],
+            modSeq: 10
+        )
+        let allMailPath = "[Gmail]/All Mail"
+        let allMail = ScriptedMailbox(path: allMailPath, uidValidity: 22)
+        let folders = [
+            inboxMailbox(),
+            IMAPMailbox(
+                path: allMailPath,
+                name: "All Mail",
+                separator: "/",
+                role: .archive,
+                mailboxID: nil,
+                attributes: ["\\All"]
+            ),
+            IMAPMailbox(
+                path: "[Gmail]/Sent Mail",
+                name: "Sent Mail",
+                separator: "/",
+                role: .sent,
+                mailboxID: nil,
+                attributes: ["\\Sent"]
+            ),
+            IMAPMailbox(
+                path: "[Gmail]/Drafts",
+                name: "Drafts",
+                separator: "/",
+                role: .drafts,
+                mailboxID: nil,
+                attributes: ["\\Drafts"]
+            ),
+            IMAPMailbox(
+                path: "[Gmail]/Spam",
+                name: "Spam",
+                separator: "/",
+                role: .junk,
+                mailboxID: nil,
+                attributes: ["\\Junk"]
+            ),
+            IMAPMailbox(
+                path: "[Gmail]/Trash",
+                name: "Trash",
+                separator: "/",
+                role: .trash,
+                mailboxID: nil,
+                attributes: ["\\Trash"]
+            ),
+            IMAPMailbox(
+                path: "[Gmail]/Starred",
+                name: "Starred",
+                separator: "/",
+                role: .none,
+                mailboxID: nil,
+                attributes: ["\\Flagged"]
+            ),
+            IMAPMailbox(
+                path: "[Gmail]/Important",
+                name: "Important",
+                separator: "/",
+                role: .none,
+                mailboxID: nil,
+                attributes: []
+            ),
+        ]
+        let world = ScriptedWorld(
+            capabilities: IMAPCapabilities(tokens: [
+                "IMAP4REV1", "IDLE", "CONDSTORE", "MOVE", "SPECIAL-USE", "X-GM-EXT-1",
+            ]),
+            folders: folders,
+            mailboxes: [
+                "INBOX": inbox,
+                allMailPath: allMail,
+                "[Gmail]/Sent Mail": ScriptedMailbox(path: "[Gmail]/Sent Mail", uidValidity: 22),
+                "[Gmail]/Drafts": ScriptedMailbox(path: "[Gmail]/Drafts", uidValidity: 22),
+                "[Gmail]/Spam": ScriptedMailbox(path: "[Gmail]/Spam", uidValidity: 22),
+                "[Gmail]/Trash": ScriptedMailbox(path: "[Gmail]/Trash", uidValidity: 22),
+                "[Gmail]/Starred": ScriptedMailbox(path: "[Gmail]/Starred", uidValidity: 22),
+                "[Gmail]/Important": ScriptedMailbox(path: "[Gmail]/Important", uidValidity: 22),
+            ]
+        )
+        world.isGmail = true
+        let (engine, _) = makeEngine(store: store, world: world, dir: dir, window: 2)
+        await engine.start()
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let summaries = try await store.fetchFolders(account: sampleConfig().id)
+            return summaries.contains {
+                $0.path == "INBOX" && $0.totalCount == 1 && $0.backfill == .complete
+            } && summaries.contains { $0.path == allMailPath }
+        }
+        let inboxFolder = try #require(await inboxFolder(store))
+        let firstPage = try await store.page(in: inboxFolder.id, after: nil, limit: 10)
+        let message = try #require(firstPage.rows.first)
+        let generation = try #require(await store.liveGeneration(for: inboxFolder.id))
+        let initialState = try #require(await store.fetchSyncState(for: generation))
+        #expect(initialState.deltaPath == .condstore)
+
+        world.updateMailbox("INBOX") { mailbox in
+            mailbox.messages[1]?.flags = ["\\Seen"]
+            mailbox.messages[1]?.modSeq = 12
+            mailbox.highestModSeq = 12
+        }
+        await engine.refreshNow()
+        try await waitUntil(timeout: .seconds(5)) {
+            let page = try await store.page(in: inboxFolder.id, after: nil, limit: 10)
+            let state = try await store.fetchSyncState(for: generation)
+            return page.rows.first?.isRead == true && state?.deltaPath == .condstore
+        }
+
+        try await store.enqueueMove(message: message.id, to: .archive)
+        try await waitUntil(timeout: .seconds(5)) {
+            try await store.snapshotMoveQueue().isEmpty
+                && world.archiveCommandSnapshot() == ["MOVE INBOX \(allMailPath) 1"]
+        }
+        #expect(world.mailbox("INBOX").messages[1] == nil)
+        #expect(world.mailbox(allMailPath).messages[1] != nil)
+        let errors = try await store.fetchErrorLog()
+        #expect(!errors.contains { $0.message.localizedCaseInsensitiveContains("unsupported") })
+        await engine.stop()
+    }
+}
+
 @Test func engineQuarantinesFailedFetchWithoutStallingFolder() async throws {
     try await withSyncStore { store, dir in
         var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 3, highestModSeq: 2)
@@ -519,6 +648,10 @@ private func nextMailEvent(
             try await store.fetchFolders(account: sampleConfig().id)
                 .contains { $0.role == .inbox && $0.backfill == .complete && $0.totalCount == 2 }
         }
+        // IDLE is opened only after the initial backfill pass. Wait for its
+        // scripted readiness before publishing the UIDVALIDITY replacement so
+        // the refresh cannot race socket setup.
+        await world.waitForIdleStart()
 
         world.updateMailbox("INBOX") { live in
             live.uidValidity = 99
@@ -1146,7 +1279,9 @@ func staleQuarantineFallbackCannotResurrectExpungedUID(
             #expect(stopped)
         }
 
-        #expect(await factory.closedClientCount() == 1)
+        // The dedicated INBOX IDLE socket and the primary command socket are
+        // both closed during teardown.
+        #expect(await factory.closedClientCount() == 2)
         let inbox = try #require(await inboxFolder(store))
         let generation = try #require(await store.liveGeneration(for: inbox.id))
         let state = try #require(await store.fetchSyncState(for: generation))
@@ -1524,4 +1659,283 @@ func staleQuarantineFallbackCannotResurrectExpungedUID(
         }
         await engine.stop()
     }
+}
+private func schedulerMailbox(
+    path: String,
+    role: FolderRole,
+    count: Int
+) -> (mailbox: IMAPMailbox, scripted: ScriptedMailbox) {
+    let mailbox = IMAPMailbox(
+        path: path,
+        name: path,
+        separator: "/",
+        role: role,
+        mailboxID: nil,
+        attributes: []
+    )
+    var scripted = ScriptedMailbox(
+        path: path,
+        uidValidity: 1,
+        uidNext: UInt32(count + 1),
+        highestModSeq: 2
+    )
+    if count > 0 {
+        for uid in 1...count {
+            scripted.messages[UInt32(uid)] = makePlainMessage(
+                uid: UInt32(uid),
+                subject: "\(path)-\(uid)"
+            )
+        }
+    }
+    return (mailbox, scripted)
+}
+
+private func schedulerFolders() -> [
+    (mailbox: IMAPMailbox, scripted: ScriptedMailbox)
+] {
+    [
+        schedulerMailbox(path: "INBOX", role: .inbox, count: 4),
+        schedulerMailbox(path: "Sent", role: .sent, count: 4),
+        schedulerMailbox(path: "Projects", role: .none, count: 4),
+    ]
+}
+
+private func prepareSchedulerFolders(
+    _ store: MailStore,
+    account: AccountConfig,
+    keepLocally: Bool = true
+) async throws -> [FolderID] {
+    try await store.upsertAccount(account)
+    var ids: [FolderID] = []
+    for item in schedulerFolders().dropFirst() {
+        let id = try await store.upsertFolder(
+            account: account.id,
+            path: item.mailbox.path,
+            name: item.mailbox.name,
+            separator: item.mailbox.separator,
+            role: item.mailbox.role,
+            objectID: nil
+        )
+        try await store.setKeepLocally(keepLocally, for: id)
+        ids.append(id)
+    }
+    return ids
+}
+
+@Test func backfillSchedulerSkipsDisabledFoldersWithoutFetch() async throws {
+    try await withSyncStore { store, dir in
+        let config = sampleConfig()
+        let fixtures = schedulerFolders()
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: fixtures.map(\.mailbox),
+            mailboxes: Dictionary(uniqueKeysWithValues: fixtures.map { ($0.scripted.path, $0.scripted) })
+        )
+        let engine = SyncEngine(
+            store: store,
+            config: config,
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(dir: dir, window: 2)
+        )
+
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            let summaries = try await store.fetchFolders(account: config.id)
+            return summaries.contains {
+                $0.path == "INBOX" && $0.backfill == .complete && $0.totalCount == 4
+            }
+        }
+        #expect(!world.snapshotMetadataFetchPaths().contains("Projects"))
+        let projects = try #require(
+            try await store.fetchFolders(account: config.id).first { $0.path == "Projects" }
+        )
+        #expect(projects.keepLocally == false)
+        #expect(projects.totalCount == 4)
+        await engine.stop()
+    }
+}
+
+@Test func enablingFolderQueuesBackfillWithinOneSchedulerTick() async throws {
+    try await withSyncStore { store, dir in
+        let config = sampleConfig()
+        let fixtures = schedulerFolders()
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: fixtures.map(\.mailbox),
+            mailboxes: Dictionary(uniqueKeysWithValues: fixtures.map { ($0.scripted.path, $0.scripted) })
+        )
+        let factory = ScriptedFactory(world: world)
+        let engine = SyncEngine(
+            store: store,
+            config: config,
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: factory,
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(dir: dir, window: 2)
+        )
+
+        await engine.start()
+        let projects = try await waitUntilFolder(store, account: config.id, path: "Projects")
+        try await store.setKeepLocally(true, for: projects.id)
+        try await waitUntil(timeout: .seconds(2), poll: .milliseconds(10)) {
+            await engine.setKeepLocally(true, for: projects.id)
+            return world.snapshotMetadataFetchPaths().contains("Projects")
+        }
+        #expect(world.snapshotMetadataFetchPaths().contains("Projects"))
+        await engine.stop()
+    }
+}
+
+@Test func disablingFolderMidBackfillCancelsFetchAndKeepsRows() async throws {
+    try await withSyncStore { store, dir in
+        let config = sampleConfig()
+        let fixtures = [schedulerMailbox(path: "Projects", role: .none, count: 20)]
+        try await store.upsertAccount(config)
+        let folderID = try await store.upsertFolder(
+            account: config.id,
+            path: "Projects",
+            name: "Projects",
+            separator: "/",
+            role: .none,
+            objectID: nil
+        )
+        try await store.setKeepLocally(true, for: folderID)
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [fixtures[0].mailbox],
+            mailboxes: ["Projects": fixtures[0].scripted]
+        )
+        world.fetchNanos = 100_000_000
+        let engine = SyncEngine(
+            store: store,
+            config: config,
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(dir: dir, window: 2)
+        )
+
+        await engine.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            (try await store.fetchFolderSummary(folderID))?.totalCount ?? 0 >= 2
+        }
+        let pathsBefore = world.snapshotMetadataFetchPaths().count
+        try await store.setKeepLocally(false, for: folderID)
+        await engine.setKeepLocally(false, for: folderID)
+        try await Task.sleep(for: .milliseconds(250))
+        let summary = try #require(await store.fetchFolderSummary(folderID))
+        #expect(summary.keepLocally == false)
+        #expect(summary.totalCount >= 2)
+        #expect(world.snapshotMetadataFetchPaths().count <= pathsBefore + 1)
+        await engine.stop()
+    }
+}
+
+@Test func backfillInterleavesThreeFoldersAcrossThreeConnections() async throws {
+    try await withSyncStore { store, dir in
+        let config = sampleConfig()
+        let ids = try await prepareSchedulerFolders(store, account: config)
+        let fixtures = schedulerFolders()
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: fixtures.map(\.mailbox),
+            mailboxes: Dictionary(uniqueKeysWithValues: fixtures.map { ($0.scripted.path, $0.scripted) })
+        )
+        world.fetchNanos = 50_000_000
+        let factory = ScriptedFactory(world: world)
+        let engine = SyncEngine(
+            store: store,
+            config: config,
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: factory,
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(dir: dir, window: 2)
+        )
+
+        await engine.start()
+        try await waitUntil(timeout: .seconds(10)) {
+            try await store.fetchFolders(account: config.id).filter { $0.totalCount == 4 }.count == 3
+        }
+        #expect(ids.count == 2)
+        let clientCount = factory.clientCount()
+        #expect(clientCount == 4) // primary + IDLE + two workers
+        #expect(world.snapshotMaxConcurrentFetches() >= 2)
+        #expect(Set(world.snapshotMetadataFetchPaths()) == ["INBOX", "Sent", "Projects"])
+        await engine.stop()
+    }
+}
+
+@Test func backfillConnectionCapFallsBackToTwoWorkers() async throws {
+    try await withSyncStore { store, dir in
+        let config = sampleConfig()
+        _ = try await prepareSchedulerFolders(store, account: config)
+        let fixtures = schedulerFolders()
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: fixtures.map(\.mailbox),
+            mailboxes: Dictionary(uniqueKeysWithValues: fixtures.map { ($0.scripted.path, $0.scripted) })
+        )
+        world.fetchNanos = 40_000_000
+        let factory = ScriptedFactory(
+            world: world,
+            secondConnectError: IMAPError.taggedNO(
+                tag: "t",
+                message: "Too many connections",
+                code: nil
+            ),
+            connectErrorFromAttempt: 4
+        )
+        let engine = SyncEngine(
+            store: store,
+            config: config,
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: factory,
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(dir: dir, window: 2)
+        )
+
+        await engine.start()
+        try await waitUntil(timeout: .seconds(10)) {
+            try await store.fetchFolders(account: config.id).filter { $0.totalCount == 4 }.count == 3
+        }
+        let clientCount = factory.clientCount()
+        let closedClientCount = await factory.closedClientCount()
+        #expect(clientCount == 4) // fourth attempt is rejected
+        #expect(closedClientCount == 1) // rejected attempt
+        #expect(world.snapshotMaxConcurrentFetches() >= 2)
+        await engine.stop()
+    }
+}
+
+private actor FolderSummaryResult {
+    private var value: FolderSummary?
+
+    func set(_ value: FolderSummary?) {
+        self.value = value
+    }
+
+    func get() -> FolderSummary? {
+        value
+    }
+}
+
+private func waitUntilFolder(
+    _ store: MailStore,
+    account: AccountID,
+    path: String
+) async throws -> FolderSummary {
+    let result = FolderSummaryResult()
+    try await waitUntil(timeout: .seconds(5)) {
+        let value = try await store.fetchFolders(account: account).first { $0.path == path }
+        await result.set(value)
+        return value != nil
+    }
+    return try #require(await result.get())
 }

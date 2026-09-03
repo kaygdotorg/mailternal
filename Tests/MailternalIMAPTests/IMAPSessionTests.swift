@@ -56,6 +56,9 @@ import Testing
         try await imap.writeServer(#"* LIST () "/" "INBOX""#)
         try await imap.writeServer(#"* LIST () "/" "Projects""#)
         try await imap.writeServer(#"* LIST () "/" "Spam""#)
+        try await imap.writeServer(#"* LIST (\All) "/" "[Gmail]/All Mail""#)
+        try await imap.writeServer(#"* LIST (\Flagged) "/" "[Gmail]/Starred""#)
+        try await imap.writeServer(#"* LIST (\Important) "/" "[Gmail]/Important""#)
         try await imap.ok(tag, "LIST completed")
         let discovery = try await listing.value
         let roles = Dictionary(uniqueKeysWithValues: discovery.folders.map { ($0.name, $0.role) })
@@ -63,6 +66,11 @@ import Testing
         #expect(roles["Sent"] == .sent)
         #expect(roles["Trash"] == .trash)
         #expect(roles["Junk"] == .junk)
+        #expect(roles["All Mail"] == .archive)
+        #expect(roles["Starred"] == FolderRole.none)
+        #expect(roles["Important"] == FolderRole.none)
+        let allMail = try #require(discovery.folders.first { $0.path == "[Gmail]/All Mail" })
+        #expect(allMail.name == "All Mail")
         #expect(roles["Archive"] == .archive)
         #expect(roles["Drafts"] == .drafts)
         #expect(roles["Spam"] == .junk)
@@ -190,6 +198,36 @@ import Testing
         do {
             try await storing.value
             Issue.record("storeSeen should surface tagged NO")
+        } catch let error as IMAPError {
+            #expect(error.isTaggedNO)
+        }
+    }
+}
+
+@Test func renameMailboxEncodesAndSurfacesTaggedResponse() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let renaming = Task {
+            try await imap.session.renameMailbox(from: "Projects/Old", to: "Projects/New")
+        }
+        let (tag, line) = try await imap.expectCommand(containing: "RENAME")
+        #expect(line.contains(#"RENAME "Projects/Old" "Projects/New""#))
+        try await imap.ok(tag)
+        try await renaming.value
+    }
+}
+
+@Test func renameMailboxSurfacesTaggedNO() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let renaming = Task {
+            try await imap.session.renameMailbox(from: "Old", to: "New")
+        }
+        let (tag, _) = try await imap.expectCommand(containing: "RENAME")
+        try await imap.no(tag, "[ALREADYEXISTS] New exists")
+        do {
+            try await renaming.value
+            Issue.record("renameMailbox should surface tagged NO")
         } catch let error as IMAPError {
             #expect(error.isTaggedNO)
         }

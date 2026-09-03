@@ -1,10 +1,12 @@
 import Foundation
 import SwiftUI
+import MailternalInterfaces
 
 enum UIIdentifier {
     static let mainWindow = "main-window"
     static let settingsSectionTitle = "settings-section-title"
     static let accountsSectionTitle = "accounts-section-title"
+    static let cacheSectionTitle = "cache-section-title"
     static let settingsWindow = "settings-window"
     static let sidebar = "folder-sidebar"
     static let messageTable = "message-table"
@@ -27,6 +29,7 @@ enum UIIdentifier {
     static let setupPort = "setup-port"
     static let accountsList = "accounts-list"
     static let accountsAdd = "accounts-add"
+    // Retained for UI-test source compatibility; removal now lives inline.
     static let accountsRemove = "accounts-remove"
     static let accountsEmptyAdd = "accounts-empty-add"
     static let accountEditorSheet = "account-editor-sheet"
@@ -40,8 +43,20 @@ enum UIIdentifier {
     static let accountEditorSecurity = "account-editor-security"
     static let accountEditorSave = "account-editor-save"
     static let accountEditorCancel = "account-editor-cancel"
+    static let accountEditorRemove = "account-editor-remove"
+    // The display-name field moved into each row; keep the historical
+    // identifier so existing automation and the row-specific name stay one
+    // address.
+    static let accountsRowName = accountEditorDisplayName
+    static let accountsRowEmail = "accounts-row-email"
+    static let accountsRowDisclosure = "accounts-row-disclosure"
+    static let cacheTree = "cache-tree"
+    static let cacheAll = "cache-all"
+    static func cacheAccount(_ id: String) -> String { "cache-account-\(id)" }
+    static func cacheFolder(_ id: String) -> String { "cache-folder-\(id)" }
     static func accountsRow(_ id: String) -> String { "accounts-row-\(id)" }
     static let sidebarAccountTitle = "sidebar-account-title"
+    static let sidebarAccountTitleField = "sidebar-account-title-field"
     static let emailReadingMode = "appearance-email-reading"
     static let actionsSection = "settings-actions"
     static let actionsSwipeLeading0 = "actions-swipe-leading-0"
@@ -59,6 +74,22 @@ enum UIIdentifier {
     }
     static func sidebarFolder(_ path: String) -> String {
         "sidebar-folder-\(path)"
+    }
+
+    /// Folder IDs keep the editing control addressable after its path/name changes.
+    static func sidebarFolderRenameField(_ id: FolderID) -> String {
+        "sidebar-folder-rename-field-\(id.rawValue)"
+    }
+}
+
+enum FolderRenamePolicy {
+    /// IMAP special-use folders are server-managed destinations and remain fixed.
+    static func canRename(role: FolderRole) -> Bool {
+        role == .none
+    }
+
+    static func fieldIdentifier(for id: FolderID) -> String {
+        UIIdentifier.sidebarFolderRenameField(id)
     }
 }
 

@@ -27,8 +27,9 @@ rationale → revisit-when.
 8. **Push posture: "zero-content", not "E2EE".** IMAP watching requires the daemon to
    hold credentials; we say so plainly. True zero-knowledge arrives with JMAP
    PushSubscription relay and is marketed only there.
-9. **Consumer Gmail deferred.** Restricted-scope OAuth requires Google verification +
-   annual CASA assessment; not worth it pre-traction. Explicitly unsupported in docs.
+9. **Consumer Gmail OAuth deferred.** A Mailternal-owned restricted-scope OAuth client
+   requires Google verification + annual CASA assessment; App Password IMAP remains
+   the shipped 0.0.1 path for accounts with 2-Step Verification.
 10. **iOS 26 / macOS 26 minimums.** Newest SwiftUI; no legacy weight at launch.
 11. **FTS5 `unicode61 remove_diacritics 2`.** Right for whitespace-delimited scripts;
     porter is English-biased, trigram triples the index. *Known limitation*: unicode61
@@ -58,14 +59,11 @@ rationale → revisit-when.
     reflexively; undo actually protects.
 18. **Message identity is the deep link everywhere** (AccountLinkID + folder locator +
     UIDVALIDITY/UID): non-secret, stable, cross-device; CLI rows print it as `link`.
-19. **Gmail via App Password (default) + bring-your-own OAuth client (advanced); no
-    CASA.** Google requires an annual lab assessment ($540–1,800/yr) for any app
-    shipping its own restricted-scope client id; Thunderbird/K-9/Mimestream pay it,
-    FairEmail/mutt/aerc don't. Unverified projects cap at 100 lifetime users. App
-    passwords remain officially supported for consumer IMAP/SMTP with 2SV (research/
-    google-gmail-oauth-verification-2026.md). Web-session scraping is blocked by
-    Google and against ToS (it killed Mailplane) — never. Revisit when revenue
-    justifies the fee.
+19. **Gmail via App Password shipped in 0.0.1 for 2SV accounts; OAuth stays deferred.**
+    Google App Passwords remain officially supported for consumer IMAP/SMTP with 2SV,
+    avoiding the verification and annual CASA assessment required by a Mailternal-owned
+    restricted-scope OAuth client. Web-session scraping is blocked by Google and against
+    its ToS (it killed Mailplane) — never. Revisit OAuth when revenue justifies the fee.
 20. **Pairing is a direction-free handshake.** QR/8-word code carries a session key +
     rendezvous; the encrypted bundle then flows either way (push or pull), covering
     every device pair. iCloud Keychain sync when both devices share an iCloud

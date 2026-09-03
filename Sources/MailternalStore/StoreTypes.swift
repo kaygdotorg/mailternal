@@ -255,6 +255,35 @@ public struct MoveOp: Hashable, Sendable, Identifiable {
     }
 }
 
+// MARK: - Folder rename queue
+
+/// Persisted mailbox rename mutation. A folder has at most one pending rename;
+/// subsequent edits replace the target while retaining one durable operation.
+public struct FolderRenameOp: Hashable, Sendable, Identifiable {
+    public var id: Int64
+    public var account: AccountID
+    public var folder: FolderID
+    public var targetName: String
+    public var targetPath: String
+    public var enqueuedAt: Date
+
+    public init(
+        id: Int64,
+        account: AccountID,
+        folder: FolderID,
+        targetName: String,
+        targetPath: String,
+        enqueuedAt: Date
+    ) {
+        self.id = id
+        self.account = account
+        self.folder = folder
+        self.targetName = targetName
+        self.targetPath = targetPath
+        self.enqueuedAt = enqueuedAt
+    }
+}
+
 
 
 // MARK: - Error log
@@ -394,6 +423,7 @@ public struct AttachmentPin: Hashable, Sendable {
 public enum MailStoreError: Error, Sendable, Equatable {
     case accountNotFound
     case folderNotFound
+    case invalidFolderName
     case messageNotFound
     case generationNotFound
     case replacementAlreadyExists

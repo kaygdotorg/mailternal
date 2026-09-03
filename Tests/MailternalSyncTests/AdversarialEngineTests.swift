@@ -328,6 +328,9 @@ private struct HalfNoIMAPClient: IMAPClient {
     func move(uids: IMAPUIDSet, to mailbox: String) async throws {
         try await base.move(uids: uids, to: mailbox)
     }
+    func renameMailbox(from source: String, to destination: String) async throws {
+        try await base.renameMailbox(from: source, to: destination)
+    }
     func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
         try await base.copy(uids: uids, to: mailbox)
     }

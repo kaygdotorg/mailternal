@@ -9,30 +9,34 @@ struct FolderSidebar: View {
     @State private var inspectorFolder: FolderSummary?
 
     var body: some View {
-        let roots = FolderHierarchy.make(from: model.folders)
-        let specialRoots = roots.filter { $0.folder.role != .none }
-        let customRoots = roots.filter { $0.folder.role == .none }
+        let accountOrder = model.accountConfigs.map(\.id)
+        let disabledAccountIDs = Set(
+            model.accountConfigs.lazy.filter { !$0.isEnabled }.map(\.id)
+        )
+        let accountGroups = FolderHierarchy.groupedByAccount(
+            model.folders,
+            accountOrder: accountOrder,
+            disabledAccountIDs: disabledAccountIDs
+        )
 
         List(selection: Binding(
             get: { model.selectedFolderID },
             set: { model.selectFolder($0) }
         )) {
-            if !specialRoots.isEmpty {
+            ForEach(accountGroups, id: \.account) { group in
+                let roots = FolderHierarchy.make(from: group.folders)
+                let specialRoots = roots.filter { $0.folder.role != .none }
+                let customRoots = roots.filter { $0.folder.role == .none }
+                let account = model.accountConfigs.first { $0.id == group.account }
                 Section {
-                    ForEach(specialRoots) { node in
+                    ForEach(specialRoots + customRoots) { node in
                         folderNode(node)
                     }
                 } header: {
-                    sectionHeader(nil, includeAccountTitle: true)
-                }
-            }
-            if !customRoots.isEmpty {
-                Section {
-                    ForEach(customRoots) { node in
-                        folderNode(node)
-                    }
-                } header: {
-                    sectionHeader("Folders", includeAccountTitle: specialRoots.isEmpty)
+                    sectionHeader(
+                        customRoots.isEmpty ? nil : "Folders",
+                        account: account
+                    )
                 }
             }
         }
@@ -74,16 +78,18 @@ struct FolderSidebar: View {
     }
 
     @ViewBuilder
-    private func sectionHeader(_ title: String?, includeAccountTitle: Bool) -> some View {
-        if includeAccountTitle, model.hasAccount {
+    private func sectionHeader(
+        _ title: String?,
+        account: AccountConfig?
+    ) -> some View {
+        if model.hasAccount {
             VStack(alignment: .leading, spacing: 4) {
-                Text(AccountTitlePolicy.title(for: model.accountConfig) ?? model.listTitleAccountName)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .accessibilityAddTraits(.isHeader)
-                    .accessibilityIdentifier(UIIdentifier.sidebarAccountTitle)
+                SidebarAccountTitle(
+                    title: AccountTitlePolicy.title(for: account) ?? account?.emailAddress ?? model.listTitleAccountName,
+                    onRename: account.map { account in
+                        { name in Task { await model.renameAccount(account.id, to: name) } }
+                    }
+                )
                 if let title {
                     Text(title)
                 }
@@ -108,6 +114,22 @@ struct FolderSidebar: View {
                     Task { await model.copyDeepLink(for: folder.id) }
                 }
                 : nil,
+            onKeepLocally: { folder, keep in
+                Task { @MainActor in
+                    do {
+                        try await model.facade.setKeepLocally(keep, for: folder.id)
+                    } catch {
+                        model.toasts.post(
+                            title: "Couldn’t update cache setting",
+                            detail: error.localizedDescription,
+                            severity: .error
+                        )
+                    }
+                }
+            },
+            onRenameFolder: { folder, name in
+                await model.renameFolder(folder.id, to: name)
+            },
             onDrop: { folderID, providers in
                 guard folderID != model.selectedFolderID else { return false }
                 var accepted = false
@@ -249,6 +271,8 @@ private struct FolderTreeNodeView: View {
     @Binding var inspectorFolder: FolderSummary?
     let onRefresh: () -> Void
     let onCopyDeepLink: ((FolderSummary) -> Void)?
+    let onKeepLocally: (FolderSummary, Bool) -> Void
+    let onRenameFolder: (FolderSummary, String) async -> Bool
     let onDrop: (FolderID, [NSItemProvider]) -> Bool
     @State private var isExpanded = true
     @State private var isDropTargeted = false
@@ -264,6 +288,8 @@ private struct FolderTreeNodeView: View {
                         inspectorFolder: $inspectorFolder,
                         onRefresh: onRefresh,
                         onCopyDeepLink: onCopyDeepLink,
+                        onKeepLocally: onKeepLocally,
+                        onRenameFolder: onRenameFolder,
                         onDrop: onDrop
                     )
                 }
@@ -272,9 +298,14 @@ private struct FolderTreeNodeView: View {
             }
         }
     }
-
     private var decoratedRow: some View {
-        FolderRow(folder: node.folder, selected: node.folder.id == selectedID)
+        FolderRow(
+            folder: node.folder,
+            selected: node.folder.id == selectedID,
+            onRename: { name in
+                await onRenameFolder(node.folder, name)
+            }
+        )
             .tag(node.folder.id)
             .contextMenu {
                 Button("Get Info…") {
@@ -290,6 +321,14 @@ private struct FolderTreeNodeView: View {
                         onCopyDeepLink(node.folder)
                     }
                 }
+                Toggle(
+                    "Keep locally",
+                    isOn: Binding(
+                        get: { node.folder.keepLocally },
+                        set: { onKeepLocally(node.folder, $0) }
+                    )
+                )
+                .toggleStyle(.checkbox)
             }
             .onDrop(
                 of: [UTType(exportedAs: MessageLinkPasteboard.type)],
@@ -315,15 +354,33 @@ private struct FolderTreeNodeView: View {
 struct FolderRow: View {
     let folder: FolderSummary
     let selected: Bool
+    let onRename: ((String) async -> Bool)?
     @Environment(AccentSource.self) private var accent
+    @State private var isEditing = false
+
+    init(
+        folder: FolderSummary,
+        selected: Bool,
+        onRename: ((String) async -> Bool)? = nil
+    ) {
+        self.folder = folder
+        self.selected = selected
+        self.onRename = onRename
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: folder.role.systemImage)
                 .frame(width: 16)
                 .foregroundStyle(.secondary)
-            Text(folder.name)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            SidebarInline(
+                value: folder.name,
+                font: .body,
+                canEdit: FolderRenamePolicy.canRename(role: folder.role),
+                fieldIdentifier: FolderRenamePolicy.fieldIdentifier(for: folder.id),
+                onCommit: onRename,
+                isEditing: $isEditing
+            )
             Spacer(minLength: 4)
             backfillAccessory
             if folder.unreadCount > 0 {
@@ -340,7 +397,9 @@ struct FolderRow: View {
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .focusEffectDisabled(true)
-        .accessibilityElement(children: .combine)
+        // Keep the row addressable while exposing the editing field as its own
+        // AX element; combining children would hide the stable field ID.
+        .accessibilityElement(children: isEditing ? .contain : .combine)
         .accessibilityLabel(accessibilityLabel)
         .accessibilityValue(selected ? "Selected" : "")
         // Every folder row is addressed by path in the UI tests, so the
@@ -373,6 +432,74 @@ struct FolderRow: View {
             break
         }
         return parts.joined(separator: ", ")
+    }
+}
+
+/// Finder-like inline editing for the name portion of a sidebar row.
+private struct SidebarInline: View {
+    let value: String
+    let font: Font
+    let canEdit: Bool
+    let fieldIdentifier: String
+    let onCommit: ((String) async -> Bool)?
+    @Binding var isEditing: Bool
+    @State private var draft = ""
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            // The text remains the sizing anchor while editing, so the field
+            // cannot move the icon, accessories, or neighboring rows.
+            Text(value)
+                .font(font)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .opacity(isEditing ? 0 : 1)
+            if isEditing {
+                TextField("Folder name", text: $draft)
+                    .textFieldStyle(.plain)
+                    .font(font)
+                    .lineLimit(1)
+                    .background(.clear)
+                    .focusEffectDisabled()
+                    .focused($isFocused)
+                    .onSubmit(commit)
+                    .onExitCommand(perform: cancel)
+                    .onChange(of: isFocused) { _, focused in
+                        if !focused, isEditing {
+                            commit()
+                        }
+                    }
+                    .accessibilityLabel("Folder name")
+                    .accessibilityIdentifier(fieldIdentifier)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2, perform: beginEditing)
+    }
+
+    private func beginEditing() {
+        guard !isEditing, canEdit, onCommit != nil else { return }
+        draft = value
+        isEditing = true
+        isFocused = true
+    }
+
+    private func commit() {
+        guard isEditing else { return }
+        let candidate = draft
+        isEditing = false
+        isFocused = false
+        guard let onCommit else { return }
+        Task {
+            _ = await onCommit(candidate)
+        }
+    }
+
+    private func cancel() {
+        isEditing = false
+        isFocused = false
+        draft = ""
     }
 }
 
@@ -433,5 +560,57 @@ struct EmptyMailboxState: View {
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// The sidebar's account H1. Double-click swaps the text for a same-font
+/// field; Return commits through `AppModel.renameAccount`, Escape or focus
+/// loss cancels. Rendering stays a plain `Text` until editing starts so the
+/// list header keeps its measured geometry.
+private struct SidebarAccountTitle: View {
+    let title: String
+    let onRename: ((String) -> Void)?
+    @State private var draft = ""
+    @State private var isEditing = false
+    @FocusState private var isFieldFocused: Bool
+
+    private let font = Font.system(size: 20, weight: .semibold)
+
+    var body: some View {
+        Group {
+            if isEditing {
+                TextField("Account name", text: $draft)
+                    .textFieldStyle(.plain)
+                    .font(font)
+                    .lineLimit(1)
+                    .background(.clear)
+                    .focusEffectDisabled()
+                    .focused($isFieldFocused)
+                    .onSubmit {
+                        onRename?(draft)
+                        isEditing = false
+                    }
+                    .onExitCommand { isEditing = false }
+                    .onChange(of: isFieldFocused) { _, focused in
+                        if !focused { isEditing = false }
+                    }
+                    .accessibilityIdentifier(UIIdentifier.sidebarAccountTitleField)
+            } else {
+                Text(title)
+                    .font(font)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        guard onRename != nil else { return }
+                        draft = title
+                        isEditing = true
+                        isFieldFocused = true
+                    }
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityIdentifier(UIIdentifier.sidebarAccountTitle)
+            }
+        }
     }
 }

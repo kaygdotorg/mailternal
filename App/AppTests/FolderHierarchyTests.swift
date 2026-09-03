@@ -10,6 +10,20 @@ final class FolderHierarchyTests: XCTestCase {
         XCTAssertNil(FolderHierarchy.parentPath(for: "ArchiveReport", name: "Report", separator: nil))
         XCTAssertNil(FolderHierarchy.parentPath(for: "ArchiveReport", name: "Report", separator: "/"))
     }
+    func testGmailPrefixIsStrippedForSidebarWithoutChangingPath() {
+        let folders = [
+            folder(1, name: "[Gmail]/All Mail", path: "[Gmail]/All Mail", separator: "/"),
+        ]
+
+        let roots = FolderHierarchy.make(from: folders)
+
+        XCTAssertEqual(roots.map(\.folder.name), ["All Mail"])
+        XCTAssertEqual(roots.first?.folder.path, "[Gmail]/All Mail")
+        XCTAssertEqual(
+            FolderHierarchy.displayName(path: "[Gmail]/Sent Mail", name: "[Gmail]/Sent Mail"),
+            "Sent Mail"
+        )
+    }
 
     func testBreakageReproKeepsAdjacentNamesAtRoot() {
         let folders = [

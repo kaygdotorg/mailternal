@@ -105,6 +105,9 @@ final class OverlayHostingView: NSHostingView<MainOverlayRoot> {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         let hit = super.hitTest(point)
+        if rootView.model.isSearchPresented {
+            return hit ?? self
+        }
         if hit === self { return nil }
         return hit
     }
@@ -396,6 +399,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             _ = model.isShowingRawSource
             _ = model.emailReadingOverride
             _ = model.appearance.emailReadingMode
+            _ = model.isSearchPresented
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.modelObservationGeneration == generation else { return }
@@ -435,13 +439,13 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         var identifiers: [NSToolbarItem.Identifier] = [
             .flexibleSpace,
             .space,
-            .separator,
         ]
         if includesSidebarToggle {
             identifiers += [.sidebarToggle, .sidebarTrackingSeparator]
         }
         // Keep each group atomic in customization as well as the default
-        // layout; exposing child IDs lets AppKit detach them from the capsule.
+        // layout; exposing only group IDs prevents AppKit from detaching
+        // child items from the shared capsule.
         identifiers += MessageToolbarPolicy.allowedGroupIdentifiers.map(toolbarGroupIdentifier)
         return identifiers
     }
@@ -482,7 +486,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
         switch item.itemIdentifier {
         case .sidebarToggle:
-            item.isEnabled = includesSidebarToggle
+            item.isHidden = !includesSidebarToggle || model.isSearchPresented
+            item.isEnabled = includesSidebarToggle && !model.isSearchPresented
         case .messageActions,
              .messageArchive, .messageTrash, .messageFlag,
              .messageSource, .messageColorScheme:
@@ -620,8 +625,12 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
         // With nothing selected the reader shows its empty state; a capsule
         // of disabled actions above it is chrome for nothing. The group hides
-        // as a unit and returns with the first selection.
-        messageActionsGroup.isHidden = model.selectedMessageIDs.isEmpty
+        // as a unit and returns with the first selection, after search has
+        // fully dismissed.
+        messageActionsGroup.isHidden = model.isSearchPresented || model.selectedMessageIDs.isEmpty
+        messageActionsGroup.isEnabled = !model.isSearchPresented
+        toggleItem.isHidden = !includesSidebarToggle || model.isSearchPresented
+        toggleItem.isEnabled = includesSidebarToggle && !model.isSearchPresented
     }
 
     private func makeToggleItem() -> NSToolbarItem {
@@ -648,7 +657,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         let item = NSToolbarItem(itemIdentifier: identifier)
         item.action = action
         item.target = self
-        item.isBordered = true
+        // The containing group owns the one shared capsule. Child borders
+        // render as dividers between the icons on macOS 26.
+        item.isBordered = false
         item.autovalidates = true
         return item
     }
@@ -663,7 +674,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         item.label = "Message Actions"
         item.paletteLabel = "Message Actions"
         item.toolTip = "Message actions"
-        item.isBordered = true
+        item.isBordered = false
         item.isEnabled = !model.selectedMessageIDs.isEmpty
         // The menu shell follows model observation; child actions validate
         // individually through validateMenuItem(_:).

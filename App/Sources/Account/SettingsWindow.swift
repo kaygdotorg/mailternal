@@ -1,15 +1,17 @@
 import AppKit
+import Observation
 import SwiftUI
 import MailternalInterfaces
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case accounts, appearance, actions
+    case accounts, cache, appearance, actions
 
     var id: Self { self }
 
     var title: String {
         switch self {
         case .accounts: "Accounts"
+        case .cache: "Cache"
         case .appearance: "Appearance"
         case .actions: "Actions"
         }
@@ -18,11 +20,125 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .accounts: "at"
+        case .cache: "internaldrive"
         case .appearance: "paintbrush"
         case .actions: "hand.draw"
         }
     }
 }
+
+/// Presentation state shared by the AppKit settings toolbar and the Accounts
+/// detail view. The request generation is an event channel; the other
+/// properties are the detail view's current toolbar validation state.
+@MainActor
+@Observable
+final class SettingsToolbarCoordinator: NSObject {
+    static let toolbarIdentifier = NSToolbar.Identifier("Mailternal.SettingsToolbar")
+    static let addAccountIdentifier = NSToolbarItem.Identifier("Mailternal.SettingsToolbar.addAccount")
+
+    private(set) var section: SettingsSection = .accounts
+    private(set) var canAddAccounts = true
+    private(set) var isValidatingAccounts = false
+    private(set) var addAccountRequestGeneration: UInt64 = 0
+
+    @ObservationIgnored private weak var toolbar: NSToolbar?
+    @ObservationIgnored private lazy var addAccountItem = makeAddAccountItem()
+
+    func makeToolbar() -> NSToolbar {
+        let toolbar = NSToolbar(identifier: Self.toolbarIdentifier)
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.autosavesConfiguration = false
+        self.toolbar = toolbar
+        updateAddAccountItem()
+        return toolbar
+    }
+
+    func update(section: SettingsSection) {
+        guard self.section != section else {
+            updateAddAccountItem()
+            return
+        }
+        self.section = section
+        updateAddAccountItem()
+        toolbar?.validateVisibleItems()
+    }
+    func reportAccountsState(canAdd: Bool, isValidating: Bool) {
+        guard canAddAccounts != canAdd || isValidatingAccounts != isValidating else {
+            return
+        }
+        canAddAccounts = canAdd
+        isValidatingAccounts = isValidating
+        updateAddAccountItem()
+        toolbar?.validateVisibleItems()
+    }
+
+    private func requestAddAccount() {
+        guard section == .accounts, canAddAccounts, !isValidatingAccounts else {
+            return
+        }
+        addAccountRequestGeneration &+= 1
+    }
+
+    private func makeAddAccountItem() -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: Self.addAccountIdentifier)
+        item.image = NSImage(
+            systemSymbolName: "plus",
+            accessibilityDescription: "Add Account"
+        )
+        item.label = "Add Account"
+        item.paletteLabel = "Add Account"
+        item.toolTip = "Add Account"
+        item.isBordered = true
+        item.target = self
+        item.action = #selector(addAccount(_:))
+        item.autovalidates = false
+        return item
+    }
+
+    private func updateAddAccountItem() {
+        addAccountItem.isHidden = section != .accounts
+        addAccountItem.isEnabled = section == .accounts
+            && canAddAccounts
+            && !isValidatingAccounts
+    }
+
+    @objc
+    private func addAccount(_ sender: NSToolbarItem) {
+        requestAddAccount()
+    }
+}
+
+extension SettingsToolbarCoordinator: NSToolbarDelegate, NSToolbarItemValidation {
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.flexibleSpace, Self.addAccountIdentifier]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.flexibleSpace, .space, Self.addAccountIdentifier]
+    }
+
+    func toolbarSelectableItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        []
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier identifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        identifier == Self.addAccountIdentifier ? addAccountItem : nil
+    }
+
+    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        guard item.itemIdentifier == Self.addAccountIdentifier else {
+            return item.isEnabled
+        }
+        updateAddAccountItem()
+        return item.isEnabled
+    }
+}
+
 
 
 struct SettingsSourceList: View {
@@ -50,6 +166,7 @@ struct SettingsDetailView: View {
     @Bindable var model: AppModel
     let appearance: AppearanceSettings
     let actions: ActionSettings
+    let toolbarCoordinator: SettingsToolbarCoordinator
     @State private var titleBottom: CGFloat = 0
 
     private var settingsDissolvePolicy: MailWindowDissolvePolicy {
@@ -65,7 +182,9 @@ struct SettingsDetailView: View {
             Group {
                 switch section {
                 case .accounts:
-                    AccountsSettingsView(model: model)
+                    AccountsSettingsView(model: model, toolbarCoordinator: toolbarCoordinator)
+                case .cache:
+                    CacheSettingsView(model: model)
                 case .appearance:
                     AppearanceSettingsForm(appearance: appearance)
                 case .actions:
@@ -89,7 +208,13 @@ struct SettingsDetailView: View {
                 .padding(.top, PaneHeaderInsetPolicy.settingsHeaderTopPadding)
                 .padding(.bottom, PaneHeaderInsetPolicy.settingsTitleBottomPadding)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityIdentifier(section == .accounts ? UIIdentifier.accountsSectionTitle : UIIdentifier.settingsSectionTitle)
+                .accessibilityIdentifier(
+                    section == .accounts
+                        ? UIIdentifier.accountsSectionTitle
+                        : section == .cache
+                            ? UIIdentifier.cacheSectionTitle
+                            : UIIdentifier.settingsSectionTitle
+                )
                 .onGeometryChange(for: CGFloat.self) { proxy in
                     // Geometry includes the optical bottom padding; remove it
                     // so the ramp starts at the H1's actual lower edge.
@@ -277,12 +402,12 @@ struct AppearanceSettingsForm: View {
     }
 }
 
-
 @MainActor
 final class SettingsSplitController: NSSplitViewController {
     private let sidebarHosting: NSHostingController<SettingsSourceList>
     private let detailHosting: NSHostingController<SettingsDetailView>
     private let sidebarItem: NSSplitViewItem
+    private let toolbarCoordinator: SettingsToolbarCoordinator
     private var backgroundEffect: NSVisualEffectView?
     private var didSetDivider = false
 
@@ -290,8 +415,10 @@ final class SettingsSplitController: NSSplitViewController {
         model: AppModel,
         appearance: AppearanceSettings,
         actions: ActionSettings,
-        selection: Binding<SettingsSection?>
+        selection: Binding<SettingsSection?>,
+        toolbarCoordinator: SettingsToolbarCoordinator
     ) {
+        self.toolbarCoordinator = toolbarCoordinator
         sidebarHosting = NSHostingController(
             rootView: SettingsSourceList(selection: selection, appearance: appearance, actions: actions)
         )
@@ -300,7 +427,8 @@ final class SettingsSplitController: NSSplitViewController {
                 section: selection.wrappedValue ?? .accounts,
                 model: model,
                 appearance: appearance,
-                actions: actions
+                actions: actions,
+                toolbarCoordinator: toolbarCoordinator
             )
         )
         sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarHosting)
@@ -317,6 +445,7 @@ final class SettingsSplitController: NSSplitViewController {
         let detailItem = NSSplitViewItem(viewController: detailHosting)
         detailItem.minimumThickness = 480
         addSplitViewItem(detailItem)
+        toolbarCoordinator.update(section: selection.wrappedValue ?? .accounts)
         splitView.isVertical = true
     }
 
@@ -328,12 +457,15 @@ final class SettingsSplitController: NSSplitViewController {
         actions: ActionSettings,
         selection: Binding<SettingsSection?>
     ) {
+        let section = selection.wrappedValue ?? .accounts
+        toolbarCoordinator.update(section: section)
         sidebarHosting.rootView = SettingsSourceList(selection: selection, appearance: appearance, actions: actions)
         detailHosting.rootView = SettingsDetailView(
-            section: selection.wrappedValue ?? .accounts,
+            section: section,
             model: model,
             appearance: appearance,
-            actions: actions
+            actions: actions,
+            toolbarCoordinator: toolbarCoordinator
         )
         configureWindow()
     }
@@ -378,11 +510,15 @@ final class SettingsWindowController: NSWindowController {
     }
     private var actions: ActionSettings?
     private var split: SettingsSplitController?
+    private let toolbarCoordinator: SettingsToolbarCoordinator
     private var model: AppModel?
     private var appearance: AppearanceSettings?
     private var hasShown = false
 
-    private init() { super.init(window: nil) }
+    private init() {
+        toolbarCoordinator = SettingsToolbarCoordinator()
+        super.init(window: nil)
+    }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -406,7 +542,8 @@ final class SettingsWindowController: NSWindowController {
                 model: model,
                 appearance: appearance,
                 actions: actions,
-                selection: selectionBinding
+                selection: selectionBinding,
+                toolbarCoordinator: toolbarCoordinator
             )
             self.split = split
             split.preferredContentSize = NSSize(width: 720, height: 460)
@@ -422,7 +559,7 @@ final class SettingsWindowController: NSWindowController {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.toolbarStyle = .unified
-            window.toolbar = NSToolbar(identifier: "Mailternal.SettingsToolbar")
+            window.toolbar = toolbarCoordinator.makeToolbar()
             window.isReleasedWhenClosed = false
             window.isRestorable = false
             window.setAccessibilitySubrole(.floatingWindow)

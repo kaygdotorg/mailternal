@@ -31,6 +31,50 @@ final class UILogicTests: XCTestCase {
         XCTAssertFalse(SidebarVisibilityPolicy.isHidden(.all))
     }
 
+    func testFolderRenamePolicyOnlyAllowsCustomFolders() {
+        XCTAssertTrue(FolderRenamePolicy.canRename(role: .none))
+
+        for role in FolderRole.allCases where role != .none {
+            XCTAssertFalse(
+                FolderRenamePolicy.canRename(role: role),
+                "\(role.rawValue) is a special-use folder"
+            )
+        }
+    }
+
+    func testFolderRenameFieldIdentifierIsStableAcrossPathChanges() {
+        let id = FolderID(rawValue: 42)
+
+        XCTAssertEqual(
+            FolderRenamePolicy.fieldIdentifier(for: id),
+            "sidebar-folder-rename-field-42"
+        )
+        XCTAssertEqual(
+            UIIdentifier.sidebarFolderRenameField(id),
+            FolderRenamePolicy.fieldIdentifier(for: id)
+        )
+        XCTAssertNotEqual(
+            FolderRenamePolicy.fieldIdentifier(for: id),
+            FolderRenamePolicy.fieldIdentifier(for: FolderID(rawValue: 43))
+        )
+    }
+    func testProviderPresetsIncludeSortedGmailAppPasswordPreset() {
+        let presets = ProviderPresets.all
+        let gmail = presets.first { $0.name == "Gmail" }
+
+        XCTAssertEqual(presets.map(\.name), presets.map(\.name).sorted())
+        XCTAssertEqual(gmail?.host, "imap.gmail.com")
+        XCTAssertEqual(gmail?.port, 993)
+        XCTAssertEqual(gmail?.security, .implicitTLS)
+        XCTAssertEqual(gmail?.smtpHost, "smtp.gmail.com")
+        XCTAssertEqual(gmail?.smtpPort, 465)
+        XCTAssertEqual(gmail?.smtpSecurity, .implicitTLS)
+        XCTAssertEqual(gmail?.usernameHint, "Your full Gmail address")
+        XCTAssertTrue(gmail?.guidance.contains("2-Step Verification") == true)
+        XCTAssertTrue(gmail?.guidance.contains("myaccount.google.com/apppasswords") == true)
+        XCTAssertTrue(gmail?.guidance.contains("account password will not work") == true)
+    }
+
     func testSettingsSectionTitleIdentifierIsStable() {
         XCTAssertEqual(UIIdentifier.settingsSectionTitle, "settings-section-title")
     }
@@ -1443,13 +1487,88 @@ final class UILogicTests: XCTestCase {
         )
     }
 
-    func testAccountsListPolicyDisablesAddAfterFirstAccount() {
-        XCTAssertTrue(AccountsListPolicy.canAdd(accountCount: 0))
-        XCTAssertFalse(AccountsListPolicy.canAdd(accountCount: 1))
+    func testCacheSettingsIdentifiersAreStable() {
+        XCTAssertEqual(UIIdentifier.cacheAll, "cache-all")
+        XCTAssertEqual(UIIdentifier.cacheTree, "cache-tree")
+    }
+    func testAccountNameCommitTrimsAndFallsBackToEmail() {
         XCTAssertEqual(
-            AccountsListPolicy.multipleAccountsCaption,
-            "Multiple accounts arrive in a later release"
+            AccountsListPolicy.committedName(input: "  Personal Mail  ", email: "ada@example.com"),
+            "Personal Mail"
+        )
+        XCTAssertEqual(
+            AccountsListPolicy.committedName(input: " \n\t", email: "ada@example.com"),
+            "ada@example.com"
         )
     }
 
+    func testAccountsListPolicyKeepsOnlyOneExpandedRow() {
+        let first = AccountID(rawValue: "first")
+        let second = AccountID(rawValue: "second")
+
+        XCTAssertEqual(AccountsListPolicy.nextExpandedID(current: nil, requested: first), first)
+        XCTAssertEqual(AccountsListPolicy.nextExpandedID(current: first, requested: second), second)
+        XCTAssertNil(AccountsListPolicy.nextExpandedID(current: second, requested: second))
+    }
+
+    func testAccountsListPolicyCancelsOnlyTheBlankRow() {
+        let blank = AccountID(rawValue: "new-account")
+        XCTAssertTrue(AccountsListPolicy.removesBlankRow(rowID: blank, blankID: blank))
+        XCTAssertFalse(
+            AccountsListPolicy.removesBlankRow(
+                rowID: AccountID(rawValue: "existing"),
+                blankID: blank
+            )
+        )
+    }
+    func testCacheTreePolicyDerivesTriStateFromFolderFlags() {
+        XCTAssertEqual(CacheTreePolicy.state(forFlags: []), .unchecked)
+        XCTAssertEqual(CacheTreePolicy.state(forFlags: [true, true]), .checked)
+        XCTAssertEqual(CacheTreePolicy.state(forFlags: [false, false]), .unchecked)
+        XCTAssertEqual(CacheTreePolicy.state(forFlags: [true, false]), .mixed)
+    }
+
+    func testCacheTreePolicyAccountAndAllTogglesTargetEveryFolder() {
+        func folder(_ id: Int64, _ keepLocally: Bool) -> FolderSummary {
+            FolderSummary(
+                id: FolderID(rawValue: id),
+                name: "Folder \(id)",
+                path: "Folder \(id)",
+                separator: nil,
+                role: .none,
+                unreadCount: 0,
+                totalCount: 10,
+                keepLocally: keepLocally,
+                backfill: .complete
+            )
+        }
+
+        let first = folder(1, true)
+        let second = folder(2, false)
+        let third = folder(3, false)
+        let account = AccountID(rawValue: "account")
+        XCTAssertEqual(CacheTreePolicy.countCaption(for: first), "10 / 10")
+        XCTAssertEqual(CacheTreePolicy.countCaption(for: second), "0 / 10")
+
+        XCTAssertEqual(CacheTreePolicy.accountState(for: [first, second]), .mixed)
+        XCTAssertEqual(
+            CacheTreePolicy.folderUpdates(for: .mixed, folders: [first, second]),
+            [first.id: true, second.id: true]
+        )
+        XCTAssertEqual(
+            CacheTreePolicy.folderUpdates(for: .unchecked, folders: [second]),
+            [second.id: true]
+        )
+        XCTAssertEqual(
+            CacheTreePolicy.folderUpdates(for: .checked, folders: [first]),
+            [first.id: false]
+        )
+
+        let tree = [account: [first, second, third]]
+        XCTAssertEqual(CacheTreePolicy.allState(for: tree), .mixed)
+        XCTAssertEqual(
+            CacheTreePolicy.folderUpdates(for: .mixed, foldersByAccount: tree),
+            [first.id: true, second.id: true, third.id: true]
+        )
+    }
 }

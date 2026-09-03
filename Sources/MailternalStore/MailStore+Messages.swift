@@ -252,6 +252,35 @@ extension MailStore {
             )
         }
     }
+    /// Returns the owning account for a message without exposing account
+    /// secrets. Facades use this to dispatch mutations and on-demand fetches
+    /// to the correct account engine.
+    public func accountID(for message: MessageID) async throws -> AccountID? {
+        try await read { db in
+            try String.fetchOne(
+                db,
+                sql: """
+                    SELECT f.account_id
+                    FROM messages m
+                    JOIN generations g ON g.id = m.generation_id
+                    JOIN folders f ON f.id = g.folder_id
+                    WHERE m.id = ?
+                    """,
+                arguments: [message.rawValue]
+            ).map(AccountID.init(rawValue:))
+        }
+    }
+
+    /// Returns the owning account for a folder.
+    public func accountID(for folder: FolderID) async throws -> AccountID? {
+        try await read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT account_id FROM folders WHERE id = ?",
+                arguments: [folder.rawValue]
+            ).map(AccountID.init(rawValue:))
+        }
+    }
 
     /// UIDs stored for `generation`, optional inclusive range, ascending.
     ///
@@ -301,6 +330,7 @@ extension MailStore {
         var sql = """
             SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date, m.uid,
                    m.is_read, m.has_attachments, m.is_flagged,
+                   f.id AS folder_id,
                    COALESCE(NULLIF(f.name, ''), CASE f.role
                        WHEN 'inbox' THEN 'INBOX'
                        WHEN 'archive' THEN 'Archive'
@@ -308,9 +338,11 @@ extension MailStore {
                        WHEN 'junk' THEN 'Junk'
                        WHEN 'sent' THEN 'Sent'
                        WHEN 'drafts' THEN 'Drafts'
-                       ELSE f.path END) AS folder_name
+                       ELSE f.path END) AS folder_name,
+                   COALESCE(NULLIF(a.display_name, ''), a.email_address) AS account_name
             FROM messages m
             JOIN folders f ON f.live_generation_id = m.generation_id
+            JOIN accounts a ON a.id = f.account_id
             WHERE f.id = ? AND f.retired = 0
             """
         var arguments: StatementArguments = [folder.rawValue]
@@ -347,6 +379,7 @@ extension MailStore {
         var sql = """
             SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date, m.uid,
                    m.is_read, m.has_attachments, m.is_flagged,
+                   f.id AS folder_id,
                    COALESCE(NULLIF(f.name, ''), CASE f.role
                        WHEN 'inbox' THEN 'INBOX'
                        WHEN 'archive' THEN 'Archive'
@@ -374,9 +407,10 @@ extension MailStore {
             return row.map { String(describing: $0.1) }.joined(separator: " | ")
         }.joined(separator: "\n")
     }
-
     static func messageRow(from row: Row, preview: String) -> MessageRow {
-        MessageRow(
+        let accountName: String? = row["account_name"]
+        let folderRawValue: Int64? = row["folder_id"]
+        return MessageRow(
             id: MessageID(rawValue: row["id"]),
             from: row["from_display"],
             subject: row["subject"],
@@ -385,10 +419,11 @@ extension MailStore {
             isRead: row["is_read"],
             hasAttachments: row["has_attachments"],
             isFlagged: row["is_flagged"],
-            folderName: row["folder_name"]
+            folderName: row["folder_name"],
+            accountName: accountName,
+            folderID: folderRawValue.map { FolderID(rawValue: $0) }
         )
     }
-
     private static let remoteTokenPrefix = "mailternal-part://part/remote."
 
     static func fetchDetail(_ db: Database, id: MessageID) throws -> MessageDetail {

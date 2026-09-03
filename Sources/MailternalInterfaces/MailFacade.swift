@@ -5,23 +5,35 @@ import Foundation
 
 @MainActor
 public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
-    // Account lifecycle (0.0.1: exactly one IMAP account)
+    // Account lifecycle. Every account has independent credentials, state, and
+    // sync engine; account IDs are stable for the life of a persisted account.
+    var accounts: [AccountConfig] { get }
+    var accountsStream: AsyncStream<[AccountConfig]> { get }
+    var accountStates: [AccountID: AccountState] { get }
+    var accountStatesStream: AsyncStream<[AccountID: AccountState]> { get }
+    func accountState(for account: AccountID) -> AccountState
+    /// Compatibility aggregate used by the launch shell: active when at least
+    /// one account is active, otherwise the first meaningful account state.
     var accountState: AccountState { get }
     var accountStateStream: AsyncStream<AccountState> { get }
-    /// The persisted non-secret configuration for the active account.
-    /// `nil` means no account has been configured.
+    /// The first account is retained as a compatibility convenience for older
+    /// settings callers; multi-account UI uses `accounts` instead.
     var accountConfig: AccountConfig? { get }
     /// Validates transport + auth per spec (TLS rules), stores secret in Keychain,
-    /// activates the account. Throws a user-presentable error on failure.
+    /// and starts this account without disturbing other running accounts.
     func addAccount(_ config: AccountConfig, password: String) async throws
-    /// Updates the active account. A nil password keeps the stored secret.
-    /// Display-name-only changes do not contact the server.
+    /// Updates one account. A nil password keeps its stored secret.
     func updateAccount(_ config: AccountConfig, password: String?) async throws
-    func removeAccount() async throws
-
-    // Folders
+    /// Enables or disables an account's sync engine while retaining its settings.
+    func setAccountEnabled(_ id: AccountID, _ enabled: Bool) async throws
+    func removeAccount(_ id: AccountID) async throws
+    // Folders from every account. Each summary carries its owning account ID.
     var foldersStream: AsyncStream<[FolderSummary]> { get }
-
+    /// Enables or disables local message retention for a folder. Disabled
+    /// folders continue discovery and STATUS count updates without FETCHes.
+    func setKeepLocally(_ keep: Bool, for folder: FolderID) async throws
+    /// Enqueues a persisted server-side mailbox rename.
+    func renameFolder(_ id: FolderID, to name: String) async throws
     // Messages — keyset-paged for rendering; full-folder IDs are a single indexed
     // query used by ⌘A and batch operations.
     func page(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) async throws -> MessagePage
@@ -66,9 +78,36 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
 }
 
 public extension MailFacade {
-    /// Facades that cannot expose persisted account settings may leave this
-    /// unavailable; the app's live and mock facades provide it for editing.
-    var accountConfig: AccountConfig? { nil }
+    /// Older settings/test callers may remove the first account explicitly.
+    func removeAccount() async throws {
+        guard let account = accounts.first else { return }
+        try await removeAccount(account.id)
+    }
+    var accountConfig: AccountConfig? { accounts.first }
+    var accountDisplayName: String? {
+        guard let account = accounts.first else { return nil }
+        let displayName = account.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return displayName.isEmpty ? account.emailAddress : displayName
+    }
+    var accountState: AccountState {
+        guard !accounts.isEmpty else { return .none }
+        let states = accounts.map { accountState(for: $0.id) }
+        if states.contains(.active) { return .active }
+        if states.contains(.validating) { return .validating }
+        return states.first ?? .none
+    }
+    var accountStateStream: AsyncStream<AccountState> {
+        AsyncStream { continuation in
+            continuation.yield(accountState)
+            continuation.finish()
+        }
+    }
+    var accountStatesStream: AsyncStream<[AccountID: AccountState]> {
+        AsyncStream { continuation in
+            continuation.yield(accountStates)
+            continuation.finish()
+        }
+    }
     func markRead(_ id: MessageID) async {
         await markRead([id])
     }

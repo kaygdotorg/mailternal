@@ -3,6 +3,147 @@ import MailternalIMAP
 import MailternalInterfaces
 import MailternalMIME
 import MailternalStore
+struct BackfillJob: Sendable {
+    let id: FolderID
+    let path: String
+    let role: FolderRole
+}
+
+/// Actor-isolated priority queue shared by the bounded backfill workers.
+/// Queue ownership is separate from engine state so ON/OFF transitions can
+/// wake a waiting worker or cancel a queued job without polling.
+actor FolderBackfillScheduler {
+    private var jobs: [FolderID: BackfillJob]
+    private var queue: [FolderID] = []
+    private var queued: Set<FolderID> = []
+    private var running: Set<FolderID> = []
+    private var requeueOnFinish: Set<FolderID> = []
+    private var enabled: Set<FolderID>
+    private var initialOutstanding: Set<FolderID>
+    private var visibleFolder: FolderID?
+    private var stopped = false
+    private var waiters: [CheckedContinuation<FolderID?, Never>] = []
+
+    init(jobs: [BackfillJob], enabled: Set<FolderID>) {
+        let jobsByID = Dictionary(uniqueKeysWithValues: jobs.map { ($0.id, $0) })
+        self.jobs = jobsByID
+        self.enabled = enabled
+        self.initialOutstanding = enabled
+        let initialQueue = enabled.filter { jobsByID[$0] != nil }
+        self.queue = Array(initialQueue)
+        self.queued = Set(initialQueue)
+    }
+
+    func setVisibleFolder(_ id: FolderID?) {
+        visibleFolder = id
+        sortQueue()
+        signalWaiters()
+    }
+
+    func setEnabled(_ id: FolderID, _ isEnabled: Bool) {
+        guard !stopped else { return }
+        if isEnabled {
+            enabled.insert(id)
+            if running.contains(id) {
+                requeueOnFinish.insert(id)
+            } else {
+                enqueueIfNeeded(id)
+            }
+        } else {
+            enabled.remove(id)
+            requeueOnFinish.remove(id)
+            queued.remove(id)
+            queue.removeAll { $0 == id }
+        }
+        sortQueue()
+        signalWaiters()
+    }
+
+    func next() async -> FolderID? {
+        if stopped { return nil }
+        if let id = dequeue() { return id }
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if stopped {
+                    continuation.resume(returning: nil)
+                } else if let id = dequeue() {
+                    continuation.resume(returning: id)
+                } else {
+                    waiters.append(continuation)
+                }
+            }
+        }, onCancel: {
+            Task { await self.stop() }
+        })
+    }
+
+    func finish(_ id: FolderID, completed: Bool) {
+        running.remove(id)
+        initialOutstanding.remove(id)
+        let shouldRequeue = requeueOnFinish.remove(id) != nil
+        if shouldRequeue, enabled.contains(id), !completed {
+            enqueueIfNeeded(id)
+        }
+        signalWaiters()
+    }
+
+    func initialPassComplete() -> Bool {
+        initialOutstanding.isEmpty
+    }
+
+    func stop() {
+        guard !stopped else { return }
+        stopped = true
+        queue.removeAll()
+        queued.removeAll()
+        for waiter in waiters {
+            waiter.resume(returning: nil)
+        }
+        waiters.removeAll()
+    }
+
+    private func enqueueIfNeeded(_ id: FolderID) {
+        guard enabled.contains(id), !queued.contains(id), !running.contains(id),
+              jobs[id] != nil else { return }
+        queued.insert(id)
+        queue.append(id)
+    }
+
+    private func dequeue() -> FolderID? {
+        guard !queue.isEmpty else { return nil }
+        sortQueue()
+        let id = queue.removeFirst()
+        queued.remove(id)
+        running.insert(id)
+        return id
+    }
+
+    private func sortQueue() {
+        queue.sort { lhs, rhs in
+            guard let a = jobs[lhs], let b = jobs[rhs] else { return lhs.rawValue < rhs.rawValue }
+            let ar = rank(a)
+            let br = rank(b)
+            if ar != br { return ar < br }
+            if a.path != b.path {
+                return a.path.localizedCaseInsensitiveCompare(b.path) == .orderedAscending
+            }
+            return a.id.rawValue < b.id.rawValue
+        }
+    }
+
+    private func rank(_ job: BackfillJob) -> Int {
+        if job.role == .inbox { return 0 }
+        if job.id == visibleFolder { return 1 }
+        return SyncPolicy.isSpecialUse(job.role) ? 2 : 3
+    }
+
+    private func signalWaiters() {
+        while !waiters.isEmpty, let id = dequeue() {
+            waiters.removeFirst().resume(returning: id)
+        }
+    }
+}
+
 private enum BackfillAttemptResult: Equatable {
     case committed
     case invalidated
@@ -32,6 +173,12 @@ public actor SyncEngine {
     private var dualConnection = false
     private var syncChannel: SyncChannel?
     private var idleChannel: SyncChannel?
+    private var backfillChannels: [SyncChannel] = []
+    private var backfillScheduler: FolderBackfillScheduler?
+    private var backfillTasks: [FolderID: Task<BackfillAttemptResult, Never>] = [:]
+    /// Learned per session after a provider rejects a new connection.
+    private var backfillConnectionCap: Int?
+    private var visibleFolderID: FolderID?
     private var folders: [FolderID: FolderRecord] = [:]
     private var inboxID: FolderID?
     private var currentStatus = SyncStatus(mode: .fullHistory, isOnline: false)
@@ -49,6 +196,11 @@ public actor SyncEngine {
     private var activeWriteOperations = 0
     private var writeDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private var qresyncEnabled = false
+    private var folderRenameInFlight: Set<FolderID> = []
+    /// Store folder rows can become visible during the initial LIST pass. Do
+    /// not let a UI wake race that pass and mistake an as-yet-unprepared row
+    /// for a retired folder.
+    private var discoveryReady = false
 
     /// HEADER for threading fields; `1` covers the common single-part body.
     /// Nested text parts are follow-up PEEKed in small UID chunks so a mixed
@@ -93,6 +245,7 @@ public actor SyncEngine {
             credentials: credentials,
             clientFactory: clientFactory,
             disk: qaAmpleDisk ? AmpleDiskSpace() : FileDiskSpace(),
+
             clock: { Date() },
             settings: .production
         )
@@ -123,6 +276,10 @@ public actor SyncEngine {
     }
     public func stop() async {
         stopping = true
+        await backfillScheduler?.stop()
+        for task in backfillTasks.values {
+            task.cancel()
+        }
         // Let any in-flight mailbox write finish its server sequence and
         // revision repair before closing the command channel or cancelling
         // the session group.
@@ -138,10 +295,39 @@ public actor SyncEngine {
         publishStatus(online: false)
     }
 
+    public func reportVisibleFolder(_ folder: FolderID?) async {
+        visibleFolderID = folder
+        await backfillScheduler?.setVisibleFolder(folder)
+    }
+
+    /// Applies a local-retention transition to the in-memory scheduler. The
+    /// facade persists the flag first; this method only coordinates running
+    /// work and keeps already-indexed rows intact.
+    public func setKeepLocally(_ keep: Bool, for folder: FolderID) async {
+        guard var record = folders[folder] else { return }
+        record.keepLocally = keep
+        folders[folder] = record
+
+        if !keep {
+            backfillTasks[folder]?.cancel()
+        }
+        await backfillScheduler?.setEnabled(folder, keep)
+
+        guard !keep,
+              var state = try? await store.fetchSyncState(for: record.generation),
+              state.backfillPhase == .walking
+    else { return }
+        state.backfillPhase = .idle
+        try? await store.saveSyncState(state)
+    }
     public func refreshNow() async {
         refreshPulse &+= 1
-        guard connected, let channel = syncChannel else { return }
+        guard connected, discoveryReady, let channel = syncChannel else { return }
         do {
+            let renamed = try await drainFolderRenames(channel: channel)
+            if renamed {
+                try await discover(channel: channel)
+            }
             try await deltaAll(channel: channel, notify: true)
         } catch {
             await logSync("refresh failed", detail: String(describing: error))
@@ -409,6 +595,7 @@ public actor SyncEngine {
 
     private func session() async throws {
         sessionBroken = false
+        discoveryReady = false
         backfillPassFinished = false
         try await store.upsertAccount(config)
         let password = try await credentials.password(for: config.id)
@@ -428,8 +615,15 @@ public actor SyncEngine {
 
         dualConnection = false
         idleChannel = nil
-        // Second connection opens only after every folder walk settles.
-        // Opening it (or IDLEing) during the 100k FETCH stalls Dovecot/NIO.
+        backfillChannels = [sync]
+        backfillScheduler = nil
+        backfillTasks.removeAll()
+        backfillConnectionCap = nil
+
+        // Reserve the dedicated INBOX IDLE socket before discovery/backfill.
+        // A provider cap only reduces the backfill pool; it never delays
+        // discovery or makes local retention unavailable.
+        await openIdleChannel(password: password)
 
         connected = true
         reconnectAttempt = 0
@@ -438,12 +632,18 @@ public actor SyncEngine {
 
         try await enablePreferredExtensions(channel: sync)
         try await discover(channel: sync)
+        discoveryReady = true
+        let renamed = try await drainFolderRenames(channel: sync)
+        if renamed {
+            try await discover(channel: sync)
+        }
+        await openBackfillConnections(password: password)
         try await deltaAll(channel: sync, notify: true)
         try await repairLegacyIncompleteBackfills()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask { await self.backfillAll() }
-            group.addTask { await self.idleAfterInboxBackfill(password: password) }
+            group.addTask { await self.idleLoop() }
             group.addTask { await self.periodicLoop() }
             group.addTask { await self.seenLoop() }
             group.addTask { await self.cleanupLoop() }
@@ -454,18 +654,31 @@ public actor SyncEngine {
             }
             group.cancelAll()
         }
-    }
 
+    }
     private func teardown() async {
         let idle = idleChannel
         let sync = syncChannel
+        let extras = Array(backfillChannels.dropFirst())
         idleChannel = nil
         syncChannel = nil
+        backfillChannels.removeAll()
+        if let scheduler = backfillScheduler {
+            await scheduler.stop()
+        }
+        backfillScheduler = nil
+        backfillTasks.removeAll()
         if let idle { await idle.close() }
+        for channel in extras {
+            await channel.close()
+        }
         if let sync { await sync.close() }
         dualConnection = false
+        folderRenameInFlight.removeAll()
+        discoveryReady = false
         sessionBroken = false
         qresyncEnabled = false
+        backfillConnectionCap = nil
     }
 
     private func enablePreferredExtensions(channel: SyncChannel) async throws {
@@ -505,14 +718,6 @@ public actor SyncEngine {
 
     private func discover(channel: SyncChannel) async throws {
         let discovery = try await channel.listFolders()
-        if discovery.isGmail {
-            try await store.recordError(StoreLogEntry(
-                kind: .sync,
-                account: config.id,
-                message: "Gmail-via-IMAP is unsupported",
-                detail: "X-GM-EXT-1 or known Gmail host"
-            ))
-        }
         var records: [FolderRecord] = []
         records.reserveCapacity(discovery.folders.count)
         var seen: [FolderKey] = []
@@ -554,6 +759,9 @@ public actor SyncEngine {
         persistBaseline: Bool
     ) async throws -> FolderRecord {
         let selected = try await channel.select(mailbox.path)
+        try await store.updateServerMessageCount(selected.exists, for: folderID)
+        let keepLocally = try await store.fetchFolderSummary(folderID)?.keepLocally
+            ?? (mailbox.role != .none)
         let advertised = advertisedDeltaPath(await channel.capabilities())
         let computedBaseline = SyncPolicy.baseline(uidNext: selected.uidNext)
         let baseline = persistBaseline ? computedBaseline : nil
@@ -601,6 +809,9 @@ public actor SyncEngine {
                 detail: mailbox.path
             ))
         }
+        if !keepLocally, state.backfillPhase == .walking {
+            state.backfillPhase = .idle
+        }
         if let mod = selected.highestModSeq {
             state.highestModseq = max(state.highestModseq ?? 0, mod)
         }
@@ -620,6 +831,7 @@ public actor SyncEngine {
             path: mailbox.path,
             name: mailbox.name,
             role: mailbox.role,
+            keepLocally: keepLocally,
             generation: generation,
             baseline: state.baselineUID,
             deltaPath: state.deltaPath,
@@ -632,33 +844,92 @@ public actor SyncEngine {
     }
     private func backfillAll() async {
         let ordered = SyncPolicy.sortFolders(Array(folders.values))
-        let maxRevisionRetries = 3
-        for record in ordered {
-            var revisionRetries = 0
-            while !stopping && !Task.isCancelled {
-                let revisionBefore = expungeRevision[record.id, default: 0]
-                let result = await syncFolderHistory(folderID: record.id)
-                let revisionAfter = expungeRevision[record.id, default: 0]
-                let state: FolderSyncState?
-                if let current = folders[record.id] {
-                    state = try? await store.fetchSyncState(for: current.generation)
-                } else {
-                    state = nil
-                }
-                let shouldRetry = result == .invalidated
-                    && !stopping
-                    && !Task.isCancelled
-                    && !sessionBroken
-                    && state?.backfillPhase == .walking
-                    && revisionAfter != revisionBefore
-                    && revisionRetries < maxRevisionRetries
-                guard shouldRetry else { break }
-                revisionRetries += 1
-            }
+        let jobs = ordered.map {
+            BackfillJob(id: $0.id, path: $0.path, role: $0.role)
         }
-        if !stopping && !Task.isCancelled {
+        let enabled = Set(ordered.filter(\.keepLocally).map(\.id))
+        let scheduler = FolderBackfillScheduler(jobs: jobs, enabled: enabled)
+        backfillScheduler = scheduler
+        await scheduler.setVisibleFolder(visibleFolderID)
+        if enabled.isEmpty {
             backfillPassFinished = true
         }
+
+        let channels = backfillChannels
+        guard !channels.isEmpty else {
+            await scheduler.stop()
+            return
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for channel in channels {
+                group.addTask {
+                    await self.backfillWorker(channel: channel, scheduler: scheduler)
+                }
+            }
+            while !stopping && !sessionBroken && !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            await scheduler.stop()
+            group.cancelAll()
+        }
+    }
+
+    private func backfillWorker(
+        channel: SyncChannel,
+        scheduler: FolderBackfillScheduler
+    ) async {
+        while !stopping && !sessionBroken && !Task.isCancelled {
+            guard let folderID = await scheduler.next() else { return }
+            guard !stopping, !sessionBroken, folders[folderID]?.keepLocally == true else {
+                await scheduler.finish(folderID, completed: false)
+                continue
+            }
+
+            let task = Task { await self.runBackfillWithRetries(folderID: folderID, channel: channel) }
+            backfillTasks[folderID] = task
+            let result = await task.value
+            if backfillTasks[folderID] != nil {
+                backfillTasks.removeValue(forKey: folderID)
+            }
+            var complete = false
+            if result == .committed, let record = folders[folderID], record.keepLocally,
+               let state = try? await store.fetchSyncState(for: record.generation) {
+                complete = state.backfillPhase == .complete
+            }
+            await scheduler.finish(folderID, completed: complete)
+            if await scheduler.initialPassComplete() {
+                backfillPassFinished = true
+            }
+        }
+    }
+
+    private func runBackfillWithRetries(
+        folderID: FolderID,
+        channel: SyncChannel
+    ) async -> BackfillAttemptResult {
+        var retries = 0
+        while !stopping && !Task.isCancelled {
+            let before = expungeRevision[folderID, default: 0]
+            let result = await syncFolderHistory(folderID: folderID, channel: channel)
+            let after = expungeRevision[folderID, default: 0]
+            let state: FolderSyncState?
+            if let current = folders[folderID] {
+                state = try? await store.fetchSyncState(for: current.generation)
+            } else {
+                state = nil
+            }
+            let retry = result == .invalidated
+                && !stopping
+                && !Task.isCancelled
+                && !sessionBroken
+                && folders[folderID]?.keepLocally == true
+                && state?.backfillPhase == .walking
+                && after != before
+                && retries < 3
+            guard retry else { return result }
+            retries += 1
+        }
+        return .halted
     }
     /// Older builds advanced the durable cursor across messages rejected by
     /// the setup-time cutoff. A completed generation with fewer local rows than
@@ -702,8 +973,11 @@ public actor SyncEngine {
     }
 
     /// Backfill, then atomically switch a replacement generation only once it is complete.
-    private func syncFolderHistory(folderID: FolderID) async -> BackfillAttemptResult {
-        let result = await backfill(folderID: folderID)
+    private func syncFolderHistory(
+        folderID: FolderID,
+        channel: SyncChannel
+    ) async -> BackfillAttemptResult {
+        let result = await backfill(folderID: folderID, channel: channel)
         await activateIfReplacementComplete(folderID: folderID)
         return result
     }
@@ -716,8 +990,12 @@ public actor SyncEngine {
         await activateReplacement(folderID: folderID)
     }
 
-    private func backfill(folderID: FolderID) async -> BackfillAttemptResult {
-        guard var record = folders[folderID], let channel = syncChannel else { return .halted }
+    private func backfill(
+        folderID: FolderID,
+        channel: SyncChannel
+    ) async -> BackfillAttemptResult {
+        guard var record = folders[folderID],
+              record.keepLocally else { return .halted }
         do {
             var state = try await store.fetchSyncState(for: record.generation)
                 ?? FolderSyncState(generation: record.generation, baselineUID: record.baseline)
@@ -739,14 +1017,12 @@ public actor SyncEngine {
                     if windowedSince == nil {
                         windowedSince = since
                     }
-                    if let windowedSince {
-                        publishStatus(mode: .windowed(since: windowedSince))
-                    }
-                    return .halted
                 }
             }
 
             let selected = try await channel.select(record.path)
+            guard folders[folderID]?.keepLocally == true else { return .halted }
+            try await store.updateServerMessageCount(selected.exists, for: folderID)
             let previousGeneration = record.generation
             try await maybeReplace(selected: selected, record: &record)
             folders[folderID] = record
@@ -769,6 +1045,7 @@ public actor SyncEngine {
             try await store.saveSyncState(state)
 
             while !stopping && !Task.isCancelled {
+                guard folders[folderID]?.keepLocally == true else { return .halted }
                 try Task.checkCancellation()
                 let snap = disk.snapshot(for: settings.diskURL)
                 let reserve = SyncPolicy.reserveBytes(volumeBytes: snap.volumeBytes)
@@ -857,6 +1134,7 @@ public actor SyncEngine {
         expectedExpungeRevision: UInt64? = nil,
         uidSetOverride: IMAPUIDSet? = nil
     ) async throws -> BackfillAttemptResult {
+        guard folders[record.id]?.keepLocally == true else { return .halted }
         let capturedGeneration = record.generation
         let uidSet = uidSetOverride ?? IMAPUIDSet(window)
         let meta: [IMAPFetchedMessage]
@@ -996,6 +1274,7 @@ public actor SyncEngine {
             return .invalidated
         }
         guard stillCurrentGeneration(capturedGeneration, folder: record.id) else { return .invalidated }
+        guard folders[record.id]?.keepLocally == true else { return .halted }
         _ = try await store.upsertMessages(built)
 
         // An expunge can arrive while the upsert is suspended. Reconcile
@@ -1182,17 +1461,41 @@ public actor SyncEngine {
         let ordered = SyncPolicy.sortFolders(Array(folders.values))
         for record in ordered {
             if stopping || Task.isCancelled { return }
-            try await delta(folderID: record.id, channel: channel, notify: notify)
+            if record.keepLocally {
+                try await delta(folderID: record.id, channel: channel, notify: notify)
+            } else {
+                try await refreshStatus(folderID: record.id, channel: channel)
+            }
         }
     }
 
+    /// Refreshes a disabled mailbox without any UID FETCH. SELECT supplies the
+    /// current EXISTS/UIDNEXT status while message rows remain untouched.
+    private func refreshStatus(folderID: FolderID, channel: SyncChannel) async throws {
+        guard let record = folders[folderID], !record.keepLocally else { return }
+        let selected = try await channel.select(record.path)
+        guard folders[folderID]?.keepLocally == false else { return }
+        try await store.updateServerMessageCount(selected.exists, for: folderID)
+        guard var latest = folders[folderID] else { return }
+        latest.serverMessageCount = selected.exists
+        latest.lastUidNext = selected.uidNext ?? latest.lastUidNext
+        latest.lastDeltaAt = clock()
+        folders[folderID] = latest
+    }
+
     private func delta(folderID: FolderID, channel: SyncChannel, notify: Bool) async throws {
-        guard var record = folders[folderID] else { return }
+        guard let current = folders[folderID] else { return }
+        guard current.keepLocally else {
+            try await refreshStatus(folderID: folderID, channel: channel)
+            return
+        }
+        var record = current
         do {
             try await runDelta(record: &record, channel: channel, notify: notify)
             record.lastDeltaAt = clock()
             folders[folderID] = record
         } catch {
+            guard folders[folderID]?.keepLocally == true else { return }
             if let reason = SyncPolicy.taggedReason(error) {
                 try await persistDowngrade(&record, reason: reason, channel: channel)
                 folders[folderID] = record
@@ -1253,6 +1556,8 @@ public actor SyncEngine {
             selected = try await channel.select(record.path)
             vanished = []
         }
+        guard folders[record.id]?.keepLocally == true else { return }
+        try await store.updateServerMessageCount(selected.exists, for: record.id)
 
         let observedExpunge = selected.exists < record.serverMessageCount || !vanished.isEmpty
         let uidNextChanged = selected.uidNext.map { $0 != record.lastUidNext } ?? false
@@ -1286,11 +1591,11 @@ public actor SyncEngine {
                         uids: vanished.map { IMAPUID(rawValue: $0) }
                     )
                 }
-                // A QRESYNC SELECT can race an in-flight EXPUNGE burst delivered
-                // on the IDLE socket. If EXISTS moved backwards or QRESYNC
-                // carried a VANISHED set, sweep stored UIDs as the lossless
-                // fallback. This never runs on an ordinary refresh.
-                if observedExpunge {
+                // A QRESYNC SELECT can race an in-flight EXPUNGE burst
+                // delivered on the IDLE socket. If EXISTS moved backwards,
+                // UIDNEXT advanced without VANISHED, or QRESYNC carried a
+                // VANISHED set, sweep stored UIDs as the lossless fallback.
+                if observedExpunge || uidNextChanged {
                     try await reconcileExpunges(
                         record: record,
                         selected: selected,
@@ -1379,12 +1684,8 @@ public actor SyncEngine {
         try await store.saveSyncState(state)
 
         folders[record.id] = record
-        if record.isReplacement {
-            _ = await backfill(folderID: record.id)
-            await activateIfReplacementComplete(folderID: record.id)
-            if let latest = folders[record.id] {
-                record = latest
-            }
+        if record.isReplacement, record.keepLocally {
+            await backfillScheduler?.setEnabled(record.id, true)
         }
     }
 
@@ -1441,31 +1742,36 @@ public actor SyncEngine {
         }
     }
 
-    /// IDLE on a second connection while the sync connection is mid-FETCH
-    /// can stall Dovecot/NIO (no tagged FETCH reply). Wait until every folder
-    /// walk has settled, then open the idle socket so the 100k INBOX + Horrors
-    /// backfill stays single-connection.
-    private func idleAfterInboxBackfill(password: String) async {
-        await waitUntilWalksSettle()
-        if stopping || Task.isCancelled { return }
-        // Catch up INBOX before sitting in IDLE. Mail and VANISHED that arrived
-        // during backfill (or a UIDVALIDITY replacement) otherwise wait on a
-        // hint that was never observed: dual-connection periodic skips INBOX,
-        // and EXISTS emitted before beginIdle is dropped.
-        await catchUpInboxDelta()
-        await openIdleChannel(password: password)
-        await idleLoop()
-    }
-
-    private func catchUpInboxDelta() async {
-        guard let sync = syncChannel, let inboxID else { return }
-        try? await delta(folderID: inboxID, channel: sync, notify: true)
-    }
-
-    private func waitUntilWalksSettle() async {
-        while !stopping && !Task.isCancelled {
-            if backfillPassFinished { return }
-            try? await Task.sleep(for: .milliseconds(200))
+    private func openBackfillConnections(password: String) async {
+        let enabledFolders = folders.values.lazy.filter(\.keepLocally).count
+        let requested = min(
+            SyncPolicy.maxBackfillConnections,
+            max(1, min(enabledFolders, backfillConnectionCap ?? SyncPolicy.maxBackfillConnections))
+        )
+        guard backfillChannels.count < requested else { return }
+        while backfillChannels.count < requested {
+            let client = clientFactory.makeClient(
+                endpoint: config.imap,
+                username: config.username,
+                password: password
+            )
+            let channel = SyncChannel(client: client)
+            do {
+                try await channel.connect()
+                backfillChannels.append(channel)
+            } catch {
+                await channel.close()
+                if SyncPolicy.isConnectionCap(error) {
+                    backfillConnectionCap = backfillChannels.count
+                    await logSync(
+                        "backfill connection cap",
+                        detail: "cap=\(backfillChannels.count) \(String(describing: error))"
+                    )
+                } else {
+                    await logSync("backfill connection failed", detail: String(describing: error))
+                }
+                break
+            }
         }
     }
 
@@ -1490,6 +1796,7 @@ public actor SyncEngine {
             dualConnection = false
             idleChannel = nil
             if SyncPolicy.isConnectionCap(error) {
+                backfillConnectionCap = 1
                 await logSync("single-connection fallback", detail: String(describing: error))
             } else {
                 await logSync("idle connect failed; multiplex", detail: String(describing: error))
@@ -1498,11 +1805,17 @@ public actor SyncEngine {
     }
 
     private func idleLoop() async {
+        // The socket is connected during session setup, but beginning IDLE
+        // waits until the initial mailbox walk has settled. This keeps the
+        // primary command channel free for the first windows.
+        while !stopping && !Task.isCancelled && !backfillPassFinished {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        guard !stopping, !Task.isCancelled else { return }
         let caps = await syncChannel?.capabilities()
         guard caps?.idle == true else { return }
-        guard let inboxID, var record = folders[inboxID] else { return }
-        let channel = dualConnection ? (idleChannel ?? syncChannel) : syncChannel
-        guard let channel else { return }
+        guard let inboxID, var record = folders[inboxID],
+              let channel = idleChannel else { return }
         while !stopping && !Task.isCancelled {
             do {
                 let selected = try await channel.select(record.path)
@@ -1588,14 +1901,17 @@ public actor SyncEngine {
             if stopping { return }
             guard let channel = syncChannel else { continue }
             // INBOX live mail must not wait for every folder walk to finish.
-            // IDLE only starts after backfillPassFinished; without this,
-            // APPEND/EXISTS during the 100k walk is never ingested.
+            // IDLE owns this path when its dedicated socket is available.
             if let inboxID, !dualConnection || !backfillPassFinished {
                 try? await delta(folderID: inboxID, channel: channel, notify: true)
             }
-            if !backfillPassFinished { continue }
+
             let now = clock()
             for record in folders.values where record.role != .inbox {
+                guard record.keepLocally else {
+                    try? await refreshStatus(folderID: record.id, channel: channel)
+                    continue
+                }
                 let interval = SyncPolicy.isSpecialUse(record.role)
                     ? settings.specialUseDelta
                     : settings.otherFolderDelta
@@ -1603,11 +1919,12 @@ public actor SyncEngine {
                     try? await delta(folderID: record.id, channel: channel, notify: true)
                 }
             }
-            for record in SyncPolicy.sortFolders(Array(folders.values)) {
+
+            for record in SyncPolicy.sortFolders(Array(folders.values)) where record.keepLocally {
                 if stopping { return }
                 if let state = try? await store.fetchSyncState(for: record.generation),
                    state.backfillPhase != .complete {
-                    _ = await syncFolderHistory(folderID: record.id)
+                    await backfillScheduler?.setEnabled(record.id, true)
                 } else {
                     await activateIfReplacementComplete(folderID: record.id)
                 }
@@ -1641,6 +1958,10 @@ public actor SyncEngine {
     private func seenLoop() async {
         while !stopping && !Task.isCancelled {
             if let channel = syncChannel {
+                let renamed = (try? await drainFolderRenames(channel: channel)) ?? false
+                if renamed {
+                    try? await discover(channel: channel)
+                }
                 try? await drainFlags(channel: channel)
                 let movedFolders = (try? await drainMove(channel: channel)) ?? []
                 // A successful server move changes both mailboxes. Reuse the
@@ -1653,6 +1974,44 @@ public actor SyncEngine {
             }
             try? await Task.sleep(for: settings.seenPoll)
         }
+    }
+
+    private func drainFolderRenames(channel: SyncChannel) async throws -> Bool {
+        let ops = try await store.snapshotFolderRenameQueue(limit: 32)
+        var didRename = false
+        for op in ops {
+            if stopping { return didRename }
+            try Task.checkCancellation()
+            if !folderRenameInFlight.insert(op.folder).inserted {
+                continue
+            }
+            defer { folderRenameInFlight.remove(op.folder) }
+
+            guard op.account == config.id else {
+                try await store.dropFolderRename(op, reason: "account mismatch")
+                continue
+            }
+            guard let summary = try await store.fetchFolderSummary(op.folder),
+                  summary.accountID == config.id,
+                  folders[op.folder] != nil
+            else {
+                try await store.dropFolderRename(op, reason: "folder missing or retired")
+                continue
+            }
+
+            do {
+                try await channel.renameMailbox(from: summary.path, to: op.targetPath)
+                try await store.dequeueFolderRename(op)
+                didRename = true
+            } catch let error as IMAPError {
+                if error.isTaggedNO || error.isTaggedBAD {
+                    try await store.dropFolderRename(op, reason: error.description)
+                } else {
+                    throw error
+                }
+            }
+        }
+        return didRename
     }
 
     private func drainFlags(channel: SyncChannel) async throws {
@@ -1724,7 +2083,7 @@ public actor SyncEngine {
             if let destinationFolderID = op.destinationFolderID {
                 target = folders[destinationFolderID]
             } else {
-                target = folders.values.first(where: { $0.role == op.destination })
+                target = SyncPolicy.destinationFolder(for: op.destination, in: folders.values)
             }
             let destinationName: String
             if let target {

@@ -25,7 +25,9 @@ enum ProviderPresets {
 
         for url in urls {
             if let presets = decode(url: url), !presets.isEmpty {
-                return presets
+                return presets.sorted {
+                    $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                }
             }
         }
         return builtin
@@ -60,17 +62,6 @@ enum ProviderPresets {
 
     private static let builtin: [IMAPProviderPreset] = [
         IMAPProviderPreset(
-            name: "iCloud",
-            host: "imap.mail.me.com",
-            port: 993,
-            security: .implicitTLS,
-            usernameHint: "Your Apple Account email",
-            guidance: "Create an app-specific password at appleid.apple.com. Two-factor authentication is required; the account password will not work.",
-            smtpHost: "smtp.mail.me.com",
-            smtpPort: 587,
-            smtpSecurity: .startTLS
-        ),
-        IMAPProviderPreset(
             name: "Fastmail",
             host: "imap.fastmail.com",
             port: 993,
@@ -78,6 +69,28 @@ enum ProviderPresets {
             usernameHint: "Your Fastmail email address",
             guidance: "Create an app-specific password in Fastmail → Privacy & Security → Integrations. The account password will not work with IMAP.",
             smtpHost: "smtp.fastmail.com",
+            smtpPort: 587,
+            smtpSecurity: .startTLS
+        ),
+        IMAPProviderPreset(
+            name: "Gmail",
+            host: "imap.gmail.com",
+            port: 993,
+            security: .implicitTLS,
+            usernameHint: "Your full Gmail address",
+            guidance: "Needs 2-Step Verification; create an App Password at myaccount.google.com/apppasswords and use it instead of the account password; the account password will not work.",
+            smtpHost: "smtp.gmail.com",
+            smtpPort: 465,
+            smtpSecurity: .implicitTLS
+        ),
+        IMAPProviderPreset(
+            name: "iCloud",
+            host: "imap.mail.me.com",
+            port: 993,
+            security: .implicitTLS,
+            usernameHint: "Your Apple Account email",
+            guidance: "Create an app-specific password at appleid.apple.com. Two-factor authentication is required; the account password will not work.",
+            smtpHost: "smtp.mail.me.com",
             smtpPort: 587,
             smtpSecurity: .startTLS
         ),

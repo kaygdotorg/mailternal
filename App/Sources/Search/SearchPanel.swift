@@ -22,8 +22,17 @@ struct SearchPanel: View {
             let maximumHeight = geometry.size.height / 3
 
             ZStack(alignment: .top) {
+                // The backdrop lags the surface on both ends: it arrives as
+                // the card lands and it is the last thing to go, so the card
+                // never lingers as a ghost over an already-clear window.
                 SearchPanelBackdrop()
                     .opacity(hasAppeared ? 1 : 0)
+                    .animation(
+                        hasAppeared
+                            ? MailMotion.searchPanel(reduceMotion: reduceMotion)
+                            : MailMotion.searchBackdropExit,
+                        value: hasAppeared
+                    )
                     .ignoresSafeArea()
                 Rectangle()
                     .fill(.clear)
@@ -60,8 +69,13 @@ struct SearchPanel: View {
                 .opacity(hasAppeared ? 1 : 0)
                 .scaleEffect(reduceMotion ? 1 : (hasAppeared ? 1 : 0.985), anchor: .top)
                 .offset(y: reduceMotion ? 0 : (hasAppeared ? 0 : -10))
+                .animation(
+                    hasAppeared
+                        ? MailMotion.searchPanel(reduceMotion: reduceMotion)
+                        : MailMotion.searchCardExit,
+                    value: hasAppeared
+                )
             }
-            .animation(MailMotion.searchPanel(reduceMotion: reduceMotion), value: hasAppeared)
             .onAppear { hasAppeared = true }
             .onDisappear { fieldFocused = false }
             .task {
@@ -89,8 +103,20 @@ struct SearchPanel: View {
 
     private func dismiss() {
         fieldFocused = false
-        model.isSearchPresented = false
         model.toasts.isSuppressed = false
+        guard hasAppeared else {
+            model.isSearchPresented = false
+            return
+        }
+        // Card first, then backdrop, then remove the overlay once both
+        // have finished; removing it immediately would cut the backdrop
+        // (an AppKit view) before the card had faded.
+        hasAppeared = false
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(MailMotion.searchDismissDuration))
+            guard !hasAppeared else { return }
+            model.isSearchPresented = false
+        }
     }
 
     private func moveSelection(_ delta: Int) {
@@ -169,6 +195,7 @@ private struct SearchPanelSurface: View {
     let onDismiss: () -> Void
     let onRetry: () -> Void
     @Environment(AccentSource.self) private var accent
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -281,48 +308,66 @@ private struct SearchPanelSurface: View {
             }
             .padding(20)
         } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(results.enumerated()), id: \.element.id) { index, row in
-                        Button { onOpen(row) } label: {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(row.subject)
-                                    .font(.body.weight(selectedIndex == index ? .semibold : .regular))
-                                    .lineLimit(2)
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text(row.from)
-                                    Spacer(minLength: 8)
-                                    if !row.folderName.isEmpty {
-                                        Text(row.folderName)
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                            .foregroundStyle(.tertiary)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(results.enumerated()), id: \.element.id) { index, row in
+                            Button { onOpen(row) } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(row.subject)
+                                        .font(.body.weight(selectedIndex == index ? .semibold : .regular))
+                                        .lineLimit(2)
+                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                        Text(row.from)
+                                        Spacer(minLength: 8)
+                                        if let accountName = row.accountName, !accountName.isEmpty {
+                                            Text(accountName)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                        }
+                                        if !row.folderName.isEmpty {
+                                            Text(row.folderName)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                        }
+                                        Text(MailDateFormat.listRow(row.date))
                                     }
-                                    Text(MailDateFormat.listRow(row.date))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                                 }
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(
+                                    selectedIndex == index
+                                        ? accent.color.opacity(contrast == .increased ? 0.24 : 0.12)
+                                        : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
+                                )
                             }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(
-                                selectedIndex == index
-                                    ? accent.color.opacity(contrast == .increased ? 0.24 : 0.12)
-                                    : Color.clear,
-                                in: RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .contextMenu {
-                            Button("Copy Deep Link") {
-                                onCopyDeepLink(row.id)
+                            .buttonStyle(.plain)
+                            .id(row.id)
+                            .contextMenu {
+                                Button("Copy Deep Link") {
+                                    onCopyDeepLink(row.id)
+                                }
                             }
                         }
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
+                .onChange(of: selectedIndex) { _, newIndex in
+                    guard let newIndex, results.indices.contains(newIndex) else { return }
+                    let messageID = results[newIndex].id
+                    if reduceMotion {
+                        proxy.scrollTo(messageID, anchor: .center)
+                    } else {
+                        withAnimation(MailMotion.disclosure) {
+                            proxy.scrollTo(messageID, anchor: .center)
+                        }
+                    }
+                }
             }
         }
     }

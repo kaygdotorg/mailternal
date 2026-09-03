@@ -6,6 +6,10 @@ import MailternalStore
 /// Pure policy helpers (spec: docs/spec/sync.md). Kept free of I/O so unit tests
 /// can pin window math, the UIDNEXT−1 baseline edge, downgrade, disk, and notify.
 enum SyncPolicy: Sendable {
+    /// Maximum number of concurrent mailbox backfill connections. The primary
+    /// sync connection counts as one; the dedicated INBOX IDLE socket is
+    /// separate and does not consume this budget.
+    static let maxBackfillConnections = 3
     static let defaultWindowSize: UInt32 = 1_000
     /// A small newest-first first commit makes the visible folder useful
     /// before the throughput-oriented history walk begins.
@@ -120,12 +124,30 @@ enum SyncPolicy: Sendable {
     }
 
     static func sortFolders(_ folders: [FolderRecord]) -> [FolderRecord] {
+
         folders.sorted { a, b in
             let ra = folderRank(a.role)
             let rb = folderRank(b.role)
             if ra != rb { return ra < rb }
             return a.path.localizedCaseInsensitiveCompare(b.path) == .orderedAscending
         }
+    }
+    /// Resolves role destinations deterministically. Gmail advertises its archive
+    /// mailbox as `\All`, represented by the canonical `[Gmail]/All Mail` path;
+    /// prefer that mailbox over a second archive-role folder when present.
+    static func destinationFolder(
+        for role: FolderRole,
+        in folders: some Sequence<FolderRecord>
+    ) -> FolderRecord? {
+        var fallback: FolderRecord?
+        for folder in folders where folder.role == role {
+            fallback = fallback ?? folder
+            if role == .archive,
+               folder.path.compare("[Gmail]/All Mail", options: [.caseInsensitive]) == .orderedSame {
+                return folder
+            }
+        }
+        return fallback
     }
 
     // MARK: Disk
@@ -279,6 +301,7 @@ struct FolderRecord: Sendable {
     var path: String
     var name: String
     var role: FolderRole
+    var keepLocally: Bool
     var generation: MailboxGeneration
     var baseline: IMAPUID?
     var deltaPath: DeltaPath

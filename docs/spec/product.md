@@ -31,14 +31,13 @@ two documents appear to conflict, design.md governs UI architecture.
 
 ## Account scope
 - v0.0.1: exactly **one IMAP account**.
-- Providers: generic IMAP, iCloud and Fastmail via app-specific passwords
-  (setup presets with guidance).
-- **Gmail** (M4, required on macOS, iOS and CLI): **App Password** is the default,
-  guided path (2-Step Verification required; deep link to Google's page, paste
-  field); **bring-your-own OAuth client** (user's own Google Cloud client id, PKCE,
-  loopback redirect) is the advanced path. No Mailternal-owned client id and no CASA
-  assessment until revenue justifies the annual fee. Never a web-session/scraping
-  path (blocked by Google since 2021; it killed Mailplane). Exchange: never.
+- Accounts can be disabled; disabling stops the engine and hides folders while retaining settings and the saved password.
+- Providers: generic IMAP, iCloud and Fastmail via app-specific passwords, plus
+  Gmail via Google App Password (2-Step Verification required; setup guidance
+  links to Google's App Password page).
+- **Gmail** (shipped in 0.0.1 for 2-Step Verification accounts): use the full
+  Gmail address with an App Password for IMAP/SMTP. OAuth stays deferred; there is
+  no Mailternal-owned OAuth client or web-session/scraping path. Exchange: never.
 - Account setup: manual host/port/TLS entry + provider presets (a plist, not a
   discovery subsystem). Full Thunderbird-autoconfig/RFC 6186 later.
 - **SMTP is collected only with the composer milestone (M5)**; presets may carry
@@ -55,8 +54,11 @@ Screens: folder sidebar → flat chronological message list per folder (configur
 swipe actions, Settings → Actions → Gestures) → reader as three floating islands
 (subject / expandable headers / body) → account setup. No threading in 0.0.1.
 
-- **Mutations**: seen, unseen, flagged/unflagged, archive, trash — all through
-  persisted optimistic queues (sync.md). **No sending until M5.**
+- **Mutations**: seen, unseen, flagged/unflagged, archive, trash, folder moves,
+  and folder renames all go through persisted optimistic queues (sync.md).
+- **Folder rename**: edits are coalesced by folder and sent as a real IMAP
+  `RENAME`; the sidebar reflects the server discovery result, preserving stable
+  OBJECTID identity when available.
 - **Full-text search** over the entire synced history, offline, instant (FTS5).
   Windowed/degraded sync states disclose "search covers mail since <date>".
 - HTML mail in `WKWebView`: **remote images blocked by default** (notice shown only

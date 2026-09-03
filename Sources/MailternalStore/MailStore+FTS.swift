@@ -21,6 +21,7 @@ extension MailStore {
             let sql = """
                 SELECT m.id, m.from_display, m.subject, m.internal_date, m.uid,
                        m.is_read, m.has_attachments, m.is_flagged, m.preview,
+                       f.id AS folder_id,
                        COALESCE(NULLIF(f.name, ''), CASE f.role
                            WHEN 'inbox' THEN 'INBOX'
                            WHEN 'archive' THEN 'Archive'
@@ -29,16 +30,19 @@ extension MailStore {
                            WHEN 'sent' THEN 'Sent'
                            WHEN 'drafts' THEN 'Drafts'
                            ELSE f.path END) AS folder_name,
+                       COALESCE(NULLIF(a.display_name, ''), a.email_address) AS account_name,
                        snippet(messages_fts, 3, '', '', '\u{2026}', 24) AS body_snippet,
                        snippet(messages_fts, 0, '', '', '\u{2026}', 16) AS subject_snippet
                 FROM messages_fts
                 JOIN messages m ON m.id = messages_fts.rowid
                 JOIN generations g ON g.id = m.generation_id AND g.state = 'live'
                 JOIN folders f ON f.id = g.folder_id AND f.retired = 0
+                JOIN accounts a ON a.id = f.account_id
                 WHERE messages_fts MATCH ?1
+                  AND a.is_enabled = 1
                 ORDER BY messages_fts.rowid DESC
                 LIMIT ?2
-                """
+            """
             let rows = try Row.fetchAll(db, sql: sql, arguments: [pattern, cap])
             return rows.map { row in
                 let bodySnippet: String? = row["body_snippet"]

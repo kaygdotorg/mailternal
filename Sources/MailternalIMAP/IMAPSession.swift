@@ -169,7 +169,8 @@ extension IMAPSession {
     }
 
     /// `LIST` all folders, skip `\Noselect`/`\NonExistent`, map SPECIAL-USE with
-    /// name-heuristic fallback, capture MAILBOXID when advertised, set the Gmail flag.
+    /// name-heuristic fallback, capture MAILBOXID when advertised, and expose
+    /// Gmail's capability/host detection to callers.
     public func listFolders() async throws -> IMAPFolderDiscovery {
         try ensureAuthenticated()
         var returnOptions: [ReturnOption] = []
@@ -208,11 +209,12 @@ extension IMAPSession {
             let components = info.path.displayStringComponents()
             let separator = info.path.pathSeparator
             let path = components.joined(separator: separator.map(String.init) ?? "/")
-            let name = components.last ?? path
+            let rawName = components.last ?? path
+            let name = IMAPRoleMapping.displayName(path: path, name: rawName)
             let id = statusIDs[info.path.name.debugDescription]
-            let role = IMAPRoleMapping.role(path: path, name: name, attributes: info.attributes)
+            let role = IMAPRoleMapping.role(path: path, name: rawName, attributes: info.attributes)
             folders.append(IMAPMailbox(
-                path: path.isEmpty ? name : path,
+                path: path.isEmpty ? rawName : path,
                 name: name,
                 separator: separator,
                 role: role,
@@ -336,6 +338,24 @@ extension IMAPSession {
         try await storeFlags(uids: uids, flag: .seen, set: true)
     }
  
+
+    /// Renames an IMAP mailbox. The tagged response is authoritative: only
+    /// tagged `OK` returns; `NO`/`BAD` are surfaced to the sync queue.
+    public func renameMailbox(from source: String, to destination: String) async throws {
+        try ensureAuthenticated()
+        let tagged = try await send(
+            .rename(
+                from: MailboxName(ByteBuffer(string: source)),
+                to: MailboxName(ByteBuffer(string: destination)),
+                parameters: [:]
+            )
+        )
+        try throwIfFailed(tagged)
+        if var selected, selected.name == source {
+            selected.name = destination
+            self.selected = selected
+        }
+    }
     /// `UID MOVE <uids> <mailbox>`. Only tagged `OK` is success.
     public func move(uids: IMAPUIDSet, to mailbox: String) async throws {
         try ensureAuthenticated()

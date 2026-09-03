@@ -33,8 +33,22 @@ message + FTS rows in bounded cleanup batches. Never blank the UI on a big folde
   it — renames then preserve identity and never resync. Without OBJECTID, a rename is
   reconciled conservatively as delete + new mailbox (fresh generation, full backfill);
   no heuristic identity matching.
-- Detect `X-GM-EXT-1` / known Gmail hosts and warn: Gmail-via-IMAP is unsupported
-  (virtual "All Mail" would double storage and duplicate search results).
+- Detect `X-GM-EXT-1` / known Gmail hosts to apply Gmail's IMAP folder semantics.
+
+### Gmail via IMAP
+- Gmail uses `imap.gmail.com:993` with implicit TLS. Authenticate with the full
+  address and a Google App Password; App Passwords require 2-Step Verification.
+- Gmail's `[Gmail]/All Mail` advertises `\All`, which maps to Mailternal's `archive`
+  role. `\Junk`, `\Trash`, `\Sent`, and `\Drafts` map to junk, trash, sent, and
+  drafts. `\Flagged` (Starred) and `\Important` remain ordinary folders with no
+  role. Labels are ordinary folders, but a labelled message is the same message
+  (the same `X-GM-MSGID`) as its copy in All Mail.
+- The sidebar strips the `[Gmail]/` display prefix while retaining each exact path
+  for `SELECT`, `MOVE`, and identity. Archive removes the INBOX label by moving to
+  `[Gmail]/All Mail` (using `UID MOVE` when advertised, or the normal COPY/DELETE
+  fallback).
+- Gmail advertises `CONDSTORE` but not `QRESYNC`; the sync engine uses the
+  CONDSTORE MODSEQ delta path. Gmail may enforce a per-user IMAP folder message cap.
 
 ## Sync policy
 - **Text-only full-history sync**: envelopes + bodies (text/plain and text/html parts)
@@ -45,20 +59,22 @@ message + FTS rows in bounded cleanup batches. Never blank the UI on a big folde
   `\Seen` transition is the explicit queued store below.
 
 ### Write queues
-0.0.1 supports six user mutations: **seen**, **unseen**, **flagged**,
-**archive**, **trash**, and **move-to-folder**. Flag operations share one
-persisted queue keyed by `(account, mailbox, UIDVALIDITY, UID, flag)`; later
-operations for the same flag replace earlier ones. Move operations share the
-historical `archive_queue` table and carry either a destination role or the
-destination folder identity. Facade batches are enqueued in one local
-transaction and drained as one UID set when their source and destination match.
+0.0.1 supports seven user mutations: **seen**, **unseen**, **flagged**,
+**archive**, **trash**, **move-to-folder**, and **folder rename**. Flag
+operations share one persisted queue keyed by `(account, mailbox, UIDVALIDITY,
+UID, flag)`; later operations for the same flag replace earlier ones. Move
+operations share the historical `archive_queue` table and carry either a
+destination role or the destination folder identity. Facade batches are
+enqueued in one local transaction and drained as one UID set when their source
+and destination match.
 
 #### Flags (`\Seen` and `\Flagged`)
 - Local read, unread, flag, and unflag actions enqueue a persisted op with
   `(account, mailbox, UIDVALIDITY, UID, flag, set)` and optimistically update
   the message row.
-- Ops are sent as `UID STORE <uid> +FLAGS.SILENT (\Seen|\Flagged)` when `set`
-  is true, or `UID STORE <uid> -FLAGS.SILENT (\Seen|\Flagged)` when false.
+- Ops are sent as `UID STORE <uid-set> +FLAGS.SILENT (\Seen|\Flagged)` when
+  `set` is true, or `UID STORE <uid-set> -FLAGS.SILENT (\Seen|\Flagged)` when
+  false.
 - Pending local `seen=true` wins over inbound unseen, `seen=false` wins over
   inbound seen, and pending `flagged` set/clear wins over inbound state until
   the corresponding STORE is acknowledged.
@@ -71,23 +87,41 @@ transaction and drained as one UID set when their source and destination match.
 - Local archive, trash, or move-to-folder enqueues a persisted, coalesced op
   `(account, mailbox, UIDVALIDITY, UID, destination[, destination_folder_id])`
   and optimistically deletes the message row from the source folder in the same
-  local write transaction. The next delta reconciles server truth after a crash
-  or failed send.
+  local write transaction. The next delta reconciles server truth after a
+  crash or failed send.
 - A folder destination is resolved by its stable folder identity to its current
   server path at drain time; a retired or missing destination is discarded and
   an error-log row records the failure. Role destinations retain their
   role-based resolution.
 - When the session advertises `MOVE`, send `UID MOVE <uid-set> <destination-mailbox>`.
-  Otherwise send `UID COPY <uid-set> <destination-mailbox>`, then
-  `UID STORE <uid-set> +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE <uid-set>` so
-  only the moved UIDs are expunged. Matching queued moves are batched into one
-  server operation.
+  Otherwise send `UID COPY <uid-set> <destination-mailbox>`, then `UID STORE
+  <uid-set> +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE <uid-set>` so only the
+  moved UIDs are expunged. Matching queued moves are batched into one server
+  operation.
 - Only a tagged `OK` for the complete server operation dequeues the ops.
   Transport errors, `BYE`, and connection loss retain them for retry; tagged
   `NO`/`BAD` drops them and records a move error.
-- Ops whose UIDVALIDITY no longer matches the live generation are dropped without
-  a server write. Replacement activation and every UIDVALIDITY mismatch cleanup
-  apply this stale-op rule.
+- Ops whose UIDVALIDITY no longer matches the live generation are dropped
+  without a server write. Replacement activation and every UIDVALIDITY mismatch
+  cleanup apply this stale-op rule.
+
+#### Folder rename
+- A rename is inserted into `folder_rename_queue` before any network command.
+  The table is keyed by `folder_id`; a later edit coalesces into the same row
+  and replaces `target_name`, `target_path`, and `enqueued_at`. The queue is
+  durable across process restart.
+- `target_path` replaces only the terminal component of the folder's current
+  path, retaining its hierarchy prefix and exact LIST separator. The local
+  folder row is not changed until discovery confirms server state, so a
+  rejected rename never leaves a cosmetic local path.
+- The sync engine drains renames serially on the command channel with IMAP
+  `RENAME`. Tagged `OK` removes the row and immediately refreshes mailbox
+  discovery. Transport errors, `BYE`, and connection loss retain the row for
+  retry. Tagged `NO`/`BAD`, account/folder mismatches, and retired folders
+  remove the row and record a user-visible store error.
+- Discovery preserves a `FolderID` when the server supplies OBJECTID/MAILBOXID.
+  Path-only servers conservatively retire the old identity and create a new
+  folder generation after a successful rename.
 
 ### Backfill algorithm (bounded, resumable)
 - Per folder: walk **descending fixed-size UID windows** from `UIDNEXT-1` (never
@@ -101,9 +135,26 @@ transaction and drained as one UID set when their source and destination match.
   reconnect, or kill.
 - A message that fails to parse/fetch is **quarantined** (stored with error state,
   envelope-only) and never blocks its folder.
-- Priority: INBOX first, then SPECIAL-USE folders, then the rest; within a folder,
-  newest first. Cancellation points between batches keep the writer responsive.
-
+- Priority queue: INBOX first, then the currently visible folder, then
+  SPECIAL-USE folders, then custom folders; within a folder, newest first.
+  `FolderBackfillScheduler` owns this ordering and wakes workers when a folder
+  is enabled. Cancellation points between batches keep the writer responsive.
+- **Local-retention flags:** `keepLocally = true` folders are backfilled and
+  included in delta passes. A `false` folder is still discovered and refreshed
+  with STATUS/SELECT counts (so its sidebar count remains current), but never
+  receives message FETCHes or a backfill/delta message walk. Turning it on
+  queues its backfill immediately; turning it off cancels its in-flight worker
+  and leaves existing rows intact.
+- **Bounded parallel backfill:** each account has up to
+  `SyncPolicy.maxBackfillConnections` (3) connections in a worker pool. The
+  dedicated INBOX IDLE connection is opened immediately and is separate from
+  that pool. Each worker owns one mailbox connection and walks independent
+  windows; the GRDB writer remains serialized while per-folder transactions
+  interleave.
+- If a server rejects a pool connection at its per-account cap (for example
+  Dovecot ~10, iCloud ~5, or Gmail ~15), the scheduler falls back to the
+  number of connections accepted and remembers that cap for the session. A
+  cap never disables discovery or the already-open workers.
 ### Disk policy (no up-front full scan)
 - Start syncing the newest INBOX window immediately — never block startup on a
   mailbox-wide size scan or an age-based cutoff.
@@ -121,9 +172,6 @@ transaction and drained as one UID set when their source and destination match.
   the durable UID cursor. Windowed mode is only the disclosed, resumable state
   while actual disk pressure has halted older history; it upgrades to full
   backfill when headroom recovers.
-- **Two connections**: one dedicated INBOX IDLE connection; one serialized sync/fetch
-  connection for everything else. Fallback to a single multiplexed connection when
-  the server caps connections (detected via `NO`/`BYE` on connect).
 - IDLE is re-issued before the RFC 2177 29-minute ceiling (default renewal 25 min;
   many servers drop sooner — renew on any timeout evidence).
 - `EXISTS`/`EXPUNGE`/`FETCH` during IDLE are **hints only**: leave IDLE, run the

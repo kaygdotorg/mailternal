@@ -18,14 +18,24 @@ private struct StoredMessage: Sendable {
 
 @MainActor
 final class MockMailFacade: MailFacade {
-    private(set) var accountState: AccountState = .none {
-        didSet { accountContinuation.yield(accountState) }
+    private(set) var accounts: [AccountConfig] = [] {
+        didSet { accountsContinuation.yield(accounts) }
     }
-
+    private(set) var accountStates: [AccountID: AccountState] = [:] {
+        didSet {
+            accountStatesContinuation.yield(accountStates)
+            accountContinuation.yield(aggregateState)
+        }
+    }
+    private(set) var accountState: AccountState = .none
+    let accountsStream: AsyncStream<[AccountConfig]>
+    let accountStatesStream: AsyncStream<[AccountID: AccountState]>
     let accountStateStream: AsyncStream<AccountState>
     let foldersStream: AsyncStream<[FolderSummary]>
     let syncStatusStream: AsyncStream<SyncStatus>
 
+    private let accountsContinuation: AsyncStream<[AccountConfig]>.Continuation
+    private let accountStatesContinuation: AsyncStream<[AccountID: AccountState]>.Continuation
     private let accountContinuation: AsyncStream<AccountState>.Continuation
     private let foldersContinuation: AsyncStream<[FolderSummary]>.Continuation
     private let syncContinuation: AsyncStream<SyncStatus>.Continuation
@@ -34,21 +44,18 @@ final class MockMailFacade: MailFacade {
     private var messages: [FolderID: [StoredMessage]] = [:]
     private var byID: [MessageID: StoredMessage] = [:]
     private var syncStatus = SyncStatus(mode: .fullHistory, isOnline: true)
-    private var seeded = false
     private var nextMessageID: Int64 = 1
-    var activeAccountID: AccountID? { config?.id }
-    var accountConfig: AccountConfig? { config }
+    private var nextFolderID: Int64 = 1
+    private var passwords: [AccountID: String] = [:]
+    var accountConfig: AccountConfig? { accounts.first }
     var accountDisplayName: String? {
-        guard let config else { return nil }
+        guard let config = accounts.first else { return nil }
         let displayName = config.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         return displayName.isEmpty ? config.emailAddress : displayName
     }
-
-
-    private var pageObservers: [UUID: PageObserver] = [:]
-    private var config: AccountConfig?
-    private var storedPassword = ""
+    var activeAccountID: AccountID? { accounts.first?.id }
     private(set) var validationCallCount = 0
+    private var pageObservers: [UUID: PageObserver] = [:]
     private struct PageObserver {
         var folder: FolderID
         var cursor: MessagePageCursor?
@@ -56,67 +63,101 @@ final class MockMailFacade: MailFacade {
         var continuation: AsyncStream<MessagePage>.Continuation
     }
 
+    private var aggregateState: AccountState {
+        guard !accounts.isEmpty else { return .none }
+        let states = accounts.map { accountStates[$0.id] ?? .none }
+        if states.contains(.active) { return .active }
+        if states.contains(.validating) { return .validating }
+        return states.first ?? .none
+    }
+
+    func accountState(for account: AccountID) -> AccountState {
+        accountStates[account] ?? .none
+    }
+
     init() {
+        let accounts = AsyncStream.makeStream(of: [AccountConfig].self, bufferingPolicy: .bufferingNewest(8))
+        let states = AsyncStream.makeStream(
+            of: [AccountID: AccountState].self,
+            bufferingPolicy: .bufferingNewest(8)
+        )
         let account = AsyncStream.makeStream(of: AccountState.self, bufferingPolicy: .bufferingNewest(8))
         let folders = AsyncStream.makeStream(of: [FolderSummary].self, bufferingPolicy: .bufferingNewest(8))
         let sync = AsyncStream.makeStream(of: SyncStatus.self, bufferingPolicy: .bufferingNewest(8))
+        accountsStream = accounts.stream
+        accountStatesStream = states.stream
         accountStateStream = account.stream
         foldersStream = folders.stream
         syncStatusStream = sync.stream
+        accountsContinuation = accounts.continuation
+        accountStatesContinuation = states.continuation
         accountContinuation = account.continuation
         foldersContinuation = folders.continuation
         syncContinuation = sync.continuation
+        accounts.continuation.yield([])
+        states.continuation.yield([:])
         account.continuation.yield(.none)
         folders.continuation.yield([])
         sync.continuation.yield(syncStatus)
     }
 
     func addAccount(_ config: AccountConfig, password: String) async throws {
-        accountState = .validating
-        try await validate(config, password: password)
+        if config.isEnabled {
+            setState(.validating, for: config.id)
+            try await validate(config, password: password)
+        }
         let mockConfig = AccountConfig(
             id: config.id,
-            accountLinkID: Self.mockAccountLinkID,
+            accountLinkID: config.accountLinkID,
             displayName: config.displayName,
             emailAddress: config.emailAddress,
             username: config.username,
-            imap: config.imap
+            imap: config.imap,
+            isEnabled: config.isEnabled
         )
-        self.config = mockConfig
-        storedPassword = password
-        if !seeded {
-            seedMailbox()
-            seeded = true
+        if let index = accounts.firstIndex(where: { $0.id == mockConfig.id }) {
+            accounts[index] = mockConfig
+        } else {
+            accounts.append(mockConfig)
         }
-        accountState = .active
-        foldersContinuation.yield(folders)
+        passwords[mockConfig.id] = password
+        seedMailbox(for: mockConfig.id)
+        setState(mockConfig.isEnabled ? .active : .none, for: mockConfig.id)
+        publishFolders()
         syncContinuation.yield(syncStatus)
     }
 
     func updateAccount(_ config: AccountConfig, password: String?) async throws {
-        guard let existing = self.config else {
-            throw MailAccountError("No account is configured.")
+        guard let index = accounts.firstIndex(where: { $0.id == config.id }) else {
+            throw MailAccountError("That account is no longer available.")
         }
-        guard existing.id == config.id else {
-            throw MailAccountError("That account is no longer active.")
-        }
-
+        let existing = accounts[index]
         var updated = config
         updated.accountLinkID = existing.accountLinkID
+        updated.isEnabled = existing.isEnabled
         let requiresValidation =
             existing.emailAddress != updated.emailAddress
             || existing.username != updated.username
             || existing.imap != updated.imap
             || password != nil
         if requiresValidation {
-            accountState = .validating
-            try await validate(updated, password: password ?? storedPassword)
+            setState(.validating, for: existing.id)
+            try await validate(updated, password: password ?? passwords[existing.id, default: ""])
         }
-        self.config = updated
-        if let password {
-            storedPassword = password
+        accounts[index] = updated
+        if let password { passwords[existing.id] = password }
+        setState(updated.isEnabled ? .active : .none, for: existing.id)
+        publishFolders()
+    }
+
+    func setAccountEnabled(_ id: AccountID, _ enabled: Bool) async throws {
+        guard let index = accounts.firstIndex(where: { $0.id == id }) else {
+            throw MailAccountError("That account is no longer available.")
         }
-        accountState = .active
+        guard accounts[index].isEnabled != enabled else { return }
+        accounts[index].isEnabled = enabled
+        setState(enabled ? .active : .none, for: id)
+        publishFolders()
     }
 
     func resetValidationCallCount() {
@@ -128,46 +169,53 @@ final class MockMailFacade: MailFacade {
         try await Task.sleep(for: .milliseconds(280))
         if password == "wrong" {
             let message = "The username or password was rejected."
-            accountState = .authFailed(message: message)
+            setState(.authFailed(message: message), for: config.id)
             throw MailAccountError(message)
         }
         if config.imap.host == "offline.local" || config.imap.host.hasPrefix("invalid.") {
             let message = "Could not connect to \(config.imap.host)."
-            accountState = .connectionFailed(message: message)
+            setState(.connectionFailed(message: message), for: config.id)
             throw MailAccountError(message)
         }
         if password.isEmpty {
             let message = "A password is required."
-            accountState = .authFailed(message: message)
+            setState(.authFailed(message: message), for: config.id)
             throw MailAccountError(message)
         }
     }
 
-    func removeAccount() async throws {
-        config = nil
-        storedPassword = ""
-        accountState = .none
-        foldersContinuation.yield([])
+    func removeAccount(_ id: AccountID) async throws {
+        let removedFolders = folders.filter { $0.accountID == id }.map(\.id)
+        folders.removeAll { $0.accountID == id }
+        for folder in removedFolders {
+            messages[folder] = nil
+        }
+        byID = byID.filter { !removedFolders.contains($0.value.folder) }
+        passwords[id] = nil
+        accounts.removeAll { $0.id == id }
+        accountStates[id] = nil
+        publishFolders()
+        publishAggregateState()
     }
 
 
     func makeDeepLink(for folder: FolderID) async throws -> MailternalDeepLink? {
-        guard accountState == .active,
-              let accountLinkID = config?.accountLinkID,
-              let summary = folders.first(where: { $0.id == folder }) else { return nil }
+        guard let summary = folders.first(where: { $0.id == folder }),
+              let account = accounts.first(where: { $0.id == summary.accountID }),
+              accountState(for: account.id) == .active else { return nil }
         return .folder(
-            accountLinkID: accountLinkID,
+            accountLinkID: account.accountLinkID,
             folderLocator: FolderLocator(kind: .path, value: summary.path)
         )
     }
 
     func makeDeepLink(for message: MessageID) async throws -> MailternalDeepLink? {
-        guard accountState == .active,
-              let accountLinkID = config?.accountLinkID,
-              let stored = byID[message],
-              let summary = folders.first(where: { $0.id == stored.folder }) else { return nil }
+        guard let stored = byID[message],
+              let summary = folders.first(where: { $0.id == stored.folder }),
+              let account = accounts.first(where: { $0.id == summary.accountID }),
+              accountState(for: account.id) == .active else { return nil }
         return .message(
-            accountLinkID: accountLinkID,
+            accountLinkID: account.accountLinkID,
             folderLocator: FolderLocator(kind: .path, value: summary.path),
             uidValidity: stored.uidValidity,
             uid: stored.uid
@@ -175,11 +223,12 @@ final class MockMailFacade: MailFacade {
     }
 
     func resolve(_ link: MailternalDeepLink) async throws -> MailternalDeepLinkResolution? {
-        guard accountState == .active,
-              let config,
-              config.accountLinkID == link.accountLinkID else { return nil }
+        guard let account = accounts.first(where: { $0.accountLinkID == link.accountLinkID }),
+              accountState(for: account.id) == .active else { return nil }
         guard let folder = folders.first(where: {
-            $0.path == link.folderLocator.value && link.folderLocator.kind == .path
+            $0.accountID == account.id
+                && $0.path == link.folderLocator.value
+                && link.folderLocator.kind == .path
         }) else { return nil }
         switch link {
         case .folder:
@@ -222,6 +271,61 @@ final class MockMailFacade: MailFacade {
         }
         return stream.stream
     }
+    func setKeepLocally(_ keep: Bool, for folder: FolderID) async throws {
+        guard let index = folders.firstIndex(where: { $0.id == folder }) else {
+            throw MailAccountError("Folder is no longer available.")
+        }
+        folders[index].keepLocally = keep
+        publishFolders()
+    }
+    func renameFolder(_ id: FolderID, to name: String) async throws {
+        let targetName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !targetName.isEmpty else {
+            throw MailAccountError("A folder name is required.")
+        }
+        guard let index = folders.firstIndex(where: { $0.id == id }) else {
+            throw MailAccountError("Folder is no longer available.")
+        }
+        guard folders[index].name != targetName else { return }
+
+        let currentPath = folders[index].path
+        let separator = folders[index].separator ?? "/"
+        let targetPath: String
+        if let lastSeparator = currentPath.lastIndex(of: separator) {
+            let prefixEnd = currentPath.index(after: lastSeparator)
+            targetPath = String(currentPath[..<prefixEnd]) + targetName
+        } else {
+            targetPath = targetName
+        }
+        folders[index].name = targetName
+        folders[index].path = targetPath
+        if var folderMessages = messages[id] {
+            for index in folderMessages.indices {
+                let messageID = folderMessages[index].row.id
+                guard var message = byID[messageID] else { continue }
+                message.row.folderName = targetName
+                byID[messageID] = message
+                folderMessages[index] = message
+            }
+            messages[id] = folderMessages
+        }
+        publishFolders()
+        publishObservers(in: id)
+    }
+
+    private func setState(_ state: AccountState, for account: AccountID) {
+        accountStates[account] = state
+        accountState = aggregateState
+    }
+
+    private func publishAggregateState() {
+        accountState = aggregateState
+    }
+    private func publishFolders() {
+        let enabledAccounts = Set(accounts.lazy.filter { $0.isEnabled }.map(\.id))
+        foldersContinuation.yield(folders.filter { enabledAccounts.contains($0.accountID) })
+    }
+
 
 
     func detail(_ id: MessageID) async throws -> MessageDetail {
@@ -248,7 +352,7 @@ final class MockMailFacade: MailFacade {
         }
         if let folderIndex = folders.firstIndex(where: { $0.id == stored.folder }) {
             folders[folderIndex].unreadCount = max(0, folders[folderIndex].unreadCount - 1)
-            foldersContinuation.yield(folders)
+            publishFolders()
         }
         publishObservers(in: stored.folder)
     }
@@ -270,7 +374,7 @@ final class MockMailFacade: MailFacade {
         }
         if let folderIndex = folders.firstIndex(where: { $0.id == stored.folder }) {
             folders[folderIndex].unreadCount += 1
-            foldersContinuation.yield(folders)
+            publishFolders()
         }
         publishObservers(in: stored.folder)
     }
@@ -290,13 +394,28 @@ final class MockMailFacade: MailFacade {
     }
 
     func trash(_ ids: [MessageID]) async {
-        guard let destination = folders.first(where: { $0.role == .trash })?.id else { return }
-        await move(ids, to: destination)
+        await moveToRole(.trash, ids: ids)
     }
 
     func archive(_ ids: [MessageID]) async {
-        guard let destination = folders.first(where: { $0.role == .archive })?.id else { return }
-        await move(ids, to: destination)
+        await moveToRole(.archive, ids: ids)
+    }
+
+    private func moveToRole(_ role: FolderRole, ids: [MessageID]) async {
+        for account in accounts {
+            guard let destination = folders.first(where: {
+                $0.accountID == account.id && $0.role == role
+            })?.id else { continue }
+            let accountIDs = ids.filter { id in
+                guard let stored = byID[id],
+                      let folder = folders.first(where: { $0.id == stored.folder })
+                else { return false }
+                return folder.accountID == account.id
+            }
+            for id in accountIDs {
+                moveOne(id, to: destination)
+            }
+        }
     }
 
     func move(_ ids: [MessageID], to destination: FolderID) async {
@@ -307,7 +426,9 @@ final class MockMailFacade: MailFacade {
 
     private func moveOne(_ id: MessageID, to destination: FolderID) {
         guard let stored = byID[id],
-              folders.contains(where: { $0.id == destination })
+              let sourceSummary = folders.first(where: { $0.id == stored.folder }),
+              let destinationSummary = folders.first(where: { $0.id == destination }),
+              sourceSummary.accountID == destinationSummary.accountID
         else { return }
         let source = stored.folder
         guard var sourceList = messages[source],
@@ -344,7 +465,7 @@ final class MockMailFacade: MailFacade {
                 folders[folderIndex].unreadCount += 1
             }
         }
-        foldersContinuation.yield(folders)
+        publishFolders()
         publishObservers(in: source)
         if source != destination {
             publishObservers(in: destination)
@@ -381,6 +502,11 @@ final class MockMailFacade: MailFacade {
         }
         for stored in all {
             if hits.count >= limit { break }
+            guard let summary = folders.first(where: { $0.id == stored.folder }),
+                  let account = accounts.first(where: { $0.id == summary.accountID }),
+                  account.isEnabled else {
+                continue
+            }
             let hay = [
                 stored.row.from,
                 stored.row.subject,
@@ -388,7 +514,11 @@ final class MockMailFacade: MailFacade {
                 stored.detail.bodyText ?? "",
             ].joined(separator: "\n").lowercased()
             if hay.contains(needle) {
-                hits.append(stored.row)
+                var row = stored.row
+                let title = account.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                row.accountName = title.isEmpty ? account.emailAddress : title
+                row.folderID = summary.id
+                hits.append(row)
             }
         }
         return hits
@@ -396,7 +526,7 @@ final class MockMailFacade: MailFacade {
 
     func refresh() async {
         guard accountState == .active else { return }
-        foldersContinuation.yield(folders)
+        publishFolders()
         syncContinuation.yield(syncStatus)
         for observer in pageObservers.values {
             observer.continuation.yield(
@@ -437,7 +567,7 @@ final class MockMailFacade: MailFacade {
         }
     }
 
-    private func seedMailbox() {
+    private func seedMailbox(for accountID: AccountID) {
         let now = Date()
         let windowStart = now.addingTimeInterval(-30 * 24 * 3600)
 
@@ -465,15 +595,18 @@ final class MockMailFacade: MailFacade {
             (id: FolderID(rawValue: 16), name: "Leaf", path: "AdjacentLeaf", separator: nil, role: .none, backfill: .complete, count: 0, unreadRate: 0),
         ]
 
-        var rng = SplitMix64(seed: 0x4D41_494C_5445_524E)
+        let base = nextFolderID
+        nextFolderID += Int64(specs.count)
+        var rng = SplitMix64(seed: 0x4D41_494C_5445_524E &+ UInt64(base))
         var allFolders: [FolderSummary] = []
         for spec in specs {
+            let folderID = FolderID(rawValue: base + spec.id.rawValue - 1)
             var unread = 0
             var list: [StoredMessage] = []
             list.reserveCapacity(spec.count)
             for index in 0..<spec.count {
                 let stored = makeMessage(
-                    folder: spec.id,
+                    folder: folderID,
                     folderName: spec.name,
                     index: index,
                     count: spec.count,
@@ -489,21 +622,23 @@ final class MockMailFacade: MailFacade {
                 if lhs.row.date != rhs.row.date { return lhs.row.date > rhs.row.date }
                 return lhs.uid > rhs.uid
             }
-            messages[spec.id] = list
+            messages[folderID] = list
             allFolders.append(
                 FolderSummary(
-                    id: spec.id,
+                    id: folderID,
                     name: spec.name,
                     path: spec.path,
                     separator: spec.separator,
                     role: spec.role,
                     unreadCount: unread,
                     totalCount: spec.count,
-                    backfill: spec.backfill
+                    keepLocally: spec.role != .none,
+                    backfill: spec.backfill,
+                    accountID: accountID
                 )
             )
         }
-        folders = allFolders
+        folders.append(contentsOf: allFolders)
         syncStatus = SyncStatus(mode: .windowed(since: windowStart), isOnline: true)
     }
 
