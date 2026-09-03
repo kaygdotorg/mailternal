@@ -191,7 +191,7 @@ final class UILogicTests: XCTestCase {
     }
 
     @MainActor
-    func testAppearanceDefaultsToFrostedBlurAtEightyPercent() {
+    func testAppearanceDefaultsToFrostedBlurAtTwentyFivePercent() {
         let suiteName = "Mailternal.AppearanceDefaultsTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -201,11 +201,9 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(settings.backdropStyle, .frostedBlur)
         XCTAssertFalse(settings.showsSenderIcons)
         XCTAssertEqual(settings.backgroundOpacity, 0.25)
-        XCTAssertEqual(
-            defaults.string(forKey: "mailternal.appearance.backdropStyle"),
-            WindowBackdropStyle.frostedBlur.rawValue
-        )
-        XCTAssertNil(defaults.object(forKey: "mailternal.appearance.usesLiquidGlass"))
+        // Defaults are not written until the user changes them.
+        XCTAssertNil(defaults.object(forKey: "mailternal.appearance.backdropStyle"))
+        XCTAssertNil(defaults.object(forKey: "mailternal.appearance.opacity"))
         let plan = WindowBackdropPlan(
             style: settings.backdropStyle,
             opacity: settings.backgroundOpacity,
@@ -214,51 +212,6 @@ final class UILogicTests: XCTestCase {
         )
         XCTAssertEqual(plan.treatment, .blur)
         XCTAssertEqual(plan.fillOpacity, 0.25, accuracy: 0.0001)
-        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 3)
-    }
-
-    @MainActor
-    func testAppearanceMigratesUnmarkedFullOpacityExactlyOnce() {
-        let suiteName = "Mailternal.AppearanceOpacityMigrationTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        defaults.set(1.0, forKey: "mailternal.appearance.opacity")
-
-        let migrated = AppearanceSettings(defaults: defaults)
-        XCTAssertEqual(migrated.backgroundOpacity, 0.25)
-        XCTAssertEqual(defaults.double(forKey: "mailternal.appearance.opacity"), 0.25)
-        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 3)
-
-        defaults.set(1.0, forKey: "mailternal.appearance.opacity")
-        let current = AppearanceSettings(defaults: defaults)
-        XCTAssertEqual(current.backgroundOpacity, 1.0)
-    }
-
-    @MainActor
-    func testAppearanceMigratesLegacyLiquidGlassChoiceExactlyOnce() {
-        for legacyValue in [false, true] {
-            let suiteName = "Mailternal.AppearanceStyleMigrationTests.\(UUID().uuidString)"
-            let defaults = UserDefaults(suiteName: suiteName)!
-            defer { defaults.removePersistentDomain(forName: suiteName) }
-            defaults.set(legacyValue, forKey: "mailternal.appearance.usesLiquidGlass")
-            let expectedStyle: WindowBackdropStyle = legacyValue ? .regularGlass : .frostedBlur
-
-            let migrated = AppearanceSettings(defaults: defaults)
-            XCTAssertEqual(migrated.backdropStyle, expectedStyle)
-            XCTAssertEqual(
-                defaults.string(forKey: "mailternal.appearance.backdropStyle"),
-                expectedStyle.rawValue
-            )
-            XCTAssertNil(defaults.object(forKey: "mailternal.appearance.usesLiquidGlass"))
-            XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 3)
-
-            // A stale legacy value written after migration cannot change the
-            // already migrated choice: version 2 and the new key win.
-            defaults.set(!legacyValue, forKey: "mailternal.appearance.usesLiquidGlass")
-            let current = AppearanceSettings(defaults: defaults)
-            XCTAssertEqual(current.backdropStyle, expectedStyle)
-            XCTAssertNil(defaults.object(forKey: "mailternal.appearance.usesLiquidGlass"))
-        }
     }
 
     @MainActor
@@ -272,26 +225,6 @@ final class UILogicTests: XCTestCase {
         settings.showsSenderIcons = true
         XCTAssertTrue(defaults.bool(forKey: "mailternal.appearance.showsSenderIcons"))
         XCTAssertTrue(AppearanceSettings(defaults: defaults).showsSenderIcons)
-    }
-
-    @MainActor
-    func testAppearanceMigratesLegacyOpaqueToShippingDefault() {
-        let suiteName = "Mailternal.AppearanceLegacyTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        defaults.set("opaque", forKey: "mailternal.appearance.backdrop")
-        defaults.set(0.62, forKey: "mailternal.appearance.opacity")
-
-        let settings = AppearanceSettings(defaults: defaults)
-
-        XCTAssertEqual(settings.backdropStyle, .frostedBlur)
-        XCTAssertEqual(settings.backgroundOpacity, 0.62)
-        XCTAssertNil(defaults.string(forKey: "mailternal.appearance.backdrop"))
-        XCTAssertEqual(
-            defaults.string(forKey: "mailternal.appearance.backdropStyle"),
-            WindowBackdropStyle.frostedBlur.rawValue
-        )
-        XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.defaultsVersion"), 3)
     }
 
     @MainActor
@@ -452,7 +385,6 @@ final class UILogicTests: XCTestCase {
 
         XCTAssertEqual(settings.backgroundOpacity, 0)
         XCTAssertEqual(defaults.double(forKey: "mailternal.appearance.opacity"), 0)
-        XCTAssertTrue(defaults.bool(forKey: "mailternal.appearance.opacity-user-written"))
         XCTAssertEqual(AppearanceSettings(defaults: defaults).backgroundOpacity, 0)
     }
 
