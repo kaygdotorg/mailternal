@@ -206,10 +206,10 @@ final class AppearanceSettings {
 
     static let defaultMessageListLines = 3
     static let messageListLineRange = 1...6
-    static let defaultBackgroundOpacity = 0.80
+    static let defaultBackgroundOpacity = 0.25
     /// Incremented when a persisted preference's meaning changes. Values
     /// written by older builds are migrated exactly once per suite.
-    static let defaultsVersion = 2
+    static let defaultsVersion = 3
     /// The full dial the settings slider offers. 100% resolves to a solid
     /// window; anything below it shows the chosen treatment, down to a window
     /// that adds no fill of its own at 0%.
@@ -247,10 +247,13 @@ final class AppearanceSettings {
             ? 0
             : defaults.integer(forKey: Keys.defaultsVersion)
         let shouldMigrateLegacyBackdropStyle = storedVersion < Self.defaultsVersion
+        // v1 moved an unwritten 1.0 to the then-default; v3 moves an
+        // unwritten 0.80 (the v1/v2 default) to the current default. A value
+        // the user set from the slider is never touched.
         let shouldMigrateLegacyFullOpacity =
-            storedVersion == 0
-            && storedOpacity == 1
-            && !defaults.bool(forKey: Keys.opacityUserWritten)
+            !defaults.bool(forKey: Keys.opacityUserWritten)
+            && ((storedVersion == 0 && storedOpacity == 1)
+                || (storedVersion < 3 && storedOpacity == 0.80))
 
         mode = AppearanceMode(rawValue: defaults.string(forKey: Keys.mode) ?? "") ?? .system
         emailReadingMode = EmailReadingMode(

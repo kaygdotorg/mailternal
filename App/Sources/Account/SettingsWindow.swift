@@ -84,8 +84,7 @@ struct SettingsDetailView: View {
             .mailWindowDissolve(settingsDissolvePolicy)
 
             Text(section.title)
-                .font(.title)
-                .fontWeight(.semibold)
+                .font(.system(size: 26, weight: .bold))
                 .padding(.horizontal, 20)
                 .padding(.top, PaneHeaderInsetPolicy.settingsHeaderTopPadding)
                 .padding(.bottom, PaneHeaderInsetPolicy.settingsTitleBottomPadding)
