@@ -78,7 +78,6 @@ struct ReaderTabItem: View {
     private var titleLabel: some View {
         Text(displaySubject)
             .font(.subheadline)
-            .italic(isTransient)
             .foregroundStyle(isActive ? .primary : .secondary)
             .lineLimit(1)
             .truncationMode(.tail)
@@ -190,7 +189,7 @@ struct ReaderTabItem: View {
     }
 }
 
-/// Active tab: tertiary fill (one step stronger than the hover wash) so the
+/// Active tab: secondary fill (two steps stronger than the hover wash) so the
 /// selected tab reads clearly against the clear strip; hover keeps quaternary.
 private struct ReaderTabGlassModifier: ViewModifier {
     let isActive: Bool
@@ -205,7 +204,7 @@ private struct ReaderTabGlassModifier: ViewModifier {
 
     private var fill: Color {
         if isActive {
-            return Color(nsColor: .tertiarySystemFill).opacity(contrast == .increased ? 1 : 0.9)
+            return Color(nsColor: .secondarySystemFill)
         }
         if isHovered {
             return Color(nsColor: .quaternarySystemFill).opacity(contrast == .increased ? 0.9 : 0.72)

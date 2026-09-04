@@ -135,13 +135,19 @@ empty-reader state and while global search is presented.
   consume spare viewport width. Scrolling MUST occur beneath a fixed 28 pt
   right-edge fade at the end of the tab viewport, directly against the
   actions cluster with no extra gap.
+- The trailing actions (Archive, Trash, More) are unbordered toolbar items —
+  no shared capsule — so the glyphs sit as close as the toolbar allows, like
+  Craft's reader chrome. They use one symbol configuration (17 pt, medium
+  weight) so unbordered images match the sidebar toggle's size. The active
+  tab fill is `secondarySystemFill`; hover is `quaternarySystemFill`.
 - Its title MUST contain only the subject, MUST use semantic `.subheadline`, and
   MUST use the trailing fade mask when compressed. The active tab MUST use
   semantic selection treatment and label color; inactive tabs MUST have no fill
   and MUST use secondary label color. The active treatment MUST remain legible
   in light, dark, and increased-contrast appearances.
-- A transient title MUST be italic. A tab title or accessory MUST NEVER show
-  unread or flag indicators.
+- Transient and permanent titles share one style (no italics): the active
+  fill alone marks state, and "Keep" in the tab menu reveals a transient. A
+  tab title or accessory MUST NEVER show unread or flag indicators.
 - Tab backgrounds MUST use a continuous `AppShapeScale.row` (12 pt) corner
   radius. The right-edge fade MUST be a 28 pt transparent mask drawn above
   scrolling tabs and MUST NOT capture tab input. No strip-level fill may

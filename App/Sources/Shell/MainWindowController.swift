@@ -785,8 +785,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             case .colorScheme: item = colorSchemeItem
             case .overflow: item = overflowItem
             }
-            item.image = NSImage(
-                systemSymbolName: visible.imageName,
+            item.image = Self.toolbarSymbol(
+                visible.imageName,
                 accessibilityDescription: visible.title
             )
             item.label = visible.title
@@ -991,6 +991,17 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         return nil
     }
 
+    /// Unbordered toolbar items draw their image at its intrinsic size. Craft's
+    /// reader chrome (design.md) uses plain medium-weight glyphs, so the
+    /// symbols are pinned to that configuration rather than the bordered
+    /// button default.
+    static let toolbarSymbolConfiguration = NSImage.SymbolConfiguration(pointSize: 17, weight: .medium, scale: .medium)
+
+    static func toolbarSymbol(_ name: String, accessibilityDescription: String?) -> NSImage? {
+        NSImage(systemSymbolName: name, accessibilityDescription: accessibilityDescription)?
+            .withSymbolConfiguration(toolbarSymbolConfiguration)
+    }
+
     private func makeMessageItem(
         identifier: NSToolbarItem.Identifier,
         action: Selector
@@ -998,7 +1009,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         let item = NSToolbarItem(itemIdentifier: identifier)
         item.action = action
         item.target = self
-        item.isBordered = true
+        // Unbordered: no shared capsule, so the icons sit as close together
+        // as the toolbar allows (user preference over the glass cluster).
+        item.isBordered = false
         item.autovalidates = true
         return item
     }
@@ -1006,14 +1019,14 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     private func makeOverflowItem() -> NSMenuToolbarItem {
         let item = NSMenuToolbarItem(itemIdentifier: .messageOverflow)
         item.menu = overflowMenu
-        item.image = NSImage(
-            systemSymbolName: "ellipsis.circle",
+        item.image = Self.toolbarSymbol(
+            "ellipsis.circle",
             accessibilityDescription: "More message actions"
         )
         item.label = "More"
         item.paletteLabel = "More"
         item.toolTip = "More message actions"
-        item.isBordered = true
+        item.isBordered = false
         item.isEnabled = !model.selectedMessageIDs.isEmpty
         item.autovalidates = false
         item.showsIndicator = false

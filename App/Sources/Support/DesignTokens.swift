@@ -82,7 +82,6 @@ enum ReaderTabTokens {
     static let hoverDelay: Duration = .zero
     static let previewWidth: CGFloat = ReaderTabLayoutPolicy.maximumTabWidth
     static let previewHeight: CGFloat = 160
-    static let previewCornerRadius: CGFloat = 18
     static let previewHorizontalPadding: CGFloat = 14
     static let previewVerticalPadding: CGFloat = 12
 }

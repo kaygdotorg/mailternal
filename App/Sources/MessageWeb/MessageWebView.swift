@@ -400,7 +400,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         _ webView: WKWebView,
         decidePolicyFor navigationAction: WKNavigationAction,
         preferences: WKWebpagePreferences,
-        decisionHandler: @escaping (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
+        decisionHandler: @escaping @MainActor (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
     ) {
         preferences.allowsContentJavaScript = false
         guard let url = navigationAction.request.url else {
@@ -422,7 +422,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     public func webView(
         _ webView: WKWebView,
         decidePolicyFor navigationResponse: WKNavigationResponse,
-        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        decisionHandler: @escaping @MainActor (WKNavigationResponsePolicy) -> Void
     ) {
         if navigationResponse.isForMainFrame,
            let url = navigationResponse.response.url,
@@ -436,7 +436,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     public func webView(
         _ webView: WKWebView,
         didReceive challenge: URLAuthenticationChallenge,
-        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+        completionHandler: @escaping @MainActor (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
         completionHandler(.cancelAuthenticationChallenge, nil)
     }
@@ -473,7 +473,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         _ webView: WKWebView,
         runJavaScriptAlertPanelWithMessage message: String,
         initiatedByFrame frame: WKFrameInfo,
-        completionHandler: @escaping () -> Void
+        completionHandler: @escaping @MainActor () -> Void
     ) {
         completionHandler()
     }
@@ -482,7 +482,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         _ webView: WKWebView,
         runJavaScriptConfirmPanelWithMessage message: String,
         initiatedByFrame frame: WKFrameInfo,
-        completionHandler: @escaping (Bool) -> Void
+        completionHandler: @escaping @MainActor (Bool) -> Void
     ) {
         completionHandler(false)
     }
@@ -492,7 +492,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         runJavaScriptTextInputPanelWithPrompt prompt: String,
         defaultText: String?,
         initiatedByFrame frame: WKFrameInfo,
-        completionHandler: @escaping (String?) -> Void
+        completionHandler: @escaping @MainActor (String?) -> Void
     ) {
         completionHandler(nil)
     }

@@ -11,61 +11,48 @@ struct ReaderTabHoverCard: View {
     let receivedDate: Date?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let sender, !sender.isEmpty {
-                HStack(spacing: 6) {
-                    Text(sender)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    if let receivedDate {
-                        Text("•")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                        Text(receivedDate.formatted(date: .abbreviated, time: .shortened))
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
+        // The popover supplies the chrome (material, border, arrow): the card
+        // paints nothing of its own and scrolls as one piece.
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 8) {
+                if let sender, !sender.isEmpty {
+                    HStack(spacing: 6) {
+                        Text(sender)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
                             .lineLimit(1)
+                        if let receivedDate {
+                            Text("•")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                            Text(receivedDate.formatted(date: .abbreviated, time: .shortened))
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
                     }
                 }
-            }
 
-            Text(subject)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-                .truncationMode(.tail)
+                Text(subject)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
 
-            ScrollView(.vertical, showsIndicators: false) {
                 Text(preview.isEmpty ? "No preview available." : preview)
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            .scrollBounceBehavior(.basedOnSize)
+            .padding(.horizontal, ReaderTabTokens.previewHorizontalPadding)
+            .padding(.vertical, ReaderTabTokens.previewVerticalPadding)
         }
-        .padding(.horizontal, ReaderTabTokens.previewHorizontalPadding)
-        .padding(.vertical, ReaderTabTokens.previewVerticalPadding)
+        .scrollBounceBehavior(.basedOnSize)
         .frame(
             width: ReaderTabTokens.previewWidth,
             height: ReaderTabTokens.previewHeight,
             alignment: .topLeading
         )
-        .background(
-            Color(nsColor: .textBackgroundColor),
-            in: RoundedRectangle(
-                cornerRadius: ReaderTabTokens.previewCornerRadius,
-                style: .continuous
-            )
-        )
-        .overlay {
-            RoundedRectangle(
-                cornerRadius: ReaderTabTokens.previewCornerRadius,
-                style: .continuous
-            )
-            .strokeBorder(Color.black.opacity(0.48), lineWidth: 0.8)
-        }
-        .shadow(color: .black.opacity(0.28), radius: 28, y: 14)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier(UIIdentifier.readerHoverCard)
         .accessibilityLabel("Preview of \(subject)")
