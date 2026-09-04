@@ -334,6 +334,7 @@ public actor SyncEngine {
     private var statusWaiters: [UUID: AsyncStream<SyncStatus>.Continuation] = [:]
     private var activityWaiters: [UUID: AsyncStream<FolderActivityUpdate>.Continuation] = [:]
     private var currentActivities: [FolderID: FolderActivity] = [:]
+    private var activityOwners: [FolderID: Int] = [:]
     private var mailWaiters: [UUID: AsyncStream<NewMailEvent>.Continuation] = [:]
     private var failureWaiters: [UUID: AsyncStream<SyncFailure>.Continuation] = [:]
     private var lastFailure: SyncFailure?
@@ -449,6 +450,7 @@ public actor SyncEngine {
         if let runTask {
             await runTask.value
         }
+        clearActiveActivities()
         self.runTask = nil
         connected = false
         publishStatus(online: false)
@@ -479,12 +481,29 @@ public actor SyncEngine {
         state.backfillPhase = .idle
         try? await store.saveSyncState(state)
     }
-    /// Runs the durable mutation drain immediately, then reconciles the
-    /// affected folders. User moves must not wait for `seenPoll` or the
-    /// periodic mailbox tick.
-    public func refreshNow() async {
-        refreshPulse &+= 1
-        guard connected, discoveryReady, let channel = syncChannel else { return }
+    private var mutationDrainBusy = false
+    private var mutationDrainWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func acquireMutationDrain() async {
+        if mutationDrainBusy {
+            await withCheckedContinuation { continuation in
+                mutationDrainWaiters.append(continuation)
+            }
+        } else {
+            mutationDrainBusy = true
+        }
+    }
+
+    private func releaseMutationDrain() {
+        if mutationDrainWaiters.isEmpty {
+            mutationDrainBusy = false
+        } else {
+            mutationDrainWaiters.removeFirst().resume()
+        }
+    }
+
+    private func runMutationDrain(channel: SyncChannel, includeAllFolders: Bool) async {
+        await acquireMutationDrain()
         do {
             let renamed = try await drainFolderRenames(channel: channel)
             if renamed {
@@ -493,13 +512,44 @@ public actor SyncEngine {
             try await drainFlags(channel: channel)
             let movedFolders = try await drainMove(channel: channel)
             for folderID in movedFolders.sorted(by: { $0.rawValue < $1.rawValue }) {
-                if stopping { return }
+                if stopping { break }
                 try await delta(folderID: folderID, channel: channel, notify: true)
             }
+            releaseMutationDrain()
+        } catch {
+            releaseMutationDrain()
+            await logSync(
+                includeAllFolders ? "refresh failed" : "move wake failed",
+                detail: String(describing: error)
+            )
+            return
+        }
+        guard includeAllFolders, !stopping else { return }
+        do {
             try await deltaAll(channel: channel, notify: true)
         } catch {
             await logSync("refresh failed", detail: String(describing: error))
         }
+    }
+
+    /// Runs the durable mutation drain immediately, then reconciles the
+    /// affected folders. User moves must not wait for `seenPoll` or the
+    /// periodic mailbox tick.
+    public func refreshNow() async {
+        refreshPulse &+= 1
+        guard connected, discoveryReady, let channel = syncChannel else { return }
+        await runMutationDrain(channel: channel, includeAllFolders: true)
+    }
+
+    /// Wakes the mutation path for a user move. The dedicated IDLE connection
+    /// is otherwise unused between IDLE commands, so it can carry mutations
+    /// without waiting behind a metadata/body FETCH on the backfill channel.
+    /// Only folders affected by a move are reconciled; unrelated folders remain
+    /// on their normal periodic cadence.
+    public func moveNow() async {
+        refreshPulse &+= 1
+        guard connected, discoveryReady, let fallback = syncChannel else { return }
+        await runMutationDrain(channel: idleChannel ?? fallback, includeAllFolders: false)
     }
 
     public var status: AsyncStream<SyncStatus> {
@@ -683,6 +733,31 @@ public actor SyncEngine {
         let update = FolderActivityUpdate(folder: folder, activity: activity)
         for continuation in activityWaiters.values {
             continuation.yield(update)
+        }
+    }
+
+    private func beginActivity(for folder: FolderID) {
+        activityOwners[folder, default: 0] += 1
+    }
+
+    private func endActivity(for folder: FolderID) {
+        guard let count = activityOwners[folder] else { return }
+        if count > 1 {
+            activityOwners[folder] = count - 1
+            return
+        }
+        activityOwners.removeValue(forKey: folder)
+        if currentActivities[folder] == .downloading || currentActivities[folder] == .indexing {
+            publishActivity(.idle, for: folder)
+        }
+    }
+
+    private func clearActiveActivities() {
+        activityOwners.removeAll()
+        for (folder, activity) in currentActivities
+            where activity == .downloading || activity == .indexing
+        {
+            publishActivity(.idle, for: folder)
         }
     }
 
@@ -1222,12 +1297,13 @@ public actor SyncEngine {
               record.keepLocally else {
             return BackfillAttempt(result: .halted, channel: activeChannel)
         }
+        beginActivity(for: folderID)
+        defer { endActivity(for: folderID) }
         publishActivity(.downloading, for: folderID)
         do {
             var state = try await store.fetchSyncState(for: record.generation)
                 ?? FolderSyncState(generation: record.generation, baselineUID: record.baseline)
             if state.backfillPhase == .complete {
-                publishActivity(.idle, for: folderID)
                 return BackfillAttempt(result: .committed, channel: activeChannel)
             }
             if state.backfillPhase == .halted {
@@ -1281,7 +1357,6 @@ public actor SyncEngine {
 
             while !stopping && !Task.isCancelled {
                 guard folders[folderID]?.keepLocally == true else {
-                    publishActivity(.idle, for: folderID)
                     return BackfillAttempt(result: .halted, channel: activeChannel)
                 }
                 try Task.checkCancellation()
@@ -1325,7 +1400,6 @@ public actor SyncEngine {
                     state.progress = 1
                     try await store.saveSyncState(state)
                     await clearWindowedModeIfResolved()
-                    publishActivity(.idle, for: folderID)
                     return BackfillAttempt(result: .committed, channel: activeChannel)
                 }
                 let capturedGeneration = record.generation
@@ -1346,10 +1420,8 @@ public actor SyncEngine {
                 case .committed:
                     break
                 case .invalidated:
-                    publishActivity(.downloading, for: folderID)
                     return BackfillAttempt(result: .invalidated, channel: activeChannel)
                 case .halted:
-                    publishActivity(.halted, for: folderID)
                     return BackfillAttempt(result: .halted, channel: activeChannel)
                 }
                 guard stillCurrentGeneration(capturedGeneration, folder: folderID) else {
@@ -1360,21 +1432,17 @@ public actor SyncEngine {
                 try await store.saveSyncState(state)
             }
         } catch is CancellationError {
-            publishActivity(.halted, for: folderID)
             return BackfillAttempt(result: .halted, channel: activeChannel)
         } catch {
             if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
-                publishActivity(.halted, for: folderID)
                 return BackfillAttempt(result: .halted, channel: activeChannel)
             }
             await logSync("backfill \(record.path)", detail: String(describing: error), folder: folderID)
             if SyncPolicy.isTransport(error) {
                 sessionBroken = true
             }
-            publishActivity(.halted, for: folderID)
             return BackfillAttempt(result: .halted, channel: activeChannel)
         }
-        publishActivity(.halted, for: folderID)
         return BackfillAttempt(result: .halted, channel: activeChannel)
     }
 
@@ -2011,6 +2079,8 @@ public actor SyncEngine {
             try await refreshStatus(folderID: folderID, channel: channel)
             return
         }
+        beginActivity(for: folderID)
+        defer { endActivity(for: folderID) }
         var record = current
         do {
             try await runDelta(record: &record, channel: channel, notify: notify)
@@ -2483,19 +2553,7 @@ public actor SyncEngine {
     private func seenLoop() async {
         while !stopping && !Task.isCancelled {
             if let channel = syncChannel {
-                let renamed = (try? await drainFolderRenames(channel: channel)) ?? false
-                if renamed {
-                    try? await discover(channel: channel)
-                }
-                try? await drainFlags(channel: channel)
-                let movedFolders = (try? await drainMove(channel: channel)) ?? []
-                // A successful server move changes both mailboxes. Reuse the
-                // normal delta path immediately, coalescing a batch into one
-                // refresh per affected folder instead of waiting for a timer.
-                for folderID in movedFolders.sorted(by: { $0.rawValue < $1.rawValue }) {
-                    if stopping { return }
-                    try? await delta(folderID: folderID, channel: channel, notify: true)
-                }
+                await runMutationDrain(channel: channel, includeAllFolders: false)
             }
             try? await Task.sleep(for: settings.seenPoll)
         }

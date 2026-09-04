@@ -22,6 +22,7 @@ final class ScriptedWorld: @unchecked Sendable {
     var storedSeen: [UInt32] = []
     var flagCommands: [String] = []
     var archiveCommands: [String] = []
+    var archiveFetchCounts: [Int] = []
     var renameCommands: [String] = []
     var fetchNanos: UInt64 = 0
     /// Sleep `fetchNanos` only on fetches after this count. `nil` sleeps every fetch.
@@ -140,6 +141,12 @@ final class ScriptedWorld: @unchecked Sendable {
         defer { lock.unlock() }
         return archiveCommands
     }
+
+    func snapshotArchiveFetchCounts() -> [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return archiveFetchCounts
+    }
     func renameCommandSnapshot() -> [String] {
         lock.lock()
         defer { lock.unlock() }
@@ -171,6 +178,7 @@ final class ScriptedWorld: @unchecked Sendable {
         }
         if !selected.isEmpty {
             archiveCommands.append("MOVE \(path) \(destination) \(uidSetDescription(selected))")
+            archiveFetchCounts.append(fetchCount)
         }
         target.uidNext = max(target.uidNext, target.messages.keys.max().map { $0 &+ 1 } ?? target.uidNext)
         mailboxes[path] = source

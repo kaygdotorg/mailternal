@@ -68,3 +68,128 @@ func enqueuedMoveDrainsOnRefreshWithoutPeriodicTick() async throws {
         #expect(world.mailbox(destinationPath).messages[1] != nil)
     }
 }
+
+@Test
+func moveWakePreemptsConcurrentBackfill() async throws {
+    try await withSyncStore { store, dir in
+        let destinationPath = "Horrors2"
+        let world = ScriptedWorld(
+            capabilities: IMAPCapabilities(tokens: ["IMAP4REV1", "IDLE", "MOVE"]),
+            folders: [inboxMailbox(), IMAPMailbox(
+                path: destinationPath,
+                name: destinationPath,
+                separator: "/",
+                role: .archive,
+                mailboxID: nil,
+                attributes: []
+            )],
+            mailboxes: [
+                "INBOX": populatedInbox(uidValidity: 1, count: 20),
+                destinationPath: ScriptedMailbox(path: destinationPath, uidValidity: 1)
+            ]
+        )
+        world.fetchNanos = 50_000_000
+        let engine = SyncEngine(
+            store: store,
+            config: sampleConfig(),
+            credentials: StaticPassword(value: "pw"),
+            clientFactory: ScriptedFactory(world: world),
+            disk: ampleDisk(),
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            settings: testSettings(
+                dir: dir,
+                window: 2,
+                seenPoll: .seconds(30),
+                periodicTick: .seconds(30)
+            )
+        )
+        let activity = await engine.activity
+        let activityLog = ActivityLog()
+        let activityTask = Task {
+            for await update in activity {
+                await activityLog.record(update)
+            }
+        }
+        await engine.start()
+        defer {
+            activityTask.cancel()
+            Task { await engine.stop() }
+        }
+
+        try await waitUntil(timeout: .seconds(3)) {
+            guard let folder = try await inboxFolder(store) else { return false }
+            return try await store.liveGeneration(for: folder.id) != nil
+        }
+        let inbox = try #require(await inboxFolder(store))
+        let generation = try #require(try await store.liveGeneration(for: inbox.id))
+        let seed = IncomingMessage(
+            generation: generation,
+            uid: IMAPUID(rawValue: 1),
+            envelope: Envelope(
+                subject: "seed",
+                from: [MailAddress(displayName: "Alice", address: "alice@example.com")],
+                to: [MailAddress(displayName: nil, address: "qa@example.com")],
+                cc: [],
+                replyTo: [],
+                internalDate: Date(timeIntervalSince1970: 1_800_000_000),
+                headerDate: nil,
+                rfcMessageID: nil,
+                inReplyTo: nil,
+                references: []
+            ),
+            bodyText: "seed"
+        )
+        _ = try await store.upsertMessages([seed])
+        let message = try #require(
+            try await store.page(in: inbox.id, after: nil, limit: 10).rows.first
+        )
+        let destination = try #require(
+            try await store.fetchFolders(account: sampleConfig().id)
+                .first(where: { $0.path == destinationPath })
+        )
+        world.pauseMetadataFetch = true
+        try await waitUntil(timeout: .seconds(3)) {
+            return world.metadataFetchDidEnter()
+        }
+        let fetchesAtWake = world.snapshotFetchCount()
+        try await store.enqueueMove(messages: [message.id], to: destination.id)
+
+        let started = ContinuousClock.now
+        let wake = Task { await engine.moveNow() }
+        try await waitUntil(timeout: .seconds(3), poll: .milliseconds(5)) {
+            !world.archiveCommandSnapshot().isEmpty
+        }
+        let elapsed = started.duration(to: ContinuousClock.now)
+        #expect(elapsed < .milliseconds(500))
+        let archiveFetches = world.snapshotArchiveFetchCounts()
+        #expect((archiveFetches.first ?? .max) - fetchesAtWake <= 1)
+        world.releaseMetadataFetch()
+        await wake.value
+
+
+        try await waitUntil(timeout: .seconds(5), poll: .milliseconds(20)) {
+            let rows = try await store.page(
+                in: destination.id,
+                after: nil,
+                limit: 10
+            ).rows
+            return !rows.isEmpty
+        }
+        try await waitUntil(timeout: .seconds(5), poll: .milliseconds(20)) {
+            let latest = await activityLog.snapshot()
+            return latest[inbox.id] == .idle && latest[destination.id] == .idle
+        }
+        await engine.stop()
+    }
+}
+private actor ActivityLog {
+    private var latest: [FolderID: FolderActivity] = [:]
+
+    func record(_ update: FolderActivityUpdate) {
+        latest[update.folder] = update.activity
+    }
+
+    func snapshot() -> [FolderID: FolderActivity] {
+        latest
+    }
+}
