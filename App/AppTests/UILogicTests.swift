@@ -1326,6 +1326,7 @@ final class UILogicTests: XCTestCase {
             ReaderTabLayoutPolicy.widths(availableWidth: 400, tabCount: 0),
             []
         )
+        XCTAssertEqual(ReaderTabLayoutPolicy.toolbarSpacing, 8)
     }
 
     func testMessageToolbarPolicyGroupsKeepAllActionsInOneCapsule() {

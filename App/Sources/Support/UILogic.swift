@@ -98,12 +98,8 @@ enum ReaderTabLayoutPolicy {
     static let minimumTabWidth: CGFloat = 120
     static let maximumTabWidth: CGFloat = 220
     static let tabSpacing: CGFloat = 4
-    static let actionControlSize: CGFloat = 32
-    static let actionSpacing: CGFloat = 4
-    static let actionsTrailingInset: CGFloat = 8
     static let rightFadeWidth: CGFloat = 28
-    static let actionsClusterWidth: CGFloat =
-        actionControlSize * 3 + actionSpacing * 2 + actionsTrailingInset
+    static let toolbarSpacing: CGFloat = 8
 
     /// The width assigned to each tab before horizontal scrolling is needed.
     /// The returned value is always within the documented tab bounds.

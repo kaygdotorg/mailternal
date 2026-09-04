@@ -352,16 +352,70 @@ final class MainShellViewController: NSViewController {
 
 private extension NSToolbarItem.Identifier {
     static let sidebarToggle = NSToolbarItem.Identifier("Mailternal.sidebarToggle")
+    static let readerTabs = NSToolbarItem.Identifier("Mailternal.readerTabs")
+    static let messageActions = NSToolbarItem.Identifier(MessageToolbarPolicy.Group.messageActions.rawValue)
+    static let messageArchive = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.archive.rawValue)
+    static let messageTrash = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.trash.rawValue)
+    static let messageFlag = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.flag.rawValue)
+    static let messageSource = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.source.rawValue)
+    static let messageColorScheme = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.colorScheme.rawValue)
+    static let messageOverflow = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.overflow.rawValue)
 }
 
 @MainActor
-final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemValidation {
+private final class ReaderTabsHostingView: NSHostingView<ReaderTabBar> {
+    var onLayout: (() -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onLayout?()
+    }
+
+    override func layout() {
+        super.layout()
+        onLayout?()
+    }
+}
+
+@MainActor
+final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemValidation, NSMenuDelegate {
     private var model: AppModel
     private var modelObservationGeneration: UInt64 = 0
     private let includesSidebarToggle: Bool
     private let toggleAction: @MainActor () -> Void
     private weak var toolbar: NSToolbar?
     private lazy var toggleItem = makeToggleItem()
+    private lazy var readerTabsHosting = makeReaderTabsHosting()
+    private lazy var readerTabsItem = makeReaderTabsItem()
+    private var readerTabsWidthConstraint: NSLayoutConstraint?
+    private lazy var archiveItem = makeMessageItem(
+        identifier: .messageArchive,
+        action: #selector(archiveSelected(_:))
+    )
+    private lazy var trashItem = makeMessageItem(
+        identifier: .messageTrash,
+        action: #selector(trashSelected(_:))
+    )
+    private lazy var flagItem = makeMessageItem(
+        identifier: .messageFlag,
+        action: #selector(flagSelected(_:))
+    )
+    private lazy var sourceItem = makeMessageItem(
+        identifier: .messageSource,
+        action: #selector(toggleRawSource(_:))
+    )
+    private lazy var colorSchemeItem = makeMessageItem(
+        identifier: .messageColorScheme,
+        action: #selector(toggleEmailReadingOverride(_:))
+    )
+    private lazy var overflowItem = makeOverflowItem()
+    private lazy var messageActionsGroup = makeMessageGroup(.messageActions)
+    private lazy var overflowMenu: NSMenu = {
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.autoenablesItems = false
+        return menu
+    }()
 
     init(
         model: AppModel,
@@ -379,16 +433,34 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         self.model = model
         modelObservationGeneration &+= 1
         observeModelChanges()
+        if includesSidebarToggle {
+            readerTabsHosting.rootView = ReaderTabBar(model: model)
+        }
+        configureMessageItems()
+        configureReaderTabs()
         toolbar?.validateVisibleItems()
     }
 
+    /// AppKit's toolbar validation is not driven by SwiftUI's observation
+    /// updates. Keep the native items in step with selection changes while
+    /// leaving per-menu-item validation to `validateMenuItem(_:).`
     private func observeModelChanges() {
         let generation = modelObservationGeneration
         withObservationTracking {
+            _ = model.selectedMessageIDs
+            _ = model.listRows
+            _ = model.folders
+            _ = model.selectedFolderID
+            _ = model.isShowingRawSource
+            _ = model.emailReadingOverride
+            _ = model.appearance.emailReadingMode
             _ = model.isSearchPresented
+            _ = model.tabs.activeID
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.modelObservationGeneration == generation else { return }
+                self.configureMessageItems()
+                self.configureReaderTabs()
                 self.toolbar?.validateVisibleItems()
                 self.observeModelChanges()
             }
@@ -402,19 +474,39 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         toolbar.allowsUserCustomization = true
         toolbar.autosavesConfiguration = false
         self.toolbar = toolbar
+        configureMessageItems()
+        configureReaderTabs()
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateReaderTabsWidth()
+            }
+        }
         return toolbar
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        guard includesSidebarToggle else { return [] }
-        return [.flexibleSpace, .sidebarToggle, .sidebarTrackingSeparator]
+        var identifiers: [NSToolbarItem.Identifier] = []
+        if includesSidebarToggle {
+            identifiers += [.flexibleSpace, .sidebarToggle, .sidebarTrackingSeparator, .readerTabs]
+        }
+        identifiers += [.flexibleSpace]
+        identifiers += MessageToolbarPolicy.defaultGroupIdentifiers.map(toolbarGroupIdentifier)
+        return identifiers
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        var identifiers: [NSToolbarItem.Identifier] = [.flexibleSpace, .space]
+        var identifiers: [NSToolbarItem.Identifier] = [
+            .flexibleSpace,
+            .space,
+        ]
         if includesSidebarToggle {
-            identifiers += [.sidebarToggle, .sidebarTrackingSeparator]
+            identifiers += [.sidebarToggle, .sidebarTrackingSeparator, .readerTabs]
         }
+        identifiers += MessageToolbarPolicy.allowedGroupIdentifiers.map(toolbarGroupIdentifier)
         return identifiers
     }
 
@@ -427,15 +519,165 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         itemForItemIdentifier identifier: NSToolbarItem.Identifier,
         willBeInsertedIntoToolbar flag: Bool
     ) -> NSToolbarItem? {
-        guard identifier == .sidebarToggle, includesSidebarToggle else { return nil }
-        return toggleItem
+        switch identifier {
+        case .sidebarToggle where includesSidebarToggle:
+            return toggleItem
+        case .readerTabs where includesSidebarToggle:
+            return readerTabsItem
+        case .messageActions:
+            return messageActionsGroup
+        case .messageArchive:
+            return archiveItem
+        case .messageTrash:
+            return trashItem
+        case .messageFlag:
+            return flagItem
+        case .messageSource:
+            return sourceItem
+        case .messageColorScheme:
+            return colorSchemeItem
+        case .messageOverflow:
+            return overflowItem
+        default:
+            return nil
+        }
     }
 
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
-        guard item.itemIdentifier == .sidebarToggle else { return item.isEnabled }
-        item.isHidden = !includesSidebarToggle || model.isSearchPresented
-        item.isEnabled = includesSidebarToggle && !model.isSearchPresented
+        switch item.itemIdentifier {
+        case .sidebarToggle:
+            item.isHidden = !includesSidebarToggle || model.isSearchPresented
+            item.isEnabled = includesSidebarToggle && !model.isSearchPresented
+        case .readerTabs:
+            configureReaderTabs()
+        case .messageActions,
+             .messageArchive, .messageTrash, .messageFlag,
+             .messageSource, .messageColorScheme:
+            configureMessageItems()
+        case .messageOverflow:
+            configureMessageItems()
+            item.isEnabled = !model.selectedMessageIDs.isEmpty
+        default:
+            return item.isEnabled
+        }
         return item.isEnabled
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
+        menu.removeAllItems()
+        menu.addItem(NSMenuItem())
+        for policyItem in MessageToolbarPolicy.overflowItems(
+            selection: model.selectedMessageIDs,
+            isReadStates: readStates,
+            flagStates: flagStates,
+            folders: model.folders,
+            current: model.selectedFolderID
+        ) {
+            addMenuItem(policyItem, to: menu)
+        }
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard let action = menuItem.representedObject as? MessageContextMenuPolicy.Action else {
+            return menuItem.isEnabled
+        }
+        let policyItems = MessageToolbarPolicy.overflowItems(
+            selection: model.selectedMessageIDs,
+            isReadStates: readStates,
+            flagStates: flagStates,
+            folders: model.folders,
+            current: model.selectedFolderID
+        )
+        let enabled = overflowItem(for: action, in: policyItems)?.isEnabled ?? false
+        menuItem.isEnabled = enabled
+        return enabled
+    }
+
+    private var flagStates: [MessageID: Bool] {
+        Dictionary(uniqueKeysWithValues: model.listRows.map { ($0.id, $0.isFlagged) })
+    }
+
+    private var readStates: [MessageID: Bool] {
+        Dictionary(uniqueKeysWithValues: model.listRows.map { ($0.id, $0.isRead) })
+    }
+
+    private func toolbarGroupIdentifier(
+        _ group: MessageToolbarPolicy.Group
+    ) -> NSToolbarItem.Identifier {
+        NSToolbarItem.Identifier(group.rawValue)
+    }
+
+    private func messageItem(
+        for identifier: MessageToolbarPolicy.Identifier
+    ) -> NSToolbarItem? {
+        switch identifier {
+        case .archive: return archiveItem
+        case .trash: return trashItem
+        case .flag: return flagItem
+        case .source: return sourceItem
+        case .colorScheme: return colorSchemeItem
+        case .overflow: return overflowItem
+        }
+    }
+
+    private func makeMessageGroup(
+        _ group: MessageToolbarPolicy.Group
+    ) -> NSToolbarItemGroup {
+        let item = NSToolbarItemGroup(itemIdentifier: toolbarGroupIdentifier(group))
+        item.subitems = MessageToolbarPolicy.itemIdentifiers(in: group)
+            .compactMap { messageItem(for: $0) }
+        item.label = "Message Actions"
+        item.paletteLabel = item.label
+        item.isBordered = true
+        item.isEnabled = true
+        item.controlRepresentation = .expanded
+        item.selectionMode = .selectAny
+        item.autovalidates = false
+        return item
+    }
+
+    private func configureMessageItems() {
+        let visibleItems = MessageToolbarPolicy.visibleItems(
+            selection: model.selectedMessageIDs,
+            flagStates: flagStates,
+            effectiveEmailReadingMode: model.effectiveEmailReadingMode,
+            isShowingRawSource: model.isShowingRawSource
+        )
+        for visible in visibleItems {
+            let item: NSToolbarItem
+            switch visible.identifier {
+            case .archive: item = archiveItem
+            case .trash: item = trashItem
+            case .flag: item = flagItem
+            case .source: item = sourceItem
+            case .colorScheme: item = colorSchemeItem
+            case .overflow: continue
+            }
+            item.image = NSImage(
+                systemSymbolName: visible.imageName,
+                accessibilityDescription: visible.title
+            )
+            item.label = visible.title
+            item.paletteLabel = visible.title
+            item.toolTip = visible.title
+            item.isEnabled = visible.isEnabled
+        }
+        let sourceIndex = MessageToolbarPolicy.itemIdentifiers(in: .messageActions)
+            .firstIndex(of: .source)
+        if let sourceIndex {
+            for index in messageActionsGroup.subitems.indices {
+                messageActionsGroup.setSelected(
+                    index == sourceIndex && model.isShowingRawSource,
+                    at: index
+                )
+            }
+        }
+        overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
+        messageActionsGroup.isHidden = model.isSearchPresented || model.selectedMessageIDs.isEmpty
+        messageActionsGroup.isEnabled = !model.isSearchPresented
+        toggleItem.isHidden = !includesSidebarToggle || model.isSearchPresented
+        toggleItem.isEnabled = includesSidebarToggle && !model.isSearchPresented
     }
 
     private func makeToggleItem() -> NSToolbarItem {
@@ -455,8 +697,210 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         return item
     }
 
+    private func makeReaderTabsHosting() -> ReaderTabsHostingView {
+        let hosting = ReaderTabsHostingView(rootView: ReaderTabBar(model: model))
+        hosting.safeAreaRegions = []
+        hosting.sizingOptions = []
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        hosting.clipsToBounds = false
+        hosting.wantsLayer = true
+        hosting.layer?.masksToBounds = false
+        hosting.onLayout = { [weak self] in
+            self?.updateReaderTabsWidth()
+        }
+        return hosting
+    }
+
+    private func makeReaderTabsItem() -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: .readerTabs)
+        item.view = readerTabsHosting
+        item.label = "Reader Tabs"
+        item.paletteLabel = item.label
+        item.toolTip = "Open reader tabs"
+        item.minSize = NSSize(width: 0, height: ReaderTabLayoutPolicy.rowHeight)
+        item.maxSize = NSSize(width: .greatestFiniteMagnitude, height: ReaderTabLayoutPolicy.rowHeight)
+        item.isEnabled = false
+        item.autovalidates = false
+        readerTabsWidthConstraint = readerTabsHosting.widthAnchor.constraint(equalToConstant: 0)
+        readerTabsWidthConstraint?.isActive = true
+        return item
+    }
+
+    private func configureReaderTabs() {
+        guard includesSidebarToggle else { return }
+        readerTabsItem.isHidden = model.tabs.active == nil || model.isSearchPresented
+        readerTabsItem.isEnabled = !readerTabsItem.isHidden
+        updateReaderTabsWidth()
+    }
+
+    /// The custom tab item fills the reader column between the split's detail
+    /// origin and the native message-actions group. Its width is constrained
+    /// explicitly because toolbar custom views otherwise use their fitting size.
+    private func updateReaderTabsWidth() {
+        guard includesSidebarToggle,
+              let window = readerTabsHosting.window,
+              let contentView = window.contentView
+        else { return }
+        let detailOrigin = detailColumnOrigin(in: contentView, contentView: contentView) ?? 0
+        let actionWidth = max(
+            messageActionsGroup.minSize.width,
+            messageActionsGroup.view?.fittingSize.width ?? 0
+        )
+        let width = max(0, contentView.bounds.width - detailOrigin - actionWidth - 8)
+        if abs((readerTabsWidthConstraint?.constant ?? -1) - width) > 0.5 {
+            readerTabsWidthConstraint?.constant = width
+        }
+    }
+
+    private func detailColumnOrigin(in view: NSView, contentView: NSView) -> CGFloat? {
+        var origin: CGFloat?
+        if let split = view as? NSSplitView, let detail = split.subviews.last {
+            let frame = detail.convert(detail.bounds, to: contentView)
+            if frame.width > 0 {
+                origin = frame.minX
+            }
+        }
+        for subview in view.subviews {
+            if let childOrigin = detailColumnOrigin(in: subview, contentView: contentView) {
+                origin = max(origin ?? childOrigin, childOrigin)
+            }
+        }
+        return origin
+    }
+
+    private func makeMessageItem(
+        identifier: NSToolbarItem.Identifier,
+        action: Selector
+    ) -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.action = action
+        item.target = self
+        item.isBordered = false
+        item.autovalidates = true
+        return item
+    }
+
+    private func makeOverflowItem() -> NSMenuToolbarItem {
+        let item = NSMenuToolbarItem(itemIdentifier: .messageOverflow)
+        item.menu = overflowMenu
+        item.image = NSImage(
+            systemSymbolName: "ellipsis.circle",
+            accessibilityDescription: "Message actions"
+        )
+        item.label = "Message Actions"
+        item.paletteLabel = "Message Actions"
+        item.toolTip = "Message actions"
+        item.isBordered = false
+        item.isEnabled = !model.selectedMessageIDs.isEmpty
+        item.autovalidates = false
+        item.showsIndicator = false
+        return item
+    }
+
+    private func addMenuItem(
+        _ policyItem: MessageContextMenuPolicy.Item,
+        to menu: NSMenu
+    ) {
+        let item = NSMenuItem(
+            title: policyItem.title,
+            action: policyItem.action == nil ? nil : #selector(performOverflowAction(_:)),
+            keyEquivalent: ""
+        )
+        item.target = self
+        item.representedObject = policyItem.action
+        item.toolTip = policyItem.toolTip
+        item.isEnabled = policyItem.isEnabled
+        if policyItem.action == .viewRawSource {
+            item.state = model.isShowingRawSource ? .on : .off
+        }
+        if !policyItem.children.isEmpty {
+            let submenu = NSMenu()
+            submenu.autoenablesItems = false
+            for child in policyItem.children {
+                addMenuItem(child, to: submenu)
+            }
+            item.submenu = submenu
+        }
+        menu.addItem(item)
+    }
+
+    private func overflowItem(
+        for action: MessageContextMenuPolicy.Action,
+        in items: [MessageContextMenuPolicy.Item]
+    ) -> MessageContextMenuPolicy.Item? {
+        for item in items {
+            if item.action == action { return item }
+            if let match = overflowItem(for: action, in: item.children) { return match }
+        }
+        return nil
+    }
+
+    private func clearTransientMessageActionSelection() {
+        let identifiers: [MessageToolbarPolicy.Identifier] = [.archive, .trash, .flag]
+        let groupedIdentifiers = MessageToolbarPolicy.itemIdentifiers(in: .messageActions)
+        for identifier in identifiers {
+            guard let index = groupedIdentifiers.firstIndex(of: identifier) else { continue }
+            messageActionsGroup.setSelected(false, at: index)
+        }
+    }
+
+    @objc private func trashSelected(_ sender: Any?) {
+        model.perform(.trash, on: model.selectedMessageIDs)
+        clearTransientMessageActionSelection()
+    }
+
+    @objc private func flagSelected(_ sender: Any?) {
+        model.perform(.toggleFlag, on: model.selectedMessageIDs)
+        clearTransientMessageActionSelection()
+    }
+
     @objc private func toggleSidebar(_ sender: Any?) {
         toggleAction()
+    }
+
+    @objc private func archiveSelected(_ sender: Any?) {
+        model.perform(.archive, on: model.selectedMessageIDs)
+        clearTransientMessageActionSelection()
+    }
+
+    @objc private func toggleRawSource(_ sender: Any?) {
+        guard model.selectedMessageIDs.count == 1 else { return }
+        model.toggleRawSource()
+    }
+
+    @objc private func toggleEmailReadingOverride(_ sender: Any?) {
+        guard model.selectedMessageIDs.count == 1 else { return }
+        model.toggleEmailReadingOverride()
+    }
+
+    @objc private func performOverflowAction(_ sender: NSMenuItem) {
+        guard let action = sender.representedObject as? MessageContextMenuPolicy.Action else {
+            return
+        }
+        let selection = model.selectedMessageIDs
+        guard !selection.isEmpty else { return }
+        switch action {
+        case .markRead, .markUnread:
+            model.perform(.toggleRead, on: selection)
+        case .moveToJunk:
+            guard let junk = model.folders.first(where: { $0.role == .junk }) else { return }
+            model.move(ids: selection, to: junk.id)
+        case .moveTo(let folder):
+            model.move(ids: selection, to: folder)
+        case .openInNewWindow:
+            guard selection.count == 1, let id = selection.first else { return }
+            model.openMessageWindow(id)
+        case .copyLink:
+            Task { await model.copyDeepLinks(for: selection) }
+        case .copySubject:
+            model.copySubjects(for: selection)
+        case .viewRawSource:
+            toggleRawSource(nil)
+        case .toggleEmailReadingOverride:
+            toggleEmailReadingOverride(nil)
+        case .flag, .unflag, .delete, .archive, .reply, .replyAll, .forward:
+            break
+        }
     }
 }
 @MainActor

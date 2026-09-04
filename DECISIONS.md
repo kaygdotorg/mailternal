@@ -90,17 +90,20 @@ rationale → revisit-when.
     https://github.com/apple/swift-nio-imap/pull/849 proposes the small
     `IMAPClientHandler` initializer parameter so this fork can be retired once the API is
     accepted and released. Revisit: replace the fork with the upstream release.
-26. **Reader tabs are one row in the main reader pane; the transient persists.**
-    A single row keeps reader height stable while a browser-like strip supplies
-    familiar compression, scrolling, and keyboard mechanics; the fixed
-    trailing actions stay reachable. Persisting the transient preserves the
-    user's open reading context and its scroll position across launches rather
-    than silently discarding a real tab. Tabs deliberately show no unread or
-    flag marks: those states belong to message-list triage, while tab titles
-    stay quiet and scannable. Tabs are main-window-only so detached message
-    windows remain focused, simple, and tab-less instead of creating a second
-    tab state to synchronize. Revisit: only if a future multi-window reader
-    model can preserve one unambiguous tab owner.
+26. **Reader tabs occupy the native main-window titlebar toolbar; the transient persists.**
+    A measured toolbar item over the rightmost reader column keeps the reader
+    content at its original top inset while a browser-like strip supplies
+    familiar compression, scrolling, and keyboard mechanics. The native
+    trailing `NSToolbarItemGroup` remains the sole message-actions surface, so
+    Archive, Trash, Flag, Raw Source, Email Reading mode, and More retain their
+    platform treatment. Persisting the transient preserves the user's open
+    reading context and its scroll position across launches rather than silently
+    discarding a real tab. Tabs deliberately show no unread or flag marks: those
+    states belong to message-list triage, while tab titles stay quiet and
+    scannable. Tabs are main-window-only so detached message windows remain
+    focused, simple, and tab-less instead of creating a second tab state to
+    synchronize. Revisit: only if a future multi-window reader model can
+    preserve one unambiguous tab owner.
 27. **Process-wide backfill resource budgets are bounded and shared.** All account
     engines acquire connection permits from one `BackfillConnectionBudget`, capped at
     four backfill connections total; the primary sync channel counts while the

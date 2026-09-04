@@ -34,28 +34,22 @@ struct MessageViewer: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if model.tabs.active != nil {
-                ReaderTabBar(model: model)
+        ZStack(alignment: .topTrailing) {
+            content
+            if model.isFindPresented {
+                FindBar(
+                    query: $model.findQuery,
+                    matchCount: findSnapshot.count,
+                    selectedMatchNumber: findSnapshot.selectedMatchNumber,
+                    next: { stepFind(.next) },
+                    previous: { stepFind(.previous) },
+                    close: { model.isFindPresented = false }
+                )
+                .padding(.top, 12)
+                .padding(.trailing, 16)
+                .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+                .zIndex(1)
             }
-            ZStack(alignment: .topTrailing) {
-                content
-                if model.isFindPresented {
-                    FindBar(
-                        query: $model.findQuery,
-                        matchCount: findSnapshot.count,
-                        selectedMatchNumber: findSnapshot.selectedMatchNumber,
-                        next: { stepFind(.next) },
-                        previous: { stepFind(.previous) },
-                        close: { model.isFindPresented = false }
-                    )
-                    .padding(.top, 12)
-                    .padding(.trailing, 16)
-                    .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
-                    .zIndex(1)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .animation(MailMotion.disclosure, value: model.isFindPresented)
         .focusScope(viewerFocus)

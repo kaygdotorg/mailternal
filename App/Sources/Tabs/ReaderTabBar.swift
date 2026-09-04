@@ -18,34 +18,25 @@ struct ReaderTabBar: View {
     @State private var tabFrames: [UUID: CGRect] = [:]
 
     var body: some View {
-        if model.tabs.active != nil {
+        if model.tabs.active != nil && !model.isSearchPresented {
             GeometryReader { geometry in
                 let contentWidth = max(0, geometry.size.width)
-                let viewportWidth = max(
-                    0,
-                    contentWidth
-                        - ReaderTabLayoutPolicy.actionsClusterWidth
-                        - ReaderTabLayoutPolicy.tabSpacing
-                )
                 let tabWidth = ReaderTabLayoutPolicy.tabWidth(
-                    availableWidth: viewportWidth,
+                    availableWidth: contentWidth,
                     tabCount: model.tabs.tabs.count
                 )
                 let tabsContentWidth = ReaderTabLayoutPolicy.contentWidth(
-                    availableWidth: viewportWidth,
+                    availableWidth: contentWidth,
                     tabCount: model.tabs.tabs.count
                 )
                 ZStack(alignment: .topLeading) {
                     GlassEffectContainer(spacing: ReaderTabLayoutPolicy.tabSpacing) {
-                        HStack(spacing: 0) {
-                            tabViewport(
-                                width: viewportWidth,
-                                tabWidth: tabWidth,
-                                contentWidth: tabsContentWidth,
-                                glassNamespace: glassNamespace
-                            )
-                            ReaderActionsCluster(model: model)
-                        }
+                        tabViewport(
+                            width: contentWidth,
+                            tabWidth: tabWidth,
+                            contentWidth: tabsContentWidth,
+                            glassNamespace: glassNamespace
+                        )
                     }
                     .frame(width: geometry.size.width, height: ReaderTabLayoutPolicy.rowHeight)
                 }
@@ -82,9 +73,8 @@ struct ReaderTabBar: View {
                 }
                 .animation(reduceMotion ? MailMotion.disclosure : MailMotion.hover, value: hoveredTabID)
             }
-            .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
-
-
+            .padding(.leading, 12)
+            .padding(.trailing, 8)
             .frame(height: ReaderTabLayoutPolicy.rowHeight)
             .zIndex(hoveredPreview == nil ? 0 : 1)
             .accessibilityIdentifier(UIIdentifier.readerTabBar)
