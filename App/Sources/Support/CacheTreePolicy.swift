@@ -8,6 +8,20 @@ import MailternalInterfaces
 /// Empty collections are unchecked, which also makes an empty cache tree
 /// naturally non-actionable.
 enum CacheTreePolicy {
+    /// Groups folders by their owning account and sorts each account's folders
+    /// by localized path so the cache tree has deterministic, account-local
+    /// ordering.
+    static func foldersByAccount(_ folders: [FolderSummary]) -> [AccountID: [FolderSummary]] {
+        Dictionary(grouping: folders, by: \.accountID)
+            .mapValues { accountFolders in
+                accountFolders.sorted {
+                    let pathOrder = $0.path.localizedStandardCompare($1.path)
+                    if pathOrder != .orderedSame { return pathOrder == .orderedAscending }
+                    return $0.id.rawValue < $1.id.rawValue
+                }
+            }
+    }
+
     enum State: Equatable, Sendable {
         case checked
         case mixed

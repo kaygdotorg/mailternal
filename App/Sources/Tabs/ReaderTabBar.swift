@@ -6,115 +6,101 @@ import MailternalInterfaces
 /// activation, persistence, and mutation all stay on AppModel/ReaderTabs.
 struct ReaderTabBar: View {
     @Bindable var model: AppModel
+    init(model: AppModel) {
+        self.model = model
+    }
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hoveredTabID: UUID?
-    @State private var hoverCandidateID: UUID?
-    @State private var hoverTask: Task<Void, Never>?
+    @State private var hoverDismissTask: Task<Void, Never>?
+    @State private var hoverPopover: ReaderTabHoverPopover?
+    @State private var isCardHovered = false
     @FocusState private var readerHasFocus: Bool
-
-    @Namespace private var glassNamespace
-
     @State private var tabFrames: [UUID: CGRect] = [:]
+    @State private var tabBarView: NSView?
 
     var body: some View {
-        if model.tabs.active != nil && !model.isSearchPresented {
+        if !model.tabs.tabs.isEmpty && !model.isSearchPresented {
             GeometryReader { geometry in
-                let contentWidth = max(0, geometry.size.width)
-                let tabWidth = ReaderTabLayoutPolicy.tabWidth(
-                    availableWidth: contentWidth,
-                    tabCount: model.tabs.tabs.count
+                let widths = model.tabs.tabs.map { tabWidth(for: $0) }
+                let contentWidth = ReaderTabLayoutPolicy.contentWidth(tabWidths: widths)
+                tabViewport(
+                    width: max(0, geometry.size.width),
+                    widths: widths,
+                    contentWidth: contentWidth
                 )
-                let tabsContentWidth = ReaderTabLayoutPolicy.contentWidth(
-                    availableWidth: contentWidth,
-                    tabCount: model.tabs.tabs.count
-                )
-                ZStack(alignment: .topLeading) {
-                    GlassEffectContainer(spacing: ReaderTabLayoutPolicy.tabSpacing) {
-                        tabViewport(
-                            width: contentWidth,
-                            tabWidth: tabWidth,
-                            contentWidth: tabsContentWidth,
-                            glassNamespace: glassNamespace
-                        )
-                    }
-                    .frame(width: geometry.size.width, height: ReaderTabLayoutPolicy.rowHeight)
-                }
                 .frame(width: geometry.size.width, height: ReaderTabLayoutPolicy.rowHeight)
-                // The preview is deliberately an overlay of the complete tab
-                // row, rather than a child of the scrolling tab content. This
-                // keeps its coordinate origin at the row's top and lets it
-                // paint over the reader below the strip.
-                .overlay(alignment: .topLeading) {
-                    if let preview = hoveredPreview,
-                       let frame = tabFrames[preview.id] {
-                        ReaderTabHoverCard(
-                            subject: preview.subject,
-                            preview: preview.preview,
-                            sender: preview.sender,
-                            receivedDate: preview.receivedDate
-                        )
-                        .offset(
-                            x: cardX(for: frame, in: geometry.size.width),
-                            y: ReaderTabLayoutPolicy.rowHeight + 4
-                        )
-                        .transition(
-                            reduceMotion
-                                ? .opacity
-                                : .opacity.combined(with: .move(edge: .top))
-                        )
-                        .zIndex(10)
-                        .allowsHitTesting(false)
-                    }
-                }
                 .coordinateSpace(name: "reader-tab-bar")
                 .onPreferenceChange(ReaderTabFramePreferenceKey.self) { frames in
                     tabFrames = frames
+                    if let hoveredTabID {
+                        showHoverPanel(for: hoveredTabID)
+                    }
                 }
-                .animation(reduceMotion ? MailMotion.disclosure : MailMotion.hover, value: hoveredTabID)
+                .background(
+                    ReaderTabWindowProbe { view in
+                        tabBarView = view
+                    }
+                )
             }
-            .padding(.leading, 12)
-            .padding(.trailing, 8)
+            .padding(.leading, ReaderTabLayoutPolicy.leadingInset)
             .frame(height: ReaderTabLayoutPolicy.rowHeight)
-            .zIndex(hoveredPreview == nil ? 0 : 1)
+            .zIndex(hoveredTabID == nil ? 0 : 1)
             .accessibilityIdentifier(UIIdentifier.readerTabBar)
             .focusable()
             .focusEffectDisabled(true)
             .focused($readerHasFocus)
+            .background {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .contextMenu {
+                        Picker("Tab Style", selection: Bindable(model.appearance).tabStyle) {
+                            ForEach(ReaderTabStyle.allCases, id: \.self) { style in
+                                Text(style.label).tag(style)
+                            }
+                        }
+                    }
+            }
             .onChange(of: model.tabs.activeID) { _, activeID in
                 readerHasFocus = activeID != nil
             }
+            .onChange(of: isCardHovered) { _, cardHovered in
+                if cardHovered {
+                    hoverDismissTask?.cancel()
+                    hoverDismissTask = nil
+                } else if hoveredTabID == nil {
+                    scheduleHoverDismissal()
+                }
+            }
             .onDisappear {
-                hoverTask?.cancel()
-                hoverTask = nil
-                hoverCandidateID = nil
-                hoveredTabID = nil
+                dismissHoverCard()
+                readerHasFocus = false
             }
         }
     }
 
     private func tabViewport(
         width: CGFloat,
-        tabWidth: CGFloat,
-        contentWidth: CGFloat,
-        glassNamespace: Namespace.ID
+        widths: [CGFloat],
+        contentWidth: CGFloat
     ) -> some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(spacing: ReaderTabLayoutPolicy.tabSpacing) {
-                    ForEach(model.tabs.tabs) { tab in
+                HStack(spacing: ReaderTabLayoutPolicy.tabSpacing) {
+                    ForEach(Array(model.tabs.tabs.enumerated()), id: \.element.id) { index, tab in
+                        let width = index < widths.count
+                            ? widths[index]
+                            : ReaderTabLayoutPolicy.minimumTabWidth
                         ReaderTabItem(
                             model: model,
                             tab: tab,
                             subject: subject(for: tab),
-                            width: tabWidth,
-                            glassNamespace: glassNamespace,
+                            sender: sender(for: tab),
+                            width: width,
                             onHoverChanged: { hovering in
                                 updateHover(for: tab.id, hovering: hovering)
                             },
                             onClose: closeTab
                         )
-
                         .id(tab.id)
                         .background {
                             GeometryReader { itemGeometry in
@@ -136,7 +122,7 @@ struct ReaderTabBar: View {
                             let destination = ReaderTabsPolicy.dropDestination(
                                 sourceIndex: sourceIndex,
                                 targetIndex: target,
-                                afterTarget: location.x > tabWidth / 2,
+                                afterTarget: location.x > width / 2,
                                 count: model.tabs.tabs.count
                             )
                             model.tabs.move(sourceID, to: destination)
@@ -144,32 +130,66 @@ struct ReaderTabBar: View {
                         }
                     }
                 }
-                .padding(.leading, 0)
                 .padding(.trailing, ReaderTabLayoutPolicy.rightFadeWidth)
-                .frame(minWidth: contentWidth, alignment: .leading)
+                .frame(minWidth: max(width, contentWidth), alignment: .leading)
             }
             .focusEffectDisabled(true)
             .frame(width: width, height: ReaderTabLayoutPolicy.rowHeight)
-            // The toolbar owns the material behind the hosting view. A
-            // gradient painted here would instead tint the strip's trailing
-            // edge with an opaque/dark window color and can hide the pills.
-            // Let the scroll view's clip reveal the toolbar material directly.
-            .clipped()
+            .mask {
+                if ReaderTabLayoutPolicy.showsFade(
+                    contentWidth: contentWidth,
+                    viewportWidth: width
+                ) {
+                    GeometryReader { maskGeometry in
+                        let fadeStart = max(
+                            0,
+                            min(
+                                1,
+                                1 - ReaderTabLayoutPolicy.rightFadeWidth / max(maskGeometry.size.width, 1)
+                            )
+                        )
+                        LinearGradient(
+                            stops: [
+                                .init(color: .black, location: 0),
+                                .init(color: .black, location: fadeStart),
+                                .init(color: .clear, location: 1)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    }
+                } else {
+                    Color.white
+                }
+            }
             .onChange(of: model.tabs.activeID) { _, activeID in
                 guard let activeID else { return }
-                withAnimation(reduceMotion ? MailMotion.disclosure : MailMotion.hover) {
-                    proxy.scrollTo(activeID, anchor: .center)
-                }
+                proxy.scrollTo(activeID, anchor: .center)
             }
-            .task(id: model.tabs.activeID) {
-                guard let activeID = model.tabs.activeID else { return }
-                await Task.yield()
-                withAnimation(reduceMotion ? MailMotion.disclosure : MailMotion.hover) {
-                    proxy.scrollTo(activeID, anchor: .center)
-                }
-            }
-
         }
+    }
+
+    private func tabWidth(for tab: ReaderTab) -> CGFloat {
+        let title = subject(for: tab).isEmpty ? "No Subject" : subject(for: tab)
+        let titleWidth: CGFloat
+        if ReaderTabStylePolicy.showsSubject(for: model.appearance.tabStyle) {
+            let font = NSFont.preferredFont(forTextStyle: .subheadline)
+            titleWidth = ceil(
+                (title as NSString).size(withAttributes: [.font: font]).width
+            )
+        } else {
+            titleWidth = 0
+        }
+        let leadingWidth = ReaderTabStylePolicy.showsLeadingSlot(
+            for: model.appearance.tabStyle,
+            isHovered: false
+        ) ? ReaderTabLayoutPolicy.leadingSlotWidth : 0
+        let intrinsic = leadingWidth
+            + titleWidth
+            + (titleWidth > 0 ? ReaderTabLayoutPolicy.subjectItemSpacing : 0)
+            + (titleWidth > 0 ? ReaderTabLayoutPolicy.subjectLeadingPadding : 0)
+            + (titleWidth > 0 ? ReaderTabLayoutPolicy.subjectTrailingPadding : 0)
+        return ReaderTabLayoutPolicy.tabWidth(intrinsic: intrinsic)
     }
 
     private var hoveredPreview: ReaderTabPreview? {
@@ -188,6 +208,18 @@ struct ReaderTabBar: View {
             return model.detail?.envelope.subject ?? ""
         }
         return ""
+    }
+
+    private func sender(for tab: ReaderTab) -> String? {
+        if let row = model.listRows.first(where: { $0.id == tab.message }) {
+            return row.from
+        }
+        if let detail = model.detail, detail.id == tab.message {
+            return detail.envelope.from.first.map {
+                ($0.displayName?.isEmpty == false ? $0.displayName : nil) ?? $0.address
+            }
+        }
+        return nil
     }
 
     private func preview(for tab: ReaderTab) -> ReaderTabPreview {
@@ -225,31 +257,68 @@ struct ReaderTabBar: View {
     }
 
     private func updateHover(for id: UUID, hovering: Bool) {
-        guard hovering else {
-            guard hoverCandidateID == id || hoveredTabID == id else { return }
-            if hoverCandidateID == id {
-                hoverCandidateID = nil
+        if hovering {
+            // The active tab's content is already on screen; no preview.
+            guard model.tabs.activeID != id else {
+                if hoveredTabID != nil { hoveredTabID = nil; scheduleHoverDismissal() }
+                return
             }
-            hoverTask?.cancel()
-            hoverTask = nil
-            withAnimation(reduceMotion ? MailMotion.disclosure : MailMotion.hover) {
-                if hoveredTabID == id { hoveredTabID = nil }
+            hoverDismissTask?.cancel()
+            hoverDismissTask = nil
+            if hoveredTabID != id {
+                hoveredTabID = id
             }
+            showHoverPanel(for: id)
             return
         }
 
-        // onContinuousHover emits active phases repeatedly. Keep the
-        // candidate stable so those phases do not restart the dwell timer.
-        guard hoveredTabID != id, hoverCandidateID != id else { return }
-        hoverTask?.cancel()
-        hoverCandidateID = id
-        hoverTask = Task { @MainActor in
-            try? await Task.sleep(for: ReaderTabTokens.hoverDelay)
-            guard !Task.isCancelled, hoverCandidateID == id else { return }
-            withAnimation(reduceMotion ? MailMotion.disclosure : MailMotion.hover) {
-                hoveredTabID = id
-            }
+        guard hoveredTabID == id else { return }
+        hoveredTabID = nil
+        scheduleHoverDismissal()
+    }
+
+    private func showHoverPanel(for id: UUID) {
+        guard let preview = hoveredPreview,
+              let frame = tabFrames[id],
+              let anchor = tabBarView else {
+            return
         }
+        let card = ReaderTabHoverCard(
+            subject: preview.subject,
+            preview: preview.preview,
+            sender: preview.sender,
+            receivedDate: preview.receivedDate
+        )
+        let popover: ReaderTabHoverPopover
+        if let hoverPopover {
+            popover = hoverPopover
+            popover.update(card: card)
+        } else {
+            popover = ReaderTabHoverPopover(card: card, cardHovered: $isCardHovered)
+            hoverPopover = popover
+        }
+        popover.present(tabFrame: frame, in: anchor)
+    }
+
+    private func scheduleHoverDismissal() {
+        hoverDismissTask?.cancel()
+        guard !isCardHovered else { return }
+        hoverDismissTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled, !isCardHovered, hoveredTabID == nil else { return }
+            hoverPopover?.dismiss()
+            hoverPopover = nil
+            hoverDismissTask = nil
+        }
+    }
+
+    private func dismissHoverCard() {
+        hoverDismissTask?.cancel()
+        hoverDismissTask = nil
+        hoverPopover?.dismiss()
+        hoverPopover = nil
+        hoveredTabID = nil
+        isCardHovered = false
     }
 
     private func closeTab(_ id: UUID) {
@@ -262,15 +331,6 @@ struct ReaderTabBar: View {
         }
     }
 
-
-    private func cardX(for frame: CGRect, in width: CGFloat) -> CGFloat {
-        let cardWidth = ReaderTabTokens.previewWidth
-        return min(
-            max(frame.midX - cardWidth / 2, 8),
-            max(8, width - cardWidth - 8)
-        )
-    }
-
     private static func plainText(fromHTML html: String) -> String {
         let stripped = html
             .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
@@ -280,6 +340,44 @@ struct ReaderTabBar: View {
     }
 }
 
+
+@MainActor
+/// Reports the AppKit view that backs the strip's coordinate space so the
+/// hover popover can be anchored to a tab frame.
+private struct ReaderTabWindowProbe: NSViewRepresentable {
+    let onViewReady: (NSView?) -> Void
+
+    func makeNSView(context: Context) -> ReaderTabWindowProbeView {
+        ReaderTabWindowProbeView(onViewReady: onViewReady)
+    }
+
+    func updateNSView(_ nsView: ReaderTabWindowProbeView, context: Context) {
+        nsView.onViewReady = onViewReady
+        nsView.resolveWindow()
+    }
+}
+
+@MainActor
+private final class ReaderTabWindowProbeView: NSView {
+    var onViewReady: (NSView?) -> Void
+
+    init(onViewReady: @escaping (NSView?) -> Void) {
+        self.onViewReady = onViewReady
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        resolveWindow()
+    }
+
+    func resolveWindow() {
+        onViewReady(window == nil ? nil : self)
+    }
+}
 private struct ReaderTabPreview: Identifiable {
     let id: UUID
     let subject: String

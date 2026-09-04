@@ -92,10 +92,11 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsLinkPreview = false
-        // macOS WKWebView is opaque by default (isOpaque is get-only here);
-        // the mode-driven canvas is enforced via underPageBackgroundColor + CSS.
+        // A nil appearance follows the containing window (and therefore the
+        // app's System/Light/Dark setting); the dark override must be explicit
+        // because WKWebView does not inherit SwiftUI's color-scheme environment.
+        webView.appearance = MessageHTMLReadingPolicy.appearance(for: .original)
         webView.underPageBackgroundColor = Self.canvasColor(for: .original)
-        webView.frame = bounds
         errorLabel.autoresizingMask = [.width, .height]
         errorLabel.frame = bounds.insetBy(dx: 24, dy: 24)
         addSubview(webView)
@@ -138,17 +139,26 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         handler.update(provider: partProvider, remoteAllowed: remoteImagesAllowed)
         let modeChanged = self.emailReadingMode != emailReadingMode
         self.emailReadingMode = emailReadingMode
+        webView.appearance = MessageHTMLReadingPolicy.appearance(for: emailReadingMode)
         webView.underPageBackgroundColor = Self.canvasColor(for: emailReadingMode)
         let next = HTMLRenderIdempotence.identity(html: html, remoteAllowed: remoteImagesAllowed)
-        if HTMLRenderIdempotence.action(displayed: lastHTMLIdentity, next: next) == .skip,
-           !modeChanged {
+        if HTMLRenderIdempotence.action(displayed: lastHTMLIdentity, next: next) == .skip {
+            guard modeChanged else { return }
+            // Changing only the reading mode does not require another document
+            // navigation. Updating the injected style keeps the current scroll
+            // position and avoids a white/black navigation flash.
+            if documentDidFinish {
+                updateReaderStyle()
+            } else {
+                requestLoad()
+            }
             return
         }
         lastHTML = html
         lastHTMLIdentity = next
         requestLoad()
-    }
 
+    }
     /// Re-render so consented remote tokens become fetchable through the scheme
     /// handler. The categorical network content-rule block stays active.
     /// Does not go through ``render(html:partProvider:)``.
@@ -292,6 +302,27 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             _ = try? await self.webView.evaluateJavaScript(script)
             guard !Task.isCancelled else { return }
             self.captureDocumentScroll(after: .zero)
+        }
+    }
+
+    private func updateReaderStyle() {
+        let css = Self.readerCSS(for: emailReadingMode)
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: css,
+            options: [.fragmentsAllowed]
+        ),
+        let javascriptString = String(data: data, encoding: .utf8) else {
+            return
+        }
+        let script = """
+        (() => {
+          const style = document.getElementById('mailternal-reader-style');
+          if (style) style.textContent = \(javascriptString);
+        })();
+        """
+        Task { @MainActor [weak self] in
+            guard let self, self.documentDidFinish else { return }
+            _ = try? await self.webView.evaluateJavaScript(script)
         }
     }
 
@@ -599,43 +630,49 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         return scheme == "about" || scheme == "applewebdata"
     }
 
-    /// Reader chrome. Author colors in the HTML are not remapped, but the
-    /// reading canvas is always opaque so authored light or dark text has a
-    /// stable surface beneath it.
+    /// Reader chrome. In Original mode authored colors are preserved while the
+    /// WebKit appearance follows the containing window. Dark mode adds the
+    /// same invert treatment used by common mail readers so hard-coded light
+    /// backgrounds become readable on the dark canvas.
     /// Matches the dark `NSColor.textBackgroundColor`.
     private static let darkCanvasHex = "#1e1e1e"
+    private static let darkFilterCanvasHex = "#e1e1e1"
 
     private static func canvasColor(for mode: EmailReadingMode) -> NSColor {
         switch mode {
         case .original:
-            .white
+            NSColor.textBackgroundColor
         case .dark:
             NSColor(calibratedWhite: 0.117647, alpha: 1)
         }
     }
 
     private static func readerCSS(for mode: EmailReadingMode) -> String {
-        let colorScheme: String
         let canvas: String
+        let textColor: String
         switch mode {
         case .original:
-            colorScheme = "light"
-            canvas = "#ffffff"
+            canvas = "transparent"
+            textColor = "-apple-system-label"
         case .dark:
-            colorScheme = "dark"
-            canvas = darkCanvasHex
+            // The dark filter inverts this light source canvas to
+            // `darkCanvasHex`, while also remapping authored light surfaces.
+            canvas = darkFilterCanvasHex
+            textColor = "#000000"
         }
+        let darkTreatment = mode == .dark
+            ? MessageHTMLReadingPolicy.darkTreatmentCSS
+            : ""
         return """
-        /* The canvas lives on html and stays opaque so mail that declares no
-           colors is readable; author body/background declarations must win,
-           so only color-scheme is forced. */
-        html { color-scheme: \(colorScheme) !important; background: \(canvas); height: auto; min-height: 0; }
+        /* The mode is also advertised through the CSS media feature so
+           message styles using prefers-color-scheme follow the override. */
+        html { color-scheme: \(MessageHTMLReadingPolicy.colorScheme(for: mode)) !important; background: \(canvas); height: auto; min-height: 0; }
         body {
           height: auto; min-height: 0; margin: 0; padding: 18px 20px;
           font: -apple-system-body;
           font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
           font-size: 13px; line-height: 18px;
-          color: -apple-system-label; background: \(canvas);
+          color: \(textColor); background: \(canvas);
           word-wrap: break-word; overflow-wrap: break-word;
         }
         p { margin: 0 0 10px 0; }
@@ -652,11 +689,16 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         pre { white-space: pre-wrap; }
         img, svg { max-width: 100%; height: auto; }
         table { border-collapse: collapse; max-width: 100%; }
+        \(darkTreatment)
         """
     }
 
     private static func wrap(_ html: String, emailReadingMode: EmailReadingMode) -> String {
-        let styleTag = "<meta charset=\"utf-8\"><style>\(readerCSS(for: emailReadingMode))</style>"
+        let colorScheme = MessageHTMLReadingPolicy.colorScheme(for: emailReadingMode)
+        let styleTag = """
+        <meta charset="utf-8"><meta name="color-scheme" content="\(colorScheme)">
+        <style id="mailternal-reader-style">\(readerCSS(for: emailReadingMode))</style>
+        """
         if let head = html.range(of: "<head", options: .caseInsensitive) {
             var cursor = head.upperBound
             var quote: Character?
@@ -677,12 +719,15 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         return "<!DOCTYPE html><html><head>\(styleTag)</head><body>\(html)</body></html>"
     }
 
-    /// Block every network load. `about:`, `mailternal-part:`, and `data:image/`
-    /// are excepted so the initial document, scheme handler, and allowlisted
-    /// data-image bytes can still resolve. Direct http(s) never reaches the page.
+    /// Block every network subresource. Main-frame documents are intentionally
+    /// left available so a user link reaches ``decidePolicyFor``; that delegate
+    /// immediately forwards it to the external handler and cancels the load.
+    /// `about:`, `mailternal-part:`, and `data:image/` are excepted so the
+    /// initial document, scheme handler, and allowlisted data-image bytes can
+    /// still resolve. Direct http(s) never reaches the page.
     private static let blockListJSON = """
     [
-      { "trigger": { "url-filter": ".*" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": ".*", "resource-type": ["image", "style-sheet", "script", "font", "media", "raw", "svg-document", "ping", "fetch", "websocket", "other"] }, "action": { "type": "block" } },
       { "trigger": { "url-filter": "^about:" }, "action": { "type": "ignore-previous-rules" } },
       { "trigger": { "url-filter": "^applewebdata:" }, "action": { "type": "ignore-previous-rules" } },
       { "trigger": { "url-filter": "^mailternal-part:" }, "action": { "type": "ignore-previous-rules" } },
@@ -699,6 +744,38 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
 /// document so wide mail can still be panned.
 @MainActor
 private final class DocumentWebView: WKWebView {
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+
+        guard let openLink = menu.items.first(where: {
+            $0.title == "Open Link in New Window"
+        }) else {
+            return
+        }
+        let copyLink = menu.items.first(where: { $0.title == "Copy Link" })
+        let hasSelectedText = menu.items.contains {
+            $0.title == "Copy" && $0.isEnabled
+        }
+        openLink.title = "Open Link"
+
+        for item in menu.items.reversed() where item !== openLink && item !== copyLink {
+            if hasSelectedText && Self.isTextSelectionItem(item) {
+                continue
+            }
+            menu.removeItem(item)
+        }
+    }
+
+    private static func isTextSelectionItem(_ item: NSMenuItem) -> Bool {
+        let title = item.title
+        return title == "Copy"
+            || title == "Services"
+            || title == "Share"
+            || title.hasPrefix("Look Up")
+            || title.hasPrefix("Search")
+            || title.hasPrefix("Translate")
+    }
+
     override func scrollWheel(with event: NSEvent) {
         let vertical = abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX)
         if vertical, let scrollView = enclosingScrollView {

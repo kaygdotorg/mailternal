@@ -2,6 +2,70 @@ import Foundation
 import CoreTransferable
 import UniformTypeIdentifiers
 import MailternalInterfaces
+/// Extracts and normalizes the domain used for favicon lookup from a sender
+/// address. Display names are intentionally not accepted as domains.
+enum SenderDomainPolicy {
+    static func domain(from rawAddress: String?) -> String? {
+        guard var value = rawAddress?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        if let open = value.lastIndex(of: "<"), let close = value.lastIndex(of: ">"),
+           open < close {
+            value = String(value[value.index(after: open)..<close])
+        }
+        guard let at = value.lastIndex(of: "@"), at < value.index(before: value.endIndex) else {
+            return nil
+        }
+        let domain = value[value.index(after: at)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            .lowercased()
+        guard !domain.isEmpty else { return nil }
+        return domain
+    }
+}
+
+struct MessageListIconMetrics: Equatable, Sendable {
+    let diameter: CGFloat
+    let leadingInset: CGFloat
+    let verticalInset: CGFloat
+    let textLeading: CGFloat
+}
+
+/// Pure geometry for the optional sender-icon column in message-list rows.
+enum MessageListIconPolicy {
+    static let leadingInset: CGFloat = 8
+    static let verticalInset: CGFloat = 4
+    static let textGap: CGFloat = 8
+
+    static func diameter(for lineCount: Int) -> CGFloat {
+        switch MessageListLayout.normalizedLineCount(lineCount) {
+        case 1: return 20
+        case 2: return 28
+        default: return 32
+        }
+    }
+
+    static func textLeading(for lineCount: Int) -> CGFloat {
+        leadingInset + diameter(for: lineCount) + textGap
+    }
+
+    static func leadingInset(for lineCount: Int) -> CGFloat {
+        _ = lineCount
+        return leadingInset
+    }
+
+    static func metrics(for lineCount: Int) -> MessageListIconMetrics {
+        let diameter = diameter(for: lineCount)
+        let maxDiameter = max(MessageListLayout.rowHeight(for: lineCount) - verticalInset * 2, 0)
+        let fittedDiameter = min(diameter, maxDiameter)
+        return MessageListIconMetrics(
+            diameter: fittedDiameter,
+            leadingInset: leadingInset,
+            verticalInset: verticalInset,
+            textLeading: leadingInset + fittedDiameter + textGap
+        )
+    }
+}
 
 /// Pure transition rules for the per-message email reading override.
 enum EmailReadingOverridePolicy {
@@ -36,6 +100,81 @@ enum ReaderSelectionPolicy {
         return remainingSelection.first
     }
 }
+/// Describes the input that may have caused an NSTableView selection change.
+/// Keeping the event conversion and classification separate from AppKit makes
+/// keyboard-selection behavior deterministic and directly testable.
+struct MessageTableSelectionEvent: Equatable, Sendable {
+    enum Kind: Equatable, Sendable {
+        case mouseDown
+        case mouseUp
+        case keyDown(MessageTableNavigationKey)
+        case keyUp(MessageTableNavigationKey)
+        case other
+    }
+
+    let kind: Kind
+    let command: Bool
+    let shift: Bool
+
+    init(kind: Kind, command: Bool = false, shift: Bool = false) {
+        self.kind = kind
+        self.command = command
+        self.shift = shift
+    }
+}
+
+enum MessageTableNavigationKey: Equatable, Sendable {
+    case left
+    case right
+    case up
+    case down
+    case home
+    case end
+    case pageUp
+    case pageDown
+}
+
+enum MessageTableSelectionClassification: Equatable, Sendable {
+    case user
+    case programmatic
+}
+
+enum MessageTableSelectionPolicy {
+    static func classification(
+        for event: MessageTableSelectionEvent?
+    ) -> MessageTableSelectionClassification {
+        guard let event else { return .programmatic }
+        switch event.kind {
+        case .mouseDown, .mouseUp,
+             .keyDown(_), .keyUp(_):
+            return .user
+        case .other:
+            return .programmatic
+        }
+    }
+
+    /// A single physical navigation can produce both key-down and key-up
+    /// selection notifications. Only the key-down notification (or a mouse
+    /// selection) owns opening the reader; key-up is a follow-up state update.
+    static func opensReader(for event: MessageTableSelectionEvent?) -> Bool {
+        switch event?.kind {
+        case .mouseDown, .mouseUp, .keyDown(_):
+            return true
+        case .keyUp(_), .other, nil:
+            return false
+        }
+    }
+
+    static func isMouseSelection(_ event: MessageTableSelectionEvent?) -> Bool {
+        switch event?.kind {
+        case .mouseDown, .mouseUp:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 
 /// The menu's value model is deliberately independent of AppKit. This keeps
 /// the Mail-style ordering, state-aware labels, account-grouped destinations,

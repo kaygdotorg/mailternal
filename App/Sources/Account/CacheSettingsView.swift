@@ -5,15 +5,23 @@ struct CacheSettingsView: View {
     @Bindable var model: AppModel
 
     private var foldersByAccount: [AccountID: [FolderSummary]] {
-        guard let account = model.accountConfig else { return [:] }
-        return [account.id: model.folders.sorted { lhs, rhs in
-            lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
-        }]
+        CacheTreePolicy.foldersByAccount(model.folders)
+    }
+
+    private var accounts: [AccountConfig] {
+        AccountsListPolicy.sorted(model.accountConfigs)
     }
 
     private var accountIDs: [AccountID] {
-        foldersByAccount.keys.sorted { $0.rawValue.localizedStandardCompare($1.rawValue) == .orderedAscending }
+        let knownIDs = accounts.map(\.id)
+        let unknownIDs = foldersByAccount.keys
+            .filter { !knownIDs.contains($0) }
+            .sorted { $0.rawValue.localizedStandardCompare($1.rawValue) == .orderedAscending }
+        return knownIDs + unknownIDs
     }
+
+    @State private var collapsedAccountIDs: Set<AccountID> = []
+
 
     var body: some View {
         Form {
@@ -36,7 +44,6 @@ struct CacheSettingsView: View {
             } footer: {
                 Text("Choose which folders retain mail on this Mac.")
             }
-
             Section("Accounts") {
                 if accountIDs.isEmpty {
                     Text("No account configured")
@@ -56,47 +63,87 @@ struct CacheSettingsView: View {
     @ViewBuilder
     private func accountNode(_ accountID: AccountID) -> some View {
         let folders = foldersByAccount[accountID] ?? []
-        CacheTriStateToggle(
-            title: accountTitle(for: accountID),
-            state: CacheTreePolicy.accountState(for: folders),
-            onToggle: {
-                let state = CacheTreePolicy.accountState(for: folders)
-                setKeepLocally(
-                    CacheTreePolicy.desiredValue(for: state),
-                    folderIDs: CacheTreePolicy.folderUpdates(for: state, folders: folders).keys
-                )
-            }
-        )
-        .accessibilityIdentifier(UIIdentifier.cacheAccount(accountID.rawValue))
+        let config = model.accountConfigs.first { $0.id == accountID }
+        let title = AccountTitlePolicy.title(for: config) ?? accountID.rawValue
+        let isExpanded = !collapsedAccountIDs.contains(accountID)
 
-        ForEach(folders) { folder in
-            Toggle(isOn: Binding(
-                get: { folder.keepLocally },
-                set: { keep in setKeepLocally(keep, folderIDs: [folder.id]) }
-            )) {
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(folder.name)
-                            .lineLimit(1)
-                        Text(CacheTreePolicy.countCaption(for: folder))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: CacheSettingsLayout.accountToFoldersGap) {
+            HStack(alignment: .center, spacing: 8) {
+                Button {
+                    withAnimation(MailMotion.expand) {
+                        if isExpanded {
+                            collapsedAccountIDs.insert(accountID)
+                        } else {
+                            collapsedAccountIDs.remove(accountID)
+                        }
                     }
-                    Spacer(minLength: 0)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: CacheSettingsLayout.titleSubtitleGap) {
+                            Text(title)
+                                .lineLimit(1)
+                            if let config {
+                                Text(config.emailAddress)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    .contentShape(Rectangle())
                 }
-            }
-            .toggleStyle(.checkbox)
-            .padding(.leading, 24)
-            .accessibilityIdentifier(UIIdentifier.cacheFolder(String(folder.id.rawValue)))
-            .accessibilityValue(folder.keepLocally ? "Kept locally" : "Not kept locally")
-        }
-    }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(title), \(config?.emailAddress ?? "")")
 
-    private func accountTitle(for id: AccountID) -> String {
-        if let config = model.accountConfig, config.id == id {
-            return AccountTitlePolicy.title(for: config) ?? config.emailAddress
+                Spacer(minLength: 8)
+
+                CacheTriStateToggle(
+                    title: "All",
+                    state: CacheTreePolicy.accountState(for: folders),
+                    onToggle: {
+                        let state = CacheTreePolicy.accountState(for: folders)
+                        setKeepLocally(
+                            CacheTreePolicy.desiredValue(for: state),
+                            folderIDs: CacheTreePolicy.folderUpdates(for: state, folders: folders).keys
+                        )
+                    }
+                )
+                .accessibilityIdentifier(UIIdentifier.cacheAccount(accountID.rawValue))
+            }
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: CacheSettingsLayout.folderRowGap) {
+                    ForEach(folders) { folder in
+                        Toggle(isOn: Binding(
+                            get: { folder.keepLocally },
+                            set: { keep in setKeepLocally(keep, folderIDs: [folder.id]) }
+                        )) {
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: CacheSettingsLayout.titleSubtitleGap) {
+                                    Text(folder.name)
+                                        .lineLimit(1)
+                                    Text(CacheTreePolicy.countCaption(for: folder))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                        .padding(.leading, 24)
+                        .padding(.vertical, CacheSettingsLayout.folderRowInset)
+                        .accessibilityIdentifier(UIIdentifier.cacheFolder(String(folder.id.rawValue)))
+                        .accessibilityValue(folder.keepLocally ? "Kept locally" : "Not kept locally")
+                    }
+                }
+                .transition(.opacity)
+            }
         }
-        return id.rawValue
+        .animation(MailMotion.expand, value: isExpanded)
     }
 
     private func setKeepLocally(_ keep: Bool, folderIDs: some Collection<FolderID>) {
@@ -150,4 +197,13 @@ private struct CacheTriStateToggle: View {
         case .unchecked: "Unchecked"
         }
     }
+}
+
+/// Cache pane rhythm: rows need room to breathe between title/subtitle and
+/// between list items (user review 2026-09-04).
+enum CacheSettingsLayout {
+    static let titleSubtitleGap: CGFloat = 4
+    static let folderRowGap: CGFloat = 6
+    static let folderRowInset: CGFloat = 4
+    static let accountToFoldersGap: CGFloat = 10
 }

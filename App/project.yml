@@ -68,6 +68,8 @@ targets:
       - path: Sources/Shell/WindowBackdrop.swift
       - path: Sources/Support/PartFetchRouting.swift
       - path: Sources/MessageWeb/PartSchemeHandler.swift
+      - path: Sources/Support/FaviconStore.swift
+      - path: Sources/MessageWeb/MessageReadingPolicy.swift
       - path: Sources/Sidebar/FolderHierarchy.swift
       - path: Sources/Mock/MockMailFacade.swift
       - path: Sources/Support/AccountTitlePolicy.swift
@@ -95,6 +97,7 @@ targets:
     sources:
       - path: UITests
       - path: Sources/Support/UILogic.swift
+      - path: Sources/Support/AppearanceSettings.swift
     dependencies:
       - target: Mailternal
       - package: MailternalCore

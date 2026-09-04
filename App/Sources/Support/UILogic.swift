@@ -90,42 +90,62 @@ enum UIIdentifier {
     }
 
 }
-/// Pure geometry decisions for the reader's fixed-height tab strip. Tabs first
-/// compress toward the minimum width; once the minimum is reached the scroll
-/// viewport can expose more tabs without ever shrinking them below 120 pt.
+/// Pure geometry decisions for the reader's intrinsic-width tab strip. The
+/// viewport never stretches tabs to consume spare space; it only scrolls once
+/// their clamped intrinsic widths no longer fit.
 enum ReaderTabLayoutPolicy {
     static let rowHeight: CGFloat = 40
-    static let minimumTabWidth: CGFloat = 120
+    static let minimumTabWidth: CGFloat = 72
     static let maximumTabWidth: CGFloat = 220
-    static let tabSpacing: CGFloat = 4
+    static let tabSpacing: CGFloat = 8
     static let rightFadeWidth: CGFloat = 28
     static let toolbarSpacing: CGFloat = 8
+    /// The first tab lines up with the reader's subject/header card, so the
+    /// strip inset equals the reader's horizontal card padding.
+    static var leadingInset: CGFloat { MessageViewerLayoutPolicy.horizontalPadding }
+    /// Width reserved for the trailing Archive/Trash/More cluster when its
+    /// toolbar view has not been measured yet.
+    static let fallbackActionsWidth: CGFloat = 136
+    /// The leading sender/close slot used by icon-bearing tabs.
+    static let leadingSlotWidth: CGFloat = 25
+    static let subjectLeadingPadding: CGFloat = 4
+    static let subjectTrailingPadding: CGFloat = 10
+    static let subjectItemSpacing: CGFloat = 2
 
-    /// The width assigned to each tab before horizontal scrolling is needed.
-    /// The returned value is always within the documented tab bounds.
-    static func tabWidth(availableWidth: CGFloat, tabCount: Int) -> CGFloat {
-        guard tabCount > 0, availableWidth.isFinite, availableWidth > 0 else {
-            return minimumTabWidth
-        }
-        let spacing = CGFloat(max(0, tabCount - 1)) * tabSpacing
-        let perTab = (availableWidth - spacing) / CGFloat(tabCount)
-        return min(maximumTabWidth, max(minimumTabWidth, perTab))
+    /// Clamps the complete intrinsic width. Callers provide the leading slot,
+    /// subject glyph width, inter-item spacing, and title paddings.
+    static func tabWidth(intrinsic: CGFloat) -> CGFloat {
+        guard intrinsic.isFinite else { return minimumTabWidth }
+        return min(maximumTabWidth, max(minimumTabWidth, intrinsic))
     }
 
-    static func widths(availableWidth: CGFloat, tabCount: Int) -> [CGFloat] {
-        Array(repeating: tabWidth(availableWidth: availableWidth, tabCount: tabCount), count: max(0, tabCount))
-    }
-
-    static func contentWidth(availableWidth: CGFloat, tabCount: Int) -> CGFloat {
-        guard tabCount > 0 else { return 0 }
-        let width = tabWidth(availableWidth: availableWidth, tabCount: tabCount)
-        return CGFloat(tabCount) * width + CGFloat(tabCount - 1) * tabSpacing
+    static func contentWidth(tabWidths: [CGFloat]) -> CGFloat {
+        guard !tabWidths.isEmpty else { return 0 }
+        let widths = tabWidths.filter(\.isFinite).map { max(0, $0) }
+        guard !widths.isEmpty else { return 0 }
+        return widths.reduce(0, +) + CGFloat(widths.count - 1) * tabSpacing
     }
 
     static func showsFade(contentWidth: CGFloat, viewportWidth: CGFloat) -> Bool {
         contentWidth.isFinite && viewportWidth.isFinite && contentWidth > viewportWidth + 0.5
     }
 }
+enum ReaderTabStylePolicy {
+    static func showsIcon(for style: ReaderTabStyle) -> Bool {
+        style != .text
+    }
+
+    static func showsSubject(for style: ReaderTabStyle) -> Bool {
+        style != .icon
+    }
+
+    /// Icon-bearing styles reserve the leading slot even before hover. Text
+    /// tabs collapse it until the close affordance needs to appear.
+    static func showsLeadingSlot(for style: ReaderTabStyle, isHovered: Bool) -> Bool {
+        style != .text || isHovered
+    }
+}
+
 
 
 enum FolderRenamePolicy {
@@ -138,38 +158,42 @@ enum FolderRenamePolicy {
         UIIdentifier.sidebarFolderRenameField(id)
     }
 }
-/// Presentation policy for the folder activity accessory. Keeping the symbol
-/// names here makes the mapping testable without constructing a SwiftUI view.
+/// Presentation policy for the folder activity accessory. The active states
+/// use a standard spinner; only the halted state has a symbolic glyph.
 enum FolderActivityPolicy {
     static func symbolName(for activity: FolderActivity) -> String? {
-        switch activity {
-        case .downloading:
-            "arrow.down"
-        case .indexing:
-            "arrow.triangle.2.circlepath"
-        case .halted:
-            "pause.circle"
-        case .idle, .quarantinedStall:
-            nil
+        activity == .halted ? "pause.circle" : nil
+    }
+
+    static func percentage(for folder: FolderSummary) -> Int? {
+        guard case .syncing(let progress) = folder.backfill,
+              let progress else {
+            return nil
         }
+        let clamped = min(1, max(0, progress))
+        return Int((clamped * 100).rounded())
     }
 
     static func tooltip(for folder: FolderSummary) -> String? {
-        guard folder.activity == .downloading else { return nil }
-        guard case .syncing(let progress) = folder.backfill,
-              let progress,
-              folder.totalCount > 0 else {
-            return "Downloading…"
+        let label: String
+        switch folder.activity {
+        case .downloading:
+            label = "Downloading messages"
+        case .indexing:
+            label = "Indexing messages"
+        case .idle, .halted, .quarantinedStall:
+            return nil
         }
-        let clamped = min(1, max(0, progress))
-        let completed = Int((Double(folder.totalCount) * clamped).rounded())
-        return "Downloading \(completed.formatted()) of \(folder.totalCount.formatted())"
+        guard let percentage = percentage(for: folder) else {
+            return label
+        }
+        return "\(label) — \(percentage)%"
     }
 
     static func accessibilityLabel(for activity: FolderActivity) -> String? {
         switch activity {
-        case .downloading: "Syncing"
-        case .indexing: "Indexing"
+        case .downloading: "Downloading messages"
+        case .indexing: "Indexing messages"
         case .halted: "Sync halted"
         case .quarantinedStall: "Sync stalled on quarantined message"
         case .idle: nil
@@ -422,9 +446,16 @@ struct MailWindowDissolvePolicy: Equatable, Sendable {
     /// zero while the message list reaches the window bottom.
     let bottomReservedHeight: CGFloat
 
+    /// The reader's ramp starts exactly where the tab strip ends (the 40 pt
+    /// strip is centred in the 52 pt titlebar) and dissolves content over a
+    /// short reach below it, so scrolled content fades out beneath the tabs
+    /// instead of behind the window buttons.
+    static let viewerTopReach: CGFloat = 24
+    static let viewerTopOrigin: CGFloat =
+        (MailWindowTopDissolvePolicy.titlebarDepth + ReaderTabLayoutPolicy.rowHeight) / 2
     static let viewer = Self(
-        topOrigin: .windowTop,
-        topReach: MailWindowTopDissolvePolicy.titlebarDepth,
+        topOrigin: .measured(viewerTopOrigin),
+        topReach: viewerTopReach,
         bottomReach: nil,
         bottomReservedHeight: 0
     )

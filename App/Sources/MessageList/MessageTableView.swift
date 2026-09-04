@@ -34,12 +34,18 @@ struct MessageListPane: View {
                 currentFolder: model.selectedFolderID,
                 epoch: model.listEpoch,
                 lineCount: model.appearance.messageListLines,
+                showsSenderIcons: model.appearance.showsSenderIcons,
+                faviconRevision: model.faviconRevision,
+                faviconForDomain: { model.favicon(forSenderDomain: $0) },
                 accent: model.appearance.accent,
                 leading: actions.leadingSwipe,
                 trailing: actions.trailingSwipe,
                 topRestDepth: listDissolvePolicy.restDepth(safeAreaTop: 0),
                 listScrollOffset: model.selectedFolderID.flatMap {
                     model.listScrollOffsets[$0]
+                },
+                onWarmup: { domains in
+                    Task { await model.warmupFavicons(forSenderDomains: domains) }
                 },
                 onSelect: { ids, anchor in
                     model.selectMessages(ids, anchor: anchor)
@@ -129,11 +135,15 @@ struct MessageTableRepresentable: NSViewRepresentable {
     var currentFolder: FolderID?
     var epoch: UInt64
     var lineCount: Int
+    var showsSenderIcons: Bool
+    var faviconRevision: UInt64
+    var faviconForDomain: (String) -> NSImage?
     var accent: AccentSource
     var leading: [SwipeActionKind]
     var trailing: [SwipeActionKind]
     var topRestDepth: CGFloat
     var listScrollOffset: CGFloat?
+    var onWarmup: ([String]) -> Void
     var onSelect: (Set<MessageID>, MessageID?) -> Void
     var onOpenMessage: (MessageID, Bool) -> Void
     var onSelectAll: () -> Void
@@ -162,6 +172,9 @@ struct MessageTableRepresentable: NSViewRepresentable {
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
         var parent: MessageTableRepresentable?
         private var lineCount = MessageListLayout.defaultLineCount
+        private var showsSenderIcons = false
+        private var faviconRevision: UInt64 = 0
+        private var warmedDomains = Set<String>()
         weak var container: MessageTableContainer?
         fileprivate weak var tableView: MessageTableKeyView?
         private var epoch: UInt64 = 0
@@ -175,12 +188,18 @@ struct MessageTableRepresentable: NSViewRepresentable {
             self.container = container
             tableView = container.tableView
             lineCount = MessageListLayout.normalizedLineCount(parent.lineCount)
+            showsSenderIcons = parent.showsSenderIcons
+            faviconRevision = parent.faviconRevision
             container.tableView.rowHeight = MessageListLayout.rowHeight(for: lineCount)
             container.updateAccent(parent.accent)
             container.tableView.delegate = self
             container.tableView.dataSource = self
             container.onVisibleRow = { [weak self] row in
-                self?.parent?.onPrefetch(row)
+                guard let self else { return }
+                self.parent?.onPrefetch(row)
+                if let table = self.tableView, let parent = self.parent {
+                    self.warmVisibleFavicons(in: table, parent: parent)
+                }
             }
             container.onScrollOffset = { [weak self] offset in
                 guard let self, self.canPersistScroll,
@@ -201,6 +220,10 @@ struct MessageTableRepresentable: NSViewRepresentable {
         }
 
         @objc private func handleDoubleAction(_ sender: NSTableView) {
+            // NSTableView can route keyboard activation through its
+            // doubleAction target. Only a real double-click may promote a
+            // transient reader tab to permanent.
+            guard NSApp.currentEvent?.clickCount ?? 0 >= 2 else { return }
             guard let parent else { return }
             let row = sender.clickedRow >= 0 ? sender.clickedRow : sender.selectedRow
             guard let messageID = parent.rows[safe: row]?.id else { return }
@@ -218,9 +241,13 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 pendingScrollOffset = parent.listScrollOffset.map { max($0, 0) }
             }
             renderedFolder = parent.currentFolder
-            // SwiftUI observes AccentSource; resolve it at this AppKit bridge
-            // and refresh rows only when the canonical color actually changes.
+            // SwiftUI observes AccentSource and the favicon revision; resolve
+            // both at this AppKit bridge so reused rows update in place.
             let accentChanged = container.updateAccent(parent.accent)
+            let showsSenderIconsChanged = parent.showsSenderIcons != showsSenderIcons
+            showsSenderIcons = parent.showsSenderIcons
+            let faviconChanged = parent.faviconRevision != faviconRevision
+            faviconRevision = parent.faviconRevision
             let oldCount = rowIDs.count
             let newIDs = parent.rows.map(\.id)
             let newLineCount = MessageListLayout.normalizedLineCount(parent.lineCount)
@@ -238,8 +265,12 @@ struct MessageTableRepresentable: NSViewRepresentable {
             } else if newIDs != rowIDs {
                 rowIDs = newIDs
                 table.reloadData()
-            } else if accentChanged {
+            } else if accentChanged || showsSenderIconsChanged {
                 reloadVisibleRows(in: table)
+            }
+
+            if faviconChanged {
+                reloadRowsWithFavicons(in: table, parent: parent)
             }
 
             if lineCountChanged {
@@ -258,6 +289,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
                     scrollView.reflectScrolledClipView(scrollView.contentView)
                 }
             }
+            warmVisibleFavicons(in: table, parent: parent)
             restorePendingScrollOffset(in: container)
             syncSelection(in: table)
             canPersistScroll = pendingScrollOffset == nil
@@ -280,6 +312,51 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 )
             }
         }
+        private func reloadRowsWithFavicons(
+            in table: NSTableView,
+            parent: MessageTableRepresentable
+        ) {
+            let visible = table.rows(in: table.visibleRect)
+            guard visible.length > 0 else { return }
+            let indexes = IndexSet(
+                (visible.location..<(visible.location + visible.length)).filter { row in
+                    guard let message = parent.rows[safe: row],
+                          let domain = SenderDomainPolicy.domain(from: message.senderAddress)
+                    else { return false }
+                    return parent.faviconForDomain(domain) != nil
+                }
+            )
+            guard !indexes.isEmpty else { return }
+            table.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
+        }
+
+        private func warmVisibleFavicons(in table: NSTableView, parent: MessageTableRepresentable) {
+            guard parent.showsSenderIcons else { return }
+            let visible = table.rows(in: table.visibleRect)
+            guard visible.length > 0 else { return }
+            var domains = Set<String>()
+            for row in visible.location..<(visible.location + visible.length) {
+                guard let message = parent.rows[safe: row],
+                      let domain = SenderDomainPolicy.domain(from: message.senderAddress),
+                      parent.faviconForDomain(domain) == nil,
+                      !warmedDomains.contains(domain)
+                else { continue }
+                domains.insert(domain)
+            }
+            guard !domains.isEmpty else { return }
+            warmedDomains.formUnion(domains)
+            parent.onWarmup(domains.sorted())
+        }
+
+        private func apply(_ rowModel: MessageRow, to cell: MessageCellView, parent: MessageTableRepresentable) {
+            let domain = SenderDomainPolicy.domain(from: rowModel.senderAddress)
+            cell.apply(
+                rowModel,
+                lineCount: lineCount,
+                showsSenderIcons: parent.showsSenderIcons,
+                favicon: domain.flatMap { parent.faviconForDomain($0) }
+            )
+        }
 
         func numberOfRows(in tableView: NSTableView) -> Int {
             parent?.rows.count ?? 0
@@ -290,8 +367,8 @@ struct MessageTableRepresentable: NSViewRepresentable {
             let cell = tableView.makeView(withIdentifier: MessageCellView.identifier, owner: self) as? MessageCellView
                 ?? MessageCellView()
             cell.updateAccentColor(container?.accentColor)
-            if let rowModel = parent?.rows[safe: row] {
-                cell.apply(rowModel, lineCount: lineCount)
+            if let rowModel = parent?.rows[safe: row], let parent {
+                apply(rowModel, to: cell, parent: parent)
             }
             return cell
         }
@@ -342,14 +419,21 @@ struct MessageTableRepresentable: NSViewRepresentable {
             let ids = Set(tableView.selectedRowIndexes.compactMap { index in
                 parent.rows[safe: index]?.id
             })
-            let clickedID = parent.rows[safe: tableView.clickedRow]?.id
-            let event = NSApp.currentEvent
-            let modifiers = event?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
-            let isUserSelectionEvent = event?.type == .leftMouseDown
-                || event?.type == .leftMouseUp
-                || event?.type == .keyDown
-            let opensReader = isUserSelectionEvent && modifiers.isDisjoint(with: [.command, .shift])
-            if modifiers.contains(.command), let clickedID {
+            let selectionEvent = tableView.consumeSelectionEvent()
+            var modifiers: NSEvent.ModifierFlags = []
+            if let selectionEvent {
+                if selectionEvent.command { modifiers.insert(.command) }
+                if selectionEvent.shift { modifiers.insert(.shift) }
+            }
+            let isUserSelectionEvent = MessageTableSelectionPolicy.classification(for: selectionEvent) == .user
+            let isMouseSelectionEvent = MessageTableSelectionPolicy.isMouseSelection(selectionEvent)
+            let clickedID = isMouseSelectionEvent
+                ? parent.rows[safe: tableView.clickedRow]?.id
+                : nil
+            let opensReader = isUserSelectionEvent
+                && MessageTableSelectionPolicy.opensReader(for: selectionEvent)
+                && modifiers.isDisjoint(with: [.command, .shift])
+            if isMouseSelectionEvent, modifiers.contains(.command), let clickedID {
                 var selection = parent.selectedIDs
                 if ids.contains(clickedID) {
                     selection.insert(clickedID)
@@ -610,6 +694,7 @@ fileprivate final class MessageTableKeyView: NSTableView {
     var onKeyCommand: ((MessageTableKeyCommand) -> Void)?
     fileprivate private(set) var contextMenuRow: Int?
     fileprivate private(set) var receivedContextMenuEvent = false
+    private var pendingSelectionEvent: MessageTableSelectionEvent?
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
@@ -628,7 +713,30 @@ fileprivate final class MessageTableKeyView: NSTableView {
         receivedContextMenuEvent = false
     }
 
+    fileprivate func consumeSelectionEvent() -> MessageTableSelectionEvent? {
+        defer { pendingSelectionEvent = nil }
+        return pendingSelectionEvent
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        defer { pendingSelectionEvent = nil }
+        pendingSelectionEvent = mouseSelectionEvent(for: event, kind: .mouseDown)
+        // NSTableView normally becomes first responder as part of a click, but
+        // the custom row views and SwiftUI host can leave focus elsewhere.
+        // Claim it before AppKit performs selection so arrows work immediately.
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer { pendingSelectionEvent = nil }
+        pendingSelectionEvent = mouseSelectionEvent(for: event, kind: .mouseUp)
+        super.mouseUp(with: event)
+    }
+
     override func keyDown(with event: NSEvent) {
+        defer { pendingSelectionEvent = nil }
+        pendingSelectionEvent = selectionEvent(for: event, phase: .down)
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if modifiers == .command,
            event.charactersIgnoringModifiers?.lowercased() == "a" {
@@ -652,6 +760,60 @@ fileprivate final class MessageTableKeyView: NSTableView {
             }
         }
         super.keyDown(with: event)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        defer { pendingSelectionEvent = nil }
+        pendingSelectionEvent = selectionEvent(for: event, phase: .up)
+        super.keyUp(with: event)
+    }
+
+    private enum KeyPhase {
+        case down
+        case up
+    }
+
+    private func selectionEvent(
+        for event: NSEvent,
+        phase: KeyPhase
+    ) -> MessageTableSelectionEvent {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let command = modifiers.contains(.command)
+        let shift = modifiers.contains(.shift)
+        guard let key = Self.navigationKey(for: event.keyCode) else {
+            return MessageTableSelectionEvent(kind: .other, command: command, shift: shift)
+        }
+        let kind: MessageTableSelectionEvent.Kind = phase == .down
+            ? .keyDown(key)
+            : .keyUp(key)
+        return MessageTableSelectionEvent(kind: kind, command: command, shift: shift)
+    }
+
+    private func mouseSelectionEvent(
+        for event: NSEvent,
+        kind: MessageTableSelectionEvent.Kind
+    ) -> MessageTableSelectionEvent {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        return MessageTableSelectionEvent(
+            kind: kind,
+            command: modifiers.contains(.command),
+            shift: modifiers.contains(.shift)
+        )
+    }
+
+
+    private static func navigationKey(for keyCode: UInt16) -> MessageTableNavigationKey? {
+        switch keyCode {
+        case 123: return .left
+        case 124: return .right
+        case 125: return .down
+        case 126: return .up
+        case 115: return .home
+        case 119: return .end
+        case 116: return .pageUp
+        case 121: return .pageDown
+        default: return nil
+        }
     }
 }
 
@@ -694,6 +856,7 @@ final class MessageTableContainer: NSView {
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
+        OverlayScrollerPolicy.apply(to: scrollView)
         scrollView.borderType = .noBorder
         scrollView.contentView.backgroundColor = .clear
         // The pane's frame runs to the physical window top, so rows travel up
@@ -861,12 +1024,16 @@ final class MessageCellView: NSTableCellView {
     private let subjectLabel = NSTextField(labelWithString: "")
     private let previewLabel = NSTextField(labelWithString: "")
     private let dateLabel = NSTextField(labelWithString: "")
+    private let senderGlyph = NSImageView()
     private let flagIcon = NSImageView()
     private let paperclip = NSImageView()
     private var accentColor: NSColor?
     private var isSelectedRow = false
     private var isHovered = false
     private var lineCount = MessageListLayout.defaultLineCount
+    private var fromLeadingConstraint: NSLayoutConstraint!
+    private var senderGlyphWidthConstraint: NSLayoutConstraint!
+    private var senderGlyphHeightConstraint: NSLayoutConstraint!
     private var subjectTopFromConstraint: NSLayoutConstraint!
     private var subjectTopRowConstraint: NSLayoutConstraint!
 
@@ -879,15 +1046,11 @@ final class MessageCellView: NSTableCellView {
         hoverLayer.opacity = 0
         hoverLayer.cornerCurve = .continuous
         selectionLayer.cornerCurve = .continuous
-        layer?.addSublayer(hoverLayer)
-        layer?.addSublayer(selectionLayer)
-#if DEBUG
-        assert(selectionLayer.superlayer === layer)
-#endif
         fromLabel.translatesAutoresizingMaskIntoConstraints = false
         subjectLabel.translatesAutoresizingMaskIntoConstraints = false
         previewLabel.translatesAutoresizingMaskIntoConstraints = false
         dateLabel.translatesAutoresizingMaskIntoConstraints = false
+        senderGlyph.translatesAutoresizingMaskIntoConstraints = false
         flagIcon.translatesAutoresizingMaskIntoConstraints = false
         paperclip.translatesAutoresizingMaskIntoConstraints = false
         fromLabel.lineBreakMode = .byTruncatingTail
@@ -908,9 +1071,14 @@ final class MessageCellView: NSTableCellView {
         flagIcon.setAccessibilityLabel("Flagged")
         flagIcon.isHidden = true
         flagIcon.setAccessibilityHidden(true)
+        senderGlyph.imageScaling = .scaleProportionallyUpOrDown
+        senderGlyph.imageAlignment = .alignCenter
+        senderGlyph.isHidden = true
+        senderGlyph.setAccessibilityHidden(true)
         paperclip.image = NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Has attachments")
         paperclip.contentTintColor = .tertiaryLabelColor
         paperclip.symbolConfiguration = .init(pointSize: 11, weight: .regular)
+        addSubview(senderGlyph)
         addSubview(fromLabel)
         addSubview(subjectLabel)
         addSubview(previewLabel)
@@ -919,8 +1087,15 @@ final class MessageCellView: NSTableCellView {
         addSubview(paperclip)
         subjectTopFromConstraint = subjectLabel.topAnchor.constraint(equalTo: fromLabel.bottomAnchor, constant: 2)
         subjectTopRowConstraint = subjectLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10)
+        fromLeadingConstraint = fromLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16)
+        senderGlyphWidthConstraint = senderGlyph.widthAnchor.constraint(equalToConstant: 20)
+        senderGlyphHeightConstraint = senderGlyph.heightAnchor.constraint(equalToConstant: 20)
         NSLayoutConstraint.activate([
-            fromLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            fromLeadingConstraint,
+            senderGlyph.leadingAnchor.constraint(equalTo: leadingAnchor, constant: MessageListIconPolicy.leadingInset),
+            senderGlyph.centerYAnchor.constraint(equalTo: centerYAnchor),
+            senderGlyphWidthConstraint,
+            senderGlyphHeightConstraint,
             fromLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             dateLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
             dateLabel.centerYAnchor.constraint(equalTo: fromLabel.centerYAnchor),
@@ -1010,7 +1185,12 @@ final class MessageCellView: NSTableCellView {
     }
 
 
-    func apply(_ row: MessageRow, lineCount: Int) {
+    func apply(
+        _ row: MessageRow,
+        lineCount: Int,
+        showsSenderIcons: Bool = false,
+        favicon: NSImage? = nil
+    ) {
         let normalizedLineCount = MessageListLayout.normalizedLineCount(lineCount)
         if self.lineCount != normalizedLineCount {
             self.lineCount = normalizedLineCount
@@ -1018,6 +1198,21 @@ final class MessageCellView: NSTableCellView {
             needsLayout = true
         }
         let visibility = MessageListLayout.fieldVisibility(for: normalizedLineCount)
+        let iconMetrics = MessageListIconPolicy.metrics(for: normalizedLineCount)
+        senderGlyph.isHidden = !showsSenderIcons
+        senderGlyph.image = showsSenderIcons
+            ? SenderGlyph.nsImage(
+                favicon: favicon,
+                initials: SenderGlyph.initials(for: row.from),
+                accent: accentColor ?? .controlAccentColor,
+                diameter: iconMetrics.diameter
+            )
+            : nil
+        fromLeadingConstraint.constant = showsSenderIcons
+            ? iconMetrics.textLeading
+            : 16
+        senderGlyphWidthConstraint.constant = iconMetrics.diameter
+        senderGlyphHeightConstraint.constant = iconMetrics.diameter
         fromLabel.isHidden = !visibility.sender
         dateLabel.isHidden = !visibility.date
         previewLabel.isHidden = !visibility.preview

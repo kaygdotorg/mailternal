@@ -59,6 +59,22 @@ enum WindowBackdropStyle: String, CaseIterable, Identifiable {
     }
 }
 
+enum ReaderTabStyle: String, CaseIterable, Identifiable {
+    case icon
+    case iconAndText
+    case text
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .icon: "Icon"
+        case .iconAndText: "Icon and Text"
+        case .text: "Text"
+        }
+    }
+}
+
 struct AccentColorValue: Hashable, Sendable {
     var red: Double
     var green: Double
@@ -163,6 +179,12 @@ final class AppearanceSettings {
             defaults.set(emailReadingMode.rawValue, forKey: Keys.emailReadingMode)
         }
     }
+    var tabStyle: ReaderTabStyle {
+        didSet {
+            guard oldValue != tabStyle else { return }
+            defaults.set(tabStyle.rawValue, forKey: Keys.tabStyle)
+        }
+    }
 
     var showsSenderIcons: Bool {
         didSet {
@@ -211,6 +233,7 @@ final class AppearanceSettings {
     /// window; anything below it shows the chosen treatment, down to a window
     /// that adds no fill of its own at 0%.
     static let backgroundOpacityRange = 0.0...1.0
+    static let defaultTabStyle: ReaderTabStyle = .iconAndText
 
     static func clampMessageListLines(_ value: Int) -> Int {
         min(max(value, messageListLineRange.lowerBound), messageListLineRange.upperBound)
@@ -236,9 +259,13 @@ final class AppearanceSettings {
         emailReadingMode = EmailReadingMode(
             rawValue: defaults.string(forKey: Keys.emailReadingMode) ?? ""
         ) ?? .original
+        tabStyle = ReaderTabStyle(
+            rawValue: defaults.string(forKey: Keys.tabStyle) ?? ""
+        ) ?? Self.defaultTabStyle
         showsSenderIcons = defaults.bool(forKey: Keys.showsSenderIcons)
         backdropStyle = defaults.string(forKey: Keys.backdropStyle)
             .flatMap(WindowBackdropStyle.init(rawValue:)) ?? .frostedBlur
+
         backgroundOpacity = defaults.object(forKey: Keys.opacity) == nil
             ? Self.defaultBackgroundOpacity
             : Self.clampBackgroundOpacity(defaults.double(forKey: Keys.opacity))
@@ -265,5 +292,6 @@ final class AppearanceSettings {
         static let messageListLines = "mailternal.appearance.message-list-lines"
         static let emailReadingMode = "mailternal.appearance.email-reading"
         static let showsSenderIcons = "mailternal.appearance.showsSenderIcons"
+        static let tabStyle = "mailternal.appearance.tab-style"
     }
 }

@@ -2,11 +2,39 @@ import ObjectiveC
 import AppKit
 import SwiftUI
 import MailternalInterfaces
+import os
+
+private let sidebarLog = Logger(subsystem: "org.kayg.mailternal", category: "Sidebar")
+
+/// `log show` is unusable over SSH on the QA host, so sidebar diagnostics are
+/// also appended to `~/Library/Logs/Mailternal/sidebar.log` in Debug builds.
+private func sidebarTrace(_ message: String) {
+    sidebarLog.log("\(message, privacy: .public)")
+    #if DEBUG
+    let dir = FileManager.default.homeDirectoryForCurrentUser
+        .appending(path: "Library/Logs/Mailternal", directoryHint: .isDirectory)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = dir.appending(path: "sidebar.log")
+    let line = "\(Date().ISO8601Format()) \(message)\n"
+    if let handle = try? FileHandle(forWritingTo: url) {
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: Data(line.utf8))
+        try? handle.close()
+    } else {
+        try? Data(line.utf8).write(to: url)
+    }
+    #endif
+}
 
 
 struct FolderSidebar: View {
     @Bindable var model: AppModel
     @State private var inspectorFolder: FolderSummary?
+    /// Account-rename edit state lives here, not in the header view: SwiftUI
+    /// renders a sidebar section header twice (floating + in-row copy), and a
+    /// double-click lands on whichever copy is hit-tested, so header-local
+    /// @State toggled the invisible copy.
+    @State private var accountRename = SidebarAccountRenameState()
 
     var body: some View {
         let accountOrder = model.accountConfigs.map(\.id)
@@ -86,6 +114,8 @@ struct FolderSidebar: View {
             VStack(alignment: .leading, spacing: 4) {
                 SidebarAccountTitle(
                     title: AccountTitlePolicy.title(for: account) ?? account?.emailAddress ?? model.listTitleAccountName,
+                    accountID: account?.id,
+                    rename: $accountRename,
                     onRename: account.map { account in
                         { name in Task { await model.renameAccount(account.id, to: name) } }
                     }
@@ -342,7 +372,6 @@ struct FolderRow: View {
     let selected: Bool
     let onRename: ((String) async -> Bool)?
     @Environment(AccentSource.self) private var accent
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isEditing = false
 
     init(
@@ -396,24 +425,14 @@ struct FolderRow: View {
     @ViewBuilder
     private var backfillAccessory: some View {
         switch folder.activity {
-        case .downloading:
-            if let symbol = FolderActivityPolicy.symbolName(for: .downloading) {
-                Image(systemName: symbol)
-                    .font(.caption2)
-                    .symbolEffect(.bounce.down, options: .repeat(.continuous), isActive: !reduceMotion)
-                    .foregroundStyle(accent.color.opacity(0.8))
-                    .help(FolderActivityPolicy.tooltip(for: folder) ?? "Downloading…")
-                    .accessibilityLabel(FolderActivityPolicy.accessibilityLabel(for: .downloading) ?? "Syncing")
-            }
-        case .indexing:
-            if let symbol = FolderActivityPolicy.symbolName(for: .indexing) {
-                Image(systemName: symbol)
-                    .font(.caption2)
-                    .symbolEffect(.rotate, options: .repeat(.continuous), isActive: !reduceMotion)
-                    .foregroundStyle(accent.color.opacity(0.8))
-                    .help("Indexing")
-                    .accessibilityLabel(FolderActivityPolicy.accessibilityLabel(for: .indexing) ?? "Indexing")
-            }
+        case .downloading, .indexing:
+            ProgressView()
+                .controlSize(.small)
+                .tint(accent.color.opacity(0.8))
+                .help(FolderActivityPolicy.tooltip(for: folder) ?? "Syncing")
+                .accessibilityLabel(
+                    FolderActivityPolicy.accessibilityLabel(for: folder.activity) ?? "Syncing"
+                )
         case .halted:
             if let symbol = FolderActivityPolicy.symbolName(for: .halted) {
                 Image(systemName: symbol)
@@ -463,6 +482,7 @@ private struct SidebarInline: View {
                 value: value,
                 font: .preferredFont(forTextStyle: .body),
                 identifier: nil,
+                isDoubleClickEnabled: !isEditing,
                 onDoubleClick: beginEditing
             )
             .opacity(isEditing ? 0 : 1)
@@ -487,6 +507,8 @@ private struct SidebarInline: View {
     private func beginEditing() {
         guard !isEditing, canEdit, onCommit != nil else { return }
         draft = value
+        sidebarTrace("Sidebar folder rename edit began")
+
         isEditing = true
     }
 
@@ -558,8 +580,20 @@ private struct SidebarInlineTextField: NSViewRepresentable {
         }
 
         func controlTextDidEndEditing(_ obj: Notification) {
-            guard !finished else { return }
-            finish(commit: parent.commitOnFocusLoss)
+            guard !finished, let field = obj.object as? InlineTextFieldView else { return }
+            // A sidebar section header exists twice (floating + in-row copy),
+            // so its field can lose focus to its own twin. Decide after the new
+            // first responder is installed: a twin keeps the edit alive.
+            let identifier = parent.identifier
+            let commitOnFocusLoss = parent.commitOnFocusLoss
+            DispatchQueue.main.async { [weak self, weak field] in
+                guard let self, !self.finished else { return }
+                if let responder = field?.window?.firstResponder,
+                   InlineTextFieldView.isTwin(of: identifier, responder: responder) {
+                    return
+                }
+                self.finish(commit: commitOnFocusLoss)
+            }
         }
 
         func control(
@@ -592,6 +626,19 @@ private struct SidebarInlineTextField: NSViewRepresentable {
 
 private final class InlineTextFieldView: NSTextField {
     var onAppear: (() -> Void)?
+
+    /// True when `responder` is (the field editor of) another inline field
+    /// carrying the same identifier, i.e. the twin copy of a section header.
+    static func isTwin(of identifier: String, responder: NSResponder) -> Bool {
+        let field: NSTextField?
+        if let editor = responder as? NSTextView {
+            field = editor.delegate as? NSTextField
+        } else {
+            field = responder as? NSTextField
+        }
+        guard let twin = field as? InlineTextFieldView else { return false }
+        return twin.accessibilityIdentifier() == identifier
+    }
 
     override var intrinsicContentSize: NSSize {
         var size = super.intrinsicContentSize
@@ -632,12 +679,15 @@ private struct SidebarRenameLabel: NSViewRepresentable {
     let value: String
     let font: NSFont
     let identifier: String?
+    var isDoubleClickEnabled = true
     let onDoubleClick: () -> Void
 
     func makeNSView(context: Context) -> SidebarRenameLabelView {
         let view = SidebarRenameLabelView()
         view.stringValue = value
         view.font = font
+        view.isDoubleClickEnabled = isDoubleClickEnabled
+
         view.onDoubleClick = onDoubleClick
         if let identifier {
             view.setAccessibilityIdentifier(identifier)
@@ -648,6 +698,8 @@ private struct SidebarRenameLabel: NSViewRepresentable {
     func updateNSView(_ nsView: SidebarRenameLabelView, context: Context) {
         nsView.stringValue = value
         nsView.font = font
+        nsView.isDoubleClickEnabled = isDoubleClickEnabled
+
         nsView.onDoubleClick = onDoubleClick
         if let identifier {
             nsView.setAccessibilityIdentifier(identifier)
@@ -656,7 +708,10 @@ private struct SidebarRenameLabel: NSViewRepresentable {
 }
 
 private final class SidebarRenameLabelView: NSTextField {
+    var isDoubleClickEnabled = true
+
     var onDoubleClick: (() -> Void)?
+    private var doubleClickMonitor: Any?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -680,13 +735,36 @@ private final class SidebarRenameLabelView: NSTextField {
         fatalError("init(coder:) has not been implemented")
     }
 
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
     }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        removeDoubleClickMonitor()
+        super.viewWillMove(toWindow: newWindow)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        removeDoubleClickMonitor()
         installDoubleClickRouter()
+        guard window != nil else { return }
+
+        // A Section header is not necessarily represented by an NSTableRowView.
+        doubleClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) {
+            [weak self] event in
+            guard let self, let window = self.window, event.window === window,
+                  event.clickCount == 2, self.isDoubleClickEnabled else {
+                return event
+            }
+            let point = self.convert(event.locationInWindow, from: nil)
+            guard self.bounds.contains(point) else { return event }
+            sidebarTrace("Sidebar rename double-click detected")
+            self.onDoubleClick?()
+            return nil
+        }
+
         Task { @MainActor [weak self] in
             self?.installDoubleClickRouter()
         }
@@ -702,10 +780,20 @@ private final class SidebarRenameLabelView: NSTextField {
         installDoubleClickRouter()
     }
 
+    private func removeDoubleClickMonitor() {
+        if let doubleClickMonitor {
+            NSEvent.removeMonitor(doubleClickMonitor)
+            self.doubleClickMonitor = nil
+        }
+    }
+
     private func installDoubleClickRouter() {
-        guard let tableView = enclosingTableView else { return }
+        guard let tableView = enclosingTableView else {
+            return
+        }
         SidebarDoubleClickRouter.install(on: tableView)
     }
+
 
     private var enclosingTableView: NSTableView? {
         var ancestor = superview
@@ -744,17 +832,42 @@ private final class SidebarDoubleClickRouter: NSObject {
     }
 
     @objc private func tableDoubleClicked(_ sender: Any?) {
-        guard let tableView,
-              tableView.clickedRow >= 0,
-              let rowView = tableView.rowView(
-                atRow: tableView.clickedRow,
-                makeIfNecessary: false
-              ),
-              let label = findLabel(in: rowView)
-        else {
+        guard let tableView else { return }
+
+        let point = tableView.window.map {
+            tableView.convert($0.mouseLocationOutsideOfEventStream, from: nil)
+        }
+        let row = tableView.clickedRow >= 0
+            ? tableView.clickedRow
+            : point.map { tableView.row(at: $0) } ?? -1
+
+        if row >= 0,
+           let rowView = tableView.rowView(atRow: row, makeIfNecessary: false),
+           let label = findLabel(in: rowView) {
+            sidebarTrace("Sidebar rename double-click detected in table row")
+            label.onDoubleClick?()
             return
         }
-        label.onDoubleClick?()
+
+        // Section headers/group rows can sit outside NSTableView's row-view
+        // hierarchy. Walk the actual hit-test path as a second route.
+        if let point,
+           let label = findLabel(at: point, in: tableView) {
+            sidebarTrace("Sidebar rename double-click detected in table header")
+            label.onDoubleClick?()
+        }
+    }
+
+    private func findLabel(at point: NSPoint, in tableView: NSTableView) -> SidebarRenameLabelView? {
+        guard let hitView = tableView.hitTest(point) else { return nil }
+        var view: NSView? = hitView
+        while let current = view {
+            if let label = current as? SidebarRenameLabelView {
+                return label
+            }
+            view = current.superview
+        }
+        return nil
     }
 
     private func findLabel(in view: NSView) -> SidebarRenameLabelView? {
@@ -835,12 +948,21 @@ struct EmptyMailboxState: View {
 /// field; Return commits through `AppModel.renameAccount`, Escape or focus
 /// loss cancels. Rendering stays a native label until editing starts so the
 /// list header keeps its measured geometry.
+struct SidebarAccountRenameState: Equatable {
+    var accountID: AccountID?
+    var draft = ""
+    var isEditing: Bool { accountID != nil }
+}
+
 private struct SidebarAccountTitle: View {
     let title: String
+    let accountID: AccountID?
+    @Binding var rename: SidebarAccountRenameState
     let onRename: ((String) -> Void)?
-    @State private var draft = ""
-    @State private var isEditing = false
 
+    private var isEditing: Bool {
+        rename.isEditing && rename.accountID == accountID
+    }
 
     var body: some View {
         ZStack(alignment: .leading) {
@@ -848,6 +970,7 @@ private struct SidebarAccountTitle: View {
                 value: title,
                 font: .systemFont(ofSize: 20, weight: .semibold),
                 identifier: UIIdentifier.sidebarAccountTitle,
+                isDoubleClickEnabled: !isEditing,
                 onDoubleClick: beginEditing
             )
             .opacity(isEditing ? 0 : 1)
@@ -857,7 +980,7 @@ private struct SidebarAccountTitle: View {
 
             if isEditing {
                 SidebarInlineTextField(
-                    text: $draft,
+                    text: $rename.draft,
                     identifier: UIIdentifier.sidebarAccountTitleField,
                     font: .systemFont(ofSize: 20, weight: .semibold),
                     commitOnFocusLoss: false,
@@ -869,20 +992,19 @@ private struct SidebarAccountTitle: View {
         }
     }
     private func beginEditing() {
-        guard onRename != nil else { return }
-        draft = title
-        isEditing = true
+        guard !isEditing, onRename != nil, let accountID else { return }
+        sidebarTrace("Sidebar account rename edit began")
+        rename = SidebarAccountRenameState(accountID: accountID, draft: title)
     }
 
     private func commit() {
         guard isEditing else { return }
-        let candidate = draft
-        isEditing = false
+        let candidate = rename.draft
+        rename = SidebarAccountRenameState()
         onRename?(candidate)
     }
 
     private func cancel() {
-        isEditing = false
-        draft = ""
+        rename = SidebarAccountRenameState()
     }
 }

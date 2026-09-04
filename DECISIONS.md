@@ -93,17 +93,25 @@ rationale → revisit-when.
 26. **Reader tabs occupy the native main-window titlebar toolbar; the transient persists.**
     A measured toolbar item over the rightmost reader column keeps the reader
     content at its original top inset while a browser-like strip supplies
-    familiar compression, scrolling, and keyboard mechanics. The native
-    trailing `NSToolbarItemGroup` remains the sole message-actions surface, so
-    Archive, Trash, Flag, Raw Source, Email Reading mode, and More retain their
-    platform treatment. Persisting the transient preserves the user's open
-    reading context and its scroll position across launches rather than silently
-    discarding a real tab. Tabs deliberately show no unread or flag marks: those
-    states belong to message-list triage, while tab titles stay quiet and
-    scannable. Tabs are main-window-only so detached message windows remain
-    focused, simple, and tab-less instead of creating a second tab state to
-    synchronize. Revisit: only if a future multi-window reader model can
-    preserve one unambiguous tab owner.
+    familiar compression, scrolling, and keyboard mechanics. The strip is
+    clear, has an 8 pt leading inset, intrinsic 72–220 pt tab widths
+    (`leading slot + subject width + inter-item spacing + title paddings`), 8 pt
+    gaps, and a 28 pt transparent trailing fade that reaches the fixed native
+    message-actions cluster with no extra gap. The reader-tabs toolbar item has
+    no label or tooltip and toolbar customization is disabled. The strip is
+    absent when the reader has no tabs or global search is presented.
+    Hovering immediately presents a non-activating 220×160 child panel with a
+    scrollable card and no entrance animation; a 150 ms grace period keeps it
+    open while the pointer moves between tab and card. Persisting the transient
+    preserves the user's open reading context and its scroll position across
+    launches rather than silently discarding a real tab. Persisted links that
+    no longer resolve, or details removed before load, close silently and never
+    leave a phantom tab or endless reader spinner. Tabs deliberately show no
+    unread or flag marks: those states belong to message-list triage, while tab
+    titles stay quiet and scannable. Tabs are main-window-only so detached
+    message windows remain focused, simple, and tab-less instead of creating a
+    second tab state to synchronize. Revisit: only if a future multi-window
+    reader model can preserve one unambiguous tab owner.
 27. **Process-wide backfill resource budgets are bounded and shared.** All account
     engines acquire connection permits from one `BackfillConnectionBudget`, capped at
     four backfill connections total; the primary sync channel counts while the

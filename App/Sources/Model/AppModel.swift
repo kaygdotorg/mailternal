@@ -23,6 +23,12 @@ final class AppModel {
     let appearance: AppearanceSettings
     let actions: ActionSettings
     let toasts = ToastPresenter()
+    @ObservationIgnored private let faviconStore: FaviconStore
+    private var faviconImages: [String: NSImage] = [:]
+    /// Changes whenever a newly warmed favicon becomes available to AppKit
+    /// rows. The cached image lookup itself remains synchronous.
+    var faviconRevision: UInt64 = 0
+
 
     var accountState: AccountState = .none
     var accountStates: [AccountID: AccountState] = [:]
@@ -75,12 +81,37 @@ final class AppModel {
     var hasRemoteImageReferences: Bool {
         detail?.hasRemoteImageReferences ?? false
     }
+    /// Returns a previously warmed sender icon without starting synchronous
+    /// work on the main actor. Reader-tab views trigger the async warmup.
+    func favicon(forSenderDomain rawDomain: String) -> NSImage? {
+        guard let domain = FaviconStore.normalizedDomain(rawDomain) else { return nil }
+        return faviconImages[domain]
+    }
+    /// Fetches sender icons off the main actor and publishes positive results
+    /// for the synchronous lookup used while rendering each tab and row.
+    func warmupFavicons(forSenderDomains domains: [String]) async {
+        let loaded = await faviconStore.warmup(domains: domains)
+        guard !Task.isCancelled else { return }
+        var changed = false
+        for (domain, data) in loaded {
+            guard let image = NSImage(data: data) else { continue }
+            if faviconImages[domain] == nil {
+                faviconImages[domain] = image
+                changed = true
+            }
+        }
+        if changed {
+            faviconRevision &+= 1
+        }
+    }
+
 
 
     @ObservationIgnored private var pageTask: Task<Void, Never>?
     @ObservationIgnored private var observeTask: Task<Void, Never>?
     @ObservationIgnored private var deepLinkQueue = DeepLinkRouteQueue()
     @ObservationIgnored private var foldersSnapshotReady = false
+    @ObservationIgnored private var qaLaunchFoldersLogged = false
     @ObservationIgnored private var streamsStarted = false
     @ObservationIgnored private var markedRead: Set<MessageID> = []
     @ObservationIgnored private var qaSelectionSequence: UInt64 = 0
@@ -127,10 +158,16 @@ final class AppModel {
         accountStates.values.contains(.active) || accountState == .active
     }
 
-    init(facade: any MailFacade, appearance: AppearanceSettings, actions: ActionSettings) {
+    init(
+        facade: any MailFacade,
+        appearance: AppearanceSettings,
+        actions: ActionSettings,
+        faviconStore: FaviconStore = FaviconStore()
+    ) {
         self.facade = facade
         self.appearance = appearance
         self.actions = actions
+        self.faviconStore = faviconStore
         self.tabs = ReaderTabs()
         accountState = facade.accountState
         accountStates = facade.accountStates
@@ -319,9 +356,11 @@ final class AppModel {
                 guard let self else { return }
                 for await folders in facade.foldersStream {
                     self.folders = folders
-                    #if DEBUG
-                    if !self.foldersSnapshotReady { QALaunch.launchPhase("folders-snapshot") }
-                    #endif
+                    if !qaLaunchFoldersLogged && !folders.isEmpty {
+                        qaLaunchFoldersLogged = true
+                        QALaunch.launchPhase("folders-snapshot")
+                        MainWindowController.noteLaunchDataPhase("folders-snapshot")
+                    }
                     self.foldersSnapshotReady = true
                     if selectedFolderID == nil, let inbox = folders.first(where: { $0.role == .inbox }) {
                         selectFolder(inbox.id)
@@ -516,6 +555,14 @@ final class AppModel {
                 guard selectedMessageID == id, selectedMessageIDs == Set([id]) else { return }
                 detail = loaded
                 isLoadingDetail = false
+                let senderDomains = loaded.envelope.from.compactMap { address in
+                    address.address.split(separator: "@", omittingEmptySubsequences: true).last.map(String.init)
+                }
+                if !senderDomains.isEmpty {
+                    Task { [weak self] in
+                        await self?.warmupFavicons(forSenderDomains: senderDomains)
+                    }
+                }
                 #if DEBUG
                 if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
                     QALaunch.log(
@@ -525,8 +572,10 @@ final class AppModel {
                 #endif
                 markRead(id)
             } catch {
-                isLoadingDetail = false
-                toasts.post(title: "Couldn’t open message", detail: error.localizedDescription)
+                guard !Task.isCancelled,
+                      selectedMessageID == id,
+                      selectedMessageIDs == Set([id]) else { return }
+                closeUnavailableTab(messageID: id)
             }
         }
     }
@@ -815,11 +864,8 @@ final class AppModel {
     }
 
     func openMessage(_ id: MessageID, permanent: Bool) {
-        // A permanent open is an explicit double-click action. It must not be
-        // swallowed when AppKit reports it while a programmatic selection sync
-        // is still unwinding; the tab state is authoritative and the sync can
-        // safely observe the promoted tab afterward.
-        guard !isSyncingTabSelection || permanent else { return }
+        // Explicit opens are never dropped: a transient open reuses the one
+        // transient tab, a permanent open promotes or inserts (ReaderTabs.open).
         tabs.open(id, permanent: permanent)
         if let folder = folderContaining(id), selectedFolderID != folder {
             selectFolder(folder)
@@ -830,19 +876,28 @@ final class AppModel {
             return
         }
         Task { @MainActor [weak self] in
-            guard let self,
-                  let link = try? await self.facade.makeDeepLink(for: id),
-                  let destination = try? await self.facade.resolve(link),
-                  case .message(let folder, _, let row) = destination else { return }
-            guard !Task.isCancelled else { return }
-            if self.selectedFolderID != folder {
-                self.selectFolder(folder)
+            guard let self else { return }
+            do {
+                guard let link = try await self.facade.makeDeepLink(for: id),
+                      let destination = try await self.facade.resolve(link),
+                      case .message(let folder, _, let row) = destination else {
+                    guard !Task.isCancelled else { return }
+                    self.closeUnavailableTab(messageID: id)
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                if self.selectedFolderID != folder {
+                    self.selectFolder(folder)
+                }
+                if !self.listRows.contains(where: { $0.id == id }) {
+                    self.listRows.insert(row, at: 0)
+                }
+                guard self.tabs.active?.message == id else { return }
+                self.syncSelection(to: id, folder: folder)
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.closeUnavailableTab(messageID: id)
             }
-            if !self.listRows.contains(where: { $0.id == id }) {
-                self.listRows.insert(row, at: 0)
-            }
-            guard self.tabs.active?.message == id else { return }
-            self.syncSelection(to: id, folder: folder)
         }
     }
 
@@ -861,12 +916,22 @@ final class AppModel {
             return
         }
         Task { @MainActor [weak self] in
-            guard let self,
-                  let link = try? await self.facade.makeDeepLink(for: tab.message),
-                  let destination = try? await self.facade.resolve(link),
-                  case .message(let folder, _, _) = destination,
-                  self.canSync(folder: folder) else { return }
-            self.syncSelection(to: tab.message, folder: folder)
+            guard let self else { return }
+            do {
+                guard let link = try await self.facade.makeDeepLink(for: tab.message),
+                      let destination = try await self.facade.resolve(link),
+                      case .message(let folder, _, _) = destination,
+                      self.canSync(folder: folder) else {
+                    guard !Task.isCancelled else { return }
+                    self.closeUnavailableTab(messageID: tab.message)
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                self.syncSelection(to: tab.message, folder: folder)
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.closeUnavailableTab(messageID: tab.message)
+            }
         }
     }
 
@@ -913,6 +978,25 @@ final class AppModel {
             }
         }
         return true
+    }
+
+    /// Detail/route failures mean the message is gone, not a reader loading
+    /// state. Remove its tab without a toast and leave the reader empty when
+    /// no other tab remains.
+    private func closeUnavailableTab(messageID: MessageID) {
+        guard let tabID = tabs.tabs.first(where: { $0.message == messageID })?.id else {
+            return
+        }
+        let wasActive = tabs.activeID == tabID
+        tabs.close(tabID)
+        guard wasActive else { return }
+        if let active = tabs.active {
+            activateTab(active.id)
+        } else {
+            clearReaderSelection()
+            selectedMessageIDs.removeAll()
+            selectedMessageID = nil
+        }
     }
 
     private func syncSelection(to id: MessageID, folder: FolderID?) {
@@ -1249,9 +1333,10 @@ final class AppModel {
         dumpQAContextMenuIfRequested(firstRow: page.rows.first)
 #endif
         if listRows.isEmpty {
-            #if DEBUG
-            if !page.rows.isEmpty { QALaunch.launchPhase("first-rows n=\(page.rows.count)") }
-            #endif
+            if !page.rows.isEmpty {
+                QALaunch.launchPhase("first-rows n=\(page.rows.count)")
+                MainWindowController.noteLaunchDataPhase("first-rows")
+            }
             listRows = page.rows
             listCursor = page.next
             return

@@ -84,6 +84,26 @@ final class ReaderTabsPolicyTests: XCTestCase {
         XCTAssertEqual(restored.activeID, first.id)
         XCTAssertEqual(restored.scrollOffset(for: first.id), 42)
     }
+
+    func testRestoreWithNoResolvableMessagesLeavesNoActiveTab() {
+        let missingID = UUID()
+        let snapshot = ReaderTabsSnapshot(
+            tabs: [
+                .init(
+                    id: missingID,
+                    link: "mailternal://open/v1/expunged",
+                    isTransient: false,
+                    scrollOffset: 0
+                )
+            ],
+            activeID: missingID,
+            mruIDs: [missingID]
+        )
+        let restored = ReaderTabs()
+        restored.restore(snapshot, messagesByTabID: [:])
+        XCTAssertTrue(restored.tabs.isEmpty)
+        XCTAssertNil(restored.activeID)
+    }
     func testRemovingMessageKeepsReaderAnchorWhenItsTabIsOpen() {
         let messageID = message(42)
         let tab = ReaderTab(message: messageID, isTransient: false)

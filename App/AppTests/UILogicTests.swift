@@ -41,22 +41,16 @@ final class UILogicTests: XCTestCase {
             )
         }
     }
-    func testFolderActivityPolicyMapsToBouncingDownloadArrow() {
-        XCTAssertEqual(
-            FolderActivityPolicy.symbolName(for: .downloading),
-            "arrow.down"
-        )
-        XCTAssertEqual(
-            FolderActivityPolicy.symbolName(for: .indexing),
-            "arrow.triangle.2.circlepath"
-        )
+    func testFolderActivityPolicyKeepsOnlyHaltedGlyph() {
+        XCTAssertNil(FolderActivityPolicy.symbolName(for: .downloading))
+        XCTAssertNil(FolderActivityPolicy.symbolName(for: .indexing))
         XCTAssertEqual(FolderActivityPolicy.symbolName(for: .halted), "pause.circle")
         XCTAssertNil(FolderActivityPolicy.symbolName(for: .idle))
         XCTAssertNil(FolderActivityPolicy.symbolName(for: .quarantinedStall))
     }
 
-    func testFolderActivityTooltipUsesBackfillProgress() {
-        let folder = FolderSummary(
+    func testFolderActivityPolicyUsesPercentageTooltips() {
+        var folder = FolderSummary(
             id: FolderID(rawValue: 1),
             name: "Inbox",
             path: "INBOX",
@@ -64,14 +58,22 @@ final class UILogicTests: XCTestCase {
             role: .inbox,
             unreadCount: 0,
             totalCount: 15_365,
-            backfill: .syncing(progress: 12_372.0 / 15_365.0),
+            backfill: .syncing(progress: 0.42),
             activity: .downloading
         )
+        XCTAssertEqual(FolderActivityPolicy.percentage(for: folder), 42)
         XCTAssertEqual(
             FolderActivityPolicy.tooltip(for: folder),
-            "Downloading 12,372 of 15,365"
+            "Downloading messages — 42%"
+        )
+
+        folder.activity = .indexing
+        XCTAssertEqual(
+            FolderActivityPolicy.tooltip(for: folder),
+            "Indexing messages — 42%"
         )
     }
+
 
 
     func testFolderRenameFieldIdentifierIsStableAcrossPathChanges() {
@@ -188,6 +190,31 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(defaultSettings.messageListLines, 6)
         XCTAssertEqual(defaults.integer(forKey: "mailternal.appearance.message-list-lines"), 6)
     }
+    @MainActor
+    func testReaderTabStyleDefaultsPersistsAndExposesStylePolicy() {
+        let suiteName = "Mailternal.ReaderTabStyleTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppearanceSettings(defaults: defaults)
+        XCTAssertEqual(settings.tabStyle, .iconAndText)
+        XCTAssertTrue(ReaderTabStylePolicy.showsIcon(for: .icon))
+        XCTAssertFalse(ReaderTabStylePolicy.showsSubject(for: .icon))
+        XCTAssertTrue(ReaderTabStylePolicy.showsIcon(for: .iconAndText))
+        XCTAssertTrue(ReaderTabStylePolicy.showsSubject(for: .iconAndText))
+        XCTAssertFalse(ReaderTabStylePolicy.showsIcon(for: .text))
+        XCTAssertTrue(ReaderTabStylePolicy.showsSubject(for: .text))
+        XCTAssertFalse(ReaderTabStylePolicy.showsLeadingSlot(for: .text, isHovered: false))
+        XCTAssertTrue(ReaderTabStylePolicy.showsLeadingSlot(for: .text, isHovered: true))
+
+        settings.tabStyle = .text
+        XCTAssertEqual(defaults.string(forKey: "mailternal.appearance.tab-style"), "text")
+        XCTAssertEqual(AppearanceSettings(defaults: defaults).tabStyle, .text)
+
+        defaults.set("unsupported", forKey: "mailternal.appearance.tab-style")
+        XCTAssertEqual(AppearanceSettings(defaults: defaults).tabStyle, .iconAndText)
+    }
+
 
     @MainActor
     func testEmailReadingModeDefaultsPersistsAndRejectsInvalidValues() {
@@ -217,6 +244,21 @@ final class UILogicTests: XCTestCase {
     func testEmailReadingOverridePolicyTogglesFromGlobalDarkToOriginal() {
         XCTAssertEqual(EmailReadingOverridePolicy.next(effective: .dark), .original)
         XCTAssertEqual(EmailReadingOverridePolicy.next(effective: .original), .dark)
+    }
+
+    func testHTMLReadingPolicyMapsSystemAndDarkOverride() {
+        XCTAssertNil(MessageHTMLReadingPolicy.appearance(for: .original))
+        XCTAssertEqual(
+            MessageHTMLReadingPolicy.colorScheme(for: .original),
+            "light dark"
+        )
+
+        XCTAssertEqual(
+            MessageHTMLReadingPolicy.appearance(for: .dark)?.name,
+            NSAppearance.Name.darkAqua
+        )
+        XCTAssertEqual(MessageHTMLReadingPolicy.colorScheme(for: .dark), "dark")
+        XCTAssertTrue(MessageHTMLReadingPolicy.darkTreatmentCSS.contains("invert(1)"))
     }
 
     @MainActor
@@ -523,6 +565,34 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(heights, heights.sorted())
         XCTAssertTrue(zip(heights, heights.dropFirst()).allSatisfy { $0.0 < $0.1 })
     }
+    func testMessageListIconMetricsFitAndShiftTextAtEveryLineCount() {
+        for lineCount in MessageListLayout.lineRange {
+            let metrics = MessageListIconPolicy.metrics(for: lineCount)
+            let rowHeight = MessageListLayout.rowHeight(for: lineCount)
+            XCTAssertLessThanOrEqual(
+                metrics.diameter,
+                rowHeight - metrics.verticalInset * 2,
+                "icon must fit line count \(lineCount)"
+            )
+            XCTAssertEqual(metrics.leadingInset, 8)
+            XCTAssertEqual(
+                metrics.textLeading,
+                metrics.leadingInset + metrics.diameter + 8
+            )
+            XCTAssertGreaterThan(metrics.textLeading, 16)
+        }
+        XCTAssertEqual(MessageListIconPolicy.diameter(for: 1), 20)
+        XCTAssertEqual(MessageListIconPolicy.diameter(for: 2), 28)
+        XCTAssertEqual(MessageListIconPolicy.diameter(for: 3), 32)
+        XCTAssertEqual(MessageListIconPolicy.diameter(for: 6), 32)
+    }
+
+    func testSenderDomainPolicyUsesAddressNotDisplayName() {
+        XCTAssertEqual(SenderDomainPolicy.domain(from: "Alex Rivera <alex@Example.COM>"), "example.com")
+        XCTAssertEqual(SenderDomainPolicy.domain(from: "alex@Example.COM"), "example.com")
+        XCTAssertNil(SenderDomainPolicy.domain(from: "Alex Rivera"))
+        XCTAssertNil(SenderDomainPolicy.domain(from: nil))
+    }
 
     func testSearchNormalizesQueryAndTreatsWhitespaceAsEmpty() {
         XCTAssertNil(SearchQueryPolicy.normalizedQuery(""))
@@ -812,7 +882,16 @@ final class UILogicTests: XCTestCase {
 
     func testReaderTopInsetIsFixedAcrossSafeAreaChanges() {
         let inset = MessageViewerLayoutPolicy.readerTopInset()
-        XCTAssertEqual(inset, MailWindowTopDissolvePolicy.titlebarDepth + MessageViewerLayoutPolicy.fadeGuard)
+        // The ramp starts under the titlebar (tab strip) and reaches 24 pt
+        // into the content; the first glyph rests one guard below that.
+        XCTAssertEqual(MailWindowDissolvePolicy.viewerTopOrigin, 46)
+        XCTAssertEqual(
+            inset,
+            MailWindowDissolvePolicy.viewerTopOrigin
+                + MailWindowDissolvePolicy.viewerTopReach
+                + MessageViewerLayoutPolicy.fadeGuard
+        )
+        XCTAssertEqual(MailWindowDissolvePolicy.viewer.alpha(atDepth: MailWindowDissolvePolicy.viewerTopOrigin, safeAreaTop: 0), 0)
 
         for safeAreaTop in [CGFloat(0), 28, 52, 80] {
             XCTAssertEqual(
@@ -913,7 +992,7 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(emptyValue.valueCopyText, "")
         XCTAssertEqual(emptyValue.copyText, "X-Empty:")
     }
-    
+
     func testQRCodePolicyUsesExactCopyPayloadAndRejectsEmptyText() {
         XCTAssertEqual(
             QRCodePolicy.payload(for: "ada@example.com"),
@@ -1339,32 +1418,33 @@ final class UILogicTests: XCTestCase {
         XCTAssertFalse(secondaryItem.children[0].isEnabled)
     }
 
-    func testReaderTabLayoutCompressesBeforeScrolling() {
+    func testReaderTabLayoutClampsIntrinsicWidthsAndScrolls() {
         XCTAssertEqual(
-            ReaderTabLayoutPolicy.tabWidth(availableWidth: 900, tabCount: 3),
-            220
-        )
-        XCTAssertEqual(
-            ReaderTabLayoutPolicy.tabWidth(availableWidth: 500, tabCount: 6),
-            120
-        )
-        XCTAssertEqual(
-            ReaderTabLayoutPolicy.contentWidth(availableWidth: 500, tabCount: 6),
-            740
-        )
-        XCTAssertTrue(ReaderTabLayoutPolicy.showsFade(contentWidth: 740, viewportWidth: 500))
-        XCTAssertFalse(ReaderTabLayoutPolicy.showsFade(contentWidth: 220, viewportWidth: 500))
-    }
-
-    func testReaderTabLayoutKeepsMinimumWidthForNarrowViewports() {
-        XCTAssertEqual(
-            ReaderTabLayoutPolicy.tabWidth(availableWidth: 80, tabCount: 1),
+            ReaderTabLayoutPolicy.tabWidth(intrinsic: 40),
             ReaderTabLayoutPolicy.minimumTabWidth
         )
+        XCTAssertEqual(ReaderTabLayoutPolicy.tabWidth(intrinsic: 141), 141)
         XCTAssertEqual(
-            ReaderTabLayoutPolicy.widths(availableWidth: 400, tabCount: 0),
-            []
+            ReaderTabLayoutPolicy.tabWidth(intrinsic: 300),
+            ReaderTabLayoutPolicy.maximumTabWidth
         )
+        XCTAssertEqual(
+            ReaderTabLayoutPolicy.contentWidth(tabWidths: [72, 220, 100]),
+            408
+        )
+        XCTAssertTrue(ReaderTabLayoutPolicy.showsFade(contentWidth: 408, viewportWidth: 300))
+        XCTAssertFalse(ReaderTabLayoutPolicy.showsFade(contentWidth: 220, viewportWidth: 300))
+    }
+
+    func testReaderTabLayoutUsesRequestedGeometry() {
+        XCTAssertEqual(ReaderTabLayoutPolicy.minimumTabWidth, 72)
+        XCTAssertEqual(ReaderTabLayoutPolicy.maximumTabWidth, 220)
+        XCTAssertEqual(ReaderTabLayoutPolicy.tabSpacing, 8)
+        XCTAssertEqual(ReaderTabLayoutPolicy.rightFadeWidth, 28)
+        XCTAssertEqual(ReaderTabLayoutPolicy.leadingSlotWidth, 25)
+        XCTAssertEqual(ReaderTabLayoutPolicy.subjectLeadingPadding, 4)
+        XCTAssertEqual(ReaderTabLayoutPolicy.subjectTrailingPadding, 10)
+        XCTAssertEqual(ReaderTabLayoutPolicy.subjectItemSpacing, 2)
         XCTAssertEqual(ReaderTabLayoutPolicy.toolbarSpacing, 8)
     }
 
@@ -1623,6 +1703,35 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(CacheTreePolicy.state(forFlags: [false, false]), .unchecked)
         XCTAssertEqual(CacheTreePolicy.state(forFlags: [true, false]), .mixed)
     }
+
+    func testCacheTreePolicyGroupsFoldersByOwningAccountAndSortsEachGroup() {
+        func folder(_ id: Int64, _ accountID: AccountID, _ path: String) -> FolderSummary {
+            FolderSummary(
+                id: FolderID(rawValue: id),
+                name: path,
+                path: path,
+                separator: nil,
+                role: .none,
+                unreadCount: 0,
+                totalCount: 0,
+                backfill: .complete,
+                accountID: accountID
+            )
+        }
+
+        let first = AccountID(rawValue: "first")
+        let second = AccountID(rawValue: "second")
+        let grouped = CacheTreePolicy.foldersByAccount([
+            folder(1, second, "Zeta"),
+            folder(2, first, "Inbox"),
+            folder(3, second, "Archive"),
+        ])
+
+        XCTAssertEqual(Set(grouped.keys), Set([first, second]))
+        XCTAssertEqual(grouped[first]?.map(\.path), ["Inbox"])
+        XCTAssertEqual(grouped[second]?.map(\.path), ["Archive", "Zeta"])
+    }
+
 
     func testCacheTreePolicyAccountAndAllTogglesTargetEveryFolder() {
         func folder(_ id: Int64, _ keepLocally: Bool) -> FolderSummary {

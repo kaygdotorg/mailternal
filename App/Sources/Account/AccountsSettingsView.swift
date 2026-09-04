@@ -72,35 +72,19 @@ struct AccountsSettingsView: View {
 
     private var accountList: some View {
         ScrollViewReader { proxy in
-            List {
-                ForEach(accounts, id: \.id) { account in
-                    accountSection(account)
-                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                            Button {
-                                Task { await model.setAccountEnabled(account.id, !account.isEnabled) }
-                            } label: {
-                                Label(
-                                    account.isEnabled ? "Disable" : "Enable",
-                                    systemImage: account.isEnabled ? "pause.circle" : "play.circle"
-                                )
-                            }
-                            .tint(account.isEnabled ? .orange : .green)
-                        }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button(role: .destructive) {
-                                requestRemoval(account.id)
-                            } label: {
-                                Label("Remove", systemImage: "trash")
-                            }
-                        }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    ForEach(accounts, id: \.id) { account in
+                        accountSection(account)
+                    }
+                    if isAdding {
+                        accountSection(nil)
+                    }
                 }
-                if isAdding {
-                    accountSection(nil)
-                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .safeAreaPadding(.vertical, 8)
             .onChange(of: expandedRowID) { _, rowID in
                 guard let rowID else { return }
                 DispatchQueue.main.async {
@@ -127,12 +111,16 @@ struct AccountsSettingsView: View {
                 displayName: displayNameBinding(for: account),
                 isExpanded: isExpanded,
                 onToggle: { toggleExpansion(for: rowID) },
-                onCommitName: { commitDisplayName($0, for: rowID) }
+                onCommitName: { commitDisplayName($0, for: rowID) },
+                onToggleEnabled: account == nil ? nil : {
+                    Task { await model.setAccountEnabled(rowID, !account!.isEnabled) }
+                },
+                onRemove: account == nil ? nil : { requestRemoval(rowID) }
             )
 
             // Keep the editor in the hierarchy while collapsed. Its fixed-size
             // measurement remains available even though the outer container
-            // clips it to zero height, preventing List from reflowing twice.
+            // clips it to zero height, preventing a second reflow.
             ZStack(alignment: .top) {
                 AccountEditorSheet(
                     model: model,
@@ -165,9 +153,8 @@ struct AccountsSettingsView: View {
         }
         .background(Color(nsColor: NSColor.controlBackgroundColor).opacity(0.18))
         .clipShape(RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
         .opacity(account.map { $0.isEnabled ? 1 : 0.55 } ?? 1)
-        .listRowSeparator(.hidden)
-        .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
         .id(rowID)
     }
 
@@ -288,6 +275,9 @@ private struct AccountRow: View {
     let isExpanded: Bool
     let onToggle: () -> Void
     let onCommitName: (String) -> Void
+    let onToggleEnabled: (() -> Void)?
+    let onRemove: (() -> Void)?
+    @State private var isHovered = false
     @FocusState private var isNameFocused: Bool
 
     private var rowID: String {
@@ -334,10 +324,35 @@ private struct AccountRow: View {
                         .foregroundStyle(.red)
                         .lineLimit(2)
                 }
-
             }
 
             Spacer(minLength: 0)
+
+            if let account {
+                HStack(spacing: 4) {
+                    Button {
+                        onToggleEnabled?()
+                    } label: {
+                        Image(systemName: account.isEnabled ? "pause.circle" : "play.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(account.isEnabled ? "Disable Account" : "Enable Account")
+                    .help(account.isEnabled ? "Disable account" : "Enable account")
+
+                    Button(role: .destructive) {
+                        onRemove?()
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier(UIIdentifier.accountsRemove)
+                    .accessibilityLabel("Remove Account")
+                    .help("Remove account")
+                }
+                .opacity(isHovered ? 1 : 0)
+                .allowsHitTesting(isHovered)
+                .animation(MailMotion.hover, value: isHovered)
+            }
 
             Image(systemName: "chevron.right")
                 .font(.caption.weight(.semibold))
@@ -354,6 +369,24 @@ private struct AccountRow: View {
         .onTapGesture {
             guard !isNameFocused else { return }
             onToggle()
+        }
+        .onHover { isHovered = $0 }
+        .contextMenu {
+            if let account {
+                Button {
+                    onToggleEnabled?()
+                } label: {
+                    Label(
+                        account.isEnabled ? "Disable Account" : "Enable Account",
+                        systemImage: account.isEnabled ? "pause.circle" : "play.circle"
+                    )
+                }
+                Button(role: .destructive) {
+                    onRemove?()
+                } label: {
+                    Label("Remove Account", systemImage: "trash")
+                }
+            }
         }
     }
 

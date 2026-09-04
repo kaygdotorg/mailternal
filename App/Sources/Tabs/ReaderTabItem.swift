@@ -1,14 +1,14 @@
 import AppKit
 import SwiftUI
 
-/// One subject-only tab in the reader strip. The model owns activation and
-/// close semantics; this view only supplies the native controls and gestures.
+/// One sender-and-subject tab in the reader strip. The model owns activation
+/// and close semantics; this view only supplies the native controls and gestures.
 struct ReaderTabItem: View {
     @Bindable var model: AppModel
     let tab: ReaderTab
     let subject: String
+    let sender: String?
     let width: CGFloat
-    let glassNamespace: Namespace.ID
 
     let onHoverChanged: (Bool) -> Void
     /// Optional owner hook lets the strip restore focus after closing its
@@ -17,7 +17,6 @@ struct ReaderTabItem: View {
 
 
     @Environment(\.colorSchemeContrast) private var contrast
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var isHovered = false
 
     private var isActive: Bool { model.tabs.activeID == tab.id }
@@ -28,18 +27,66 @@ struct ReaderTabItem: View {
         subject.isEmpty ? "No Subject" : subject
     }
 
-    private var titleLabel: some View {
-        ZStack(alignment: .leading) {
-            Text(displaySubject)
-                .font(.subheadline)
-                .italic(isTransient)
-                .foregroundStyle(isActive ? .primary : .secondary)
-                .fixedSize(horizontal: true, vertical: false)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
+    private var senderInitial: String {
+        SenderGlyph.initials(for: sender ?? "?")
+    }
+    private var style: ReaderTabStyle { model.appearance.tabStyle }
+
+    private var senderDomain: String? {
+        SenderDomainPolicy.domain(from: sender)
+    }
+
+    @ViewBuilder
+    private var senderGlyph: some View {
+        SenderGlyph(
+            favicon: senderDomain.flatMap { model.favicon(forSenderDomain: $0) },
+            initials: senderInitial,
+            accent: .secondary,
+            diameter: 22
+        )
+    }
+
+    @ViewBuilder
+    private var leadingSlot: some View {
+        if ReaderTabStylePolicy.showsLeadingSlot(for: style, isHovered: isHovered) {
+            ZStack(alignment: .leading) {
+                if !isHovered {
+                    senderGlyph
+                        .accessibilityHidden(true)
+                }
+                Button {
+                    closeTab()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .focusEffectDisabled(true)
+                .accessibilityLabel("Close \(displaySubject)")
+                .accessibilityIdentifier(UIIdentifier.readerTabClose(tab.id))
+                .padding(.leading, 3)
+                .opacity(isHovered ? 1 : 0)
+                .allowsHitTesting(isHovered)
+            }
+            .frame(width: 25, height: 28, alignment: .leading)
         }
-        .clipped()
-        .contentShape(Rectangle())
+    }
+
+    private var titleLabel: some View {
+        Text(displaySubject)
+            .font(.subheadline)
+            .italic(isTransient)
+            .foregroundStyle(isActive ? .primary : .secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, ReaderTabLayoutPolicy.subjectLeadingPadding)
+            .padding(.trailing, ReaderTabLayoutPolicy.subjectTrailingPadding)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
     }
 
 
@@ -54,54 +101,33 @@ struct ReaderTabItem: View {
 
     var body: some View {
         HStack(spacing: 2) {
-            ZStack(alignment: .leading) {
-                if isHovered {
-                    Button {
-                        closeTab()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 22, height: 22)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .focusEffectDisabled(true)
-                    .accessibilityLabel("Close \(displaySubject)")
-                    .accessibilityIdentifier(UIIdentifier.readerTabClose(tab.id))
-                    .padding(.leading, 3)
-                    .transition(.opacity)
-                }
-            }
-            .frame(width: 25, height: 28, alignment: .leading)
-            .animation(MailMotion.hover, value: isHovered)
+            leadingSlot
 
-            Button {
-                model.activateTab(tab.id)
-            } label: {
-                titleLabel
+            if ReaderTabStylePolicy.showsSubject(for: style) {
+                Button {
+                    model.activateTab(tab.id)
+                } label: {
+                    titleLabel
+                }
+                .buttonStyle(.plain)
+                .focusEffectDisabled(true)
+                .highPriorityGesture(
+                    TapGesture(count: 2)
+                        .onEnded {
+                            if isTransient { model.tabs.keep(tab.id) }
+                            model.activateTab(tab.id)
+                        }
+                )
             }
-            .buttonStyle(.plain)
-            .focusEffectDisabled(true)
-            .highPriorityGesture(
-                TapGesture(count: 2)
-                    .onEnded {
-                        if isTransient { model.tabs.keep(tab.id) }
-                        model.activateTab(tab.id)
-                    }
-            )
         }
         .frame(width: width, height: 32)
         .modifier(
             ReaderTabGlassModifier(
-                isVisible: isActive || isHovered,
-                reduceTransparency: reduceTransparency,
+                isActive: isActive,
+                isHovered: isHovered,
                 contrast: contrast
             )
         )
-        .glassEffectID(tab.id, in: glassNamespace)
-        .glassEffectTransition(.matchedGeometry)
-        .contentShape(RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous))
         .frame(width: width, height: ReaderTabLayoutPolicy.rowHeight)
         .focusEffectDisabled(true)
         .onContinuousHover { phase in
@@ -117,7 +143,6 @@ struct ReaderTabItem: View {
         .contextMenu {
             Button("Close", systemImage: "xmark") {
                 closeTab()
-
             }
             Button("Close Others", systemImage: "rectangle.on.rectangle") {
                 let wasActive = model.tabs.activeID == tab.id
@@ -140,6 +165,12 @@ struct ReaderTabItem: View {
                 }
             }
             Divider()
+            Picker("Tab Style", selection: Bindable(model.appearance).tabStyle) {
+                ForEach(ReaderTabStyle.allCases, id: \.self) { style in
+                    Text(style.label).tag(style)
+                }
+            }
+            Divider()
             Button("Open in New Window", systemImage: "arrow.up.right.square") {
                 model.openMessageWindow(tab.message)
             }
@@ -159,38 +190,27 @@ struct ReaderTabItem: View {
     }
 }
 
+/// Active tab: tertiary fill (one step stronger than the hover wash) so the
+/// selected tab reads clearly against the clear strip; hover keeps quaternary.
 private struct ReaderTabGlassModifier: ViewModifier {
-    let isVisible: Bool
-    let reduceTransparency: Bool
+    let isActive: Bool
+    let isHovered: Bool
     let contrast: ColorSchemeContrast
 
-    private static var debugGlassEnabled: Bool {
-        #if DEBUG
-        ProcessInfo.processInfo.environment["MAILTERNAL_DEBUG_GLASS_EFFECT"] == "1"
-        #else
-        false
-        #endif
+    func body(content: Content) -> some View {
+        content.background {
+            Capsule().fill(fill)
+        }
     }
 
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if !reduceTransparency && isVisible && Self.debugGlassEnabled {
-            // Liquid Glass currently renders as a dark/opaque surface when
-            // hosted inside an NSToolbar on macOS 26. Keep it opt-in for
-            // visual debugging until the system compositor handles that host.
-            content.glassEffect(.regular.interactive(), in: .capsule)
-        } else {
-            content.background {
-                Capsule()
-                    .fill(
-                        isVisible
-                            ? Color(nsColor: .quaternarySystemFill).opacity(
-                                contrast == .increased ? 0.9 : 0.72
-                            )
-                            : .clear
-                    )
-            }
+    private var fill: Color {
+        if isActive {
+            return Color(nsColor: .tertiarySystemFill).opacity(contrast == .increased ? 1 : 0.9)
         }
+        if isHovered {
+            return Color(nsColor: .quaternarySystemFill).opacity(contrast == .increased ? 0.9 : 0.72)
+        }
+        return .clear
     }
 }
 

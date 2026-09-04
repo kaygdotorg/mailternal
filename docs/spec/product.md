@@ -64,6 +64,10 @@ swipe actions, Settings → Actions → Gestures) → reader as three floating i
 - HTML mail in `WKWebView`: **remote images blocked by default** (notice shown only
   when the message references remote content), inline `cid:` parts always shown,
   Email Reading mode Original/Dark with an opaque canvas, plain-text fallback.
+  A single click on an `http(s)` or `mailto:` link MUST open it through the
+  system default handler; it MUST NOT navigate the reader. A link context menu
+  MUST provide only **Open Link** and **Copy Link**, while retaining text-selection
+  actions such as **Copy**, **Look Up**, and **Services** when text is selected.
 - Live updates via in-app IMAP IDLE + macOS local notifications (no daemon needed on
   macOS). Notifications fire only for post-activation mail — never from backfill
   (baseline rule in sync.md).
@@ -129,6 +133,11 @@ The reader-tab state MUST use the following model names and fields:
   `activeID`, and per-tab reader scroll, and MUST NOT contain message bodies,
   rendered HTML, or other reader content.
 
+Persisted entries whose deep links no longer resolve, or whose messages are
+removed before detail loads, MUST be closed silently. They MUST NOT remain as
+phantom tabs or leave the reader in an endless loading state; when no entry
+resolves, `activeID` MUST be nil and the reader MUST show its empty state.
+
 After every operation and restore, `ReaderTabs` MUST contain at most one
 transient tab, MUST NOT contain duplicate `MessageID` values, and MUST satisfy
 `activeID == nil` if and only if `tabs.isEmpty`; otherwise `activeID` MUST name
@@ -193,30 +202,31 @@ change `order` without changing `id` or `message`.
 - A tab context menu MUST provide **Close**, **Close Others**, **Close to the
   Right**, **Keep** (only for the transient tab), **Open in New Window**, and
   **Copy Link**. Close Others MUST retain only the chosen tab; Close to the
-  Right MUST close every later tab in `order`. Keep MUST clear `isTransient`
-  without changing the tab's `id`, message, or position. **Open in New Window**
-  MUST create a tab-less detached message window; **Copy Link** MUST copy the
-  stable message deep link.
-
 ### Reader tab strip and preview
 
-- The reader tab strip MUST be one row at the top of the reader pane and MUST
-  be visible whenever any message is open, including when exactly one tab
-  exists. It MUST be hidden in the empty-reader state. While the Command-K
-  search overlay is presented and a message remains open, the reader tab strip
-  MUST remain rendered at its normal size and visible beneath the material
-  backdrop; presenting or dismissing search MUST NOT hide, replace, or reflow
-  the strip.
+- The reader tab strip MUST be a single native unified-titlebar/toolbar row
+  over the rightmost reader column and MUST be visible whenever
+  `tabs.tabs` is non-empty, including when exactly one tab exists. It MUST be
+  hidden when the reader is empty and while global search is presented.
 - The reader tab strip MUST keep Archive, Trash, and More in a fixed trailing
   cluster. More MUST contain Flag, Raw Source, Email Reading mode, and every
   other tab-strip action not named Archive or Trash. The sidebar toggle MUST
-  remain in the window titlebar.
-- Hovering a tab after a short intent delay MUST show a floating card beneath
-  that tab with the message's rendered/plain preview. If sender and received
-  time are already available locally, the card MUST include them in a compact
-  metadata line; otherwise it MUST omit them and MUST NOT fetch them. It MUST
-  overlay the reader without reflowing it, changing selection or scroll,
-  marking the message read, or fetching remote content.
+  remain in the window titlebar. The strip MUST have no own background, the
+  reader-tabs toolbar item MUST have no label or tooltip, and toolbar
+  customization MUST be disabled.
+- Each tab MUST use its intrinsic width, computed as leading slot plus subject
+  text width plus title paddings, clamped to 72–220 pt. Tabs MUST have an 8 pt
+  leading strip inset and 8 pt spacing. When they overflow, they MUST scroll
+  horizontally beneath a fixed 28 pt trailing fade up to the actions cluster.
+- Hovering a tab MUST immediately show a local preview in a non-activating
+  child panel beneath that tab, with no dwell delay or entrance animation. The
+  panel MUST be exactly 220 pt wide by 160 pt high and contain a scrollable
+  preview body. If sender and received time are already available locally, the
+  card MUST include them in a compact metadata line; otherwise it MUST omit
+  them and MUST NOT fetch them. It MUST overlay the reader without reflowing it,
+  changing selection or scroll, marking the message read, or fetching remote
+  content. The panel MUST remain hoverable while the pointer is over either the
+  tab or card and dismiss after a 150 ms grace period after leaving both.
 
 ## Non-goals for 0.0.1
 Threading, multi-account, unified inbox, rules/snooze/send-later, JMAP, monetization,

@@ -36,17 +36,21 @@ struct ReaderTabHoverCard: View {
                 .lineLimit(2)
                 .truncationMode(.tail)
 
-            Text(preview.isEmpty ? "No preview available." : preview)
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .lineLimit(6)
-                .truncationMode(.tail)
-                .frame(maxHeight: .infinity, alignment: .topLeading)
+            ScrollView(.vertical, showsIndicators: false) {
+                Text(preview.isEmpty ? "No preview available." : preview)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+            .scrollBounceBehavior(.basedOnSize)
         }
         .padding(.horizontal, ReaderTabTokens.previewHorizontalPadding)
         .padding(.vertical, ReaderTabTokens.previewVerticalPadding)
-        .frame(width: ReaderTabTokens.previewWidth, alignment: .topLeading)
-        .frame(maxHeight: ReaderTabTokens.previewMaximumHeight, alignment: .topLeading)
+        .frame(
+            width: ReaderTabTokens.previewWidth,
+            height: ReaderTabTokens.previewHeight,
+            alignment: .topLeading
+        )
         .background(
             Color(nsColor: .textBackgroundColor),
             in: RoundedRectangle(

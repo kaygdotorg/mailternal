@@ -51,7 +51,7 @@ enum MailMotion {
     /// with no overshoot, so the reveal reads as growth rather than a jump.
     static let expand = Animation.spring(duration: 0.32, bounce: 0)
     /// Settings editors grow without overshoot and collapse quickly enough to
-    /// keep the surrounding List's row rhythm feeling immediate.
+    /// keep the surrounding settings stack's row rhythm feeling immediate.
     static let accountEditorCollapse = Animation.easeOut(duration: 0.14)
     /// The source island should acknowledge the toggle immediately while its
     /// height still eases cleanly into the detailed header layout.
@@ -79,11 +79,10 @@ enum MailMotion {
 /// sizing lives in `ReaderTabLayoutPolicy`; these values describe the visual
 /// surfaces that policy intentionally does not decide.
 enum ReaderTabTokens {
-    static let hoverDelay: Duration = .milliseconds(350)
-    static let previewWidth: CGFloat = 320
+    static let hoverDelay: Duration = .zero
+    static let previewWidth: CGFloat = ReaderTabLayoutPolicy.maximumTabWidth
+    static let previewHeight: CGFloat = 160
     static let previewCornerRadius: CGFloat = 18
-    static let previewMaximumWidth: CGFloat = 360
-    static let previewMaximumHeight: CGFloat = 220
     static let previewHorizontalPadding: CGFloat = 14
     static let previewVerticalPadding: CGFloat = 12
 }

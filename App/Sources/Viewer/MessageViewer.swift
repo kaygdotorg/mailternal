@@ -33,6 +33,15 @@ struct MessageViewer: View {
         model.isFindPresented ? model.findQuery : ""
     }
 
+
+    /// Plain text is SwiftUI-rendered, so scope the per-message override to
+    /// this body surface instead of changing the reader chrome. Original mode
+    /// follows the app's System/Light/Dark appearance.
+    private var emailBodyColorScheme: ColorScheme? {
+        model.effectiveEmailReadingMode == .dark
+            ? .dark
+            : model.appearance.mode.colorScheme
+    }
     var body: some View {
         ZStack(alignment: .topTrailing) {
             content
@@ -84,7 +93,7 @@ struct MessageViewer: View {
             )
         } else if let detail = model.detail {
             reader(detail)
-        } else if model.isLoadingDetail || model.tabs.active != nil {
+        } else if model.isLoadingDetail {
             ProgressView()
                 .controlSize(.small)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -208,6 +217,7 @@ struct MessageViewer: View {
                 selectedMatchIndex: findSnapshot.index,
                 findTick: findTick,
             )
+            .preferredColorScheme(emailBodyColorScheme)
             .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
             .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
             // The pane stays full width; only the plain-text measure narrows.
@@ -408,6 +418,7 @@ private final class ReaderScrollTrackingView: NSView {
         if scrollView !== enclosing {
             detach()
             scrollView = enclosing
+            OverlayScrollerPolicy.apply(to: enclosing)
             let clip = enclosing.contentView
             clip.postsBoundsChangedNotifications = true
             NotificationCenter.default.addObserver(
@@ -910,23 +921,10 @@ struct MessageEnvelopeRegion: View {
 
 }
 
-/// A small accent wash keeps the monogram legible without fetching an avatar.
-private struct MonogramView: View {
-    let initials: String
-    let accent: Color
 
-    var body: some View {
-        Text(initials)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(accent)
-            .frame(width: 26, height: 26)
-            .background(accent.opacity(0.15), in: Circle())
-            .accessibilityHidden(true)
-    }
-}
-
-/// Replaces a copy target's text with a clipboard glyph without changing the
-/// target's measured size. Reduced Motion swaps the two states immediately.
+/// Replaces a copy target's text with a centered clipboard glyph (matching the
+/// detailed header's overlay) without changing the target's measured size.
+/// Reduced Motion swaps the two states immediately.
 private struct CopyFeedbackLabel<Label: View>: View {
     let label: Label
     let isShowingCopy: Bool
@@ -943,7 +941,7 @@ private struct CopyFeedbackLabel<Label: View>: View {
     }
 
     var body: some View {
-        ZStack(alignment: .leading) {
+        ZStack(alignment: .center) {
             label
                 .opacity(isShowingCopy ? 0 : 1)
             Image(systemName: "doc.on.clipboard")

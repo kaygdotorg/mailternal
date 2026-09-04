@@ -73,6 +73,11 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   AppKit table scroll view. Bottom ramp 48 pt at the pane edge. The column
   carries **no top chrome** — windowed-mode coverage is disclosed in the ⌘K
   panel.
+- **Reader**: the top ramp starts exactly where the tab strip ends (46 pt: the
+  40 pt strip centred in the 52 pt titlebar) and reaches 24 pt into the pane,
+  so scrolled content dissolves under the tabs rather than behind the window
+  buttons; the subject card rests one 12 pt guard below the ramp. No bottom
+  ramp.
 
 ## Component vocabulary (reuse the pattern, adapt to mail)
 - **Sidebar rows**: native `List` label rows with context menus, swipes, drag/drop
@@ -111,21 +116,25 @@ The reader tab strip MUST be Craft-like in finish and browser-like in
 mechanics. It MUST occupy one measured row in the window's native titlebar/
 toolbar, over the rightmost reader column, and MUST NOT add a titlebar
 accessory row or in-pane reader chrome. The row MUST remain the native unified
-toolbar height, with 12 pt leading and 8 pt trailing content insets. It MUST be
-present whenever a message is open, including with one tab, and MUST be absent
-in the empty-reader state and while global search is presented.
+toolbar height, with an 8 pt leading and no trailing content inset. The strip
+container MUST be clear so the native toolbar material shows through. It MUST
+be present whenever `tabs.tabs` is non-empty and MUST be absent in the
+empty-reader state and while global search is presented.
 
 ### Tabs and actions
 
 - The tab viewport belongs to the toolbar's reader-tabs item. The native
   NSToolbarItemGroup at the trailing edge remains the sole message-actions
   group: Archive, Trash, Flag, Raw Source, Email Reading mode, and More.
-  The sidebar toggle MUST remain in the titlebar.
-- Each tab MUST be 120–220 pt wide, with 10 pt horizontal and 7 pt vertical
-  internal padding. Tabs MUST be separated by 4 pt. They MUST compress toward
-  120 pt before the viewport becomes horizontally scrollable; tabs MUST NOT
-  become narrower than 120 pt. Scrolling MUST occur beneath a fixed 28 pt
-  right-edge fade at the end of the tab viewport.
+  The sidebar toggle MUST remain in the titlebar. The reader-tabs toolbar item
+  MUST have no label or tooltip, and toolbar customization MUST be disabled.
+- Each tab MUST use its intrinsic width:
+  `(leading slot + subject text width + inter-item spacing + title paddings)`,
+  clamped to 72–220 pt. Subject title leading padding is 4 pt and trailing
+  padding is 10 pt. Tabs MUST be separated by 8 pt and MUST NOT stretch to
+  consume spare viewport width. Scrolling MUST occur beneath a fixed 28 pt
+  right-edge fade at the end of the tab viewport, directly against the
+  actions cluster with no extra gap.
 - Its title MUST contain only the subject, MUST use semantic `.subheadline`, and
   MUST use the trailing fade mask when compressed. The active tab MUST use
   semantic selection treatment and label color; inactive tabs MUST have no fill
@@ -134,33 +143,44 @@ in the empty-reader state and while global search is presented.
 - A transient title MUST be italic. A tab title or accessory MUST NEVER show
   unread or flag indicators.
 - Tab backgrounds MUST use a continuous `AppShapeScale.row` (12 pt) corner
-  radius. The right-edge fade MUST be a 28 pt gradient from transparent over
-  the tab viewport to the toolbar backdrop, drawn above scrolling tabs. It
-  MUST NOT capture tab input.
+  radius. The right-edge fade MUST be a 28 pt transparent mask drawn above
+  scrolling tabs and MUST NOT capture tab input. No strip-level fill may
+  obscure the toolbar material.
 - The native message-actions group MUST contain Flag, Raw Source, Email Reading
   mode, and every other action not named Archive or Trash. Archive and Trash
   MUST remain directly reachable in that fixed group.
 
+### Tab display styles
+
+The tab display style is persisted in Appearance Settings and defaults to
+**Icon and Text**. It is available from **View > Tab Style**, from the empty
+strip background context menu, and from each tab's context menu; the three
+choices are mutually exclusive:
+
+- **Icon** shows only the sender glyph. The glyph is the sender domain's
+  favicon when available, with a sender-initial circle as the fallback.
+- **Icon and Text** shows the sender glyph followed by the subject.
+- **Text** shows only the subject. Its leading slot collapses while idle; on
+  hover, the close (×) affordance appears in that slot and the subject shifts
+  right. The shift uses `MailMotion.hover`.
+
 ### Hover preview card
 
-- After 0.35 s of pointer dwell on a tab, a floating card MUST appear beneath
-  that tab. Leaving the tab MUST dismiss it; moving directly to another tab
-  restarts the dwell timer for the new tab.
-- The card MUST be 320 pt wide, at most 360 pt wide, and at most 220 pt high.
-  It MUST use 14 pt horizontal and 12 pt vertical padding, a continuous
-  `AppShapeScale.card` (18 pt) corner radius, semantic control/window colors,
-  and the standard card shadow: black at 0.28 opacity, 28 pt blur radius,
-  14 pt downward offset.
-- The card MUST show a local rendered or plain-text preview, clipped to six
-  body lines using the reader's body typography. If sender and received time
-  are already available locally, the card MUST include them in a compact
-  metadata line; otherwise it MUST omit them and MUST NOT fetch them. It MUST
-  NEVER fetch remote content, mark the message read, alter selection or either
-  scroll position, or reflow the reader; it MUST overlay the reader content
-  below the toolbar.
-- The reveal and dismissal MUST use `MailMotion.hover` (ease-out 0.12 s). With
-  Reduce Motion enabled, the card MUST use an opacity-only
-  `MailMotion.disclosure` transition and no translation or scale.
+- Hovering a tab MUST immediately show a floating card beneath that tab with no
+  dwell delay or entrance animation. Leaving the tab MUST dismiss it after a
+  150 ms grace period unless the pointer is over the card; moving directly to
+  another tab transfers the card immediately.
+- The card MUST be a non-activating borderless child panel exactly 220 pt wide
+  by 160 pt high, containing a vertically scrollable child for the local
+  rendered or plain-text preview. It MUST use 14 pt horizontal and 12 pt
+  vertical padding, a continuous `AppShapeScale.card` (18 pt) corner radius,
+  semantic control/window colors, and the standard card shadow: black at 0.28
+  opacity, 28 pt blur radius, 14 pt downward offset.
+- If sender and received time are already available locally, the card MUST
+  include them in a compact metadata line; otherwise it MUST omit them and MUST
+  NOT fetch them. It MUST NEVER fetch remote content, mark the message read,
+  alter selection or either scroll position, or reflow the reader; it MUST
+  overlay the reader content below the toolbar.
 
 References: [Craft Tab Management](https://support.craft.do/en/introduction/navigation/tabs)
 (tab-layout image and tab-preview description); [Chrome keyboard shortcuts](https://support.google.com/chrome/answer/157179)
@@ -184,15 +204,31 @@ References: [Craft Tab Management](https://support.craft.do/en/introduction/navi
 | Account setup | Settings-style grouped form in a floating utility window |
 | Sync/auth errors | Toast stack |
 
+### Message-list row anatomy
+
+Each message-list row is an AppKit table row with continuous 12 pt corners and
+the existing sender, subject/preview, date, unread, flag, attachment, and swipe
+surfaces. When **Appearance ▸ Sender icons** is enabled, a leading icon column
+is reserved:
+
+| Visible row lines | Icon diameter | Leading inset | Text origin |
+|---:|---:|---:|---:|
+| 1 | 20 pt | 8 pt | 36 pt |
+| 2 | 28 pt | 8 pt | 44 pt |
+| 3–6 | 32 pt | 8 pt | 48 pt |
+
+The icon is vertically centered with a 4 pt minimum top/bottom inset. It uses
+the sender-domain favicon with aspect-fill scaling and a circular clip; until
+the favicon is cached, the sender display-name monogram is shown in the
+accent-tinted circle. With sender icons disabled, the icon column collapses and
+the text origin remains the original 16 pt inset.
+
 ### Sidebar sync activity indicators
 
 Folder rows use one compact trailing accessory for the current activity. While a
-backfill window is downloading, show an accent-tinted `arrow.down` at badge
-height with a continuous `.bounce.down` effect; while its fetched rows are
-indexed/committed, show `arrow.triangle.2.circlepath` with a continuous rotate
-effect.
-Disk-policy halts show the existing `pause.circle` glyph. Idle folders and
-quarantine stalls do not add a glyph, so a row never becomes visually noisy.
-Reduce Motion disables both symbol effects while retaining their static glyphs.
-Hovering the downloading glyph exposes the exact local progress when available,
-for example “Downloading 12,372 of 15,365”.
+backfill window is downloading or its fetched rows are being indexed/committed,
+show the standard small spinner. Hovering the spinner exposes the current local
+progress when available, for example “Downloading messages — 42%” or
+“Indexing messages — 42%”.
+Disk-policy halts retain the existing `pause.circle` glyph. Idle folders and
+quarantine stalls do not add an accessory, so a row never becomes visually noisy.

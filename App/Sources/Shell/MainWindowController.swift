@@ -1,7 +1,18 @@
 import AppKit
+import os
 import Observation
 import SwiftUI
+
 import MailternalInterfaces
+
+private let mainWindowSignpostLog = OSLog(subsystem: "org.kayg.mailternal", category: "ShellLaunch")
+
+@inline(__always)
+private func shellLaunchPhase(_ name: String) {
+    QALaunch.launchSubphase(name)
+    os_signpost(.event, log: mainWindowSignpostLog, name: "shell-launch", "%{public}s", name)
+}
+
 
 struct MainSplitRoot: View {
     @Bindable var model: AppModel
@@ -243,6 +254,7 @@ final class MainShellViewController: NSViewController {
     private let contentHosting: NSHostingController<MainSplitRoot>
     private var overlayHosting: OverlayHostingView?
     private var backgroundHosting: NSHostingView<WindowBackdropRoot>?
+    private var didMarkFirstLayout = false
 
     var visibilityBridgeView: MainSplitVisibilityBridgeView? {
         visibilityBridgeBox.view
@@ -257,6 +269,7 @@ final class MainShellViewController: NSViewController {
     }
 
     init(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
+        shellLaunchPhase("shell-vc-init-begin")
         self.model = model
         self.appearance = appearance
         self.actions = actions
@@ -270,9 +283,11 @@ final class MainShellViewController: NSViewController {
                 onVisibilityBridge: { bridgeBox.view = $0 }
             )
         )
+        shellLaunchPhase("shell-hosting-controller-ready")
         super.init(nibName: nil, bundle: nil)
         configureTransparentHostingView(contentHosting.view)
         contentHosting.sizingOptions = []
+        shellLaunchPhase("shell-vc-init-end")
     }
 
     @available(*, unavailable)
@@ -280,6 +295,7 @@ final class MainShellViewController: NSViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        shellLaunchPhase("shell-navsplit-attach-begin")
         addChild(contentHosting)
         let contentView = contentHosting.view
         contentView.translatesAutoresizingMaskIntoConstraints = false
@@ -291,11 +307,18 @@ final class MainShellViewController: NSViewController {
             contentView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
         makeOverlay()
+        shellLaunchPhase("shell-navsplit-attach-end")
     }
 
     override func viewDidAppear() {
         super.viewDidAppear()
         configureWindowIfAttached()
+    }
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        guard !didMarkFirstLayout else { return }
+        didMarkFirstLayout = true
+        shellLaunchPhase("shell-navsplit-first-layout")
     }
 
     func update(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
@@ -332,6 +355,7 @@ final class MainShellViewController: NSViewController {
 
     private func configureWindowIfAttached() {
         guard view.window != nil, backgroundHosting == nil else { return }
+        shellLaunchPhase("shell-materials-begin")
         let hosting = NSHostingView(rootView: WindowBackdropRoot(appearance: appearance))
         configureTransparentHostingView(hosting)
         hosting.safeAreaRegions = []
@@ -340,6 +364,7 @@ final class MainShellViewController: NSViewController {
         hosting.autoresizingMask = [.width, .height]
         view.addSubview(hosting, positioned: .below, relativeTo: nil)
         backgroundHosting = hosting
+        shellLaunchPhase("shell-materials-end")
     }
 
     private func configureTransparentHostingView(_ hosting: NSView) {
@@ -364,7 +389,6 @@ private extension NSToolbarItem.Identifier {
 
 @MainActor
 private final class ReaderTabsHostingView: NSHostingView<ReaderTabBar> {
-    var onLayout: (() -> Void)?
     var desiredWidth: CGFloat = 0 {
         didSet {
             guard abs(oldValue - desiredWidth) > 0.5 else { return }
@@ -375,16 +399,90 @@ private final class ReaderTabsHostingView: NSHostingView<ReaderTabBar> {
     override var intrinsicContentSize: NSSize {
         NSSize(width: desiredWidth, height: ReaderTabLayoutPolicy.rowHeight)
     }
+}
 
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        onLayout?()
+/// Tab hover preview: a system `NSPopover` (same chrome as the QR-code
+/// popover) anchored to the hovered tab. `.applicationDefined` behaviour keeps
+/// it open while the pointer is over the tab or the card; the owner dismisses
+/// it. The content tracks pointer entry/exit so scrolling the preview works.
+@MainActor
+final class ReaderTabHoverPopover: NSPopover {
+    private let trackingView = ReaderTabHoverTrackingView()
+    private let hostingView: NSHostingView<ReaderTabHoverCard>
+
+    init(card: ReaderTabHoverCard, cardHovered: Binding<Bool>) {
+        hostingView = NSHostingView(rootView: card)
+        super.init()
+        trackingView.onHoverChanged = { inside in
+            cardHovered.wrappedValue = inside
+        }
+        trackingView.addSubview(hostingView)
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            hostingView.leadingAnchor.constraint(equalTo: trackingView.leadingAnchor),
+            hostingView.trailingAnchor.constraint(equalTo: trackingView.trailingAnchor),
+            hostingView.topAnchor.constraint(equalTo: trackingView.topAnchor),
+            hostingView.bottomAnchor.constraint(equalTo: trackingView.bottomAnchor)
+        ])
+        let controller = NSViewController()
+        controller.view = trackingView
+        contentViewController = controller
+        contentSize = NSSize(
+            width: ReaderTabTokens.previewWidth,
+            height: ReaderTabTokens.previewHeight
+        )
+        behavior = .applicationDefined
+        animates = false
     }
 
-    override func layout() {
-        super.layout()
-        onLayout?()
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(card: ReaderTabHoverCard) {
+        hostingView.rootView = card
     }
+
+    /// `tabFrame` is in `view`'s SwiftUI (top-left) coordinates.
+    func present(tabFrame: CGRect, in view: NSView) {
+        var rect = tabFrame.intersection(view.bounds)
+        if rect.isNull || rect.isEmpty { rect = view.bounds }
+        if !view.isFlipped {
+            rect.origin.y = view.bounds.height - rect.maxY
+        }
+        if isShown {
+            positioningRect = rect
+            return
+        }
+        show(relativeTo: rect, of: view, preferredEdge: .maxY)
+    }
+
+    func dismiss() {
+        if isShown { performClose(nil) }
+    }
+}
+
+@MainActor
+private final class ReaderTabHoverTrackingView: NSView {
+    var onHoverChanged: ((Bool) -> Void)?
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) { onHoverChanged?(true) }
+    override func mouseExited(with event: NSEvent) { onHoverChanged?(false) }
 }
 
 @MainActor
@@ -405,6 +503,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         identifier: .messageTrash,
         action: #selector(trashSelected(_:))
     )
+    private var cachedMessageActionsWidth: CGFloat?
+    private var readerTabsWidthUpdateScheduled = false
     private lazy var flagItem = makeMessageItem(
         identifier: .messageFlag,
         action: #selector(flagSelected(_:))
@@ -465,6 +565,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             _ = model.appearance.emailReadingMode
             _ = model.isSearchPresented
             _ = model.tabs.activeID
+            _ = model.tabs.tabs.count
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.modelObservationGeneration == generation else { return }
@@ -477,12 +578,13 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     }
 
     func makeToolbar(identifier: String = "Mailternal.MainToolbar") -> NSToolbar {
+        UserDefaults.standard.removeObject(forKey: "NSToolbar Configuration \(identifier)")
         let toolbar = NSToolbar(identifier: identifier)
+        self.toolbar = toolbar
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
-        toolbar.allowsUserCustomization = true
-        toolbar.autosavesConfiguration = false
-        self.toolbar = toolbar
+        toolbar.allowsDisplayModeCustomization = false
+        toolbar.allowsUserCustomization = false
         configureMessageItems()
         configureReaderTabs()
         NotificationCenter.default.addObserver(
@@ -490,24 +592,21 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.updateReaderTabsWidth()
-            }
+            self?.scheduleReaderTabsWidthUpdate()
         }
         NotificationCenter.default.addObserver(
             forName: NSSplitView.didResizeSubviewsNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.updateReaderTabsWidth()
-            }
+            self?.scheduleReaderTabsWidthUpdate()
         }
-        // NSToolbar installs its item views after makeToolbar returns. A
-        // next-turn pass observes the final split geometry, rather than the
-        // zero-sized pre-install layout.
+        // NSToolbar installs its item views after makeToolbar returns. Cache the
+        // fixed native action width only after installation, then size tabs
+        // from split geometry on that stable value.
         DispatchQueue.main.async { [weak self, weak toolbar] in
             guard let self, self.toolbar === toolbar else { return }
+            self.cacheMessageActionsWidth()
             self.configureReaderTabs()
             self.updateReaderTabsWidth()
         }
@@ -517,9 +616,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         var identifiers: [NSToolbarItem.Identifier] = []
         if includesSidebarToggle {
-            identifiers += [.flexibleSpace, .sidebarToggle, .sidebarTrackingSeparator, .readerTabs]
+            identifiers += [.flexibleSpace, .sidebarToggle, .sidebarTrackingSeparator, .flexibleSpace, .readerTabs]
+        } else {
+            identifiers += [.flexibleSpace]
         }
-        identifiers += [.flexibleSpace]
         identifiers += MessageToolbarPolicy.defaultGroupIdentifiers.map(toolbarGroupIdentifier)
         return identifiers
     }
@@ -530,7 +630,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             .space,
         ]
         if includesSidebarToggle {
-            identifiers += [.sidebarToggle, .sidebarTrackingSeparator, .readerTabs]
+            identifiers += [.sidebarToggle, .sidebarTrackingSeparator, .flexibleSpace, .readerTabs]
         }
         identifiers += MessageToolbarPolicy.allowedGroupIdentifiers.map(toolbarGroupIdentifier)
         return identifiers
@@ -657,7 +757,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             .compactMap { messageItem(for: $0) }
         item.label = "Message Actions"
         item.paletteLabel = item.label
-        item.isBordered = true
+        // A bordered NSToolbarItemGroup draws separators between its subitems
+        // on macOS 26. The subitems are bordered instead: adjacent bordered
+        // items share one capsule without dividers.
+        item.isBordered = false
         item.isEnabled = true
         item.controlRepresentation = .expanded
         item.selectionMode = .selectAny
@@ -698,6 +801,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         messageActionsGroup.isEnabled = !model.isSearchPresented
         toggleItem.isHidden = !includesSidebarToggle || model.isSearchPresented
         toggleItem.isEnabled = includesSidebarToggle && !model.isSearchPresented
+        // The cluster width feeds the strip viewport.
+        scheduleReaderTabsWidthUpdate()
     }
 
     private func makeToggleItem() -> NSToolbarItem {
@@ -717,6 +822,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         return item
     }
 
+
     private func makeReaderTabsHosting() -> ReaderTabsHostingView {
         let hosting = ReaderTabsHostingView(rootView: ReaderTabBar(model: model))
         hosting.safeAreaRegions = []
@@ -730,18 +836,15 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         hosting.layer?.backgroundColor = NSColor.clear.cgColor
         hosting.layer?.isOpaque = false
         hosting.layer?.masksToBounds = false
-        hosting.onLayout = { [weak self] in
-            self?.updateReaderTabsWidth()
-        }
         return hosting
     }
 
     private func makeReaderTabsItem() -> NSToolbarItem {
         let item = NSToolbarItem(itemIdentifier: .readerTabs)
         item.view = readerTabsHosting
-        item.label = "Reader Tabs"
-        item.paletteLabel = item.label
-        item.toolTip = "Open reader tabs"
+        item.label = ""
+        item.paletteLabel = ""
+        item.isBordered = false
         item.minSize = NSSize(width: 0, height: ReaderTabLayoutPolicy.rowHeight)
         item.maxSize = NSSize(width: 0, height: ReaderTabLayoutPolicy.rowHeight)
         item.isEnabled = false
@@ -750,48 +853,125 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     }
 
     private func configureReaderTabs() {
-        readerTabsItem.isHidden = model.tabs.active == nil || model.isSearchPresented
-        readerTabsItem.isEnabled = !readerTabsItem.isHidden
-        updateReaderTabsWidth()
+        let shouldShow = !model.tabs.tabs.isEmpty && !model.isSearchPresented
+        guard let toolbar else {
+            readerTabsItem.isHidden = !shouldShow
+            readerTabsItem.isEnabled = shouldShow
+            return
+        }
+        if shouldShow {
+            if !toolbar.items.contains(where: { $0.itemIdentifier == .readerTabs }) {
+                let insertionIndex = toolbar.items.firstIndex {
+                    $0.itemIdentifier == .messageActions
+                } ?? toolbar.items.count
+                toolbar.insertItem(withItemIdentifier: .readerTabs, at: insertionIndex)
+            }
+            readerTabsItem.isHidden = false
+            readerTabsItem.isEnabled = true
+            updateReaderTabsWidth()
+            // NSToolbar attaches the item view after insertItem returns; size
+            // again once it is in the window.
+            scheduleReaderTabsWidthUpdate()
+        } else {
+            if let index = toolbar.items.firstIndex(where: { $0.itemIdentifier == .readerTabs }) {
+                toolbar.removeItem(at: index)
+            }
+            readerTabsHosting.desiredWidth = 0
+        }
     }
 
-    /// The custom tab item fills the reader column between the split's detail
-    /// origin and the native message-actions group. Its intrinsic size is
-    /// updated explicitly because unified toolbar layout otherwise collapses
-    /// custom items whose fitting size is zero during installation.
-    private func updateReaderTabsWidth() {
-        guard includesSidebarToggle,
-              let window = readerTabsHosting.window,
-              let contentView = window.contentView
-        else { return }
-        let detailOrigin = detailColumnOrigin(in: contentView, contentView: contentView) ?? 0
-        let actionWidth = max(
+    /// Width of the trailing native actions cluster. Measured once its item
+    /// view exists; until then the policy fallback keeps the tab strip from
+    /// disappearing (an unmeasured width must never hide the tabs).
+    private var messageActionsWidth: CGFloat {
+        // Prefer the live laid-out width: the group is measured at toolbar
+        // install with no selection, when its fitting size understates the
+        // visible cluster and the strip then overflows into the list column.
+        if let live = messageActionsGroup.view?.frame.width, live > 0 {
+            cachedMessageActionsWidth = live
+            return live
+        }
+        if let cachedMessageActionsWidth { return cachedMessageActionsWidth }
+        let width = max(
             messageActionsGroup.minSize.width,
             messageActionsGroup.view?.fittingSize.width ?? 0
         )
-        let width = max(0, contentView.bounds.width - detailOrigin - actionWidth - 32)
-        readerTabsHosting.desiredWidth = width
-        let hidden = model.tabs.active == nil || model.isSearchPresented || width < 140
+        if width > 0 {
+            cachedMessageActionsWidth = width
+            return width
+        }
+        return ReaderTabLayoutPolicy.fallbackActionsWidth
+    }
+
+    private func cacheMessageActionsWidth() {
+        _ = messageActionsWidth
+    }
+
+    private func scheduleReaderTabsWidthUpdate() {
+        guard !readerTabsWidthUpdateScheduled else { return }
+        readerTabsWidthUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.readerTabsWidthUpdateScheduled = false
+            self.updateReaderTabsWidth()
+        }
+    }
+
+    private func updateReaderTabsWidth() {
+        guard includesSidebarToggle,
+              let window = readerTabsHosting.window,
+              let contentView = window.contentView,
+              readerTabsHosting.superview != nil
+        else { return }
+        let actionWidth = messageActionsWidth
+        let detailOrigin = detailColumnOrigin(in: contentView, contentView: contentView) ?? 0
+        let detailWidth = max(0, contentView.bounds.maxX - detailOrigin)
+        // NSToolbar adds inter-item spacing; without this slack the strip
+        // overflows the toolbar and is shifted left into the list column.
+        let tabViewportWidth = max(
+            0,
+            detailWidth - actionWidth - ReaderTabLayoutPolicy.toolbarSpacing * 2
+        )
+        let hidden = model.tabs.tabs.isEmpty
+            || model.isSearchPresented
+            || tabViewportWidth < ReaderTabLayoutPolicy.minimumTabWidth
         readerTabsItem.isHidden = hidden
         readerTabsItem.isEnabled = !hidden
-        let size = NSSize(width: width, height: ReaderTabLayoutPolicy.rowHeight)
+        readerTabsHosting.desiredWidth = hidden ? 0 : tabViewportWidth
+        let size = NSSize(
+            width: hidden ? 0 : tabViewportWidth,
+            height: ReaderTabLayoutPolicy.rowHeight
+        )
         readerTabsItem.minSize = size
         readerTabsItem.maxSize = size
     }
 
+
+    /// Leading edge of the reader (detail) column in window-content
+    /// coordinates. The split view's detail pane is authoritative; the
+    /// message table's trailing edge sits ~17 pt left of the pane divider
+    /// (scroller/inset), so it is only a fallback for layouts without a
+    /// measurable detail pane.
     private func detailColumnOrigin(in view: NSView, contentView: NSView) -> CGFloat? {
-        if let tableEdge = messageTableTrailingEdge(in: view, contentView: contentView) {
-            return tableEdge
+        if let paneOrigin = splitDetailOrigin(in: view, contentView: contentView) {
+            return paneOrigin
         }
+        return messageTableTrailingEdge(in: view, contentView: contentView)
+    }
+
+    private func splitDetailOrigin(in view: NSView, contentView: NSView) -> CGFloat? {
         var origin: CGFloat?
-        if let split = view as? NSSplitView, let detail = split.subviews.last {
+        // `subviews` also holds divider/shadow/titlebar helper views; the
+        // panes are the arranged subviews and the detail pane is the last.
+        if let split = view as? NSSplitView, split.arrangedSubviews.count >= 2,
+           let detail = split.arrangedSubviews.last {
             let frame = detail.convert(detail.bounds, to: contentView)
             if frame.width >= 140 {
                 origin = frame.minX
             }
         }
         for subview in view.subviews {
-            if let childOrigin = detailColumnOrigin(in: subview, contentView: contentView) {
+            if let childOrigin = splitDetailOrigin(in: subview, contentView: contentView) {
                 origin = max(origin ?? childOrigin, childOrigin)
             }
         }
@@ -818,7 +998,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         let item = NSToolbarItem(itemIdentifier: identifier)
         item.action = action
         item.target = self
-        item.isBordered = false
+        item.isBordered = true
         item.autovalidates = true
         return item
     }
@@ -833,7 +1013,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         item.label = "More"
         item.paletteLabel = "More"
         item.toolTip = "More message actions"
-        item.isBordered = false
+        item.isBordered = true
         item.isEnabled = !model.selectedMessageIDs.isEmpty
         item.autovalidates = false
         item.showsIndicator = false
@@ -976,10 +1156,36 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     static let shared = MainWindowController()
     private var shell: MainShellViewController?
     private var toolbarController: MainToolbarController?
-
+    private var didScheduleFirstFrame = false
+    private var didScheduleSettledFrame = false
+    private var launchDataPhases: Set<String> = []
 
     private init() { super.init(window: nil) }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Records the two data phases that make the initial shell useful. The
+    /// completion is intentionally attached to Core Animation rather than a
+    /// SwiftUI task, so QA measures a committed frame instead of model time.
+    static func noteLaunchDataPhase(_ phase: String) {
+        guard ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" else { return }
+        shared.launchDataPhases.insert(phase)
+        shared.scheduleSettledFrameIfReady()
+    }
+
+    private func scheduleSettledFrameIfReady() {
+        guard !didScheduleSettledFrame,
+              launchDataPhases.contains("folders-snapshot"),
+              launchDataPhases.contains("first-rows"),
+              let window
+        else { return }
+        didScheduleSettledFrame = true
+        CATransaction.begin()
+        CATransaction.setCompletionBlock {
+            QALaunch.launchPhase("settled-frame")
+        }
+        window.contentView?.needsLayout = true
+        CATransaction.commit()
+    }
 
     func show(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
         var toolbarToInstall: MainToolbarController?
@@ -987,8 +1193,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             shell.update(model: model, appearance: appearance, actions: actions)
             toolbarController?.update(model: model)
         } else {
+            shellLaunchPhase("shell-construction-begin")
             let shell = MainShellViewController(model: model, appearance: appearance, actions: actions)
             self.shell = shell
+            shellLaunchPhase("shell-construction-end")
             let window = NSWindow(
                 contentRect: NSRect(origin: .zero, size: MainWindowStartupConfiguration.defaultContentSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -1002,17 +1210,27 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 toggleAction: { [weak shell] in shell?.toggleSidebar(nil) }
             )
             self.toolbarController = toolbarController
+            shellLaunchPhase("shell-toolbar-controller-ready")
             self.window = window
             MainWindowStartupConfiguration.attach(shell, to: window)
+            shellLaunchPhase("shell-window-attached")
             toolbarToInstall = toolbarController
         }
 
         guard let window else { return }
-        window.makeKeyAndOrderFront(nil)
+        if !didScheduleFirstFrame {
+            didScheduleFirstFrame = true
+            CATransaction.begin()
+            CATransaction.setCompletionBlock {
+                QALaunch.launchPhase("first-frame")
+            }
+            window.makeKeyAndOrderFront(nil)
+            CATransaction.commit()
+        } else {
+            window.makeKeyAndOrderFront(nil)
+        }
         NSApp.activate()
-        #if DEBUG
         QALaunch.launchPhase("window-front")
-        #endif
 
         // The shell is already attached when the window fronts. Install the
         // toolbar on the next main-actor turn so its native setup cannot delay
@@ -1020,9 +1238,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if let toolbarToInstall {
             Task { @MainActor [weak self, weak window, toolbarToInstall] in
                 guard let self, let window, self.window === window else { return }
+                shellLaunchPhase("shell-toolbar-install-begin")
                 window.toolbar = toolbarToInstall.makeToolbar()
+                shellLaunchPhase("shell-toolbar-install-end")
             }
         }
+        scheduleSettledFrameIfReady()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
