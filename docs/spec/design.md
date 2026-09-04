@@ -139,7 +139,7 @@ empty-reader state and while global search is presented.
   no shared capsule — so the glyphs sit as close as the toolbar allows, like
   Craft's reader chrome. They use one symbol configuration (17 pt, medium
   weight) so unbordered images match the sidebar toggle's size. The active
-  tab fill is `secondarySystemFill`; hover is `quaternarySystemFill`.
+  tab fill is `unemphasizedSelectedContentBackgroundColor`; hover is `quaternarySystemFill`.
 - Its title MUST contain only the subject, MUST use semantic `.subheadline`, and
   MUST use the trailing fade mask when compressed. The active tab MUST use
   semantic selection treatment and label color; inactive tabs MUST have no fill
@@ -172,16 +172,17 @@ choices are mutually exclusive:
 
 ### Hover preview card
 
-- Hovering a tab MUST immediately show a floating card beneath that tab with no
-  dwell delay or entrance animation. Leaving the tab MUST dismiss it after a
-  150 ms grace period unless the pointer is over the card; moving directly to
-  another tab transfers the card immediately.
-- The card MUST be a non-activating borderless child panel exactly 220 pt wide
-  by 160 pt high, containing a vertically scrollable child for the local
-  rendered or plain-text preview. It MUST use 14 pt horizontal and 12 pt
-  vertical padding, a continuous `AppShapeScale.card` (18 pt) corner radius,
-  semantic control/window colors, and the standard card shadow: black at 0.28
-  opacity, 28 pt blur radius, 14 pt downward offset.
+- Hovering an inactive tab MUST immediately show a floating card beneath that
+  tab with no dwell delay or entrance animation; the active tab never shows a
+  card (its content is already on screen). Leaving the tab MUST dismiss it
+  after a 150 ms grace period unless the pointer is over the card; moving
+  directly to another tab transfers the card immediately.
+- The card MUST be a system `NSPopover` (`.applicationDefined` behaviour,
+  no animation) anchored below the hovered tab, exactly 220 pt wide by
+  160 pt high, whose whole content scrolls as one piece without a scroll
+  indicator. The popover supplies the chrome (the same as the QR-code
+  popover); the card paints no background of its own. 14 pt horizontal and
+  12 pt vertical padding.
 - If sender and received time are already available locally, the card MUST
   include them in a compact metadata line; otherwise it MUST omit them and MUST
   NOT fetch them. It MUST NEVER fetch remote content, mark the message read,

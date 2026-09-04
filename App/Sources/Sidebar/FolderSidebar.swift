@@ -663,12 +663,28 @@ private final class InlineTextFieldView: NSTextField {
 
     override func becomeFirstResponder() -> Bool {
         let became = super.becomeFirstResponder()
-        if became, let editor = currentEditor() as? NSTextView {
-            editor.drawsBackground = false
-            editor.backgroundColor = .clear
-            editor.insertionPointColor = .labelColor
-        }
+        if became { clearFieldEditorBackground() }
         return became
+    }
+
+    /// The cell re-applies its own attributes to the field editor after the
+    /// field becomes first responder (which is what painted the opaque
+    /// `textBackgroundColor` band); clear it again once editing has begun.
+    override func textDidBeginEditing(_ notification: Notification) {
+        super.textDidBeginEditing(notification)
+        clearFieldEditorBackground()
+    }
+
+    private func clearFieldEditorBackground() {
+        guard let editor = currentEditor() as? NSTextView else { return }
+        editor.drawsBackground = false
+        editor.backgroundColor = .clear
+        editor.insertionPointColor = .labelColor
+        editor.enclosingScrollView?.drawsBackground = false
+        DispatchQueue.main.async { [weak editor] in
+            editor?.drawsBackground = false
+            editor?.backgroundColor = .clear
+        }
     }
 }
 

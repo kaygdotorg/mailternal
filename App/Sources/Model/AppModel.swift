@@ -2,6 +2,13 @@ import AppKit
 import Observation
 import SwiftUI
 import MailternalInterfaces
+import os
+
+private let appModelSignpostLog = OSLog(
+    subsystem: "org.kayg.mailternal",
+    category: "ReaderTabs"
+)
+
 private enum MailModelRouteError: LocalizedError {
     case messageUnavailable
     case linkUnavailable
@@ -22,6 +29,9 @@ final class AppModel {
     let facade: any MailFacade
     let appearance: AppearanceSettings
     let actions: ActionSettings
+    /// Retains fetched content while a reader tab is inactive, so activating
+    /// a loaded tab does not issue another facade.detail request.
+    @ObservationIgnored private var detailCache: [MessageID: MessageDetail] = [:]
     let toasts = ToastPresenter()
     @ObservationIgnored private let faviconStore: FaviconStore
     private var faviconImages: [String: NSImage] = [:]
@@ -414,6 +424,7 @@ final class AppModel {
             selectedFolderID = nil
             selectedMessageIDs.removeAll()
             selectedMessageID = nil
+            detailCache.removeAll(keepingCapacity: false)
             detail = nil
             listRows = []
             messageDeepLinks.removeAll()
@@ -535,6 +546,15 @@ final class AppModel {
     private func loadMessageDetail(_ id: MessageID) {
         qaSelectionSequence &+= 1
         let qaSelection = qaSelectionSequence
+        let signpostID = OSSignpostID(log: appModelSignpostLog)
+        os_signpost(
+            .begin,
+            log: appModelSignpostLog,
+            name: "loadMessageDetail",
+            signpostID: signpostID,
+            "message=%{public}s",
+            String(id.rawValue)
+        )
         #if DEBUG
         if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
             QALaunch.log(
@@ -548,30 +568,35 @@ final class AppModel {
         findQuery = ""
         allowRemoteImages = false
         isLoadingDetail = true
+        if let cached = detailCache[id] {
+            presentDetail(
+                cached,
+                id: id,
+                selection: qaSelection,
+                source: "cache",
+                signpostID: signpostID
+            )
+            return
+        }
         Task { [weak self] in
             guard let self else { return }
             do {
                 let loaded = try await facade.detail(id)
-                guard selectedMessageID == id, selectedMessageIDs == Set([id]) else { return }
-                detail = loaded
-                isLoadingDetail = false
-                let senderDomains = loaded.envelope.from.compactMap { address in
-                    address.address.split(separator: "@", omittingEmptySubsequences: true).last.map(String.init)
-                }
-                if !senderDomains.isEmpty {
-                    Task { [weak self] in
-                        await self?.warmupFavicons(forSenderDomains: senderDomains)
-                    }
-                }
-                #if DEBUG
-                if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
-                    QALaunch.log(
-                        "selection-perf event=detail serial=\(qaSelection) t=\(DispatchTime.now().uptimeNanoseconds)"
-                    )
-                }
-                #endif
-                markRead(id)
+                presentDetail(
+                    loaded,
+                    id: id,
+                    selection: qaSelection,
+                    source: "facade",
+                    signpostID: signpostID
+                )
             } catch {
+                os_signpost(
+                    .end,
+                    log: appModelSignpostLog,
+                    name: "loadMessageDetail",
+                    signpostID: signpostID,
+                    "result=error"
+                )
                 guard !Task.isCancelled,
                       selectedMessageID == id,
                       selectedMessageIDs == Set([id]) else { return }
@@ -579,6 +604,44 @@ final class AppModel {
             }
         }
     }
+
+    private func presentDetail(
+        _ loaded: MessageDetail,
+        id: MessageID,
+        selection: UInt64,
+        source: String,
+        signpostID: OSSignpostID
+    ) {
+        detailCache[id] = loaded
+        os_signpost(
+            .end,
+            log: appModelSignpostLog,
+            name: "loadMessageDetail",
+            signpostID: signpostID,
+            "result=%{public}s",
+            source
+        )
+        guard selectedMessageID == id, selectedMessageIDs == Set([id]) else { return }
+        detail = loaded
+        isLoadingDetail = false
+        let senderDomains = loaded.envelope.from.compactMap { address in
+            address.address.split(separator: "@", omittingEmptySubsequences: true).last.map(String.init)
+        }
+        if !senderDomains.isEmpty {
+            Task { [weak self] in
+                await self?.warmupFavicons(forSenderDomains: senderDomains)
+            }
+        }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
+            QALaunch.log(
+                "selection-perf event=detail serial=\(selection) source=\(source) t=\(DispatchTime.now().uptimeNanoseconds)"
+            )
+        }
+        #endif
+        markRead(id)
+    }
+
 
     private func clearReaderSelection() {
         detail = nil
@@ -903,6 +966,23 @@ final class AppModel {
 
     func activateTab(_ id: UUID) {
         guard let tab = tabs.tabs.first(where: { $0.id == id }) else { return }
+        let signpostID = OSSignpostID(log: appModelSignpostLog)
+        os_signpost(
+            .begin,
+            log: appModelSignpostLog,
+            name: "activateTab",
+            signpostID: signpostID,
+            "tab=%{public}s",
+            id.uuidString
+        )
+        defer {
+            os_signpost(
+                .end,
+                log: appModelSignpostLog,
+                name: "activateTab",
+                signpostID: signpostID
+            )
+        }
         tabs.activate(id)
         if let folder = folderContaining(tab.message),
            listRows.contains(where: { $0.id == tab.message }),
@@ -967,6 +1047,7 @@ final class AppModel {
     @discardableResult
     func messageRemoved(_ id: MessageID) -> Bool {
         guard tabs.messageRemoved(id) else { return false }
+        detailCache.removeValue(forKey: id)
         toasts.post(title: "Message was deleted")
         if selectedMessageID == id {
             if let active = tabs.active {
@@ -984,6 +1065,7 @@ final class AppModel {
     /// state. Remove its tab without a toast and leave the reader empty when
     /// no other tab remains.
     private func closeUnavailableTab(messageID: MessageID) {
+        detailCache.removeValue(forKey: messageID)
         guard let tabID = tabs.tabs.first(where: { $0.message == messageID })?.id else {
             return
         }
@@ -1003,6 +1085,23 @@ final class AppModel {
         guard !isSyncingTabSelection else { return }
         isSyncingTabSelection = true
         defer { isSyncingTabSelection = false }
+        let signpostID = OSSignpostID(log: appModelSignpostLog)
+        os_signpost(
+            .begin,
+            log: appModelSignpostLog,
+            name: "syncSelection",
+            signpostID: signpostID,
+            "message=%{public}s",
+            String(id.rawValue)
+        )
+        defer {
+            os_signpost(
+                .end,
+                log: appModelSignpostLog,
+                name: "syncSelection",
+                signpostID: signpostID
+            )
+        }
         if let folder, selectedFolderID != folder {
             selectFolder(folder)
         }

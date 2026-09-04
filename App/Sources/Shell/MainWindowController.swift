@@ -6,6 +6,10 @@ import SwiftUI
 import MailternalInterfaces
 
 private let mainWindowSignpostLog = OSLog(subsystem: "org.kayg.mailternal", category: "ShellLaunch")
+private let readerToolbarSignpostLog = OSLog(
+    subsystem: "org.kayg.mailternal",
+    category: "ReaderToolbar"
+)
 
 @inline(__always)
 private func shellLaunchPhase(_ name: String) {
@@ -853,6 +857,11 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     }
 
     private func configureReaderTabs() {
+        os_signpost(
+            .event,
+            log: readerToolbarSignpostLog,
+            name: "configureReaderTabs"
+        )
         let shouldShow = !model.tabs.tabs.isEmpty && !model.isSearchPresented
         guard let toolbar else {
             readerTabsItem.isHidden = !shouldShow
@@ -918,6 +927,11 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     }
 
     private func updateReaderTabsWidth() {
+        os_signpost(
+            .event,
+            log: readerToolbarSignpostLog,
+            name: "updateReaderTabsWidth"
+        )
         guard includesSidebarToggle,
               let window = readerTabsHosting.window,
               let contentView = window.contentView,

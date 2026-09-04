@@ -3,6 +3,10 @@ import AppKit
 import os
 import WebKit
 import MailternalSanitizer
+private let messageHTMLSignpostLog = OSLog(
+    subsystem: "org.kayg.mailternal",
+    category: "HTMLRender"
+)
 
 /// Failure to install the categorical `WKContentRuleList` network fence.
 public struct MessageWebIsolationError: Error, LocalizedError, Sendable {
@@ -57,6 +61,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     private var documentScrollTask: Task<Void, Never>?
     private var documentScrollGeneration: UInt64 = 0
     private var pendingDocumentScrollOffset: CGFloat?
+    private var pendingHTMLSignpostID: OSSignpostID?
     #if DEBUG
     private var qaRenderSequence: UInt64 = 0
     #endif
@@ -350,6 +355,23 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
                 )
             }
             #endif
+            if let pendingHTMLSignpostID {
+                os_signpost(
+                    .end,
+                    log: messageHTMLSignpostLog,
+                    name: "html-requested",
+                    signpostID: pendingHTMLSignpostID,
+                    "result=superseded"
+                )
+            }
+            let signpostID = OSSignpostID(log: messageHTMLSignpostLog)
+            pendingHTMLSignpostID = signpostID
+            os_signpost(
+                .begin,
+                log: messageHTMLSignpostLog,
+                name: "html-requested",
+                signpostID: signpostID
+            )
             webView.loadHTMLString(Self.wrap(lastHTML, emailReadingMode: emailReadingMode), baseURL: nil)
         case .refuseHTML:
             pendingRender = false
@@ -498,6 +520,16 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     }
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
+        if let signpostID = pendingHTMLSignpostID {
+            pendingHTMLSignpostID = nil
+            os_signpost(
+                .end,
+                log: messageHTMLSignpostLog,
+                name: "html-requested",
+                signpostID: signpostID,
+                "result=did-finish"
+            )
+        }
         #if DEBUG
         if ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" {
             QALaunch.log(

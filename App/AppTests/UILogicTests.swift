@@ -1646,6 +1646,23 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(sorted.map(\.id.rawValue), ["a", "b", "z"])
     }
 
+    func testAccountsListPolicyKeepsDisabledAccountInList() {
+        let disabled = AccountConfig(
+            id: AccountID(rawValue: "disabled"),
+            accountLinkID: .random(),
+            displayName: "Offline",
+            emailAddress: "offline@example.com",
+            username: "offline@example.com",
+            imap: IMAPEndpoint(host: "imap.example.com", port: 993, security: .implicitTLS),
+            isEnabled: false
+        )
+
+        XCTAssertEqual(AccountsListPolicy.sorted([disabled]).map(\.id), [disabled.id])
+        XCTAssertFalse(AccountsListPolicy.showsEmptyState(for: [disabled], isAdding: false))
+        XCTAssertTrue(AccountsListPolicy.showsEmptyState(for: [], isAdding: false))
+        XCTAssertFalse(AccountsListPolicy.showsEmptyState(for: [], isAdding: true))
+    }
+
     func testAccountsListPolicyMapsStatesToDotStatusesAndErrors() {
         XCTAssertEqual(AccountsListPolicy.status(for: .active), .active)
         XCTAssertEqual(AccountsListPolicy.status(for: .validating), .validating)

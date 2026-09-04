@@ -78,31 +78,17 @@ struct CacheSettingsView: View {
                         }
                     }
                 } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "chevron.right")
-                            .font(.caption.weight(.semibold))
-                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                            .foregroundStyle(.secondary)
-                        VStack(alignment: .leading, spacing: CacheSettingsLayout.titleSubtitleGap) {
-                            Text(title)
-                                .lineLimit(1)
-                            if let config {
-                                Text(config.emailAddress)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                        }
-                    }
-                    .contentShape(Rectangle())
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16, height: 16)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("\(title), \(config?.emailAddress ?? "")")
-
-                Spacer(minLength: 8)
+                .accessibilityLabel(isExpanded ? "Collapse \(title)" : "Expand \(title)")
 
                 CacheTriStateToggle(
-                    title: "All",
+                    title: nil,
                     state: CacheTreePolicy.accountState(for: folders),
                     onToggle: {
                         let state = CacheTreePolicy.accountState(for: folders)
@@ -113,6 +99,23 @@ struct CacheSettingsView: View {
                     }
                 )
                 .accessibilityIdentifier(UIIdentifier.cacheAccount(accountID.rawValue))
+                .accessibilityLabel("Enable all folders under \(title)")
+
+                VStack(alignment: .leading, spacing: CacheSettingsLayout.titleSubtitleGap) {
+                    Text(title)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                if let config {
+                    Text(config.emailAddress)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .multilineTextAlignment(.trailing)
+                        .frame(minWidth: 80, maxWidth: 180, alignment: .trailing)
+                }
             }
 
             if isExpanded {
@@ -167,7 +170,7 @@ struct CacheSettingsView: View {
 }
 
 private struct CacheTriStateToggle: View {
-    let title: String
+    let title: String?
     let state: CacheTreePolicy.State
     let onToggle: () -> Void
 
@@ -175,8 +178,10 @@ private struct CacheTriStateToggle: View {
         Toggle(isOn: Binding(
             get: { state == .checked },
             set: { _ in onToggle() }
-        )) {
-            Text(title)
+        ) {
+            if let title {
+                Text(title)
+            }
         }
         .toggleStyle(.checkbox)
         .accessibilityValue(accessibilityValue)

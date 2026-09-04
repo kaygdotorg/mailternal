@@ -1,6 +1,12 @@
 import AppKit
 import SwiftUI
 import MailternalInterfaces
+import os
+
+private let readerTabBarSignpostLog = OSLog(
+    subsystem: "org.kayg.mailternal",
+    category: "ReaderTabs"
+)
 
 /// The main-window reader's single tab row. It owns no message state: opening,
 /// activation, persistence, and mutation all stay on AppModel/ReaderTabs.
@@ -19,6 +25,11 @@ struct ReaderTabBar: View {
     @State private var tabBarView: NSView?
 
     var body: some View {
+        let _ = os_signpost(
+            .event,
+            log: readerTabBarSignpostLog,
+            name: "ReaderTabBar.body"
+        )
         if !model.tabs.tabs.isEmpty && !model.isSearchPresented {
             GeometryReader { geometry in
                 let widths = model.tabs.tabs.map { tabWidth(for: $0) }

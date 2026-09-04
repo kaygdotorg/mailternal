@@ -189,8 +189,9 @@ struct ReaderTabItem: View {
     }
 }
 
-/// Active tab: secondary fill (two steps stronger than the hover wash) so the
-/// selected tab reads clearly against the clear strip; hover keeps quaternary.
+/// Active tab: the system's unemphasized selection background (the same
+/// colour a non-key list uses for its selected row), so the selected tab reads
+/// as a selection against the clear strip; hover keeps the quaternary wash.
 private struct ReaderTabGlassModifier: ViewModifier {
     let isActive: Bool
     let isHovered: Bool
@@ -204,7 +205,7 @@ private struct ReaderTabGlassModifier: ViewModifier {
 
     private var fill: Color {
         if isActive {
-            return Color(nsColor: .secondarySystemFill)
+            return Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
         }
         if isHovered {
             return Color(nsColor: .quaternarySystemFill).opacity(contrast == .increased ? 0.9 : 0.72)

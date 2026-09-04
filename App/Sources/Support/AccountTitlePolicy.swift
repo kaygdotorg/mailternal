@@ -54,6 +54,13 @@ enum AccountsListPolicy {
         }
     }
 
+    /// The account editor's empty state is reserved for an actually empty
+    /// configuration list. Disabled accounts remain visible so they can be
+    /// enabled again.
+    static func showsEmptyState(for configs: [AccountConfig], isAdding: Bool) -> Bool {
+        configs.isEmpty && !isAdding
+    }
+
     static func rowSummary(for config: AccountConfig) -> RowSummary {
         RowSummary(
             displayName: AccountTitlePolicy.title(for: config) ?? "",

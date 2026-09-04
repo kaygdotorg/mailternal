@@ -8,7 +8,6 @@ struct AccountsSettingsView: View {
     @State private var expandedRowID: AccountID?
     @State private var pendingRemovalID: AccountID?
     @State private var draftDisplayNames: [AccountID: String] = [:]
-    @State private var editorHeights: [AccountID: CGFloat] = [:]
     @State private var isRemoveConfirmationPresented = false
 
     private static let blankAccountID = AccountID(rawValue: "new-account")
@@ -33,7 +32,7 @@ struct AccountsSettingsView: View {
     }
     var body: some View {
         Group {
-            if accounts.isEmpty && !isAdding {
+            if AccountsListPolicy.showsEmptyState(for: accounts, isAdding: isAdding) {
                 emptyState
             } else {
                 accountList
@@ -72,19 +71,16 @@ struct AccountsSettingsView: View {
 
     private var accountList: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
-                    ForEach(accounts, id: \.id) { account in
-                        accountSection(account)
-                    }
-                    if isAdding {
-                        accountSection(nil)
-                    }
+            List {
+                ForEach(accounts, id: \.id) { account in
+                    accountSection(account)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 8)
+                if isAdding {
+                    accountSection(nil)
+                }
             }
+            .listStyle(.inset)
+            .scrollContentBackground(.hidden)
             .onChange(of: expandedRowID) { _, rowID in
                 guard let rowID else { return }
                 DispatchQueue.main.async {
@@ -99,64 +95,51 @@ struct AccountsSettingsView: View {
     @ViewBuilder
     private func accountSection(_ account: AccountConfig?) -> some View {
         let rowID = account?.id ?? Self.blankAccountID
-        let isExpanded = expandedRowID == rowID
-        let state = account.map { model.accountStates[$0.id] ?? .none } ?? .none
-        let editorHeight = editorHeights[rowID] ?? 0
-        let targetEditorHeight = isExpanded ? editorHeight : 0
 
-        VStack(spacing: 0) {
-            AccountRow(
-                account: account,
-                state: state,
-                displayName: displayNameBinding(for: account),
-                isExpanded: isExpanded,
-                onToggle: { toggleExpansion(for: rowID) },
-                onCommitName: { commitDisplayName($0, for: rowID) },
-                onToggleEnabled: account == nil ? nil : {
-                    Task { await model.setAccountEnabled(rowID, !account!.isEnabled) }
-                },
-                onRemove: account == nil ? nil : { requestRemoval(rowID) }
-            )
-
-            // Keep the editor in the hierarchy while collapsed. Its fixed-size
-            // measurement remains available even though the outer container
-            // clips it to zero height, preventing a second reflow.
-            ZStack(alignment: .top) {
-                AccountEditorSheet(
-                    model: model,
-                    configuration: account,
-                    displayName: displayNameBinding(for: account),
-                    onCancel: { cancelEditing(rowID) },
-                    onSaved: { finishEditing(rowID) },
-                    onRemove: account == nil ? nil : { requestRemoval(rowID) }
-                )
-                .padding(.leading, 28)
-                .padding(.trailing, 8)
-                .fixedSize(horizontal: false, vertical: true)
-                .onGeometryChange(for: CGFloat.self) { proxy in
-                    proxy.size.height
-                } action: { height in
-                    guard height.isFinite, height > 0 else { return }
-                    guard abs((editorHeights[rowID] ?? 0) - height) > 0.5 else { return }
-                    editorHeights[rowID] = height
-                }
-                .allowsHitTesting(isExpanded)
-                .accessibilityHidden(!isExpanded)
-            }
-            .frame(maxWidth: .infinity, alignment: .top)
-            .frame(height: targetEditorHeight, alignment: .top)
-            .clipped()
-            .animation(
-                isExpanded ? MailMotion.expand : MailMotion.accountEditorCollapse,
-                value: targetEditorHeight
-            )
+        accountRow(account)
+        if expandedRowID == rowID {
+            accountEditorRow(account)
         }
-        .background(Color(nsColor: NSColor.controlBackgroundColor).opacity(0.18))
-        .clipShape(RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous))
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .opacity(account.map { $0.isEnabled ? 1 : 0.55 } ?? 1)
+    }
+
+    private func accountRow(_ account: AccountConfig?) -> some View {
+        let rowID = account?.id ?? Self.blankAccountID
+        let state = account.map { model.accountStates[$0.id] ?? .none } ?? .none
+
+        return AccountRow(
+            account: account,
+            state: state,
+            displayName: displayNameBinding(for: account),
+            isExpanded: expandedRowID == rowID,
+            onToggle: { toggleExpansion(for: rowID) },
+            onCommitName: { commitDisplayName($0, for: rowID) },
+            onToggleEnabled: account == nil ? nil : {
+                Task { await model.setAccountEnabled(rowID, !account!.isEnabled) }
+            },
+            onRemove: account == nil ? nil : { requestRemoval(rowID) }
+        )
         .id(rowID)
     }
+
+    private func accountEditorRow(_ account: AccountConfig?) -> some View {
+        let rowID = account?.id ?? Self.blankAccountID
+
+        return AccountEditorSheet(
+            model: model,
+            configuration: account,
+            displayName: displayNameBinding(for: account),
+            onCancel: { cancelEditing(rowID) },
+            onSaved: { finishEditing(rowID) },
+            onRemove: account == nil ? nil : { requestRemoval(rowID) }
+        )
+        .padding(.leading, 28)
+        .padding(.trailing, 8)
+        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .id("\(rowID.rawValue)-editor")
+    }
+
 
     private var emptyState: some View {
         VStack(spacing: 10) {
@@ -388,16 +371,37 @@ private struct AccountRow: View {
                 }
             }
         }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            if let account {
+                Button {
+                    onToggleEnabled?()
+                } label: {
+                    Label(
+                        account.isEnabled ? "Disable Account" : "Enable Account",
+                        systemImage: account.isEnabled ? "pause.circle" : "play.circle"
+                    )
+                }
+                .tint(account.isEnabled ? .orange : .green)
+
+                Button(role: .destructive) {
+                    onRemove?()
+                } label: {
+                    Label("Remove Account", systemImage: "trash")
+                }
+            }
+        }
     }
 
     private var statusColor: Color {
-        guard account != nil else { return .secondary }
+        guard let account else { return .secondary }
+        guard account.isEnabled else { return .red }
         switch AccountsListPolicy.status(for: state) {
         case .active: return .green
         case .validating: return .orange
         case .error: return .red
         }
     }
+
 
     private func commitName() {
         onCommitName(displayName)
