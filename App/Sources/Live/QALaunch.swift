@@ -149,6 +149,11 @@ enum QALaunch: Sendable {
         log(String(format: "launch phase=%@ t=%.1fms footprint=%lld", name, millisecondsSinceProcessStart(), footprintBytes()))
     }
 
+    /// Named sub-phase marker used to attribute store and shell launch gaps.
+    static func launchSubphase(_ name: String) {
+        launchPhase(name)
+    }
+
     /// Activity Monitor "memory footprint" (`phys_footprint`), or -1 if unavailable.
     static func footprintBytes() -> Int64 {
         var info = task_vm_info_data_t()

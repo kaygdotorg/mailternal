@@ -332,7 +332,7 @@ extension MailStore {
         if cap == 0 { return MessagePage(rows: [], next: nil) }
 
         var sql = """
-            SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date, m.uid,
+            SELECT m.id, m.from_display, m.from_text, m.subject, m.preview, m.internal_date, m.uid,
                    m.is_read, m.has_attachments, m.is_flagged,
                    f.id AS folder_id,
                    COALESCE(NULLIF(f.name, ''), CASE f.role
@@ -417,6 +417,7 @@ extension MailStore {
         return MessageRow(
             id: MessageID(rawValue: row["id"]),
             from: row["from_display"],
+            senderAddress: row["from_text"],
             subject: row["subject"],
             preview: preview,
             date: Date(timeIntervalSince1970: row["internal_date"]),

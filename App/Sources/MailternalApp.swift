@@ -10,9 +10,7 @@ struct MailternalApp: App {
     @State private var actions: ActionSettings
 
     init() {
-        #if DEBUG
         QALaunch.launchPhase("app-init")
-        #endif
         let appearance = AppearanceSettings()
         let actions = ActionSettings()
         let model = AppModel(facade: Self.makeFacade(), appearance: appearance, actions: actions)
@@ -83,6 +81,12 @@ struct MailternalApp: App {
                 }
                 .keyboardShortcut("d", modifiers: [.command, .option])
                 .disabled(model.selectedMessageIDs.count != 1)
+                Picker("Tab Style", selection: $appearance.tabStyle) {
+                    ForEach(ReaderTabStyle.allCases) { style in
+                        Text(style.label).tag(style)
+                    }
+                }
+                .pickerStyle(.menu)
             }
             CommandGroup(after: .windowArrangement) {
                 Button("Close Tab") {
@@ -120,6 +124,7 @@ struct MailternalApp: App {
                 .keyboardShortcut("]", modifiers: [.command, .shift])
                 .disabled(model.tabs.tabs.count < 2)
             }
+
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") {
                     model.showSettings()
@@ -167,8 +172,8 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        #if DEBUG
         QALaunch.launchPhase("did-finish-launching")
+        #if DEBUG
         if let qa = QALaunch.parse(), qa.openWindowLink == nil,
            !ProcessInfo.processInfo.arguments.contains("-qa-gui") {
             // SwiftUI `.task` on MainSplitRoot may never fire without a rendered
@@ -220,7 +225,9 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
 
     func showMainWindow() {
         guard let model, let appearance, let actions else { return }
+        QALaunch.launchSubphase("shell-show-begin")
         MainWindowController.shared.show(model: model, appearance: appearance, actions: actions)
+        QALaunch.launchSubphase("shell-show-end")
     }
 
     func toggleSidebar() {

@@ -9,7 +9,8 @@ enum Schema {
     }
 
     static func makeMigrator(
-        progress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in }
+        progress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in },
+        openProgress: @escaping @Sendable (String) -> Void = { _ in }
     ) -> DatabaseMigrator {
         let total = 13
         var migrator = DatabaseMigrator()
@@ -122,10 +123,12 @@ enum Schema {
             // this partial index the count visits every row of the generation
             // (107 ms warm, 1.3 s cold on a 1 GB store); with it the count is
             // index-only and stays proportional to the unread rows.
+            openProgress("index-build-begin")
             try db.execute(sql: """
                 CREATE INDEX messages_unread_idx
                 ON messages(generation_id) WHERE is_read = 0
                 """)
+            openProgress("index-build-end")
         }
         migrator.registerMigration("v11_keep_locally") { db in
             progress(11, total, "v11_keep_locally")

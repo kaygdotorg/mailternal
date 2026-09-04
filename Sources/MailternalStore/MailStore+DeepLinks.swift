@@ -69,9 +69,8 @@ extension MailStore {
                 guard let row = try Row.fetchOne(
                     db,
                     sql: """
-                        SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date,
+                        SELECT m.id, m.from_display, m.from_text, m.subject, m.preview, m.internal_date,
                                m.is_read, m.has_attachments, m.is_flagged,
-                               f.id AS folder_id,
                                COALESCE(NULLIF(f.name, ''), CASE f.role
                                    WHEN 'inbox' THEN 'INBOX'
                                    WHEN 'archive' THEN 'Archive'

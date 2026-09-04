@@ -148,6 +148,8 @@ public struct Envelope: Hashable, Sendable {
 public struct MessageRow: Identifiable, Hashable, Sendable {
     public var id: MessageID
     public var from: String       // rendered sender
+    /// Original sender address retained for sender-domain favicon lookup.
+    public var senderAddress: String?
     public var subject: String
     public var preview: String
     public var date: Date
@@ -160,11 +162,11 @@ public struct MessageRow: Identifiable, Hashable, Sendable {
     public var accountName: String?
     /// Owning folder when this row came from global search.
     public var folderID: FolderID?
-    public init(id: MessageID, from: String, subject: String, preview: String,
+    public init(id: MessageID, from: String, senderAddress: String? = nil, subject: String, preview: String,
                 date: Date, isRead: Bool, hasAttachments: Bool,
                 isFlagged: Bool = false, folderName: String,
                 accountName: String? = nil, folderID: FolderID? = nil) {
-        self.id = id; self.from = from; self.subject = subject; self.preview = preview
+        self.id = id; self.from = from; self.senderAddress = senderAddress; self.subject = subject; self.preview = preview
         self.date = date; self.isRead = isRead; self.hasAttachments = hasAttachments
         self.isFlagged = isFlagged; self.folderName = folderName
         self.accountName = accountName; self.folderID = folderID

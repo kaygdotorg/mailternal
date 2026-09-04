@@ -22,7 +22,7 @@
 - Use the deployed bundle or your own chunk build; own QA container per agent
   (`cp -R ~/mailternal-qa-ReaderIslands ~/mailternal-qa-<agent>`); announce server mutations on
   hub; restore what you move.
-- **Launch timing**: `MAILTERNAL_QA=1 Mailternal -qa-account … -qa-gui` prints `launch phase=<name> t=<ms since exec>` for app-init, store-open, did-finish-launching, window-front, folders-snapshot, first-rows. The older `first-page ready` line is a 2 s poller and is not a launch metric. Cold DB file without sudo: `sqlite3 store.sqlite "VACUUM INTO 'copy.sqlite'"` into a fresh container.
+- **Launch timing**: `MAILTERNAL_QA=1 Mailternal -qa-account … -qa-gui` prints `launch phase=<name> t=<ms since exec>` for app-init, did-finish-launching, shell-show-begin/end, window-front, first-frame, folders-snapshot, first-rows, settled-frame, plus store-open subphases (`store-pool-open-*`, `store-pragmas-*`, `store-migrator-*`, `store-index-build-*`, `store-checkpoint-skipped`, `store-first-queries-*`). `first-frame` is the first Core Animation transaction completion after `orderFront`; `settled-frame` is the first Core Animation commit after both folders and rows are ready. The older `first-page ready` line is a 2 s poller and is not a launch metric. `vm-qa.sh launch-release` runs the Release app selected by `APP` (default `~/mailternal/Mailternal-release.app`).
 - **QA IMAP server** is the Dovecot on mbp itself: `-qa-account 127.0.0.1 1143 startTLS`
   (user `qa@mailternal.test`, `MAILTERNAL_QA_PASSWORD=qa-password`). `10.69.69.155:1025` is
   dead; a container seeded for a different `qa-<host>-<port>` account id is wiped by the QA

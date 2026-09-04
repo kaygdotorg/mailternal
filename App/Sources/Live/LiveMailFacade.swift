@@ -161,6 +161,9 @@ final class LiveMailFacade: MailFacade {
                             identifier: identifier
                         )
                     )
+                },
+                openProgress: { phase in
+                    QALaunch.launchSubphase("store-\(phase)")
                 }
             )
         }
@@ -209,10 +212,12 @@ final class LiveMailFacade: MailFacade {
         didRestore = true
         do {
             store = try await readyStore()
+            QALaunch.launchSubphase("store-first-queries-begin")
             if let qa = QALaunch.parse() {
                 try await seedQAAccount(qa)
             }
             let persisted = try await store.fetchAccounts()
+            QALaunch.launchSubphase("store-first-queries-end")
             accounts = persisted
             configsByID = Dictionary(uniqueKeysWithValues: persisted.map { ($0.id, $0) })
             for account in persisted {
@@ -252,9 +257,7 @@ final class LiveMailFacade: MailFacade {
             store = opened
             storeProgressTask?.cancel()
             storeLoadState = .ready
-            #if DEBUG
             QALaunch.launchPhase("store-open")
-            #endif
             return opened
         } catch {
             storeLoadState = .failed(message: error.localizedDescription)
@@ -562,7 +565,7 @@ final class LiveMailFacade: MailFacade {
             do {
                 try await store.enqueueMove(messages: messageIDs, to: destination)
                 if let accountID = destinations.first(where: { $0.value == destination })?.key {
-                    await engines[accountID]?.refreshNow()
+                    await engines[accountID]?.moveNow()
                 }
             } catch {
                 await logMoveError(error, folder: destination)
@@ -622,7 +625,7 @@ final class LiveMailFacade: MailFacade {
         } catch {
             throw await loggedMoveError(error, account: destinationAccount, folder: folder)
         }
-        await engines[destinationAccount]?.refreshNow()
+        await engines[destinationAccount]?.moveNow()
         return MoveOutcome(
             movedCount: eligible.count,
             skippedCrossAccountCount: skippedCrossAccount,

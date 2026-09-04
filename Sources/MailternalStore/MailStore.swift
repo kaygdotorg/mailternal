@@ -1,5 +1,20 @@
 import Foundation
+#if canImport(os)
+import os
+#endif
 import GRDB
+
+#if canImport(os)
+private let mailStoreSignpostLog = OSLog(subsystem: "org.kayg.mailternal", category: "StoreOpen")
+#endif
+
+@inline(__always)
+private func mailStoreOpenSignpost(_ phase: String) {
+    #if canImport(os)
+    os_signpost(.event, log: mailStoreSignpostLog, name: "store-open", "%{public}s", phase)
+    #endif
+}
+
 
 /// GRDB 7 storage layer for Mailternal (spec: sync.md Storage).
 ///
@@ -27,12 +42,15 @@ public final class MailStore: Sendable {
     /// Opens (or creates) the store at `databaseURL` with attachment files under
     /// `cachesDirectory`. `migrationProgress` is called before each migration
     /// body with its one-based position, total count, and identifier.
+    /// `openProgress` reports the synchronous open stages to an optional
+    /// launch profiler; it is otherwise unused by the store.
     public convenience init(
         databaseURL: URL,
         cachesDirectory: URL,
         attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes,
         observationDebounce: Duration = MailStore.defaultObservationDebounce,
-        migrationProgress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in }
+        migrationProgress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in },
+        openProgress: @escaping @Sendable (String) -> Void = { _ in }
     ) throws {
         try self.init(
             databaseURL: databaseURL,
@@ -42,9 +60,11 @@ public final class MailStore: Sendable {
             observationSleep: { duration in
                 try await Task.sleep(for: duration)
             },
-            migrationProgress: migrationProgress
+            migrationProgress: migrationProgress,
+            openProgress: openProgress
         )
     }
+
 
     package init(
         databaseURL: URL,
@@ -52,18 +72,40 @@ public final class MailStore: Sendable {
         attachmentCacheCapBytes: Int64 = MailStore.defaultAttachmentCacheCapBytes,
         observationDebounce: Duration = MailStore.defaultObservationDebounce,
         observationSleep: @escaping @Sendable (Duration) async throws -> Void,
-        migrationProgress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in }
+        migrationProgress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in },
+        openProgress: @escaping @Sendable (String) -> Void = { _ in }
     ) throws {
         var config = Configuration()
         config.foreignKeysEnabled = true
         config.busyMode = .timeout(5)
         config.prepareDatabase { db in
+            openProgress("pragmas-begin")
+            mailStoreOpenSignpost("pragmas-begin")
             try db.execute(sql: "PRAGMA journal_mode = WAL")
             try db.execute(sql: "PRAGMA synchronous = NORMAL")
+            mailStoreOpenSignpost("pragmas-end")
+            openProgress("pragmas-end")
         }
 
+        openProgress("pool-open-begin")
+        mailStoreOpenSignpost("pool-open-begin")
         let pool = try DatabasePool(path: databaseURL.path, configuration: config)
-        try Schema.makeMigrator(progress: migrationProgress).migrate(pool)
+        mailStoreOpenSignpost("pool-open-end")
+        openProgress("pool-open-end")
+
+        openProgress("migrator-begin")
+        mailStoreOpenSignpost("migrator-begin")
+        try Schema.makeMigrator(
+            progress: migrationProgress,
+            openProgress: openProgress
+        ).migrate(pool)
+        mailStoreOpenSignpost("migrator-end")
+        openProgress("migrator-end")
+
+        // MailStore does not issue a checkpoint at launch. Keeping this marker
+        // explicit makes a future checkpoint regression visible in QA traces.
+        mailStoreOpenSignpost("checkpoint-skipped")
+        openProgress("checkpoint-skipped")
 
         self.dbPool = pool
         self.cachesDirectory = cachesDirectory

@@ -771,6 +771,7 @@ final class MockMailFacade: MailFacade {
         let row = MessageRow(
             id: id,
             from: sender.display,
+            senderAddress: sender.email,
             subject: envelope.subject,
             preview: preview,
             date: date,

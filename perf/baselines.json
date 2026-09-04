@@ -14,5 +14,30 @@
       "write_batch_decoded_bytes": 1048576,
       "basis": "two engines receive permits from one BackfillConnectionBudget; each window releases body parts before the next message and commits bounded batches"
     }
+  },
+  "launch_qa_vm": {
+    "fixture": "qa-vm (1,636,773,888-byte migrated SQLite store)",
+    "measured_on": "2026-09-04",
+    "phase_units": "milliseconds since exec",
+    "warm_n": 5,
+    "warm_median": {
+      "app_init": 14.9,
+      "did_finish_launching": 241.8,
+      "window_front": 583.3,
+      "first_frame": 620.3,
+      "store_open": 619.9,
+      "folders_snapshot": 1177.0,
+      "first_rows": 3110.7,
+      "settled_frame": 3180.6
+    },
+    "cold_migrated_observation": {
+      "n": 1,
+      "store_open": 45561.6,
+      "folders_snapshot": 46111.6,
+      "first_rows": 46348.2,
+      "settled_frame": 46683.5,
+      "note": "This copy was v1-v9 and paid the required v10_unread_index build; it is not a steady-state launch baseline."
+    },
+    "root_cause": "GRDB v10_unread_index CREATE INDEX over the populated messages table; no-op migrator on v1-v13 is sub-2 ms."
   }
 }

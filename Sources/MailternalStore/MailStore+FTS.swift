@@ -19,9 +19,8 @@ extension MailStore {
         return try await read { db in
             guard let pattern = FTS5Pattern(matchingAllTokensIn: query) else { return [] }
             let sql = """
-                SELECT m.id, m.from_display, m.subject, m.internal_date, m.uid,
+                SELECT m.id, m.from_display, m.from_text, m.subject, m.internal_date, m.uid,
                        m.is_read, m.has_attachments, m.is_flagged, m.preview,
-                       f.id AS folder_id,
                        COALESCE(NULLIF(f.name, ''), CASE f.role
                            WHEN 'inbox' THEN 'INBOX'
                            WHEN 'archive' THEN 'Archive'
