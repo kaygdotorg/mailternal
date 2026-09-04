@@ -77,6 +77,21 @@ struct MessageViewer: View {
         .onChange(of: model.isFindPresented) { _, presented in
             if presented { restartFind() }
         }
+#if DEBUG
+        .onChange(of: model.detail?.id) { _, id in
+            guard let id,
+                  ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1"
+            else { return }
+            CATransaction.begin()
+            CATransaction.setCompletionBlock {
+                QALaunch.log(
+                    "selection-perf event=reader-commit message=\(id.rawValue) t=\(DispatchTime.now().uptimeNanoseconds)"
+                )
+            }
+            NSApp.keyWindow?.contentView?.needsLayout = true
+            CATransaction.commit()
+        }
+#endif
     }
 
     @ViewBuilder
@@ -208,26 +223,41 @@ struct MessageViewer: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
                 .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
-        } else if let html = detail.sanitizedHTML, !html.isEmpty {
-            htmlBody(detail, html: html)
-        } else if let text = detail.bodyText, !text.isEmpty {
-            PlainTextBody(
-                text: text,
-                query: activeFindQuery,
-                selectedMatchIndex: findSnapshot.index,
-                findTick: findTick,
-            )
-            .preferredColorScheme(emailBodyColorScheme)
-            .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
-            .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
-            // The pane stays full width; only the plain-text measure narrows.
-            .frame(maxWidth: MessageTypography.plainTextMeasure, alignment: .leading)
         } else {
-            Text("This message has no text.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
-                .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
+            // The HTML slot stays mounted for every message so the WKWebView
+            // (and its WebContent process) survives switching between HTML and
+            // plain-text messages. Recreating it cost seconds on a slow host;
+            // a plain-text message simply collapses the slot to zero height.
+            let html = detail.sanitizedHTML ?? ""
+            let hasHTML = !html.isEmpty
+            ZStack(alignment: .topLeading) {
+                htmlBody(detail, html: html)
+                    .frame(height: hasHTML ? nil : 0)
+                    .opacity(hasHTML ? 1 : 0)
+                    .allowsHitTesting(hasHTML)
+                    .accessibilityHidden(!hasHTML)
+                if !hasHTML {
+                    if let text = detail.bodyText, !text.isEmpty {
+                        PlainTextBody(
+                            text: text,
+                            query: activeFindQuery,
+                            selectedMatchIndex: findSnapshot.index,
+                            findTick: findTick,
+                        )
+                        .preferredColorScheme(emailBodyColorScheme)
+                        .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                        .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
+                        // The pane stays full width; only the plain-text measure narrows.
+                        .frame(maxWidth: MessageTypography.plainTextMeasure, alignment: .leading)
+                    } else {
+                        Text("This message has no text.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                            .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
+                    }
+                }
+            }
         }
     }
 

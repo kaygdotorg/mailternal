@@ -178,7 +178,7 @@ private struct CacheTriStateToggle: View {
         Toggle(isOn: Binding(
             get: { state == .checked },
             set: { _ in onToggle() }
-        ) {
+        )) {
             if let title {
                 Text(title)
             }

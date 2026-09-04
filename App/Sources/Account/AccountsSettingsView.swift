@@ -118,7 +118,30 @@ struct AccountsSettingsView: View {
             },
             onRemove: account == nil ? nil : { requestRemoval(rowID) }
         )
+        .background(Color(nsColor: NSColor.controlBackgroundColor).opacity(0.18))
+        .clipShape(RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous))
+        .opacity(account.map { $0.isEnabled ? 1 : 0.55 } ?? 1)
+        .listRowBackground(Color.clear)
         .id(rowID)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            if let account {
+                Button {
+                    Task { await model.setAccountEnabled(rowID, !account.isEnabled) }
+                } label: {
+                    Label(
+                        account.isEnabled ? "Disable Account" : "Enable Account",
+                        systemImage: account.isEnabled ? "pause.circle" : "play.circle"
+                    )
+                }
+                .tint(account.isEnabled ? .orange : .green)
+
+                Button(role: .destructive) {
+                    requestRemoval(rowID)
+                } label: {
+                    Label("Remove Account", systemImage: "trash")
+                }
+            }
+        }
     }
 
     private func accountEditorRow(_ account: AccountConfig?) -> some View {
@@ -301,7 +324,11 @@ private struct AccountRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .accessibilityIdentifier(UIIdentifier.accountsRowEmail)
-                if case .error(let message) = AccountsListPolicy.status(for: state), account != nil {
+                // A disabled account is explained by its dimmed row and red
+                // dot alone; the "no account" state message belongs to the
+                // empty pane, not to a row the user switched off.
+                if let account, account.isEnabled,
+                   case .error(let message) = AccountsListPolicy.status(for: state) {
                     Text(message)
                         .font(.caption)
                         .foregroundStyle(.red)
@@ -364,25 +391,6 @@ private struct AccountRow: View {
                         systemImage: account.isEnabled ? "pause.circle" : "play.circle"
                     )
                 }
-                Button(role: .destructive) {
-                    onRemove?()
-                } label: {
-                    Label("Remove Account", systemImage: "trash")
-                }
-            }
-        }
-        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            if let account {
-                Button {
-                    onToggleEnabled?()
-                } label: {
-                    Label(
-                        account.isEnabled ? "Disable Account" : "Enable Account",
-                        systemImage: account.isEnabled ? "pause.circle" : "play.circle"
-                    )
-                }
-                .tint(account.isEnabled ? .orange : .green)
-
                 Button(role: .destructive) {
                     onRemove?()
                 } label: {

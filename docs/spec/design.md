@@ -101,6 +101,23 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
 - **Empty states**: centered mark + secondary text (Hermternal empty-transcript
   pattern).
 
+## Settings panes
+
+- **Accounts** uses a native `List` so account rows retain platform swipe actions:
+  Enable/Disable and Remove. Context-menu and hover actions remain available as
+  secondary affordances.
+- Expanding an account inserts its inline editor as a separate `List` row inside
+  `withAnimation(MailMotion.expand)`; collapsing removes that row. The native Add
+  Account toolbar item remains the entry point and expansion scrolls the account
+  row into view.
+- A disabled account remains in the Accounts list as a dimmed row with a red
+  status dot. The “No accounts” empty state is shown only when there are no
+  account configurations.
+- **Cache** keeps the top-level **All** toggle. Each account row reads left to
+  right as disclosure caret, unlabeled tri-state “all folders” checkbox, account
+  name, and right-aligned secondary email. Folder rows retain a checkbox, name,
+  and message-count caption, with the pane's breathing-room spacing.
+
 ## Motion (exact values; all with Reduce Motion alternates)
 - Sidebar toggle: `.snappy(duration: 0.24, extraBounce: 0)`.
 - Disclosure/hover: easeOut 0.12.

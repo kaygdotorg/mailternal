@@ -33,6 +33,8 @@ case $cmd in
     for i in {1..60}; do sleep 0.25; P=$(pidof_app); [ -n "$P" ] && W=$(winof $P) && [ -n "$W" ] && break; done
     echo "P=$P W=$W"; grep 'launch phase' $C/launch.log ;;
   shot) P=$(pidof_app); W=$(winof $P); $D call get_window_state "{\"pid\":$P,\"window_id\":$W,\"screenshot_out_file\":\"$C/$3.png\",\"include_screenshot\":false,\"max_elements\":3}" >/dev/null && echo "$C/$3.png" ;;
+  shotwin) P=$(pidof_app); $D call get_window_state "{\"pid\":$P,\"window_id\":$4,\"screenshot_out_file\":\"$C/$3.png\",\"include_screenshot\":false,\"max_elements\":3}" >/dev/null && echo "$C/$3.png" ;;
+  winlist) P=$(pidof_app); $D call list_windows '{}' | jq -r ".windows[] | select(.pid==$P) | [.window_id, .bounds.x, .bounds.y, .bounds.width, .bounds.height] | @tsv" ;;
   click) P=$(pidof_app); W=$(winof $P); $D call click "{\"pid\":$P,\"window_id\":$W,\"x\":$3,\"y\":$4,\"count\":${5:-1},\"delivery_mode\":\"foreground\"}" >/dev/null ;;
   key) P=$(pidof_app); W=$(winof $P); $D call hotkey "{\"pid\":$P,\"window_id\":$W,\"keys\":\"$3\"}" ;;
   front) P=$(pidof_app); W=$(winof $P); $D call bring_to_front "{\"pid\":$P,\"window_id\":$W}" >/dev/null ;;
