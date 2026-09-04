@@ -1300,7 +1300,8 @@ final class AppModel {
             isReadStates: readStates,
             flagStates: flagStates,
             folders: folders,
-            current: selectedFolderID
+            current: selectedFolderID,
+            accounts: accountConfigs
         )
         let titles = policyItems.flatMap { item in
             [item.title] + item.children.map(\.title)

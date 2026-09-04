@@ -150,23 +150,11 @@ struct ReaderTabBar: View {
             }
             .focusEffectDisabled(true)
             .frame(width: width, height: ReaderTabLayoutPolicy.rowHeight)
-            .overlay(alignment: .trailing) {
-                if ReaderTabLayoutPolicy.showsFade(
-                    contentWidth: contentWidth,
-                    viewportWidth: width
-                ) {
-                    LinearGradient(
-                        colors: [
-                            Color.clear,
-                            Color(nsColor: .windowBackgroundColor)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                    .frame(width: ReaderTabLayoutPolicy.rightFadeWidth)
-                    .allowsHitTesting(false)
-                }
-            }
+            // The toolbar owns the material behind the hosting view. A
+            // gradient painted here would instead tint the strip's trailing
+            // edge with an opaque/dark window color and can hide the pills.
+            // Let the scroll view's clip reveal the toolbar material directly.
+            .clipped()
             .onChange(of: model.tabs.activeID) { _, activeID in
                 guard let activeID else { return }
                 withAnimation(reduceMotion ? MailMotion.disclosure : MailMotion.hover) {

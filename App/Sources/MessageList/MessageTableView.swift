@@ -30,6 +30,7 @@ struct MessageListPane: View {
                 selectedIDs: model.selectedMessageIDs,
                 messageLinks: model.messageDeepLinks,
                 folders: model.folders,
+                accounts: model.accountConfigs,
                 currentFolder: model.selectedFolderID,
                 epoch: model.listEpoch,
                 lineCount: model.appearance.messageListLines,
@@ -124,6 +125,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
     var selectedIDs: Set<MessageID>
     var messageLinks: [MessageID: String]
     var folders: [FolderSummary]
+    var accounts: [AccountConfig]
     var currentFolder: FolderID?
     var epoch: UInt64
     var lineCount: Int
@@ -473,7 +475,8 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 isReadStates: readStates,
                 flagStates: flagStates,
                 folders: parent.folders,
-                current: parent.currentFolder
+                current: parent.currentFolder,
+                accounts: parent.accounts
             )
 #if DEBUG
             if ProcessInfo.processInfo.environment["MAILTERNAL_QA_MENU"] == "1" {
@@ -488,9 +491,27 @@ struct MessageTableRepresentable: NSViewRepresentable {
             }
         }
 
-        private func addMenuItem(_ policyItem: MessageContextMenuPolicy.Item, to menu: NSMenu) {
+        private func addMenuItem(
+            _ policyItem: MessageContextMenuPolicy.Item,
+            to menu: NSMenu,
+            indentationLevel: Int = 0
+        ) {
             if policyItem.isSeparator {
                 menu.addItem(.separator())
+                return
+            }
+            // Account groups are visual headers, not disabled submenus:
+            // AppKit propagates a disabled parent's state to every descendant.
+            if policyItem.action == nil,
+               !policyItem.isEnabled,
+               !policyItem.children.isEmpty {
+                let header = NSMenuItem(title: policyItem.title, action: nil, keyEquivalent: "")
+                header.isEnabled = false
+                header.indentationLevel = indentationLevel
+                menu.addItem(header)
+                for child in policyItem.children {
+                    addMenuItem(child, to: menu, indentationLevel: indentationLevel + 1)
+                }
                 return
             }
             let menuItem = NSMenuItem(
@@ -499,6 +520,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 keyEquivalent: ""
             )
             menuItem.target = policyItem.children.isEmpty ? self : nil
+            menuItem.indentationLevel = indentationLevel
             menuItem.isEnabled = policyItem.isEnabled
             menuItem.toolTip = policyItem.toolTip
             menuItem.representedObject = policyItem.action
@@ -520,6 +542,9 @@ struct MessageTableRepresentable: NSViewRepresentable {
             }
             guard !selection.isEmpty else { return }
             switch action {
+            case .openInNewTab:
+                guard selection.count == 1, let id = selection.first else { return }
+                parent.onOpenMessage(id, true)
             case .openInNewWindow:
                 guard selection.count == 1, let id = selection.first else { return }
                 parent.onOpenMessageWindow(id)
@@ -650,6 +675,9 @@ final class MessageTableContainer: NSView {
         tableView.headerView = nil
         tableView.allowsEmptySelection = true
         tableView.allowsMultipleSelection = true
+        // Sidebar drops are in-process SwiftUI targets, so allow copy for
+        // both local and external drag sessions.
+        tableView.setDraggingSourceOperationMask(.copy, forLocal: true)
         tableView.setDraggingSourceOperationMask(.copy, forLocal: false)
         tableView.selectionHighlightStyle = .none
         tableView.backgroundColor = .clear

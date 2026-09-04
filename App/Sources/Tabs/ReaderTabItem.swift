@@ -38,14 +38,7 @@ struct ReaderTabItem: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
         }
-        .frame(width: max(0, width - 27), height: 32, alignment: .leading)
-        .mask(
-            LinearGradient(
-                colors: [.black, .black, .clear],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        )
+        .clipped()
         .contentShape(Rectangle())
     }
 
@@ -171,23 +164,32 @@ private struct ReaderTabGlassModifier: ViewModifier {
     let reduceTransparency: Bool
     let contrast: ColorSchemeContrast
 
+    private static var debugGlassEnabled: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["MAILTERNAL_DEBUG_GLASS_EFFECT"] == "1"
+        #else
+        false
+        #endif
+    }
+
     @ViewBuilder
     func body(content: Content) -> some View {
-        if reduceTransparency {
+        if !reduceTransparency && isVisible && Self.debugGlassEnabled {
+            // Liquid Glass currently renders as a dark/opaque surface when
+            // hosted inside an NSToolbar on macOS 26. Keep it opt-in for
+            // visual debugging until the system compositor handles that host.
+            content.glassEffect(.regular.interactive(), in: .capsule)
+        } else {
             content.background {
                 Capsule()
                     .fill(
                         isVisible
-                            ? Color(nsColor: .quaternaryLabelColor).opacity(
-                                contrast == .increased ? 0.34 : 0.18
+                            ? Color(nsColor: .quaternarySystemFill).opacity(
+                                contrast == .increased ? 0.9 : 0.72
                             )
                             : .clear
                     )
             }
-        } else if isVisible {
-            content.glassEffect(.regular.interactive(), in: .capsule)
-        } else {
-            content
         }
     }
 }

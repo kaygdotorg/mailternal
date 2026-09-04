@@ -1,7 +1,7 @@
+import ObjectiveC
 import AppKit
 import SwiftUI
 import MailternalInterfaces
-import UniformTypeIdentifiers
 
 
 struct FolderSidebar: View {
@@ -130,21 +130,12 @@ struct FolderSidebar: View {
             onRenameFolder: { folder, name in
                 await model.renameFolder(folder.id, to: name)
             },
-            onDrop: { folderID, providers in
-                guard folderID != model.selectedFolderID else { return false }
-                var accepted = false
-                for provider in providers where provider.hasItemConformingToTypeIdentifier(MessageLinkPasteboard.type) {
-                    accepted = true
-                    provider.loadDataRepresentation(
-                        forTypeIdentifier: MessageLinkPasteboard.type
-                    ) { data, _ in
-                        guard let data, let links = MessageLinkPasteboard.decode(data) else { return }
-                        Task { @MainActor in
-                            await model.moveDroppedLinks(links, to: folderID)
-                        }
-                    }
+            onDrop: { folderID, links in
+                guard folderID != model.selectedFolderID, !links.isEmpty else { return false }
+                Task { @MainActor in
+                    await model.moveDroppedLinks(links, to: folderID)
                 }
-                return accepted
+                return true
             }
         )
     }
@@ -273,7 +264,7 @@ private struct FolderTreeNodeView: View {
     let onCopyDeepLink: ((FolderSummary) -> Void)?
     let onKeepLocally: (FolderSummary, Bool) -> Void
     let onRenameFolder: (FolderSummary, String) async -> Bool
-    let onDrop: (FolderID, [NSItemProvider]) -> Bool
+    let onDrop: (FolderID, [String]) -> Bool
     @State private var isExpanded = true
     @State private var isDropTargeted = false
     var body: some View {
@@ -330,17 +321,12 @@ private struct FolderTreeNodeView: View {
                 )
                 .toggleStyle(.checkbox)
             }
-            .onDrop(
-                of: [UTType(exportedAs: MessageLinkPasteboard.type)],
-                isTargeted: Binding(
-                    get: { isDropTargeted },
-                    set: { isDropTargeted = node.folder.id != selectedID && $0 }
-                ),
-                perform: { providers in
-                    guard node.folder.id != selectedID else { return false }
-                    return onDrop(node.folder.id, providers)
-                }
-            )
+            .dropDestination(for: MessageLinkPayload.self) { payloads, _ in
+                guard node.folder.id != selectedID else { return false }
+                return onDrop(node.folder.id, payloads.flatMap(\.links))
+            } isTargeted: { targeted in
+                isDropTargeted = node.folder.id != selectedID && targeted
+            }
             .overlay {
                 if isDropTargeted, node.folder.id != selectedID {
                     RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
@@ -376,7 +362,6 @@ struct FolderRow: View {
                 .foregroundStyle(.secondary)
             SidebarInline(
                 value: folder.name,
-                font: .body,
                 canEdit: FolderRenamePolicy.canRename(role: folder.role),
                 fieldIdentifier: FolderRenamePolicy.fieldIdentifier(for: folder.id),
                 onCommit: onRename,
@@ -463,23 +448,27 @@ struct FolderRow: View {
 /// Finder-like inline editing for the name portion of a sidebar row.
 private struct SidebarInline: View {
     let value: String
-    let font: Font
     let canEdit: Bool
     let fieldIdentifier: String
     let onCommit: ((String) async -> Bool)?
     @Binding var isEditing: Bool
     @State private var draft = ""
-    @FocusState private var isFocused: Bool
 
     var body: some View {
         ZStack(alignment: .leading) {
-            // The text remains the sizing anchor while editing, so the field
-            // cannot move the icon, accessories, or neighboring rows.
-            Text(value)
-                .font(font)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .opacity(isEditing ? 0 : 1)
+            // Host the displayed label itself in AppKit. SwiftUI gesture
+            // overlays sit outside the List row's hit-test path and are
+            // therefore not reliable for double-clicks.
+            SidebarRenameLabel(
+                value: value,
+                font: .preferredFont(forTextStyle: .body),
+                identifier: nil,
+                onDoubleClick: beginEditing
+            )
+            .opacity(isEditing ? 0 : 1)
+            .allowsHitTesting(!isEditing)
+            .accessibilityHidden(isEditing)
+
             if isEditing {
                 SidebarInlineTextField(
                     text: $draft,
@@ -493,28 +482,18 @@ private struct SidebarInline: View {
             }
         }
         .contentShape(Rectangle())
-        .overlay {
-            if !isEditing {
-                SidebarDoubleClickCapture {
-                    beginEditing()
-                }
-                .accessibilityHidden(true)
-            }
-        }
     }
 
     private func beginEditing() {
         guard !isEditing, canEdit, onCommit != nil else { return }
         draft = value
         isEditing = true
-        isFocused = true
     }
 
     private func commit() {
         guard isEditing else { return }
         let candidate = draft
         isEditing = false
-        isFocused = false
         guard let onCommit else { return }
         Task {
             _ = await onCommit(candidate)
@@ -523,7 +502,6 @@ private struct SidebarInline: View {
 
     private func cancel() {
         isEditing = false
-        isFocused = false
         draft = ""
     }
 }
@@ -548,7 +526,8 @@ private struct SidebarInlineTextField: NSViewRepresentable {
         field.stringValue = text
         field.font = font
         field.setAccessibilityIdentifier(identifier)
-        field.onAppear = {
+        field.onAppear = { [weak field] in
+            guard let field else { return }
             field.window?.makeFirstResponder(field)
             field.selectText(nil)
         }
@@ -564,6 +543,7 @@ private struct SidebarInlineTextField: NSViewRepresentable {
         nsView.setAccessibilityIdentifier(identifier)
     }
 
+    @MainActor
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: SidebarInlineTextField
         private var finished = false
@@ -579,11 +559,7 @@ private struct SidebarInlineTextField: NSViewRepresentable {
 
         func controlTextDidEndEditing(_ obj: Notification) {
             guard !finished else { return }
-            if parent.commitOnFocusLoss {
-                finish(commit: true)
-            } else {
-                finish(commit: false)
-            }
+            finish(commit: parent.commitOnFocusLoss)
         }
 
         func control(
@@ -649,31 +625,151 @@ private final class InlineTextFieldView: NSTextField {
     }
 }
 
-private struct SidebarDoubleClickCapture: NSViewRepresentable {
+/// NSTextField-based label that remains in the List row's hit-test path.
+/// AppKit delivers the click to this view rather than to a SwiftUI overlay,
+/// while ordinary clicks continue up the responder chain for row selection.
+private struct SidebarRenameLabel: NSViewRepresentable {
+    let value: String
+    let font: NSFont
+    let identifier: String?
     let onDoubleClick: () -> Void
 
-    func makeNSView(context: Context) -> DoubleClickCaptureView {
-        let view = DoubleClickCaptureView()
+    func makeNSView(context: Context) -> SidebarRenameLabelView {
+        let view = SidebarRenameLabelView()
+        view.stringValue = value
+        view.font = font
         view.onDoubleClick = onDoubleClick
+        if let identifier {
+            view.setAccessibilityIdentifier(identifier)
+        }
         return view
     }
 
-    func updateNSView(_ nsView: DoubleClickCaptureView, context: Context) {
+    func updateNSView(_ nsView: SidebarRenameLabelView, context: Context) {
+        nsView.stringValue = value
+        nsView.font = font
         nsView.onDoubleClick = onDoubleClick
-    }
-}
-
-private final class DoubleClickCaptureView: NSView {
-    var onDoubleClick: (() -> Void)?
-
-    override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 {
-            onDoubleClick?()
-        } else {
-            super.mouseDown(with: event)
+        if let identifier {
+            nsView.setAccessibilityIdentifier(identifier)
         }
     }
 }
+
+private final class SidebarRenameLabelView: NSTextField {
+    var onDoubleClick: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isEditable = false
+        isSelectable = false
+        isBezeled = false
+        isBordered = false
+        drawsBackground = false
+        backgroundColor = .clear
+        focusRingType = .none
+        alignment = .left
+        lineBreakMode = .byTruncatingMiddle
+        cell?.usesSingleLineMode = true
+        cell?.lineBreakMode = .byTruncatingMiddle
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textColor = .labelColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        installDoubleClickRouter()
+        Task { @MainActor [weak self] in
+            self?.installDoubleClickRouter()
+        }
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        installDoubleClickRouter()
+    }
+
+    override func layout() {
+        super.layout()
+        installDoubleClickRouter()
+    }
+
+    private func installDoubleClickRouter() {
+        guard let tableView = enclosingTableView else { return }
+        SidebarDoubleClickRouter.install(on: tableView)
+    }
+
+    private var enclosingTableView: NSTableView? {
+        var ancestor = superview
+        while let view = ancestor {
+            if let tableView = view as? NSTableView {
+                return tableView
+            }
+            ancestor = view.superview
+        }
+        return nil
+    }
+}
+
+@MainActor
+private var sidebarDoubleClickRouterKey: UInt8 = 0
+@MainActor
+private final class SidebarDoubleClickRouter: NSObject {
+    weak var tableView: NSTableView?
+
+    static func install(on tableView: NSTableView) {
+        if let router = objc_getAssociatedObject(tableView, &sidebarDoubleClickRouterKey)
+            as? SidebarDoubleClickRouter {
+            router.tableView = tableView
+            return
+        }
+        let router = SidebarDoubleClickRouter()
+        router.tableView = tableView
+        objc_setAssociatedObject(
+            tableView,
+            &sidebarDoubleClickRouterKey,
+            router,
+            .OBJC_ASSOCIATION_RETAIN_NONATOMIC
+        )
+        tableView.target = router
+        tableView.doubleAction = #selector(tableDoubleClicked(_:))
+    }
+
+    @objc private func tableDoubleClicked(_ sender: Any?) {
+        guard let tableView,
+              tableView.clickedRow >= 0,
+              let rowView = tableView.rowView(
+                atRow: tableView.clickedRow,
+                makeIfNecessary: false
+              ),
+              let label = findLabel(in: rowView)
+        else {
+            return
+        }
+        label.onDoubleClick?()
+    }
+
+    private func findLabel(in view: NSView) -> SidebarRenameLabelView? {
+        if let label = view as? SidebarRenameLabelView {
+            return label
+        }
+        for child in view.subviews {
+            if let label = findLabel(in: child) {
+                return label
+            }
+        }
+        return nil
+    }
+}
+
 
 private struct FolderInspector: View {
     let folder: FolderSummary
@@ -737,53 +833,56 @@ struct EmptyMailboxState: View {
 
 /// The sidebar's account H1. Double-click swaps the text for a same-font
 /// field; Return commits through `AppModel.renameAccount`, Escape or focus
-/// loss cancels. Rendering stays a plain `Text` until editing starts so the
+/// loss cancels. Rendering stays a native label until editing starts so the
 /// list header keeps its measured geometry.
 private struct SidebarAccountTitle: View {
     let title: String
     let onRename: ((String) -> Void)?
     @State private var draft = ""
     @State private var isEditing = false
-    @FocusState private var isFieldFocused: Bool
 
-    private let font = Font.system(size: 20, weight: .semibold)
 
     var body: some View {
-        Group {
+        ZStack(alignment: .leading) {
+            SidebarRenameLabel(
+                value: title,
+                font: .systemFont(ofSize: 20, weight: .semibold),
+                identifier: UIIdentifier.sidebarAccountTitle,
+                onDoubleClick: beginEditing
+            )
+            .opacity(isEditing ? 0 : 1)
+            .allowsHitTesting(!isEditing)
+            .accessibilityHidden(isEditing)
+            .accessibilityAddTraits(.isHeader)
+
             if isEditing {
                 SidebarInlineTextField(
                     text: $draft,
                     identifier: UIIdentifier.sidebarAccountTitleField,
                     font: .systemFont(ofSize: 20, weight: .semibold),
                     commitOnFocusLoss: false,
-                    onCommit: {
-                        onRename?(draft)
-                        isEditing = false
-                    },
-                    onCancel: {
-                        isEditing = false
-                    }
+                    onCommit: commit,
+                    onCancel: cancel
                 )
                 .frame(minWidth: 40)
-            } else {
-                Text(title)
-                    .font(font)
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .contentShape(Rectangle())
-                    .overlay {
-                        SidebarDoubleClickCapture {
-                            guard onRename != nil else { return }
-                            draft = title
-                            isEditing = true
-                            isFieldFocused = true
-                        }
-                        .accessibilityHidden(true)
-                    }
-                    .accessibilityAddTraits(.isHeader)
-                    .accessibilityIdentifier(UIIdentifier.sidebarAccountTitle)
             }
         }
+    }
+    private func beginEditing() {
+        guard onRename != nil else { return }
+        draft = title
+        isEditing = true
+    }
+
+    private func commit() {
+        guard isEditing else { return }
+        let candidate = draft
+        isEditing = false
+        onRename?(candidate)
+    }
+
+    private func cancel() {
+        isEditing = false
+        draft = ""
     }
 }

@@ -19,6 +19,14 @@ targets:
     info:
       path: Mailternal-Info.plist
       properties:
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: org.kayg.mailternal.message-links
+            UTTypeDescription: Mailternal message links
+            UTTypeConformsTo:
+              - public.data
+              - public.plain-text
+            UTTypeTagSpecification:
+              public.mime-type: application/x-mailternal-message-links
         CFBundleURLTypes:
           - CFBundleURLName: org.kayg.mailternal
             CFBundleURLSchemes:

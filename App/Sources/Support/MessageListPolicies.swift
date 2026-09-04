@@ -1,4 +1,6 @@
 import Foundation
+import CoreTransferable
+import UniformTypeIdentifiers
 import MailternalInterfaces
 
 /// Pure transition rules for the per-message email reading override.
@@ -36,10 +38,11 @@ enum ReaderSelectionPolicy {
 }
 
 /// The menu's value model is deliberately independent of AppKit. This keeps
-/// the Mail-style ordering, state-aware labels, and folder-tree construction
-/// deterministic and directly testable.
+/// the Mail-style ordering, state-aware labels, account-grouped destinations,
+/// and folder-tree construction deterministic and directly testable.
 enum MessageContextMenuPolicy {
     enum Action: Equatable, Sendable {
+        case openInNewTab
         case openInNewWindow
         case reply
         case replyAll
@@ -89,7 +92,8 @@ enum MessageContextMenuPolicy {
         isReadStates: [MessageID: Bool],
         flagStates: [MessageID: Bool],
         folders: [FolderSummary],
-        current: FolderID?
+        current: FolderID?,
+        accounts: [AccountConfig]
     ) -> [Item] {
         guard !selection.isEmpty else { return [] }
         let count = selection.count
@@ -100,6 +104,7 @@ enum MessageContextMenuPolicy {
         let canMoveToJunk = folders.contains { $0.role == .junk } && currentFolder?.role != .junk
 
         return [
+            Item(title: "Open in New Tab", action: .openInNewTab, isEnabled: count == 1),
             Item(title: "Open in New Window", action: .openInNewWindow, isEnabled: count == 1),
             separator,
             Item(title: "Reply", action: .reply, isEnabled: false, toolTip: composerToolTip),
@@ -125,7 +130,7 @@ enum MessageContextMenuPolicy {
                 title: count > 1 ? "Archive \(countLabel) Messages" : "Archive",
                 action: .archive
             ),
-            moveMenu(folders: folders, current: current),
+            moveMenu(folders: folders, current: current, accounts: accounts),
             separator,
             Item(title: "Copy Link", action: .copyLink),
             Item(title: "Copy Subject", action: .copySubject),
@@ -137,15 +142,43 @@ enum MessageContextMenuPolicy {
 
     private static func moveMenu(
         folders: [FolderSummary],
-        current: FolderID?
+        current: FolderID?,
+        accounts: [AccountConfig]
     ) -> Item {
         let destinations = folders.filter { $0.id != current }
-        let tree = folderTree(destinations)
+        let currentAccountID = current.flatMap { currentID in
+            folders.first { $0.id == currentID }?.accountID
+        }
+        let foldersByAccount = Dictionary(grouping: destinations, by: \.accountID)
+        let knownAccountIDs = accounts.map(\.id).filter { foldersByAccount[$0] != nil }
+        let unknownAccountIDs = foldersByAccount.keys
+            .filter { accountID in !accounts.contains(where: { account in account.id == accountID }) }
+            .sorted { $0.rawValue.localizedStandardCompare($1.rawValue) == .orderedAscending }
+        let accountIDs = knownAccountIDs + unknownAccountIDs
+        let groups = accountIDs.compactMap { accountID -> Item? in
+            guard let accountFolders = foldersByAccount[accountID] else { return nil }
+            let folderItems = folderTree(accountFolders).map {
+                makeTreeItem($0, enabledAccountID: currentAccountID)
+            }
+            return Item(
+                title: accountTitle(for: accountID, accounts: accounts),
+                isEnabled: false,
+                children: folderItems
+            )
+        }
         return Item(
             title: "Move to",
-            isEnabled: !tree.isEmpty,
-            children: tree.map(makeTreeItem)
+            isEnabled: !groups.isEmpty,
+            children: groups
         )
+    }
+
+    private static func accountTitle(
+        for id: AccountID,
+        accounts: [AccountConfig]
+    ) -> String {
+        AccountTitlePolicy.title(for: accounts.first { $0.id == id })
+            ?? id.rawValue
     }
 
     private struct FolderTreeNode: Sendable {
@@ -191,11 +224,20 @@ enum MessageContextMenuPolicy {
         }
     }
 
-    private static func makeTreeItem(_ node: FolderTreeNode) -> Item {
-        Item(
+    private static func makeTreeItem(
+        _ node: FolderTreeNode,
+        enabledAccountID: AccountID?
+    ) -> Item {
+        let children = node.children.sorted(by: nodeOrdering).map {
+            makeTreeItem($0, enabledAccountID: enabledAccountID)
+        }
+        let isEnabled = node.folder.map { $0.accountID == enabledAccountID }
+            ?? children.contains { $0.isEnabled }
+        return Item(
             title: node.folder?.name ?? node.segment,
             action: node.folder.map { .moveTo($0.id) },
-            children: node.children.sorted(by: nodeOrdering).map(makeTreeItem)
+            isEnabled: isEnabled,
+            children: children
         )
     }
 
@@ -243,7 +285,7 @@ enum MessageToolbarPolicy {
         case messageActions = "Mailternal.message.actions"
 
         var itemIdentifiers: [Identifier] {
-            [.archive, .trash, .flag, .source, .colorScheme, .overflow]
+            [.archive, .trash, .overflow]
         }
     }
 
@@ -292,9 +334,7 @@ enum MessageToolbarPolicy {
     ) -> [VisibleItem] {
         let count = selection.count
         let plural = count > 1 ? " \(count.formatted(.number)) Messages" : ""
-        let shouldFlag = selection.contains { !(flagStates[$0] ?? false) }
         let enabled = !selection.isEmpty
-        let singleSelection = count == 1
         return [
             VisibleItem(
                 identifier: .archive,
@@ -309,23 +349,10 @@ enum MessageToolbarPolicy {
                 isEnabled: enabled
             ),
             VisibleItem(
-                identifier: .flag,
-                title: "\(shouldFlag ? "Flag" : "Unflag")\(plural)",
-                imageName: shouldFlag ? "flag" : "flag.slash",
+                identifier: .overflow,
+                title: "More",
+                imageName: "ellipsis.circle",
                 isEnabled: enabled
-            ),
-            VisibleItem(
-                identifier: .source,
-                title: "Source",
-                imageName: "chevron.left.forwardslash.chevron.right",
-                isEnabled: singleSelection,
-                isOn: isShowingRawSource
-            ),
-            VisibleItem(
-                identifier: .colorScheme,
-                title: "Email Colour Scheme",
-                imageName: effectiveEmailReadingMode == .original ? "sun.max" : "moon",
-                isEnabled: singleSelection
             ),
         ]
     }
@@ -335,14 +362,16 @@ enum MessageToolbarPolicy {
         isReadStates: [MessageID: Bool],
         flagStates: [MessageID: Bool],
         folders: [FolderSummary],
-        current: FolderID?
+        current: FolderID?,
+        accounts: [AccountConfig]
     ) -> [MessageContextMenuPolicy.Item] {
         let contextItems = MessageContextMenuPolicy.items(
             selection: selection,
             isReadStates: isReadStates,
             flagStates: flagStates,
             folders: folders,
-            current: current
+            current: current,
+            accounts: accounts
         )
         let shouldMarkRead = selection.isEmpty || selection.contains {
             !(isReadStates[$0] ?? false)
@@ -351,6 +380,9 @@ enum MessageToolbarPolicy {
         let markAction: MessageContextMenuPolicy.Action = shouldMarkRead
             ? .markRead
             : .markUnread
+        let shouldFlag = selection.isEmpty || selection.contains { !(flagStates[$0] ?? false) }
+        let flagTitle = "\(shouldFlag ? "Flag" : "Unflag")\(selection.count > 1 ? " \(selection.count.formatted(.number)) Messages" : "")"
+        let flagAction: MessageContextMenuPolicy.Action = shouldFlag ? .flag : .unflag
         let fallbackMove = MessageContextMenuPolicy.Item(
             title: "Move to",
             isEnabled: false
@@ -362,6 +394,11 @@ enum MessageToolbarPolicy {
         let mark = itemsByAction(markAction) ?? MessageContextMenuPolicy.Item(
             title: markTitle,
             action: markAction,
+            isEnabled: false
+        )
+        let flag = itemsByAction(flagAction) ?? MessageContextMenuPolicy.Item(
+            title: flagTitle,
+            action: flagAction,
             isEnabled: false
         )
         let junk = itemsByAction(.moveToJunk) ?? MessageContextMenuPolicy.Item(
@@ -397,7 +434,7 @@ enum MessageToolbarPolicy {
             action: .toggleEmailReadingOverride,
             isEnabled: selection.count == 1
         )
-        return [mark, junk, move, open, MessageContextMenuPolicy.Item(title: ""),
+        return [mark, flag, junk, move, open, MessageContextMenuPolicy.Item(title: ""),
                 copyLink, copySubject, raw, colorScheme]
     }
 }
@@ -410,19 +447,23 @@ private extension Array {
     }
 }
 
-/// The pasteboard payload used for dragging messages to a mailbox. Canonical
-/// deep links are preferred; local IDs fill the payload for selected rows whose
-/// links have not finished prefetching yet.
+/// The payload used for dragging messages to a mailbox. Canonical deep links
+/// are preferred; local IDs fill the payload for selected rows whose links
+/// have not finished prefetching yet.
 enum MessageLinkPasteboard {
     static let type = "org.kayg.mailternal.message-links"
     private static let messageIDPrefix = "mailternal-message-id:"
 
     static func encode(_ links: [String]) -> Data {
-        (try? JSONEncoder().encode(links)) ?? Data("[]".utf8)
+        (try? JSONEncoder().encode(MessageLinkPayload(links: links)))
+            ?? Data(#"{"links":[]}"#.utf8)
     }
 
     static func decode(_ data: Data) -> [String]? {
-        try? JSONDecoder().decode([String].self, from: data)
+        if let payload = try? JSONDecoder().decode(MessageLinkPayload.self, from: data) {
+            return payload.links
+        }
+        return try? JSONDecoder().decode([String].self, from: data)
     }
 
     static func encodeMessageID(_ id: MessageID) -> String {
@@ -433,6 +474,16 @@ enum MessageLinkPasteboard {
         guard value.hasPrefix(messageIDPrefix),
               let rawValue = Int64(value.dropFirst(messageIDPrefix.count)) else { return nil }
         return MessageID(rawValue: rawValue)
+    }
+}
+
+struct MessageLinkPayload: Codable, Sendable, Transferable {
+    let links: [String]
+
+    static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(
+            contentType: UTType(exportedAs: MessageLinkPasteboard.type)
+        )
     }
 }
 

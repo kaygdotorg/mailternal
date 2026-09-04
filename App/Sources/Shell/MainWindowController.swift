@@ -344,7 +344,7 @@ final class MainShellViewController: NSViewController {
 
     private func configureTransparentHostingView(_ hosting: NSView) {
         hosting.wantsLayer = true
-        hosting.layer?.backgroundColor = nil
+        hosting.layer?.backgroundColor = NSColor.clear.cgColor
         hosting.layer?.isOpaque = false
     }
 
@@ -365,6 +365,16 @@ private extension NSToolbarItem.Identifier {
 @MainActor
 private final class ReaderTabsHostingView: NSHostingView<ReaderTabBar> {
     var onLayout: (() -> Void)?
+    var desiredWidth: CGFloat = 0 {
+        didSet {
+            guard abs(oldValue - desiredWidth) > 0.5 else { return }
+            invalidateIntrinsicContentSize()
+        }
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: desiredWidth, height: ReaderTabLayoutPolicy.rowHeight)
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -387,7 +397,6 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     private lazy var toggleItem = makeToggleItem()
     private lazy var readerTabsHosting = makeReaderTabsHosting()
     private lazy var readerTabsItem = makeReaderTabsItem()
-    private var readerTabsWidthConstraint: NSLayoutConstraint?
     private lazy var archiveItem = makeMessageItem(
         identifier: .messageArchive,
         action: #selector(archiveSelected(_:))
@@ -485,6 +494,23 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
                 self?.updateReaderTabsWidth()
             }
         }
+        NotificationCenter.default.addObserver(
+            forName: NSSplitView.didResizeSubviewsNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateReaderTabsWidth()
+            }
+        }
+        // NSToolbar installs its item views after makeToolbar returns. A
+        // next-turn pass observes the final split geometry, rather than the
+        // zero-sized pre-install layout.
+        DispatchQueue.main.async { [weak self, weak toolbar] in
+            guard let self, self.toolbar === toolbar else { return }
+            self.configureReaderTabs()
+            self.updateReaderTabsWidth()
+        }
         return toolbar
     }
 
@@ -572,7 +598,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             isReadStates: readStates,
             flagStates: flagStates,
             folders: model.folders,
-            current: model.selectedFolderID
+            current: model.selectedFolderID,
+            accounts: model.accountConfigs
         ) {
             addMenuItem(policyItem, to: menu)
         }
@@ -587,7 +614,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             isReadStates: readStates,
             flagStates: flagStates,
             folders: model.folders,
-            current: model.selectedFolderID
+            current: model.selectedFolderID,
+            accounts: model.accountConfigs
         )
         let enabled = overflowItem(for: action, in: policyItems)?.isEnabled ?? false
         menuItem.isEnabled = enabled
@@ -652,7 +680,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             case .flag: item = flagItem
             case .source: item = sourceItem
             case .colorScheme: item = colorSchemeItem
-            case .overflow: continue
+            case .overflow: item = overflowItem
             }
             item.image = NSImage(
                 systemSymbolName: visible.imageName,
@@ -663,16 +691,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             item.toolTip = visible.title
             item.isEnabled = visible.isEnabled
         }
-        let sourceIndex = MessageToolbarPolicy.itemIdentifiers(in: .messageActions)
-            .firstIndex(of: .source)
-        if let sourceIndex {
-            for index in messageActionsGroup.subitems.indices {
-                messageActionsGroup.setSelected(
-                    index == sourceIndex && model.isShowingRawSource,
-                    at: index
-                )
-            }
-        }
+        // Source and reading-mode state now live in More, not in the native
+        // toolbar group. Keep the group purely action-oriented.
         overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
         messageActionsGroup.isHidden = model.isSearchPresented || model.selectedMessageIDs.isEmpty
         messageActionsGroup.isEnabled = !model.isSearchPresented
@@ -700,10 +720,15 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     private func makeReaderTabsHosting() -> ReaderTabsHostingView {
         let hosting = ReaderTabsHostingView(rootView: ReaderTabBar(model: model))
         hosting.safeAreaRegions = []
+        // The toolbar supplies the material behind this custom view. Do not
+        // let NSHostingView install an opaque layer or size itself from the
+        // SwiftUI root's intrinsic content.
         hosting.sizingOptions = []
         hosting.translatesAutoresizingMaskIntoConstraints = false
         hosting.clipsToBounds = false
         hosting.wantsLayer = true
+        hosting.layer?.backgroundColor = NSColor.clear.cgColor
+        hosting.layer?.isOpaque = false
         hosting.layer?.masksToBounds = false
         hosting.onLayout = { [weak self] in
             self?.updateReaderTabsWidth()
@@ -718,24 +743,22 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         item.paletteLabel = item.label
         item.toolTip = "Open reader tabs"
         item.minSize = NSSize(width: 0, height: ReaderTabLayoutPolicy.rowHeight)
-        item.maxSize = NSSize(width: .greatestFiniteMagnitude, height: ReaderTabLayoutPolicy.rowHeight)
+        item.maxSize = NSSize(width: 0, height: ReaderTabLayoutPolicy.rowHeight)
         item.isEnabled = false
         item.autovalidates = false
-        readerTabsWidthConstraint = readerTabsHosting.widthAnchor.constraint(equalToConstant: 0)
-        readerTabsWidthConstraint?.isActive = true
         return item
     }
 
     private func configureReaderTabs() {
-        guard includesSidebarToggle else { return }
         readerTabsItem.isHidden = model.tabs.active == nil || model.isSearchPresented
         readerTabsItem.isEnabled = !readerTabsItem.isHidden
         updateReaderTabsWidth()
     }
 
     /// The custom tab item fills the reader column between the split's detail
-    /// origin and the native message-actions group. Its width is constrained
-    /// explicitly because toolbar custom views otherwise use their fitting size.
+    /// origin and the native message-actions group. Its intrinsic size is
+    /// updated explicitly because unified toolbar layout otherwise collapses
+    /// custom items whose fitting size is zero during installation.
     private func updateReaderTabsWidth() {
         guard includesSidebarToggle,
               let window = readerTabsHosting.window,
@@ -746,17 +769,24 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             messageActionsGroup.minSize.width,
             messageActionsGroup.view?.fittingSize.width ?? 0
         )
-        let width = max(0, contentView.bounds.width - detailOrigin - actionWidth - 8)
-        if abs((readerTabsWidthConstraint?.constant ?? -1) - width) > 0.5 {
-            readerTabsWidthConstraint?.constant = width
-        }
+        let width = max(0, contentView.bounds.width - detailOrigin - actionWidth - 32)
+        readerTabsHosting.desiredWidth = width
+        let hidden = model.tabs.active == nil || model.isSearchPresented || width < 140
+        readerTabsItem.isHidden = hidden
+        readerTabsItem.isEnabled = !hidden
+        let size = NSSize(width: width, height: ReaderTabLayoutPolicy.rowHeight)
+        readerTabsItem.minSize = size
+        readerTabsItem.maxSize = size
     }
 
     private func detailColumnOrigin(in view: NSView, contentView: NSView) -> CGFloat? {
+        if let tableEdge = messageTableTrailingEdge(in: view, contentView: contentView) {
+            return tableEdge
+        }
         var origin: CGFloat?
         if let split = view as? NSSplitView, let detail = split.subviews.last {
             let frame = detail.convert(detail.bounds, to: contentView)
-            if frame.width > 0 {
+            if frame.width >= 140 {
                 origin = frame.minX
             }
         }
@@ -766,6 +796,19 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             }
         }
         return origin
+    }
+
+    private func messageTableTrailingEdge(in view: NSView, contentView: NSView) -> CGFloat? {
+        if view.accessibilityIdentifier() == UIIdentifier.messageTable {
+            let frame = view.convert(view.bounds, to: contentView)
+            return frame.width > 0 ? frame.maxX : nil
+        }
+        for subview in view.subviews {
+            if let edge = messageTableTrailingEdge(in: subview, contentView: contentView) {
+                return edge
+            }
+        }
+        return nil
     }
 
     private func makeMessageItem(
@@ -785,11 +828,11 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         item.menu = overflowMenu
         item.image = NSImage(
             systemSymbolName: "ellipsis.circle",
-            accessibilityDescription: "Message actions"
+            accessibilityDescription: "More message actions"
         )
-        item.label = "Message Actions"
-        item.paletteLabel = "Message Actions"
-        item.toolTip = "Message actions"
+        item.label = "More"
+        item.paletteLabel = "More"
+        item.toolTip = "More message actions"
         item.isBordered = false
         item.isEnabled = !model.selectedMessageIDs.isEmpty
         item.autovalidates = false
@@ -799,14 +842,34 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
 
     private func addMenuItem(
         _ policyItem: MessageContextMenuPolicy.Item,
-        to menu: NSMenu
+        to menu: NSMenu,
+        indentationLevel: Int = 0
     ) {
+        if policyItem.isSeparator {
+            menu.addItem(.separator())
+            return
+        }
+        // Account groups are visual headers, not disabled submenus:
+        // AppKit propagates a disabled parent's state to every descendant.
+        if policyItem.action == nil,
+           !policyItem.isEnabled,
+           !policyItem.children.isEmpty {
+            let header = NSMenuItem(title: policyItem.title, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            header.indentationLevel = indentationLevel
+            menu.addItem(header)
+            for child in policyItem.children {
+                addMenuItem(child, to: menu, indentationLevel: indentationLevel + 1)
+            }
+            return
+        }
         let item = NSMenuItem(
             title: policyItem.title,
             action: policyItem.action == nil ? nil : #selector(performOverflowAction(_:)),
             keyEquivalent: ""
         )
         item.target = self
+        item.indentationLevel = indentationLevel
         item.representedObject = policyItem.action
         item.toolTip = policyItem.toolTip
         item.isEnabled = policyItem.isEnabled
@@ -880,6 +943,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         let selection = model.selectedMessageIDs
         guard !selection.isEmpty else { return }
         switch action {
+        case .openInNewTab:
+            guard selection.count == 1, let id = selection.first else { return }
+            model.openMessage(id, permanent: true)
         case .markRead, .markUnread:
             model.perform(.toggleRead, on: selection)
         case .moveToJunk:
@@ -898,7 +964,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             toggleRawSource(nil)
         case .toggleEmailReadingOverride:
             toggleEmailReadingOverride(nil)
-        case .flag, .unflag, .delete, .archive, .reply, .replyAll, .forward:
+        case .flag, .unflag:
+            model.perform(.toggleFlag, on: selection)
+        case .delete, .archive, .reply, .replyAll, .forward:
             break
         }
     }
