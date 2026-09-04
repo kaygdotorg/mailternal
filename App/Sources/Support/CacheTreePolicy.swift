@@ -81,4 +81,18 @@ enum CacheTreePolicy {
         let cachedCount = folder.keepLocally ? folder.totalCount : 0
         return "\(cachedCount) / \(folder.totalCount)"
     }
+
+    /// Folders with pending user toggles applied on top of the store's values.
+    static func applyingPending(
+        _ pending: [FolderID: Bool],
+        to folders: [FolderSummary]
+    ) -> [FolderSummary] {
+        guard !pending.isEmpty else { return folders }
+        return folders.map { folder in
+            guard let keep = pending[folder.id], keep != folder.keepLocally else { return folder }
+            var updated = folder
+            updated.keepLocally = keep
+            return updated
+        }
+    }
 }

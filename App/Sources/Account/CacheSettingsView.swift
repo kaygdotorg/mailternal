@@ -4,9 +4,17 @@ import MailternalInterfaces
 struct CacheSettingsView: View {
     @Bindable var model: AppModel
 
+    /// Grouped folders with the user's pending toggles applied. A tick must
+    /// propagate to every child instantly; the facade writes land per folder
+    /// and the store stream catches up, at which point the override is dropped.
     private var foldersByAccount: [AccountID: [FolderSummary]] {
-        CacheTreePolicy.foldersByAccount(model.folders)
+        CacheTreePolicy.foldersByAccount(
+            CacheTreePolicy.applyingPending(pendingKeep, to: model.folders)
+        )
     }
+
+    @State private var pendingKeep: [FolderID: Bool] = [:]
+    @State private var reportedKeepFailure = false
 
     private var accounts: [AccountConfig] {
         AccountsListPolicy.sorted(model.accountConfigs)
@@ -137,7 +145,7 @@ struct CacheSettingsView: View {
                             }
                         }
                         .toggleStyle(.checkbox)
-                        .padding(.leading, 24)
+                        .padding(.leading, CacheSettingsLayout.folderIndent)
                         .padding(.vertical, CacheSettingsLayout.folderRowInset)
                         .accessibilityIdentifier(UIIdentifier.cacheFolder(String(folder.id.rawValue)))
                         .accessibilityValue(folder.keepLocally ? "Kept locally" : "Not kept locally")
@@ -152,17 +160,24 @@ struct CacheSettingsView: View {
     private func setKeepLocally(_ keep: Bool, folderIDs: some Collection<FolderID>) {
         let ids = Array(folderIDs).sorted { $0.rawValue < $1.rawValue }
         guard !ids.isEmpty else { return }
-        Task { @MainActor in
-            for id in ids {
+        for id in ids { pendingKeep[id] = keep }
+        let facade = model.facade
+        for id in ids {
+            Task { @MainActor in
+                var failure: (any Error)?
                 do {
-                    try await model.facade.setKeepLocally(keep, for: id)
+                    try await facade.setKeepLocally(keep, for: id)
                 } catch {
+                    failure = error
+                }
+                pendingKeep.removeValue(forKey: id)
+                if let failure, !reportedKeepFailure {
+                    reportedKeepFailure = true
                     model.toasts.post(
                         title: "Couldn’t update cache setting",
-                        detail: error.localizedDescription,
+                        detail: failure.localizedDescription,
                         severity: .error
                     )
-                    break
                 }
             }
         }
@@ -207,6 +222,9 @@ private struct CacheTriStateToggle: View {
 /// Cache pane rhythm: rows need room to breathe between title/subtitle and
 /// between list items (user review 2026-09-04).
 enum CacheSettingsLayout {
+    /// Folders sit under the account *name*, past the caret and the account
+    /// checkbox (caret 16 + gap 8 + checkbox 16 + gap 8).
+    static let folderIndent: CGFloat = 48
     static let titleSubtitleGap: CGFloat = 4
     static let folderRowGap: CGFloat = 6
     static let folderRowInset: CGFloat = 4

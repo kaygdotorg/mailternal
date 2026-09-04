@@ -156,7 +156,7 @@ empty-reader state and while global search is presented.
   no shared capsule — so the glyphs sit as close as the toolbar allows, like
   Craft's reader chrome. They use one symbol configuration (17 pt, medium
   weight) so unbordered images match the sidebar toggle's size. The active
-  tab fill is `unemphasizedSelectedContentBackgroundColor`; hover is `quaternarySystemFill`.
+  tab fill is `textBackgroundColor` (white / near-black); hover is `quaternarySystemFill`.
 - Its title MUST contain only the subject, MUST use semantic `.subheadline`, and
   MUST use the trailing fade mask when compressed. The active tab MUST use
   semantic selection treatment and label color; inactive tabs MUST have no fill

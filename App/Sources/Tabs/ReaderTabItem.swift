@@ -189,9 +189,9 @@ struct ReaderTabItem: View {
     }
 }
 
-/// Active tab: the system's unemphasized selection background (the same
-/// colour a non-key list uses for its selected row), so the selected tab reads
-/// as a selection against the clear strip; hover keeps the quaternary wash.
+/// Active tab: the text-background colour — white in light mode, near-black
+/// in dark mode — so the selected pill is the one solid surface on the clear
+/// strip; hover keeps the quaternary wash.
 private struct ReaderTabGlassModifier: ViewModifier {
     let isActive: Bool
     let isHovered: Bool
@@ -205,7 +205,7 @@ private struct ReaderTabGlassModifier: ViewModifier {
 
     private var fill: Color {
         if isActive {
-            return Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
+            return Color(nsColor: .textBackgroundColor)
         }
         if isHovered {
             return Color(nsColor: .quaternarySystemFill).opacity(contrast == .increased ? 0.9 : 0.72)

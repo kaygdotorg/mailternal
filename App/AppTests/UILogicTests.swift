@@ -1793,4 +1793,13 @@ final class UILogicTests: XCTestCase {
             [first.id: true, second.id: true, third.id: true]
         )
     }
+
+    func testCacheTreeAppliesPendingTogglesInstantly() {
+        let a = FolderSummary(id: FolderID(rawValue: 1), name: "A", path: "A", separator: "/", role: .none, unreadCount: 0, totalCount: 3, keepLocally: false, backfill: .complete, accountID: AccountID(rawValue: "x"))
+        let b = FolderSummary(id: FolderID(rawValue: 2), name: "B", path: "B", separator: "/", role: .none, unreadCount: 0, totalCount: 3, keepLocally: true, backfill: .complete, accountID: AccountID(rawValue: "x"))
+        let applied = CacheTreePolicy.applyingPending([a.id: true, b.id: true], to: [a, b])
+        XCTAssertEqual(applied.map(\.keepLocally), [true, true])
+        XCTAssertEqual(CacheTreePolicy.applyingPending([:], to: [a, b]).map(\.keepLocally), [false, true])
+    }
+
 }
