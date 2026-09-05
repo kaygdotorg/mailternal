@@ -882,8 +882,6 @@ final class UILogicTests: XCTestCase {
 
     func testReaderTopInsetIsFixedAcrossSafeAreaChanges() {
         let inset = MessageViewerLayoutPolicy.readerTopInset()
-        // The ramp starts under the titlebar (tab strip) and reaches 24 pt
-        // into the content; the first glyph rests one guard below that.
         XCTAssertEqual(MailWindowDissolvePolicy.viewerTopOrigin, 46)
         XCTAssertEqual(
             inset,
@@ -1224,6 +1222,10 @@ final class UILogicTests: XCTestCase {
         let settings = ActionSettings(defaults: defaults)
 
         XCTAssertEqual(settings.trailingSwipe, [.archive, .trash, .toggleRead])
+        XCTAssertEqual(
+            defaults.string(forKey: "mailternal.actions.swipe.trailing"),
+            "[\"archive\",\"trash\",\"toggleRead\"]"
+        )
     }
 
     @MainActor
@@ -1239,6 +1241,10 @@ final class UILogicTests: XCTestCase {
         let settings = ActionSettings(defaults: defaults)
 
         XCTAssertEqual(settings.leadingSwipe, [.toggleFlag, .archive])
+        XCTAssertEqual(
+            defaults.string(forKey: "mailternal.actions.swipe.leading"),
+            "[\"toggleFlag\",\"archive\"]"
+        )
     }
 
     @MainActor
@@ -1448,20 +1454,14 @@ final class UILogicTests: XCTestCase {
         XCTAssertEqual(ReaderTabLayoutPolicy.toolbarSpacing, 8)
     }
 
-    func testMessageToolbarPolicyGroupsKeepArchiveTrashAndMoreInOneCapsule() {
+    func testMessageToolbarPolicyOrdersIndividualActions() {
         XCTAssertEqual(
-            MessageToolbarPolicy.groups,
-            [.messageActions]
-        )
-        XCTAssertEqual(MessageToolbarPolicy.defaultGroupIdentifiers, MessageToolbarPolicy.groups)
-        XCTAssertEqual(MessageToolbarPolicy.allowedGroupIdentifiers, MessageToolbarPolicy.groups)
-        XCTAssertEqual(
-            MessageToolbarPolicy.itemIdentifiers(in: .messageActions),
+            MessageToolbarPolicy.defaultItemIdentifiers,
             [.archive, .trash, .overflow]
         )
         XCTAssertEqual(
-            MessageToolbarPolicy.defaultItemIdentifiers,
-            MessageToolbarPolicy.groups.flatMap { $0.itemIdentifiers }
+            MessageToolbarPolicy.allowedItemIdentifiers,
+            MessageToolbarPolicy.defaultItemIdentifiers
         )
     }
     func testMessageToolbarPolicyMovesSourceIntoMore() {

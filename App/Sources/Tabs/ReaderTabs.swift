@@ -9,6 +9,8 @@ final class ReaderTabs {
     var tabs: [ReaderTab]
     var activeID: UUID?
     @ObservationIgnored var onChange: (() -> Void)?
+    /// Called for every tab whose retained reader surface must be released.
+    @ObservationIgnored var onClose: ((UUID) -> Void)?
 
     private(set) var mruIDs: [UUID]
     @ObservationIgnored private var scrollOffsets: [UUID: CGFloat]
@@ -103,6 +105,7 @@ final class ReaderTabs {
         tabs.remove(at: index)
         mruIDs.removeAll { $0 == id }
         scrollOffsets.removeValue(forKey: id)
+        onClose?(id)
         activeID = next.flatMap { candidate in tabs.contains { $0.id == candidate } ? candidate : nil }
             ?? tabs.first?.id
         if wasActive, let activeID { touchMRU(activeID) }
@@ -113,7 +116,10 @@ final class ReaderTabs {
         guard tabs.contains(where: { $0.id == id }) else { return }
         let removed = tabs.filter { $0.id != id }.map(\.id)
         tabs = tabs.filter { $0.id == id }
-        removed.forEach { scrollOffsets.removeValue(forKey: $0) }
+        removed.forEach {
+            scrollOffsets.removeValue(forKey: $0)
+            onClose?($0)
+        }
         activeID = id
         mruIDs = [id]
         notify()
@@ -124,7 +130,10 @@ final class ReaderTabs {
         let removed = tabs.suffix(from: index + 1).map(\.id)
         guard !removed.isEmpty else { return }
         tabs = ReaderTabsPolicy.closeToRight(in: tabs, of: id, idOf: \.id)
-        removed.forEach { scrollOffsets.removeValue(forKey: $0) }
+        removed.forEach {
+            scrollOffsets.removeValue(forKey: $0)
+            onClose?($0)
+        }
         mruIDs.removeAll { removed.contains($0) }
         if activeID.map({ removed.contains($0) }) == true {
             activeID = id
@@ -132,6 +141,7 @@ final class ReaderTabs {
         }
         notify()
     }
+
 
     func keep(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }), tabs[index].isTransient else { return }
@@ -210,6 +220,11 @@ final class ReaderTabs {
                 messagesByTabID[entry.id] == nil ? nil : (entry.id, entry.scrollOffset)
             })
         )
+        let previousIDs = Set(tabs.map(\.id))
+        let survivorIDs = Set(normalized.tabs.map(\.id))
+        for id in previousIDs.subtracting(survivorIDs) {
+            onClose?(id)
+        }
         tabs = normalized.tabs
         activeID = normalized.activeID
         mruIDs = normalized.mruIDs

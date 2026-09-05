@@ -124,3 +124,20 @@ rationale → revisit-when.
     CPU; the dual-account resource bound is analytical from the shared four-permit
     pool and bounded window/write budgets. Revisit: only if profiling shows a lower
     cap preserves acceptable throughput.
+28. **Retain a bounded WebKit surface per reader tab.** Each open tab keeps its
+    rendered `MessageWebView` and native scroll position so switching tabs is an
+    AppKit child-view swap rather than another `loadHTMLString`. The pool is
+    capped at eight most-recently-used surfaces; opening beyond the cap evicts
+    the least-recently-used surface, and every tab-close path drops its surface
+    and cached height immediately. Reading-mode changes inject style into all
+    retained documents. Revisit: only if memory profiling on real newsletter
+    workloads shows eight surfaces is too high or too low.
+29. **Gate loaded reader-tab commits at 100 ms while keeping main-thread work at
+    16 ms.** The initial 20 ms candidate was uncalibrated and below repeatable
+    end-to-end AppKit/SwiftUI commit time even when retained surfaces performed
+    zero HTML navigations. The final uncontended dedicated-VM run measured ten
+    clean switches, 95.9 ms maximum, zero navigations, and zero malformed
+    samples. The 100 ms ceiling governs input-to-reader-commit latency; it does
+    not relax the separate 16 ms main-thread work budget. Revisit: lower the
+    ceiling after signposts isolate a consistently smaller commit phase; never
+    raise either threshold without a new measured decision.

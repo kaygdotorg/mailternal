@@ -20,9 +20,10 @@ struct ReaderTabBar: View {
     @State private var hoverDismissTask: Task<Void, Never>?
     @State private var hoverPopover: ReaderTabHoverPopover?
     @State private var isCardHovered = false
-    @FocusState private var readerHasFocus: Bool
     @State private var tabFrames: [UUID: CGRect] = [:]
     @State private var tabBarView: NSView?
+    @FocusState private var focusedTabID: UUID?
+    @State private var pendingReaderFocusIdentifier: String?
 
     var body: some View {
         let _ = os_signpost(
@@ -57,9 +58,6 @@ struct ReaderTabBar: View {
             .frame(height: ReaderTabLayoutPolicy.rowHeight)
             .zIndex(hoveredTabID == nil ? 0 : 1)
             .accessibilityIdentifier(UIIdentifier.readerTabBar)
-            .focusable()
-            .focusEffectDisabled(true)
-            .focused($readerHasFocus)
             .background {
                 Color.clear
                     .contentShape(Rectangle())
@@ -71,8 +69,11 @@ struct ReaderTabBar: View {
                         }
                     }
             }
-            .onChange(of: model.tabs.activeID) { _, activeID in
-                readerHasFocus = activeID != nil
+            .onChange(of: model.tabs.activeID) { _, _ in
+                if let hoveredTabID,
+                   !canPresentHoverPreview(for: hoveredTabID) {
+                    dismissHoverCard()
+                }
             }
             .onChange(of: isCardHovered) { _, cardHovered in
                 if cardHovered {
@@ -82,9 +83,22 @@ struct ReaderTabBar: View {
                     scheduleHoverDismissal()
                 }
             }
+            .onChange(of: focusSnapshot) { oldSnapshot, newSnapshot in
+                guard let oldActiveID = oldSnapshot.activeID,
+                      oldSnapshot.tabIDs.contains(oldActiveID),
+                      !newSnapshot.tabIDs.contains(oldActiveID),
+                      newSnapshot.activeID != nil else {
+                    return
+                }
+                let targetIdentifier = pendingReaderFocusIdentifier ?? focusedReaderTargetIdentifier()
+                pendingReaderFocusIdentifier = nil
+                restoreReaderFocus(to: targetIdentifier)
+            }
             .onDisappear {
                 dismissHoverCard()
-                readerHasFocus = false
+                if model.tabs.tabs.isEmpty && !model.isSearchPresented {
+                    restoreMessageListFocus()
+                }
             }
         }
     }
@@ -100,7 +114,7 @@ struct ReaderTabBar: View {
                     ForEach(Array(model.tabs.tabs.enumerated()), id: \.element.id) { index, tab in
                         let width = index < widths.count
                             ? widths[index]
-                            : ReaderTabLayoutPolicy.minimumTabWidth
+: ReaderTabLayoutPolicy.minimumTabWidth
                         ReaderTabItem(
                             model: model,
                             tab: tab,
@@ -110,7 +124,8 @@ struct ReaderTabBar: View {
                             onHoverChanged: { hovering in
                                 updateHover(for: tab.id, hovering: hovering)
                             },
-                            onClose: closeTab
+                            onClose: closeTab,
+                            focusedTabID: $focusedTabID
                         )
                         .id(tab.id)
                         .background {
@@ -269,9 +284,8 @@ struct ReaderTabBar: View {
 
     private func updateHover(for id: UUID, hovering: Bool) {
         if hovering {
-            // The active tab's content is already on screen; no preview.
-            guard model.tabs.activeID != id else {
-                if hoveredTabID != nil { hoveredTabID = nil; scheduleHoverDismissal() }
+            guard canPresentHoverPreview(for: id) else {
+                dismissHoverCard()
                 return
             }
             hoverDismissTask?.cancel()
@@ -288,10 +302,20 @@ struct ReaderTabBar: View {
         scheduleHoverDismissal()
     }
 
+    /// Shared gate for hover events, delayed anchor updates, and active-tab
+    /// changes: the selected tab never owns a preview.
+    private func canPresentHoverPreview(for id: UUID) -> Bool {
+        model.tabs.activeID != id
+    }
+
     private func showHoverPanel(for id: UUID) {
-        guard let preview = hoveredPreview,
+        guard canPresentHoverPreview(for: id),
+              let preview = hoveredPreview,
               let frame = tabFrames[id],
               let anchor = tabBarView else {
+            if hoveredTabID == id {
+                dismissHoverCard()
+            }
             return
         }
         let card = ReaderTabHoverCard(
@@ -332,23 +356,118 @@ struct ReaderTabBar: View {
         isCardHovered = false
     }
 
+    private var focusSnapshot: ReaderTabFocusSnapshot {
+        ReaderTabFocusSnapshot(
+            tabIDs: model.tabs.tabs.map(\.id),
+            activeID: model.tabs.activeID
+        )
+    }
+
+    private func focusedReaderTargetIdentifier() -> String? {
+        guard let window = tabBarView?.window ?? NSApp.keyWindow,
+              let contentView = window.contentView,
+              let viewer = Self.findView(
+                  withAccessibilityIdentifier: UIIdentifier.messageViewer,
+                  in: contentView
+              ),
+              let responder = window.firstResponder as? NSView,
+              responder === viewer || responder.isDescendant(of: viewer) else {
+            return nil
+        }
+
+        var target: NSView? = responder
+        while let view = target {
+            let identifier = view.accessibilityIdentifier()
+            if !identifier.isEmpty {
+                return identifier
+            }
+            target = view.superview
+        }
+        return nil
+    }
+
+    private func restoreReaderFocus(to identifier: String?) {
+        Task { @MainActor in
+            // Wait for the replacement reader's hierarchy to be installed
+            // before resolving its accessibility target.
+            await Task.yield()
+            guard let window = tabBarView?.window ?? NSApp.keyWindow,
+                  let contentView = window.contentView else {
+                return
+            }
+            let target = identifier.flatMap {
+                Self.findView(
+                    withAccessibilityIdentifier: $0,
+                    in: contentView
+                )
+            } ?? Self.findView(
+                withAccessibilityIdentifier: UIIdentifier.messageViewer,
+                in: contentView
+            )
+            guard let target, target.window === window else { return }
+            window.makeFirstResponder(target)
+        }
+    }
+
+
+    private func restoreMessageListFocus() {
+        guard let window = tabBarView?.window ?? NSApp.keyWindow,
+              let contentView = window.contentView else {
+            return
+        }
+        DispatchQueue.main.async { [weak window, weak contentView] in
+            guard let window,
+                  let contentView,
+                  let table = Self.findView(
+                    withAccessibilityIdentifier: UIIdentifier.messageTable,
+                    in: contentView
+                  ),
+                  table.window === window else {
+                return
+            }
+            window.makeFirstResponder(table)
+        }
+    }
+
+    private static func findView(
+        withAccessibilityIdentifier identifier: String,
+        in view: NSView
+    ) -> NSView? {
+        if view.accessibilityIdentifier() == identifier {
+            return view
+        }
+        for subview in view.subviews.reversed() {
+            if let match = findView(
+                withAccessibilityIdentifier: identifier,
+                in: subview
+            ) {
+                return match
+            }
+        }
+        return nil
+    }
+
     private func closeTab(_ id: UUID) {
-        let wasActive = model.tabs.activeID == id
-        if wasActive {
+        if model.tabs.activeID == id {
+            pendingReaderFocusIdentifier = focusedReaderTargetIdentifier()
             model.closeActiveTabOrWindow()
-            readerHasFocus = model.tabs.activeID != nil
         } else {
             model.tabs.close(id)
         }
     }
 
     private static func plainText(fromHTML html: String) -> String {
+
         let stripped = html
             .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
             .replacingOccurrences(of: "&nbsp;", with: " ")
             .replacingOccurrences(of: "&amp;", with: "&")
         return stripped.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
     }
+}
+private struct ReaderTabFocusSnapshot: Equatable {
+    let tabIDs: [UUID]
+    let activeID: UUID?
 }
 
 

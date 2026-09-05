@@ -64,8 +64,10 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   depth and is opaque 32 pt below it, leaving the account title's cap-height
   band clear; the `List` ignores the container top safe area and carries a
   fixed 40 pt scroll-content inset plus the header's 12 pt optical padding.
-  The system scroll-edge pocket is suppressed on this list.
-  Bottom ramp 48 pt, ending above the fixed account inset.
+  The account title stands alone—never followed by a redundant “Folders”
+  label—and retains 10 pt of header air before the first folder row. The
+  system scroll-edge pocket is suppressed on this list. Bottom ramp 48 pt,
+  ending above the fixed account inset.
 - **Message list**: the pane ignores the top safe area, its large title is
   anchored at the same fixed 52 pt window depth, and the table reserves the
   title's measured frame below that anchor. Its top dissolve is independent
@@ -118,6 +120,17 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   name, and right-aligned secondary email. Folder rows retain a checkbox, name,
   and message-count caption, with the pane's breathing-room spacing.
 
+## Reader envelope
+
+- Sender and recipient remain separate full-row copy targets, with optional
+  monograms controlled by **Appearance ▸ Sender icons**. One decorative,
+  deterministic hand-drawn accent route occupies the left direction column:
+  a subtly wavy vertical stroke begins at the sender row and ends in an open
+  arrowhead at the recipient row. The route has round caps/joins, no motion,
+  and is hidden from accessibility.
+- The former per-row arrow-circle symbols MUST NOT appear. Sent/delivered date
+  rows retain their semantic paper-plane and tray glyphs.
+
 ## Motion (exact values; all with Reduce Motion alternates)
 - Sidebar toggle: `.snappy(duration: 0.24, extraBounce: 0)`.
 - Disclosure/hover: easeOut 0.12.
@@ -140,11 +153,12 @@ empty-reader state and while global search is presented.
 
 ### Tabs and actions
 
-- The tab viewport belongs to the toolbar's reader-tabs item. The native
-  NSToolbarItemGroup at the trailing edge remains the sole message-actions
-  group: Archive, Trash, Flag, Raw Source, Email Reading mode, and More.
-  The sidebar toggle MUST remain in the titlebar. The reader-tabs toolbar item
-  MUST have no label or tooltip, and toolbar customization MUST be disabled.
+- The tab viewport belongs to the toolbar's reader-tabs item. Three adjacent,
+  individual native `NSToolbarItem`s at the trailing edge expose Archive,
+  Trash, and More; Flag, Raw Source, Email Reading mode, and the remaining
+  reader actions live inside More. The sidebar toggle MUST remain in the
+  titlebar. The reader-tabs toolbar item MUST have no label or tooltip, and
+  toolbar customization MUST be disabled.
 - Each tab MUST use its intrinsic width:
   `(leading slot + subject text width + inter-item spacing + title paddings)`,
   clamped to 72–220 pt. Subject title leading padding is 4 pt and trailing
@@ -152,11 +166,17 @@ empty-reader state and while global search is presented.
   consume spare viewport width. Scrolling MUST occur beneath a fixed 28 pt
   right-edge fade at the end of the tab viewport, directly against the
   actions cluster with no extra gap.
-- The trailing actions (Archive, Trash, More) are unbordered toolbar items —
-  no shared capsule — so the glyphs sit as close as the toolbar allows, like
-  Craft's reader chrome. They use one symbol configuration (17 pt, medium
-  weight) so unbordered images match the sidebar toggle's size. The active
-  tab fill is `textBackgroundColor` (white / near-black); hover is `quaternarySystemFill`.
+- The trailing actions (Archive, Trash, More) are independent, unbordered
+  toolbar items—never an `NSToolbarItemGroup` and never a shared capsule—so
+  the glyphs sit as close as native toolbar layout allows. Each item uses a
+  private borderless control with AppKit's intrinsic control and symbol sizing;
+  custom point-size symbol configurations, image scaling, and fixed icon
+  dimensions are prohibited. The control's tracking area supplies independent
+  native-semantic hover and pressed chrome with continuous corners: hover is
+  `quaternarySystemFill`, press is `tertiarySystemFill`, and disabled state
+  remains AppKit-semantic. Hover chrome MUST surround only the hovered item.
+  The active tab fill is `textBackgroundColor` (white / near-black); hover is
+  `quaternarySystemFill`.
 - Its title MUST contain only the subject, MUST use semantic `.subheadline`, and
   MUST use the trailing fade mask when compressed. The active tab MUST use
   semantic selection treatment and label color; inactive tabs MUST have no fill
@@ -169,9 +189,9 @@ empty-reader state and while global search is presented.
   radius. The right-edge fade MUST be a 28 pt transparent mask drawn above
   scrolling tabs and MUST NOT capture tab input. No strip-level fill may
   obscure the toolbar material.
-- The native message-actions group MUST contain Flag, Raw Source, Email Reading
-  mode, and every other action not named Archive or Trash. Archive and Trash
-  MUST remain directly reachable in that fixed group.
+- The More menu MUST contain Flag, Raw Source, Email Reading mode, and every
+  other reader action not named Archive or Trash. Archive and Trash MUST
+  remain directly reachable as adjacent individual toolbar items.
 
 ### Tab display styles
 

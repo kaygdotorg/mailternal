@@ -329,9 +329,9 @@ enum MessageViewerLayoutPolicy {
     /// keeps the whole pane; only plain text is measured.
     static let plainTextMeasureCharacters = 72
 
-    /// Depth, below the physical window top, at which the reader's first
-    /// readable glyph may rest. This is fixed to the titlebar band and does
-    /// not follow a scroll-dependent safe-area report.
+    /// Document-space inset that places the first subject glyph one guard
+    /// below the reader dissolve: the 46 pt tab-strip edge, its 24 pt ramp,
+    /// then 12 pt of clear reading space.
     static func readerTopInset(safeAreaTop _: CGFloat = 0) -> CGFloat {
         MailWindowDissolvePolicy.viewer.restDepth(safeAreaTop: 0) + fadeGuard
     }

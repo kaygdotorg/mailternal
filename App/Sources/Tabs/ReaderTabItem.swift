@@ -14,6 +14,9 @@ struct ReaderTabItem: View {
     /// Optional owner hook lets the strip restore focus after closing its
     /// active tab while keeping the model as the source of truth.
     var onClose: ((UUID) -> Void)? = nil
+    /// The owner assigns this focus value only when a tab is closed. Keeping
+    /// the binding here avoids stealing focus during ordinary activation.
+    var focusedTabID: FocusState<UUID?>.Binding
 
 
     @Environment(\.colorSchemeContrast) private var contrast
@@ -71,6 +74,9 @@ struct ReaderTabItem: View {
                 .opacity(isHovered ? 1 : 0)
                 .allowsHitTesting(isHovered)
             }
+            // Keep the breathing room inside the documented leading slot so
+            // the rendered item width matches ReaderTabLayoutPolicy.
+            .padding(.leading, 6)
             .frame(width: 25, height: 28, alignment: .leading)
         }
     }
@@ -110,6 +116,7 @@ struct ReaderTabItem: View {
                 }
                 .buttonStyle(.plain)
                 .focusEffectDisabled(true)
+                .focused(focusedTabID, equals: tab.id)
                 .highPriorityGesture(
                     TapGesture(count: 2)
                         .onEnded {
@@ -128,6 +135,13 @@ struct ReaderTabItem: View {
             )
         )
         .frame(width: width, height: ReaderTabLayoutPolicy.rowHeight)
+        .modifier(
+            ReaderTabFocusModifier(
+                isFocusable: !ReaderTabStylePolicy.showsSubject(for: style),
+                focusedTabID: focusedTabID,
+                id: tab.id
+            )
+        )
         .focusEffectDisabled(true)
         .onContinuousHover { phase in
             switch phase {
@@ -186,6 +200,23 @@ struct ReaderTabItem: View {
         .accessibilityLabel(displaySubject)
         .accessibilityValue(isActive ? "Selected" : (isTransient ? "Temporary" : ""))
         .accessibilityIdentifier(UIIdentifier.readerTab(tab.id))
+    }
+}
+
+private struct ReaderTabFocusModifier: ViewModifier {
+    let isFocusable: Bool
+    let focusedTabID: FocusState<UUID?>.Binding
+    let id: UUID
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isFocusable {
+            content
+                .focusable()
+                .focused(focusedTabID, equals: id)
+        } else {
+            content
+        }
     }
 }
 

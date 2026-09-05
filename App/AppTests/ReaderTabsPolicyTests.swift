@@ -20,6 +20,18 @@ final class ReaderTabsPolicyTests: XCTestCase {
         tabs.close(second.id)
         XCTAssertEqual(tabs.activeID, first.id)
     }
+    func testCloseNotifiesRetainedSurfaceHook() {
+        let first = ReaderTab(message: message(1), isTransient: false)
+        let second = ReaderTab(message: message(2), isTransient: false)
+        let tabs = ReaderTabs(tabs: [first, second], activeID: first.id)
+        var closed: [UUID] = []
+        tabs.onClose = { closed.append($0) }
+
+        tabs.closeOthers(first.id)
+
+        XCTAssertEqual(closed, [second.id])
+    }
+
 
     func testPromoteInPlace() {
         let transient = ReaderTab(message: message(1), isTransient: true)

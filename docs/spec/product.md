@@ -78,6 +78,14 @@ swipe actions, Settings → Actions → Gestures) → reader as three floating i
 
 The main window's rightmost pane is the reader. It MUST expose one tab strip for
 messages open in that reader; detached message windows MUST remain tab-less.
+- Each open tab retains its rendered reader surface—`WKWebView` for HTML or
+  `NSTextView` for plain text—and native scroll position in one bounded reader
+  pool. The pool keeps at most eight most-recently-used tab surfaces; opening a
+  new tab evicts the least-recently-used surface, and closing a tab releases its
+  surface immediately. Switching among retained tabs swaps the installed view
+  without reloading HTML or rebuilding attributed plain text. Reading-mode and
+  appearance changes use the existing injected-style path for every retained
+  HTML surface and invalidate only the affected native-text layout caches.
 
 ### Open and promote
 
@@ -125,6 +133,9 @@ The reader-tab state MUST use the following model names and fields:
   `activateNext`, `activatePrevious`, and `messageRemoved`.
   `scrollOffset` reads or writes the saved reader position for the addressed
   tab; it MUST be the tab's `perTabScroll`, not a global reader position.
+- Changing the selected folder MUST clear the message-list selection without
+  clearing, reloading, or hiding the active reader tab. The tab remains visible
+  even when its message is outside the selected folder.
 - `order` is the position of each `ReaderTab` in `ReaderTabs.tabs`. The MRU
   stack is ordered most-recently-used first. Activating a tab MUST move it to
   the front without duplicates; closing a tab MUST remove it.
@@ -218,15 +229,16 @@ change `order` without changing `id` or `message`.
   text width plus title paddings, clamped to 72–220 pt. Tabs MUST have an 8 pt
   leading strip inset and 8 pt spacing. When they overflow, they MUST scroll
   horizontally beneath a fixed 28 pt trailing fade up to the actions cluster.
-- Hovering a tab MUST immediately show a local preview in a non-activating
-  child panel beneath that tab, with no dwell delay or entrance animation. The
-  panel MUST be exactly 220 pt wide by 160 pt high and contain a scrollable
-  preview body. If sender and received time are already available locally, the
-  card MUST include them in a compact metadata line; otherwise it MUST omit
-  them and MUST NOT fetch them. It MUST overlay the reader without reflowing it,
-  changing selection or scroll, marking the message read, or fetching remote
-  content. The panel MUST remain hoverable while the pointer is over either the
-  tab or card and dismiss after a 150 ms grace period after leaving both.
+- Hovering an inactive tab MUST immediately show a local preview in a
+  non-activating child panel beneath that tab; hovering the active tab MUST
+  never show a redundant preview. The panel MUST be exactly 220 pt wide by
+  160 pt high and contain a scrollable preview body. If sender and received
+  time are already available locally, the card MUST include them in a compact
+  metadata line; otherwise it MUST omit them and MUST NOT fetch them. It MUST
+  overlay the reader without reflowing it, changing selection or scroll,
+  marking the message read, or fetching remote content. The panel MUST remain
+  hoverable while the pointer is over either the inactive tab or card and
+  dismiss after a 150 ms grace period after leaving both.
 
 ## Non-goals for 0.0.1
 Threading, multi-account, unified inbox, rules/snooze/send-later, JMAP, monetization,

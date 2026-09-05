@@ -26,12 +26,76 @@ private enum MailModelRouteError: LocalizedError {
 @MainActor
 @Observable
 final class AppModel {
+    private struct MessageDetailCache {
+        private static let capacity = ReaderSurfacePool.defaultCapacity
+        private var values: [MessageID: MessageDetail] = [:]
+        private var mruIDs: [MessageID] = []
+
+        mutating func value(for id: MessageID) -> MessageDetail? {
+            guard let value = values[id] else { return nil }
+            touch(id)
+            return value
+        }
+
+        mutating func insert(
+            _ value: MessageDetail,
+            for id: MessageID,
+            protectedIDs: Set<MessageID> = []
+        ) {
+            values[id] = value
+            touch(id)
+            trim(protectedIDs: protectedIDs)
+        }
+
+        mutating func removeValue(for id: MessageID) {
+            values.removeValue(forKey: id)
+            mruIDs.removeAll { $0 == id }
+        }
+
+        mutating func removeValues(notIn retainedIDs: Set<MessageID>) {
+            let obsoleteIDs = values.keys.filter { !retainedIDs.contains($0) }
+            for id in obsoleteIDs {
+                removeValue(for: id)
+            }
+        }
+
+        mutating func removeAll(keepingCapacity: Bool) {
+            values.removeAll(keepingCapacity: keepingCapacity)
+            mruIDs.removeAll(keepingCapacity: keepingCapacity)
+        }
+
+        private mutating func trim(protectedIDs: Set<MessageID>) {
+            while mruIDs.count > Self.capacity,
+                  let evictedIndex = mruIDs.lastIndex(where: { !protectedIDs.contains($0) }) {
+                let evictedID = mruIDs.remove(at: evictedIndex)
+                values.removeValue(forKey: evictedID)
+            }
+        }
+
+        private mutating func touch(_ id: MessageID) {
+            mruIDs.removeAll { $0 == id }
+            mruIDs.insert(id, at: 0)
+        }
+    }
+
+    /// Detail entries for tabs whose native surfaces are still retained are
+    /// protected from message-list/transient browsing churn. The surface pool
+    /// has the same bound, so this cannot make the detail cache grow.
+    private var retainedDetailMessageIDs: Set<MessageID> {
+        let retainedTabIDs = readerSurfacePool.retainedTabIDs
+        return Set(
+            tabs.tabs.compactMap { tab in
+                retainedTabIDs.contains(tab.id) ? tab.message : nil
+            }
+        )
+    }
+
+    /// Retains fetched content while a reader tab is inactive, so activating
+    /// a loaded tab does not issue another facade.detail request.
+    @ObservationIgnored private var detailCache = MessageDetailCache()
     let facade: any MailFacade
     let appearance: AppearanceSettings
     let actions: ActionSettings
-    /// Retains fetched content while a reader tab is inactive, so activating
-    /// a loaded tab does not issue another facade.detail request.
-    @ObservationIgnored private var detailCache: [MessageID: MessageDetail] = [:]
     let toasts = ToastPresenter()
     @ObservationIgnored private let faviconStore: FaviconStore
     private var faviconImages: [String: NSImage] = [:]
@@ -46,6 +110,10 @@ final class AppModel {
     var folders: [FolderSummary] = []
     var listScrollOffsets: [FolderID: CGFloat] = [:]
     var tabs: ReaderTabs
+    /// Retained HTML and plain-text surfaces keyed by reader-tab identity. The
+    /// pool is shared by the main reader (or one detached reader window) and
+    /// bounds native reader memory independently from persisted tab metadata.
+    let readerSurfacePool: ReaderSurfacePool
     /// The list's full selection. `selectedMessageID` remains the reader
     /// anchor so a single-message reader survives ordinary list updates.
     var selectedMessageIDs: Set<MessageID> = []
@@ -178,12 +246,23 @@ final class AppModel {
         self.appearance = appearance
         self.actions = actions
         self.faviconStore = faviconStore
+        let pool = ReaderSurfacePool()
+        self.readerSurfacePool = pool
         self.tabs = ReaderTabs()
         accountState = facade.accountState
         accountStates = facade.accountStates
         accountConfigs = facade.accounts
         tabs.onChange = { [weak self] in
             self?.scheduleTabsPersistence()
+        }
+        pool.onEvict = { [weak self] _ in
+            guard let self else { return }
+            self.detailCache.removeValues(notIn: self.retainedDetailMessageIDs)
+        }
+        tabs.onClose = { [weak self, weak pool] id in
+            pool?.drop(id)
+            guard let self else { return }
+            self.detailCache.removeValues(notIn: self.retainedDetailMessageIDs)
         }
     }
     /// malformed URLs can never reach account or folder selection.
@@ -451,9 +530,9 @@ final class AppModel {
         (facade as? LiveMailFacade)?.reportVisibleFolder(id)
         selectedMessageIDs.removeAll()
         selectedMessageID = nil
-        detail = nil
-        rawSource = nil
-        isShowingRawSource = false
+        if tabs.active == nil {
+            clearReaderSelection()
+        }
         listRows = []
         listCursor = nil
         messageDeepLinks.removeAll()
@@ -566,9 +645,13 @@ final class AppModel {
         rawSource = nil
         isFindPresented = false
         findQuery = ""
-        allowRemoteImages = false
+        let retainedRemoteImages = tabs.activeID.flatMap { tabID -> Bool? in
+            guard tabs.active?.message == id else { return nil }
+            return readerSurfacePool.remoteImagesAllowed(for: tabID)
+        } ?? false
+        allowRemoteImages = retainedRemoteImages
         isLoadingDetail = true
-        if let cached = detailCache[id] {
+        if let cached = detailCache.value(for: id) {
             presentDetail(
                 cached,
                 id: id,
@@ -598,8 +681,7 @@ final class AppModel {
                     "result=error"
                 )
                 guard !Task.isCancelled,
-                      selectedMessageID == id,
-                      selectedMessageIDs == Set([id]) else { return }
+                      isReaderRequestCurrent(id) else { return }
                 closeUnavailableTab(messageID: id)
             }
         }
@@ -612,7 +694,11 @@ final class AppModel {
         source: String,
         signpostID: OSSignpostID
     ) {
-        detailCache[id] = loaded
+        detailCache.insert(
+            loaded,
+            for: id,
+            protectedIDs: retainedDetailMessageIDs
+        )
         os_signpost(
             .end,
             log: appModelSignpostLog,
@@ -621,7 +707,7 @@ final class AppModel {
             "result=%{public}s",
             source
         )
-        guard selectedMessageID == id, selectedMessageIDs == Set([id]) else { return }
+        guard isReaderRequestCurrent(id) else { return }
         detail = loaded
         isLoadingDetail = false
         let senderDomains = loaded.envelope.from.compactMap { address in
@@ -642,6 +728,13 @@ final class AppModel {
         markRead(id)
     }
 
+
+    /// Folder navigation clears list selection, not the independently owned
+    /// active reader tab. Detached readers still use the direct selection path.
+    private func isReaderRequestCurrent(_ id: MessageID) -> Bool {
+        tabs.active?.message == id
+            || (selectedMessageID == id && selectedMessageIDs == Set([id]))
+    }
 
     private func clearReaderSelection() {
         detail = nil
@@ -929,13 +1022,34 @@ final class AppModel {
     func openMessage(_ id: MessageID, permanent: Bool) {
         // Explicit opens are never dropped: a transient open reuses the one
         // transient tab, a permanent open promotes or inserts (ReaderTabs.open).
+        let existingTabID = tabs.tabs.first(where: { $0.message == id })?.id
         tabs.open(id, permanent: permanent)
+        let activeTabID = tabs.activeID
+        let pooledRemoteImages = activeTabID.map {
+            readerSurfacePool.remoteImagesAllowed(for: $0)
+        } ?? false
+        let retainedRemoteImages = activeTabID == existingTabID
+            ? pooledRemoteImages
+            : false
+        if let activeID = activeTabID {
+            readerSurfacePool.retain(activeID)
+        }
         if let folder = folderContaining(id), selectedFolderID != folder {
             selectFolder(folder)
         }
         if let folder = folderContaining(id),
            listRows.contains(where: { $0.id == id }) {
-            syncSelection(to: id, folder: folder)
+            let selectionMatches = selectedMessageIDs == [id]
+                && selectedMessageID == id
+            let detailMatches = detail?.id == id
+            if !selectionMatches || (!detailMatches && !isLoadingDetail) {
+                syncSelection(to: id, folder: folder)
+            }
+            restoreRemoteImagesAllowed(
+                retainedRemoteImages,
+                tabID: activeTabID,
+                messageID: id
+            )
             return
         }
         Task { @MainActor [weak self] in
@@ -955,8 +1069,14 @@ final class AppModel {
                 if !self.listRows.contains(where: { $0.id == id }) {
                     self.listRows.insert(row, at: 0)
                 }
-                guard self.tabs.active?.message == id else { return }
+                guard self.tabs.activeID == activeTabID,
+                      self.tabs.active?.message == id else { return }
                 self.syncSelection(to: id, folder: folder)
+                self.restoreRemoteImagesAllowed(
+                    retainedRemoteImages,
+                    tabID: activeTabID,
+                    messageID: id
+                )
             } catch {
                 guard !Task.isCancelled else { return }
                 self.closeUnavailableTab(messageID: id)
@@ -984,15 +1104,27 @@ final class AppModel {
             )
         }
         tabs.activate(id)
+        readerSurfacePool.retain(id)
+        let retainedRemoteImages = readerSurfacePool.remoteImagesAllowed(for: id)
         if let folder = folderContaining(tab.message),
            listRows.contains(where: { $0.id == tab.message }),
            canSync(folder: folder) {
             syncSelection(to: tab.message, folder: folder)
+            restoreRemoteImagesAllowed(
+                retainedRemoteImages,
+                tabID: id,
+                messageID: tab.message
+            )
             return
         }
         guard folderContaining(tab.message) == nil || canSync(folder: folderContaining(tab.message)!) else {
             // A disabled account may retain cached detail, but activating its
             // tab must not force account/folder selection or a network fetch.
+            restoreRemoteImagesAllowed(
+                retainedRemoteImages,
+                tabID: id,
+                messageID: tab.message
+            )
             return
         }
         Task { @MainActor [weak self] in
@@ -1006,13 +1138,31 @@ final class AppModel {
                     self.closeUnavailableTab(messageID: tab.message)
                     return
                 }
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled,
+                      self.tabs.activeID == id,
+                      self.tabs.active?.message == tab.message else { return }
                 self.syncSelection(to: tab.message, folder: folder)
+                self.restoreRemoteImagesAllowed(
+                    retainedRemoteImages,
+                    tabID: id,
+                    messageID: tab.message
+                )
             } catch {
                 guard !Task.isCancelled else { return }
                 self.closeUnavailableTab(messageID: tab.message)
             }
         }
+    }
+
+    private func restoreRemoteImagesAllowed(
+        _ allowed: Bool,
+        tabID: UUID?,
+        messageID: MessageID
+    ) {
+        guard let tabID,
+              tabs.activeID == tabID,
+              tabs.active?.message == messageID else { return }
+        allowRemoteImages = allowed
     }
 
     private func canSync(folder: FolderID) -> Bool {
@@ -1046,8 +1196,8 @@ final class AppModel {
 
     @discardableResult
     func messageRemoved(_ id: MessageID) -> Bool {
+        detailCache.removeValue(for: id)
         guard tabs.messageRemoved(id) else { return false }
-        detailCache.removeValue(forKey: id)
         toasts.post(title: "Message was deleted")
         if selectedMessageID == id {
             if let active = tabs.active {
@@ -1065,7 +1215,7 @@ final class AppModel {
     /// state. Remove its tab without a toast and leave the reader empty when
     /// no other tab remains.
     private func closeUnavailableTab(messageID: MessageID) {
-        detailCache.removeValue(forKey: messageID)
+        detailCache.removeValue(for: messageID)
         guard let tabID = tabs.tabs.first(where: { $0.message == messageID })?.id else {
             return
         }
@@ -1105,17 +1255,20 @@ final class AppModel {
         if let folder, selectedFolderID != folder {
             selectFolder(folder)
         }
+        let alreadySelected = selectedMessageIDs == [id]
+            && selectedMessageID == id
+            && detail?.id == id
+            && !isLoadingDetail
         selectedMessageIDs = [id]
         selectedMessageID = id
+        guard !alreadySelected else { return }
         loadMessageDetail(id)
     }
 
     private var tabsPersistenceURL: URL {
-        #if DEBUG
         if let root = QALaunch.parse()?.containerRoot {
             return root.appendingPathComponent("reader-tabs.json", isDirectory: false)
         }
-        #endif
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask

@@ -3,6 +3,7 @@ import AppKit
 import os
 import WebKit
 import MailternalSanitizer
+import MailternalInterfaces
 private let messageHTMLSignpostLog = OSLog(
     subsystem: "org.kayg.mailternal",
     category: "HTMLRender"
@@ -46,6 +47,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     private var lastHTML = ""
     /// Identity last loaded or queued. Skip `loadHTMLString` when unchanged.
     private var lastHTMLIdentity: DisplayedHTMLIdentity?
+    private var lastRenderedMessageID: MessageID?
     private var lastProvider: PartProvider?
     private var emailReadingMode: EmailReadingMode = .original
     private var pendingRender = false
@@ -60,8 +62,19 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     private var contentHeightMeasurementGeneration: UInt64 = 0
     private var documentScrollTask: Task<Void, Never>?
     private var documentScrollGeneration: UInt64 = 0
+    private var documentScrollRestoreTask: Task<Void, Never>?
+    private var documentRenderGeneration: UInt64 = 0
+    private var requestedNavigation: WKNavigation?
+    private var requestedReadingMode: EmailReadingMode?
+    private var readerStyleTask: Task<Void, Never>?
+    private var findTask: Task<Void, Never>?
+    private var fenceCompletionTask: Task<Void, Never>?
+    private var findTaskGeneration: UInt64 = 0
+    private var isDisposedForPoolRemoval = false
     private var pendingDocumentScrollOffset: CGFloat?
+    private var pendingDocumentScrollGeneration: UInt64?
     private var pendingHTMLSignpostID: OSSignpostID?
+    private var pendingDocumentScrollMessageID: MessageID?
     #if DEBUG
     private var qaRenderSequence: UInt64 = 0
     #endif
@@ -118,7 +131,69 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     deinit {
         NotificationCenter.default.removeObserver(self)
     }
+
+    /// Permanently releases work and delegate-owned state before this surface
+    /// leaves the bounded reader pool. Unlike ordinary detach, this surface
+    /// must never be reattached.
+    func disposeForPoolRemoval() {
+        guard !isDisposedForPoolRemoval else { return }
+        isDisposedForPoolRemoval = true
+
+        contentHeightMeasurementGeneration &+= 1
+        documentScrollGeneration &+= 1
+        documentRenderGeneration &+= 1
+        findTaskGeneration &+= 1
+        contentHeightTask?.cancel()
+        contentHeightTask = nil
+        documentScrollTask?.cancel()
+        documentScrollTask = nil
+        documentScrollRestoreTask?.cancel()
+        documentScrollRestoreTask = nil
+        readerStyleTask?.cancel()
+        readerStyleTask = nil
+        findTask?.cancel()
+        findTask = nil
+        fenceCompletionTask?.cancel()
+        fenceCompletionTask = nil
+
+        if let pendingHTMLSignpostID {
+            os_signpost(
+                .end,
+                log: messageHTMLSignpostLog,
+                name: "html-requested",
+                signpostID: pendingHTMLSignpostID,
+                "result=pool-removed"
+            )
+            self.pendingHTMLSignpostID = nil
+        }
+
+        NotificationCenter.default.removeObserver(self)
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        webView.stopLoading()
+        handler.update(provider: nil, remoteAllowed: false)
+
+        onExternalLink = nil
+        onError = nil
+        onContentHeightChange = nil
+        onDocumentScrollOffset = nil
+        lastProvider = nil
+        lastHTML = ""
+        lastHTMLIdentity = nil
+        lastRenderedMessageID = nil
+        pendingRender = false
+        requestedNavigation = nil
+        requestedReadingMode = nil
+        clearPendingDocumentScrollRestoration()
+        lastFindQuery = ""
+        lastFindBackwards = false
+        documentDidFinish = false
+        lastMeasuredWidth = nil
+        lastReportedContentHeight = nil
+    }
+
     public override func layout() {
+        guard !isDisposedForPoolRemoval else { return }
         super.layout()
         webView.frame = bounds
         errorLabel.frame = bounds.insetBy(dx: 24, dy: 24)
@@ -133,19 +208,32 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     /// SwiftUI `updateNSView` may call this on every observation tick. Identical
     /// `(html hash, remoteAllowed, reading mode)` is a no-op: no
     /// `loadHTMLString`, so scroll and in-flight `mailternal-part://` fetches are
-    /// preserved. Provider is still swapped. Remote-consent changes go through
-    /// ``setRemoteImagesAllowed(_:)``, not a fresh render.
+    /// preserved. Provider is still swapped. `forceReload` is used only when a
+    /// pooled tab's transient message changes in place.
     public func render(
         html: String,
         partProvider: @escaping @Sendable (String) async throws -> (data: Data, mimeType: String),
-        emailReadingMode: EmailReadingMode = .original
+        emailReadingMode: EmailReadingMode = .original,
+        remoteImagesAllowed requestedRemoteImagesAllowed: Bool? = nil,
+        messageID: MessageID? = nil,
+        forceReload: Bool = false
     ) {
+        guard !isDisposedForPoolRemoval else { return }
+        if let requestedRemoteImagesAllowed,
+           requestedRemoteImagesAllowed != remoteImagesAllowed {
+            remoteImagesAllowed = requestedRemoteImagesAllowed
+            handler.setRemoteAllowed(requestedRemoteImagesAllowed)
+        }
         lastProvider = partProvider
         handler.update(provider: partProvider, remoteAllowed: remoteImagesAllowed)
         let modeChanged = self.emailReadingMode != emailReadingMode
         self.emailReadingMode = emailReadingMode
         webView.appearance = MessageHTMLReadingPolicy.appearance(for: emailReadingMode)
         webView.underPageBackgroundColor = Self.canvasColor(for: emailReadingMode)
+        if forceReload {
+            lastHTMLIdentity = nil
+        }
+        lastRenderedMessageID = messageID
         let next = HTMLRenderIdempotence.identity(html: html, remoteAllowed: remoteImagesAllowed)
         if HTMLRenderIdempotence.action(displayed: lastHTMLIdentity, next: next) == .skip {
             guard modeChanged else { return }
@@ -154,7 +242,10 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             // position and avoids a white/black navigation flash.
             if documentDidFinish {
                 updateReaderStyle()
-            } else {
+            } else if requestedNavigation == nil && !pendingRender {
+                // A fence callback will start a pending render. If no load is
+                // outstanding, start one now; never duplicate an active load
+                // merely because its requested mode changed.
                 requestLoad()
             }
             return
@@ -162,13 +253,31 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         lastHTML = html
         lastHTMLIdentity = next
         requestLoad()
+    }
 
+    /// The message currently rendered by this retained tab surface.
+    public var renderedMessageID: MessageID? { lastRenderedMessageID }
+
+    /// The per-surface remote-image consent used when the document was loaded.
+    public var remoteImagesAreAllowed: Bool { remoteImagesAllowed }
+
+    /// Applies an appearance change to a retained document without navigating.
+    public func updateReadingMode(_ mode: EmailReadingMode) {
+        guard !isDisposedForPoolRemoval else { return }
+        guard emailReadingMode != mode else { return }
+        emailReadingMode = mode
+        webView.appearance = MessageHTMLReadingPolicy.appearance(for: mode)
+        webView.underPageBackgroundColor = Self.canvasColor(for: mode)
+        guard documentDidFinish else { return }
+        updateReaderStyle()
     }
     /// Re-render so consented remote tokens become fetchable through the scheme
     /// handler. The categorical network content-rule block stays active.
     /// Does not go through ``render(html:partProvider:)``.
     public func setRemoteImagesAllowed(_ allowed: Bool) {
+        guard !isDisposedForPoolRemoval else { return }
         guard allowed != remoteImagesAllowed else { return }
+        let preservedOffset = currentNativeDocumentScrollOffset()
         remoteImagesAllowed = allowed
         handler.setRemoteAllowed(allowed)
         guard lastProvider != nil else { return }
@@ -177,16 +286,28 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             return
         }
         lastHTMLIdentity = next
+        if let preservedOffset {
+            pendingDocumentScrollOffset = preservedOffset
+            pendingDocumentScrollGeneration = documentRenderGeneration
+            pendingDocumentScrollMessageID = lastRenderedMessageID
+        } else {
+            clearPendingDocumentScrollRestoration()
+        }
         requestLoad()
     }
-    /// Requests restoration of the HTML document's vertical position. A
-    /// request made while a navigation is in flight is held until
-    /// ``webView(_:didFinish:)`` so the document is never visibly reset to
-    /// its top after a tab switch.
+    /// Requests restoration of the HTML document's vertical position for a
+    /// newly created surface or a transient message replacement. Retained tab
+    /// surfaces preserve their native WebKit position and do not need this
+    /// request on a switch.
     public func restoreScrollOffset(_ y: CGFloat, animated: Bool = false) {
+        guard !isDisposedForPoolRemoval else { return }
         let offset = y.isFinite ? max(y, 0) : 0
         pendingDocumentScrollOffset = offset
-        guard documentDidFinish else { return }
+        pendingDocumentScrollGeneration = documentRenderGeneration
+        pendingDocumentScrollMessageID = lastRenderedMessageID
+        documentScrollRestoreTask?.cancel()
+        documentScrollRestoreTask = nil
+        guard documentDidFinish, !pendingRender else { return }
         applyDocumentScrollOffset(animated: animated)
     }
 
@@ -194,6 +315,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     /// Empty `query` clears the highlight. Always case-insensitive and wrapping.
     @discardableResult
     public func findInPage(_ query: String, backwards: Bool = false) async -> Bool {
+        guard !isDisposedForPoolRemoval else { return false }
         lastFindQuery = query
         lastFindBackwards = backwards
         return await performFind()
@@ -203,6 +325,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     private var lastFindBackwards = false
 
     private func performFind() async -> Bool {
+        guard !isDisposedForPoolRemoval else { return false }
         let configuration = WKFindConfiguration()
         configuration.backwards = lastFindBackwards
         configuration.caseSensitive = false
@@ -243,6 +366,18 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         }
         return nil
     }
+    private func currentNativeDocumentScrollOffset() -> CGFloat? {
+        guard let documentScrollView = documentScrollView() else { return nil }
+        let offset = documentScrollView.contentView.bounds.origin.y
+        guard offset.isFinite else { return nil }
+        return max(offset, 0)
+    }
+
+    private func clearPendingDocumentScrollRestoration() {
+        pendingDocumentScrollOffset = nil
+        pendingDocumentScrollGeneration = nil
+        pendingDocumentScrollMessageID = nil
+    }
 
     @objc private func documentScrollBoundsChanged() {
         captureDocumentScroll(after: .milliseconds(90))
@@ -253,8 +388,11 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     }
 
     private func captureDocumentScroll(after delay: Duration) {
+        guard !isDisposedForPoolRemoval else { return }
         documentScrollGeneration &+= 1
-        let generation = documentScrollGeneration
+        let scrollGeneration = documentScrollGeneration
+        let renderGeneration = documentRenderGeneration
+        let renderedMessageID = lastRenderedMessageID
         documentScrollTask?.cancel()
         documentScrollTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -266,8 +404,11 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
                 }
             }
             guard !Task.isCancelled,
-                  generation == self.documentScrollGeneration,
-                  self.documentDidFinish
+                  scrollGeneration == self.documentScrollGeneration,
+                  renderGeneration == self.documentRenderGeneration,
+                  renderedMessageID == self.lastRenderedMessageID,
+                  self.documentDidFinish,
+                  !self.pendingRender
             else { return }
             let script = """
             (() => {
@@ -287,7 +428,13 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
                   let maximum = values["max"] as? NSNumber,
                   CGFloat(truncating: maximum) > 0
             else { return }
-            guard generation == self.documentScrollGeneration else { return }
+            guard !Task.isCancelled,
+                  scrollGeneration == self.documentScrollGeneration,
+                  renderGeneration == self.documentRenderGeneration,
+                  renderedMessageID == self.lastRenderedMessageID,
+                  self.documentDidFinish,
+                  !self.pendingRender
+            else { return }
             let offset = CGFloat(truncating: y)
             guard offset.isFinite else { return }
             self.onDocumentScrollOffset?(max(offset, 0))
@@ -295,23 +442,59 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     }
 
     private func applyDocumentScrollOffset(animated: Bool) {
-        guard let offset = pendingDocumentScrollOffset else { return }
+        guard !isDisposedForPoolRemoval else { return }
+        guard let offset = pendingDocumentScrollOffset,
+              pendingDocumentScrollGeneration == documentRenderGeneration,
+              pendingDocumentScrollMessageID == lastRenderedMessageID,
+              documentDidFinish,
+              !pendingRender
+        else { return }
+        let generation = documentRenderGeneration
+        let renderedMessageID = lastRenderedMessageID
+        documentScrollRestoreTask?.cancel()
         let script: String
         if animated {
             script = "window.scrollTo({top: \(offset), left: 0, behavior: 'smooth'})"
         } else {
             script = "window.scrollTo(0, \(offset))"
         }
-        Task { @MainActor [weak self] in
-            guard let self, self.documentDidFinish else { return }
+        documentScrollRestoreTask = Task { @MainActor [weak self] in
+            guard let self,
+                  !Task.isCancelled,
+                  self.documentDidFinish,
+                  !self.pendingRender,
+                  self.documentRenderGeneration == generation,
+                  self.lastRenderedMessageID == renderedMessageID,
+                  self.pendingDocumentScrollGeneration == generation,
+                  self.pendingDocumentScrollMessageID == renderedMessageID,
+                  self.pendingDocumentScrollOffset == offset
+            else { return }
             _ = try? await self.webView.evaluateJavaScript(script)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  self.documentDidFinish,
+                  !self.pendingRender,
+                  self.documentRenderGeneration == generation,
+                  self.lastRenderedMessageID == renderedMessageID,
+                  self.pendingDocumentScrollGeneration == generation,
+                  self.pendingDocumentScrollMessageID == renderedMessageID,
+                  self.pendingDocumentScrollOffset == offset
+            else { return }
+            self.clearPendingDocumentScrollRestoration()
+            guard !Task.isCancelled,
+                  self.documentDidFinish,
+                  !self.pendingRender,
+                  self.documentRenderGeneration == generation,
+                  self.lastRenderedMessageID == renderedMessageID
+            else { return }
             self.captureDocumentScroll(after: .zero)
         }
     }
 
     private func updateReaderStyle() {
-        let css = Self.readerCSS(for: emailReadingMode)
+        guard !isDisposedForPoolRemoval else { return }
+        guard documentDidFinish, !pendingRender else { return }
+        let readingMode = emailReadingMode
+        let css = Self.readerCSS(for: readingMode)
         guard let data = try? JSONSerialization.data(
             withJSONObject: css,
             options: [.fragmentsAllowed]
@@ -325,13 +508,33 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
           if (style) style.textContent = \(javascriptString);
         })();
         """
-        Task { @MainActor [weak self] in
-            guard let self, self.documentDidFinish else { return }
+        let generation = documentRenderGeneration
+        let renderedMessageID = lastRenderedMessageID
+        readerStyleTask?.cancel()
+        readerStyleTask = Task { @MainActor [weak self] in
+            guard let self,
+                  !Task.isCancelled,
+                  self.documentDidFinish,
+                  !self.pendingRender,
+                  self.emailReadingMode == readingMode,
+                  self.documentRenderGeneration == generation,
+                  self.lastRenderedMessageID == renderedMessageID
+            else { return }
             _ = try? await self.webView.evaluateJavaScript(script)
+            guard !Task.isCancelled,
+                  self.documentDidFinish,
+                  !self.pendingRender,
+                  self.emailReadingMode == readingMode,
+                  self.documentRenderGeneration == generation,
+                  self.lastRenderedMessageID == renderedMessageID
+            else { return }
+            self.invalidateContentHeightMeasurement()
+            self.scheduleContentHeightMeasurementIfNeeded()
         }
     }
 
     private func requestLoad() {
+        guard !isDisposedForPoolRemoval else { return }
         switch HTMLIsolationFence.decision(for: fence) {
         case .waitForFence:
             pendingRender = true
@@ -339,10 +542,26 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             pendingRender = false
             errorLabel.isHidden = true
             invalidateContentHeightMeasurement()
+            let preservesPendingScroll = pendingDocumentScrollOffset != nil
+                && pendingDocumentScrollMessageID != nil
+                && pendingDocumentScrollMessageID == lastRenderedMessageID
+            documentRenderGeneration &+= 1
+            let generation = documentRenderGeneration
+            documentScrollRestoreTask?.cancel()
+            documentScrollRestoreTask = nil
+            readerStyleTask?.cancel()
+            readerStyleTask = nil
             documentScrollGeneration &+= 1
             documentScrollTask?.cancel()
             documentScrollTask = nil
+            if preservesPendingScroll {
+                pendingDocumentScrollGeneration = generation
+            } else {
+                clearPendingDocumentScrollRestoration()
+            }
             documentDidFinish = false
+            requestedNavigation = nil
+            requestedReadingMode = emailReadingMode
             // keeps the current height until the new measurement lands, so
             // the island never collapses to its floor mid-toggle and the
             // host's async height application cannot reorder a stale zero
@@ -372,9 +591,14 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
                 name: "html-requested",
                 signpostID: signpostID
             )
-            webView.loadHTMLString(Self.wrap(lastHTML, emailReadingMode: emailReadingMode), baseURL: nil)
+            requestedNavigation = webView.loadHTMLString(
+                Self.wrap(lastHTML, emailReadingMode: emailReadingMode),
+                baseURL: nil
+            )
         case .refuseHTML:
             pendingRender = false
+            requestedNavigation = nil
+            requestedReadingMode = nil
             presentFenceFailure()
         }
     }
@@ -397,22 +621,27 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
             encodedContentRuleList: json
         ) { [weak self] list, error in
             let compileReason = error.map { $0.localizedDescription }
-            Task { @MainActor in
-                guard let self else { return }
-                self.fence = HTMLIsolationFence.state(compiledList: list != nil)
-                if let list {
-                    self.userContentController.add(list)
-                } else {
-                    let reason = compileReason
-                        ?? "WKContentRuleList compile returned nil"
-                    let failure = MessageWebIsolationError(reason: reason)
-                    Self.isolationLog.error(
-                        "Content-rule compile failed; refusing to load HTML. \(reason, privacy: .public)"
-                    )
-                    self.onError?(failure)
-                }
-                if self.pendingRender {
-                    self.requestLoad()
+            Task { @MainActor [weak self] in
+                guard let self, !self.isDisposedForPoolRemoval else { return }
+                self.fenceCompletionTask?.cancel()
+                self.fenceCompletionTask = Task { @MainActor [weak self] in
+                    guard let self, !self.isDisposedForPoolRemoval else { return }
+                    defer { self.fenceCompletionTask = nil }
+                    self.fence = HTMLIsolationFence.state(compiledList: list != nil)
+                    if let list {
+                        self.userContentController.add(list)
+                    } else {
+                        let reason = compileReason
+                            ?? "WKContentRuleList compile returned nil"
+                        let failure = MessageWebIsolationError(reason: reason)
+                        Self.isolationLog.error(
+                            "Content-rule compile failed; refusing to load HTML. \(reason, privacy: .public)"
+                        )
+                        self.onError?(failure)
+                    }
+                    if self.pendingRender {
+                        self.requestLoad()
+                    }
                 }
             }
         }
@@ -520,6 +749,15 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     }
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
+        guard !isDisposedForPoolRemoval else { return }
+        guard let navigation,
+              let requestedNavigation,
+              navigation === requestedNavigation else {
+            return
+        }
+        self.requestedNavigation = nil
+        let renderedReadingMode = requestedReadingMode
+        requestedReadingMode = nil
         if let signpostID = pendingHTMLSignpostID {
             pendingHTMLSignpostID = nil
             os_signpost(
@@ -538,6 +776,9 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         }
         #endif
         documentDidFinish = true
+        if renderedReadingMode != Optional(emailReadingMode) {
+            updateReaderStyle()
+        }
         // Restore before the first post-load layout pass whenever possible.
         // `restoreScrollOffset` holds this request across every navigation.
         applyDocumentScrollOffset(animated: false)
@@ -546,8 +787,16 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
         // coalesces any layout callbacks until this document is stable.
         scheduleContentHeightMeasurementIfNeeded()
         guard !lastFindQuery.isEmpty else { return }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        findTaskGeneration &+= 1
+        let findGeneration = findTaskGeneration
+        findTask?.cancel()
+        findTask = Task { @MainActor [weak self] in
+            guard let self, !self.isDisposedForPoolRemoval else { return }
+            defer {
+                if self.findTaskGeneration == findGeneration {
+                    self.findTask = nil
+                }
+            }
             _ = await self.performFind()
         }
     }
@@ -562,6 +811,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
 
     private func scheduleContentHeightMeasurementIfNeeded() {
         guard documentDidFinish, bounds.width > 0 else { return }
+        guard !isDisposedForPoolRemoval else { return }
         guard lastMeasuredWidth.map({ abs(bounds.width - $0) > 0.5 }) ?? true else { return }
         guard contentHeightTask == nil else { return }
 
@@ -642,6 +892,7 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
     }
 
     private func reportContentHeight(_ height: CGFloat) {
+        guard !isDisposedForPoolRemoval else { return }
         guard height.isFinite, height > 0,
               lastReportedContentHeight.map({ abs(height - $0) > 0.5 }) ?? true else {
             return

@@ -106,20 +106,28 @@ final class ActionSettings {
         self.defaults = defaults
         let storedLeading = Self.decode(defaults.string(forKey: Keys.leading))
         let storedTrailing = Self.decode(defaults.string(forKey: Keys.trailing))
-        leadingSwipe = Self.compact(
-            storedLeading ?? Self.defaultLeadingSwipe,
+        let leading = Self.compact(
+            storedLeading?.compactMap(SwipeActionKind.init(rawValue:)) ?? Self.defaultLeadingSwipe,
             maxCount: Self.leadingSwipeLimit
         )
-        trailingSwipe = Self.compact(
-            storedTrailing ?? Self.defaultTrailingSwipe,
+        let trailing = Self.compact(
+            storedTrailing?.compactMap(SwipeActionKind.init(rawValue:)) ?? Self.defaultTrailingSwipe,
             maxCount: Self.trailingSwipeLimit
         )
+        leadingSwipe = leading
+        trailingSwipe = trailing
 
-        if storedLeading != nil {
-            persist(leadingSwipe, key: Keys.leading)
+        if let storedLeading {
+            let decodedLeading = storedLeading.compactMap(SwipeActionKind.init(rawValue:))
+            if decodedLeading != leading || decodedLeading.count != storedLeading.count {
+                persist(leading, key: Keys.leading)
+            }
         }
-        if storedTrailing != nil {
-            persist(trailingSwipe, key: Keys.trailing)
+        if let storedTrailing {
+            let decodedTrailing = storedTrailing.compactMap(SwipeActionKind.init(rawValue:))
+            if decodedTrailing != trailing || decodedTrailing.count != storedTrailing.count {
+                persist(trailing, key: Keys.trailing)
+            }
         }
     }
 
@@ -166,10 +174,9 @@ final class ActionSettings {
         return compact(updated, maxCount: maxCount)
     }
 
-    private static func decode(_ value: String?) -> [SwipeActionKind]? {
+    private static func decode(_ value: String?) -> [String]? {
         guard let value, let data = value.data(using: .utf8) else { return nil }
-        guard let rawValues = try? JSONDecoder().decode([String].self, from: data) else { return nil }
-        return rawValues.compactMap(SwipeActionKind.init(rawValue:))
+        return try? JSONDecoder().decode([String].self, from: data)
     }
 
     private func persist(_ actions: [SwipeActionKind], key: String) {

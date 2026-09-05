@@ -171,7 +171,7 @@ private struct MessageWindowRoot: View {
     let titleChanged: (String) -> Void
 
     var body: some View {
-        MessageViewer(model: model)
+        MessageViewer(model: model, context: .detached(messageID: messageID))
             .onAppear {
                 publishTitle()
             }

@@ -1,19 +1,38 @@
 import AppKit
 import SwiftUI
 import MailternalInterfaces
+enum MessageViewerContext: Equatable {
+    case main
+    case detached(messageID: MessageID)
+}
+private struct ReaderScrollAnchor: Hashable {
+    let tabID: UUID?
+    let messageID: MessageID
+}
 
 struct MessageViewer: View {
     @Bindable var model: AppModel
+    let context: MessageViewerContext
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Namespace private var viewerFocus
     @State private var findIndex: Int?
     @State private var findBackwards = false
     @State private var findTick: UInt64 = 0
+    /// Detached readers have no tab identity, so retain only the current
+    /// transient document's measured height. Tab-owned geometry lives in the
+    /// bounded ``ReaderSurfacePool``.
+    @State private var htmlContentHeightForDetachedReader: CGFloat = 0
+    /// The pool owns active-tab heights; this signal only asks SwiftUI to
+    /// re-read the bounded entry after WebKit reports a new measurement.
+    @State private var htmlContentHeightRevision: UInt64 = 0
+    /// AppKit reports document-layout changes after pooled reader surfaces are
+    /// installed. This signal reapplies SwiftUI's top anchor for zero offsets.
+    @State private var readerLayoutRevision: UInt64 = 0
     @State private var headersStore: MessageHeadersStore
-    @State private var htmlContentHeight: CGFloat = 0
 
-    init(model: AppModel) {
+    init(model: AppModel, context: MessageViewerContext = .main) {
         self.model = model
+        self.context = context
         _headersStore = State(initialValue: MessageHeadersStore(facade: model.facade))
     }
     private var findHaystack: String {
@@ -77,6 +96,9 @@ struct MessageViewer: View {
         .onChange(of: model.isFindPresented) { _, presented in
             if presented { restartFind() }
         }
+        .onChange(of: model.effectiveEmailReadingMode) { _, mode in
+            model.readerSurfacePool.updateReadingMode(mode)
+        }
 #if DEBUG
         .onChange(of: model.detail?.id) { _, id in
             guard let id,
@@ -96,7 +118,8 @@ struct MessageViewer: View {
 
     @ViewBuilder
     private var content: some View {
-        if model.tabs.active == nil,
+        if context == .main,
+           model.tabs.active == nil,
            let title = MessageReaderStatePolicy.emptyStateTitle(
                selectionCount: model.selectedMessageIDs.count
            ) {
@@ -106,7 +129,8 @@ struct MessageViewer: View {
                     selectionCount: model.selectedMessageIDs.count
                 ) ?? "Choose one message to read it."
             )
-        } else if let detail = model.detail {
+        } else if let detail = model.detail,
+                  canRender(detail) {
             reader(detail)
         } else if model.isLoadingDetail {
             ProgressView()
@@ -120,6 +144,15 @@ struct MessageViewer: View {
         }
     }
 
+    private func canRender(_ detail: MessageDetail) -> Bool {
+        switch context {
+        case .main:
+            return model.tabs.active?.message == detail.id
+        case .detached(let messageID):
+            return messageID == detail.id
+        }
+    }
+
     /// One scroll owner, two disjoint floating islands: a continuous header
     /// surface (subject, envelope, and source headers) followed by the body.
     /// The web view reports its document height and does not own a scrolling
@@ -129,53 +162,91 @@ struct MessageViewer: View {
         let savedScrollOffset = activeTabID.map {
             model.tabs.scrollOffset(for: $0)
         } ?? 0
-        return ScrollView(.vertical) {
-            VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.islandSpacing) {
-                MessageSubjectRegion(
-                    subject: detail.envelope.subject,
-                    envelope: detail.envelope,
-                    attachments: detail.attachments,
-                    messageID: detail.id,
-                    headersStore: headersStore,
-                    backdropStyle: model.appearance.backdropStyle,
-                    showsSenderIcons: model.appearance.showsSenderIcons,
-                    isShowingRawSource: model.isShowingRawSource,
-                    accent: model.appearance.accent.color
-                )
-                bodyRegion(detail)
+        let scrollAnchor = ReaderScrollAnchor(
+            tabID: activeTabID,
+            messageID: detail.id
+        )
+        return ScrollViewReader { proxy in
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Color.clear
+                        .frame(height: 0)
+                        .id(scrollAnchor)
+                    VStack(
+                        alignment: .leading,
+                        spacing: MessageViewerLayoutPolicy.islandSpacing
+                    ) {
+                        MessageSubjectRegion(
+                            subject: detail.envelope.subject,
+                            envelope: detail.envelope,
+                            attachments: detail.attachments,
+                            messageID: detail.id,
+                            headersStore: headersStore,
+                            backdropStyle: model.appearance.backdropStyle,
+                            showsSenderIcons: model.appearance.showsSenderIcons,
+                            isShowingRawSource: model.isShowingRawSource,
+                            accent: model.appearance.accent.color
+                        )
+                        bodyRegion(detail)
+                    }
+                    .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
+                    // The first subject glyph retains the old dissolve contract while
+                    // the card's top edge can softly enter the end of the ramp.
+                    .padding(
+                        .top,
+                        max(
+                            MessageViewerLayoutPolicy.readerTopInset()
+                                - MessageViewerLayoutPolicy.islandVerticalPadding,
+                            0
+                        )
+                    )
+                    .padding(.bottom, MessageViewerLayoutPolicy.bottomPadding)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background {
+                        ReaderScrollHost(
+                            tabID: activeTabID,
+                            messageID: detail.id,
+                            restoreOffset: savedScrollOffset,
+                            onScrollEnd: { id, offset in
+                                guard model.tabs.activeID == id,
+                                      model.detail?.id == detail.id
+                                else { return }
+                                model.tabs.setScrollOffset(offset, for: id)
+                            },
+                            onLayoutChange: {
+                                guard model.tabs.activeID == activeTabID,
+                                      model.detail?.id == detail.id
+                                else { return }
+                                readerLayoutRevision &+= 1
+                            }
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
-            // The first subject glyph retains the old dissolve contract while
-            // the card's top edge can softly enter the end of the ramp.
-            .padding(
-                .top,
-                max(
-                    MessageViewerLayoutPolicy.readerTopInset()
-                        - MessageViewerLayoutPolicy.islandVerticalPadding,
-                    0
-                )
-            )
-            .padding(.bottom, MessageViewerLayoutPolicy.bottomPadding)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .background {
-            ScrollEdgeEffectSuppressor()
-        }
-        .background {
-            ReaderScrollHost(
-                tabID: activeTabID,
-                messageID: detail.id,
-                restoreOffset: savedScrollOffset
-            ) { id, offset in
-                guard model.tabs.activeID == id,
-                      model.detail?.id == detail.id
+            // SwiftUI otherwise reuses the previous reader's native scroll
+            // position while a pooled body surface is being installed.
+            .id(scrollAnchor)
+            .task(id: scrollAnchor) {
+                guard savedScrollOffset <= 0.5 else { return }
+                await Task.yield()
+                proxy.scrollTo(scrollAnchor, anchor: .top)
+            }
+            .onChange(of: readerLayoutRevision) { _, _ in
+                guard let activeTabID,
+                      model.tabs.activeID == activeTabID,
+                      model.detail?.id == detail.id,
+                      model.tabs.scrollOffset(for: activeTabID) <= 0.5
                 else { return }
-                model.tabs.setScrollOffset(offset, for: id)
+                proxy.scrollTo(scrollAnchor, anchor: .top)
             }
+            .background {
+                ScrollEdgeEffectSuppressor()
+            }
+            .ignoresSafeArea(.container, edges: .top)
+            .mailWindowDissolve(.viewer)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .ignoresSafeArea(.container, edges: .top)
-        .mailWindowDissolve(.viewer)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func bodyRegion(_ detail: MessageDetail) -> some View {
@@ -223,52 +294,53 @@ struct MessageViewer: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
                 .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
+        } else if let html = detail.sanitizedHTML, !html.isEmpty {
+            htmlBody(detail, html: html)
+        } else if let text = detail.bodyText, !text.isEmpty {
+            PlainTextBody(
+                text: text,
+                query: activeFindQuery,
+                selectedMatchIndex: findSnapshot.index,
+                findTick: findTick,
+                pool: model.readerSurfacePool,
+                tabID: model.tabs.activeID,
+                messageID: detail.id
+            )
+            .preferredColorScheme(emailBodyColorScheme)
+            .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+            .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
+            // The pane stays full width; only the plain-text measure narrows.
+            .frame(maxWidth: MessageTypography.plainTextMeasure, alignment: .leading)
         } else {
-            // The HTML slot stays mounted for every message so the WKWebView
-            // (and its WebContent process) survives switching between HTML and
-            // plain-text messages. Recreating it cost seconds on a slow host;
-            // a plain-text message simply collapses the slot to zero height.
-            let html = detail.sanitizedHTML ?? ""
-            let hasHTML = !html.isEmpty
-            ZStack(alignment: .topLeading) {
-                htmlBody(detail, html: html)
-                    .frame(height: hasHTML ? nil : 0)
-                    .opacity(hasHTML ? 1 : 0)
-                    .allowsHitTesting(hasHTML)
-                    .accessibilityHidden(!hasHTML)
-                if !hasHTML {
-                    if let text = detail.bodyText, !text.isEmpty {
-                        PlainTextBody(
-                            text: text,
-                            query: activeFindQuery,
-                            selectedMatchIndex: findSnapshot.index,
-                            findTick: findTick,
-                        )
-                        .preferredColorScheme(emailBodyColorScheme)
-                        .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
-                        .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
-                        // The pane stays full width; only the plain-text measure narrows.
-                        .frame(maxWidth: MessageTypography.plainTextMeasure, alignment: .leading)
-                    } else {
-                        Text("This message has no text.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
-                            .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
-                    }
-                }
-            }
+            Text("This message has no text.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
+                .padding(.vertical, MessageViewerLayoutPolicy.islandVerticalPadding)
         }
     }
 
 
     private func htmlBody(_ detail: MessageDetail, html: String) -> some View {
+        let activeTabID = model.tabs.activeID
         let showRemoteImageNotice = model.hasRemoteImageReferences && !model.allowRemoteImages
+        let _ = htmlContentHeightRevision
+        let cachedContentHeight: CGFloat
+        if let activeTabID {
+            cachedContentHeight = model.readerSurfacePool.height(
+                for: activeTabID,
+                messageID: detail.id
+            )
+        } else {
+            cachedContentHeight = htmlContentHeightForDetachedReader
+        }
+        let detachedContentHeight = $htmlContentHeightForDetachedReader
+        let contentHeightRevision = $htmlContentHeightRevision
         return VStack(alignment: .leading, spacing: 0) {
             // Keep a stable slot ahead of the representable. If the notice is
             // removed as a sibling, SwiftUI can shift MessageHTMLView's
-            // structural identity and recreate its WKWebView instead of
-            // delivering the consent update to updateNSView.
+            // structural identity and recreate its host instead of delivering
+            // the consent update to the pooled surface.
             ZStack(alignment: .topLeading) {
                 if showRemoteImageNotice {
                     RemoteImageNotice { model.allowRemoteImages = true }
@@ -282,28 +354,36 @@ struct MessageViewer: View {
                 showRemoteImageNotice ? MessageViewerLayoutPolicy.bodyContentSpacing : 0
             )
             MessageHTMLView(
+                pool: model.readerSurfacePool,
                 messageID: detail.id,
-                tabID: model.tabs.activeID,
-                restoreScrollOffset: model.tabs.activeID.map {
+                tabID: activeTabID,
+                restoreScrollOffset: activeTabID.map {
                     model.tabs.scrollOffset(for: $0)
                 } ?? 0,
                 html: html,
                 partProvider: model.partProvider(for: detail.id),
                 onExternalLink: { url in
-                    NSWorkspace.shared.open(url)
+                    _ = NSWorkspace.shared.open(url)
                 },
-                onContentHeightChange: { height in
-                    guard height.isFinite, height > 0 else { return }
-                    let messageID = detail.id
-                    Task { @MainActor in
-                        guard model.detail?.id == messageID else { return }
-                        let measured = MessageViewerLayoutPolicy.htmlHeight(contentHeight: height)
-                        guard abs(htmlContentHeight - measured) > 0.5 else { return }
-                        htmlContentHeight = measured
+                onContentHeightChange: { [weak model, detachedContentHeight, contentHeightRevision] height in
+                    guard let model,
+                          model.detail?.id == detail.id,
+                          height.isFinite,
+                          height > 0
+                    else { return }
+                    if let activeTabID {
+                        guard model.tabs.activeID == activeTabID else { return }
+                        contentHeightRevision.wrappedValue &+= 1
+                        return
                     }
+                    guard abs(detachedContentHeight.wrappedValue - height) > 0.5 else {
+                        return
+                    }
+                    detachedContentHeight.wrappedValue = height
                 },
-                onDocumentScrollOffset: { tabID, offset in
-                    guard model.tabs.activeID == tabID,
+                onDocumentScrollOffset: { [weak model] tabID, offset in
+                    guard let model,
+                          model.tabs.activeID == tabID,
                           model.detail?.id == detail.id
                     else { return }
                     model.tabs.setScrollOffset(offset, for: tabID)
@@ -315,10 +395,14 @@ struct MessageViewer: View {
                 findBackwards: findBackwards
             )
             // The web page is the body island's canvas. Its document height
-            // exactly owns the island height, so the outer reader is the only
-            // scroll view even for long HTML messages.
+            // exactly owns the island height, so the reader is the only
+            // scrolling surface.
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: MessageViewerLayoutPolicy.htmlHeight(contentHeight: htmlContentHeight))
+            .frame(
+                height: MessageViewerLayoutPolicy.htmlHeight(
+                    contentHeight: cachedContentHeight
+                )
+            )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -350,6 +434,7 @@ private struct ReaderScrollHost: NSViewRepresentable {
     let messageID: MessageID
     let restoreOffset: CGFloat
     let onScrollEnd: (UUID, CGFloat) -> Void
+    let onLayoutChange: () -> Void
 
     func makeNSView(context: Context) -> ReaderScrollTrackingView {
         let view = ReaderScrollTrackingView()
@@ -357,7 +442,8 @@ private struct ReaderScrollHost: NSViewRepresentable {
             tabID: tabID,
             messageID: messageID,
             restoreOffset: restoreOffset,
-            onScrollEnd: onScrollEnd
+            onScrollEnd: onScrollEnd,
+            onLayoutChange: onLayoutChange
         )
         return view
     }
@@ -367,8 +453,16 @@ private struct ReaderScrollHost: NSViewRepresentable {
             tabID: tabID,
             messageID: messageID,
             restoreOffset: restoreOffset,
-            onScrollEnd: onScrollEnd
+            onScrollEnd: onScrollEnd,
+            onLayoutChange: onLayoutChange
         )
+    }
+
+    static func dismantleNSView(
+        _ nsView: ReaderScrollTrackingView,
+        coordinator: Void
+    ) {
+        nsView.dispose()
     }
 }
 
@@ -378,12 +472,18 @@ private final class ReaderScrollTrackingView: NSView {
     private var messageID: MessageID?
     private var restoreOffset: CGFloat = 0
     private var onScrollEnd: ((UUID, CGFloat) -> Void)?
+    private var onLayoutChange: (() -> Void)?
     private weak var scrollView: NSScrollView?
     private var didApplyRestore = false
     private var restoreGeneration: UInt64 = 0
     private var captureTask: Task<Void, Never>?
-    private var isRestoring = false
-
+    private var keyEventMonitor: Any?
+    private var keyboardScrollIntentDeadline: TimeInterval = 0
+    /// Bounds changes also come from SwiftUI document layout. Persist only
+    /// changes carrying live-wheel or keyboard intent; restoration mutations
+    /// are separately suppressed.
+    private var suppressScrollPersistence = false
+    private var isLiveScrolling = false
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -395,7 +495,6 @@ private final class ReaderScrollTrackingView: NSView {
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is unavailable")
     }
-
 
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
@@ -411,15 +510,19 @@ private final class ReaderScrollTrackingView: NSView {
         tabID: UUID?,
         messageID: MessageID,
         restoreOffset: CGFloat,
-        onScrollEnd: @escaping (UUID, CGFloat) -> Void
+        onScrollEnd: @escaping (UUID, CGFloat) -> Void,
+        onLayoutChange: @escaping () -> Void
     ) {
         let contentChanged = self.tabID != tabID || self.messageID != messageID
         self.tabID = tabID
         self.messageID = messageID
         self.onScrollEnd = onScrollEnd
+        self.onLayoutChange = onLayoutChange
         if contentChanged {
             captureTask?.cancel()
             captureTask = nil
+            isLiveScrolling = false
+            suppressScrollPersistence = false
             self.restoreOffset = restoreOffset.isFinite ? max(restoreOffset, 0) : 0
             didApplyRestore = false
             restoreGeneration &+= 1
@@ -427,6 +530,7 @@ private final class ReaderScrollTrackingView: NSView {
         attach()
         if contentChanged {
             scheduleRestore(generation: restoreGeneration)
+            requestTopAnchorIfNeeded()
         }
     }
 
@@ -448,6 +552,8 @@ private final class ReaderScrollTrackingView: NSView {
         if scrollView !== enclosing {
             detach()
             scrollView = enclosing
+            didApplyRestore = false
+            installKeyEventMonitor()
             OverlayScrollerPolicy.apply(to: enclosing)
             let clip = enclosing.contentView
             clip.postsBoundsChangedNotifications = true
@@ -459,16 +565,29 @@ private final class ReaderScrollTrackingView: NSView {
             )
             NotificationCenter.default.addObserver(
                 self,
+                selector: #selector(scrollStarted),
+                name: NSScrollView.willStartLiveScrollNotification,
+                object: enclosing
+            )
+            NotificationCenter.default.addObserver(
+                self,
                 selector: #selector(scrollEnded),
                 name: NSScrollView.didEndLiveScrollNotification,
                 object: enclosing
             )
             if let documentView = enclosing.documentView {
                 documentView.postsBoundsChangedNotifications = true
+                documentView.postsFrameChangedNotifications = true
                 NotificationCenter.default.addObserver(
                     self,
                     selector: #selector(documentBoundsChanged),
                     name: NSView.boundsDidChangeNotification,
+                    object: documentView
+                )
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(documentBoundsChanged),
+                    name: NSView.frameDidChangeNotification,
                     object: documentView
                 )
             }
@@ -503,23 +622,92 @@ private final class ReaderScrollTrackingView: NSView {
     }
 
     @objc private func documentBoundsChanged() {
-        applyRestoreIfPossible()
+        // Layout can move the clip after an initial zero-offset restore. Keep
+        // reapplying the saved position until real user input updates it.
+        guard !hasUserScrollIntent else { return }
+        applyRestoreIfPossible(force: true)
+        requestTopAnchorIfNeeded()
+    }
+
+    func dispose() {
+        detach()
+        onScrollEnd = nil
+        onLayoutChange = nil
     }
 
     private func detach() {
-        guard scrollView != nil else { return }
         NotificationCenter.default.removeObserver(self)
+        if let keyEventMonitor {
+            NSEvent.removeMonitor(keyEventMonitor)
+            self.keyEventMonitor = nil
+        }
         scrollView = nil
         captureTask?.cancel()
         captureTask = nil
+        keyboardScrollIntentDeadline = 0
+        suppressScrollPersistence = false
+        isLiveScrolling = false
+    }
+
+    private func requestTopAnchorIfNeeded() {
+        guard restoreOffset <= 0.5,
+              !hasUserScrollIntent,
+              let onLayoutChange
+        else { return }
+        DispatchQueue.main.async(execute: onLayoutChange)
     }
 
     @objc private func boundsChanged() {
+        guard didApplyRestore,
+              !suppressScrollPersistence,
+              hasUserScrollIntent else { return }
         scheduleCapture()
     }
 
+    @objc private func scrollStarted() {
+        isLiveScrolling = true
+    }
+
     @objc private func scrollEnded() {
-        captureOffset()
+        let shouldCapture = isLiveScrolling
+        isLiveScrolling = false
+        if shouldCapture {
+            captureOffset()
+        }
+    }
+
+    private var hasUserScrollIntent: Bool {
+        if isLiveScrolling { return true }
+        if NSApp.currentEvent?.type == .scrollWheel { return true }
+        return ProcessInfo.processInfo.systemUptime <= keyboardScrollIntentDeadline
+    }
+
+    private func installKeyEventMonitor() {
+        guard keyEventMonitor == nil else { return }
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+            [weak self] event in
+            self?.recordKeyboardScrollIntent(for: event)
+            return event
+        }
+    }
+
+    private func recordKeyboardScrollIntent(for event: NSEvent) {
+        guard Self.isScrollKey(event),
+              let scrollView,
+              event.window === scrollView.window,
+              let responder = scrollView.window?.firstResponder as? NSView,
+              responder === scrollView || responder.isDescendant(of: scrollView)
+        else { return }
+        keyboardScrollIntentDeadline = ProcessInfo.processInfo.systemUptime + 0.75
+    }
+
+    private static func isScrollKey(_ event: NSEvent) -> Bool {
+        switch event.keyCode {
+        case 49, 115, 116, 119, 121, 125, 126:
+            true
+        default:
+            false
+        }
     }
 
     private func scheduleCapture() {
@@ -537,11 +725,18 @@ private final class ReaderScrollTrackingView: NSView {
 
     private func captureOffset() {
         guard didApplyRestore,
-              !isRestoring,
+              !suppressScrollPersistence,
               let tabID,
-              let scrollView
+              let scrollView,
+              scrollView.documentView != nil
         else { return }
-        onScrollEnd?(tabID, max(scrollView.contentView.bounds.origin.y, 0))
+        let clip = scrollView.contentView
+        let capturedOffset = visualTopOffset(
+            clipBounds: clip.bounds,
+            documentRect: clip.documentRect
+        )
+        restoreOffset = capturedOffset
+        onScrollEnd?(tabID, capturedOffset)
     }
 
     private func scheduleRestore(generation: UInt64) {
@@ -566,29 +761,69 @@ private final class ReaderScrollTrackingView: NSView {
         }
     }
 
-    private func applyRestoreIfPossible() {
-        guard !didApplyRestore,
-              !isRestoring,
+    private func applyRestoreIfPossible(force: Bool = false) {
+        guard (force || !didApplyRestore),
+              !suppressScrollPersistence,
               let scrollView,
+              scrollView.documentView != nil,
               tabID != nil
         else { return }
         let clip = scrollView.contentView
-        let target = restoreOffset
-        if abs(clip.bounds.origin.y - target) <= .ulpOfOne {
+        let documentRect = clip.documentRect
+        let target = restoreOffset.isFinite ? max(restoreOffset, 0) : 0
+        let effectiveOffset = visualTopOffset(
+            clipBounds: clip.bounds,
+            documentRect: documentRect
+        )
+        let tolerance: CGFloat = 0.5
+        if abs(effectiveOffset - target) <= tolerance {
             didApplyRestore = true
             return
         }
-        isRestoring = true
-        clip.setBoundsOrigin(NSPoint(x: clip.bounds.origin.x, y: target))
+
+        let maximumOffset = max(documentRect.height - clip.bounds.height, 0)
+        guard target <= maximumOffset + tolerance else { return }
+        let proposedBounds = proposedBounds(
+            forTopOffset: target,
+            clipBounds: clip.bounds,
+            documentRect: documentRect
+        )
+
+        suppressScrollPersistence = true
+        defer { suppressScrollPersistence = false }
+        clip.setBoundsOrigin(proposedBounds.origin)
         scrollView.reflectScrolledClipView(clip)
-        isRestoring = false
-        // AppKit clamps when the document is not laid out yet. Keep the
-        // restore pending so a later content-height pass can apply the full
-        // saved offset without visibly animating from the top.
-        if abs(clip.bounds.origin.y - target) <= .ulpOfOne {
-            didApplyRestore = true
-        }
+        let finalDocumentRect = clip.documentRect
+        didApplyRestore = abs(
+            visualTopOffset(
+                clipBounds: clip.bounds,
+                documentRect: finalDocumentRect
+            ) - target
+        ) <= tolerance
     }
+
+    /// SwiftUI's hosting document scrolls from its minimum Y even though
+    /// NSClipView's generic constraint helper can choose the opposite edge
+    /// during an early layout pass. Measure the actual visual-top origin.
+    private func visualTopOffset(
+        clipBounds: NSRect,
+        documentRect: NSRect
+    ) -> CGFloat {
+        let offset = clipBounds.minY - documentRect.minY
+        return offset.isFinite ? max(offset, 0) : 0
+    }
+
+    private func proposedBounds(
+        forTopOffset offset: CGFloat,
+        clipBounds: NSRect,
+        documentRect: NSRect
+    ) -> NSRect {
+        var proposedBounds = clipBounds
+        let topOffset = offset.isFinite ? max(offset, 0) : 0
+        proposedBounds.origin.y = documentRect.minY + topOffset
+        return proposedBounds
+    }
+
 }
 
 private enum ReaderIslandRole: Equatable {
@@ -732,10 +967,30 @@ struct MessageSubjectRegion: View {
         .readerIslandSurface(backdropStyle: backdropStyle)
     }
 }
+/// The route marker is drawn once for the sender/recipient pair rather than
+/// repeating directional SF Symbols in each row.
+struct EnvelopeRouteArrow: Shape {
+    func path(in rect: CGRect) -> Path {
+        let x = rect.midX
+        let top = rect.minY + min(8, rect.height * 0.18)
+        let tip = rect.maxY - min(8, rect.height * 0.18)
+        let arrowDepth = min(6, rect.height * 0.16)
+        let stemEnd = tip - arrowDepth
+        var path = Path()
+        path.move(to: CGPoint(x: x, y: top))
+        path.addCurve(
+            to: CGPoint(x: x, y: stemEnd),
+            control1: CGPoint(x: x + 1.5, y: top + (stemEnd - top) * 0.32),
+            control2: CGPoint(x: x - 1.5, y: top + (stemEnd - top) * 0.68)
+        )
+        let arrowWidth = min(5, rect.width * 0.2)
+        path.move(to: CGPoint(x: x - arrowWidth, y: stemEnd))
+        path.addLine(to: CGPoint(x: x, y: tip))
+        path.addLine(to: CGPoint(x: x + arrowWidth, y: stemEnd))
+        return path
+    }
+}
 
-/// The ordinary envelope is deliberately icon-led: the upward arrow means the
-/// sender and the downward arrow means the recipient. This avoids repeating
-/// the words “From” and “To” while preserving a consistent spatial pair.
 struct MessageEnvelopeRegion: View {
     let envelope: Envelope
     let attachments: [AttachmentInfo]
@@ -777,7 +1032,22 @@ struct MessageEnvelopeRegion: View {
                 senderItem
                 receiverItem
             }
+            .padding(.leading, 25)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background(alignment: .leading) {
+                EnvelopeRouteArrow()
+                    .stroke(
+                        accent.opacity(0.85),
+                        style: StrokeStyle(
+                            lineWidth: 1.7,
+                            lineCap: .round,
+                            lineJoin: .round
+                        )
+                    )
+                    .frame(width: 25)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
 
             Spacer(minLength: 8)
 
@@ -797,10 +1067,11 @@ struct MessageEnvelopeRegion: View {
     private var senderItem: some View {
         if let sender = envelope.from.first {
             EnvelopeCopyItem(
-                symbol: "arrow.up.right.circle",
+                symbol: nil,
                 payload: MessageHeaderPolicy.copyPayload(for: sender),
                 accessibilityLabel: "Sender, \(MessageHeaderPolicy.full(sender))",
-                accent: accent
+                accent: accent,
+                fillsWidth: true,
             ) {
                 HStack(alignment: .center, spacing: 8) {
                     if showsSenderIcons {
@@ -820,7 +1091,7 @@ struct MessageEnvelopeRegion: View {
                 }
             }
         } else {
-            Label("Unknown sender", systemImage: "arrow.up.right.circle")
+            Text("Unknown sender")
                 .foregroundStyle(.secondary)
         }
     }
@@ -829,10 +1100,11 @@ struct MessageEnvelopeRegion: View {
     private var receiverItem: some View {
         if let recipients = MessageHeaderPolicy.collapseRecipients(envelope.to) {
             EnvelopeCopyItem(
-                symbol: "arrow.down.left.circle",
+                symbol: nil,
                 payload: MessageHeaderPolicy.copyPayload(for: recipients.first),
                 accessibilityLabel: "Recipient, \(MessageHeaderPolicy.full(recipients.first))",
-                accent: accent
+                accent: accent,
+                fillsWidth: true,
             ) {
                 HStack(alignment: .center, spacing: 8) {
                     if showsSenderIcons {
@@ -852,7 +1124,7 @@ struct MessageEnvelopeRegion: View {
                 }
             }
         } else {
-            Label("No recipient", systemImage: "arrow.down.left.circle")
+            Text("No recipient")
                 .foregroundStyle(.secondary)
         }
     }
@@ -990,39 +1262,42 @@ private struct CopyFeedbackLabel<Label: View>: View {
 
 /// A copy target presents the same interaction for identities and dates:
 /// rounded hover wash, pointer cursor, and a brief clipboard confirmation in
-/// place of the copied text.
 private struct EnvelopeCopyItem<Label: View>: View {
-    let symbol: String
+    let symbol: String?
     let payload: String
     let accessibilityLabel: String
     let accent: Color
+    let fillsWidth: Bool
     let label: Label
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovered = false
     @State private var didCopy = false
     @State private var isShowingQRCode = false
     @State private var copyFeedbackGeneration = 0
-
     init(
-        symbol: String,
+        symbol: String?,
         payload: String,
         accessibilityLabel: String,
         accent: Color,
+        fillsWidth: Bool = false,
         @ViewBuilder label: () -> Label
     ) {
         self.symbol = symbol
         self.payload = payload
         self.accessibilityLabel = accessibilityLabel
         self.accent = accent
+        self.fillsWidth = fillsWidth
         self.label = label()
     }
 
     var body: some View {
         Button(action: copy) {
             HStack(alignment: .center, spacing: 8) {
-                Image(systemName: symbol)
-                    .foregroundStyle(accent)
-                    .frame(width: 18, alignment: .center)
+                if let symbol {
+                    Image(systemName: symbol)
+                        .foregroundStyle(accent)
+                        .frame(width: 18, alignment: .center)
+                }
                 CopyFeedbackLabel(
                     isShowingCopy: didCopy,
                     reduceMotion: reduceMotion
@@ -1030,6 +1305,10 @@ private struct EnvelopeCopyItem<Label: View>: View {
                     label
                 }
             }
+            .frame(
+                maxWidth: fillsWidth ? .infinity : nil,
+                alignment: fillsWidth ? .leading : .center
+            )
             .padding(.horizontal, 7)
             .padding(.vertical, 5)
             .background {
@@ -1246,6 +1525,9 @@ struct PlainTextBody: View {
     let query: String
     let selectedMatchIndex: Int?
     let findTick: UInt64
+    let pool: ReaderSurfacePool
+    let tabID: UUID?
+    let messageID: MessageID?
 
     var body: some View {
         HighlightedMessageText(
@@ -1253,6 +1535,9 @@ struct PlainTextBody: View {
             query: query,
             selectedMatchIndex: selectedMatchIndex,
             findTick: findTick,
+            pool: pool,
+            tabID: tabID,
+            messageID: messageID,
             font: MessageTypography.bodyFont,
             paragraphStyle: MessageTypography.bodyParagraphStyle
         )
@@ -1313,6 +1598,9 @@ struct HighlightedMessageText: NSViewRepresentable {
     let query: String
     let selectedMatchIndex: Int?
     let findTick: UInt64
+    var pool: ReaderSurfacePool?
+    var tabID: UUID?
+    var messageID: MessageID?
     var font: NSFont = MessageTypography.bodyFont
     var paragraphStyle: NSParagraphStyle = MessageTypography.bodyParagraphStyle
 
@@ -1324,78 +1612,189 @@ struct HighlightedMessageText: NSViewRepresentable {
         Coordinator()
     }
 
-    func makeNSView(context: Context) -> NSTextView {
-        let view = NSTextView(usingTextLayoutManager: false)
-        view.isEditable = false
-        view.isSelectable = true
-        view.drawsBackground = false
-        view.backgroundColor = .clear
-        view.isRichText = true
-        view.isVerticallyResizable = true
-        view.isHorizontallyResizable = false
-        view.textContainerInset = .zero
-        view.textContainer?.lineFragmentPadding = 0
-        view.textContainer?.widthTracksTextView = true
-        view.minSize = .zero
-        view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return view
+    func makeNSView(context: Context) -> HighlightedMessageTextHost {
+        let host = HighlightedMessageTextHost()
+        host.update(
+            pool: pool,
+            tabID: tabID,
+            messageID: messageID,
+            text: text,
+            query: query,
+            selectedMatchIndex: selectedMatchIndex,
+            font: font,
+            paragraphStyle: paragraphStyle
+        )
+        return host
     }
 
-    func updateNSView(_ view: NSTextView, context: Context) {
-        applyText(to: view)
+    func updateNSView(_ host: HighlightedMessageTextHost, context: Context) {
+        host.update(
+            pool: pool,
+            tabID: tabID,
+            messageID: messageID,
+            text: text,
+            query: query,
+            selectedMatchIndex: selectedMatchIndex,
+            font: font,
+            paragraphStyle: paragraphStyle
+        )
         guard context.coordinator.lastTick != findTick else { return }
         context.coordinator.lastTick = findTick
-        scrollToSelection(in: view)
+        host.scrollToSelection(
+            in: text,
+            query: query,
+            selectedMatchIndex: selectedMatchIndex
+        )
     }
 
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSTextView, context: Context) -> CGSize? {
-        let width = proposal.width ?? nsView.bounds.width
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView host: HighlightedMessageTextHost,
+        context: Context
+    ) -> CGSize? {
+        host.sizeThatFits(proposal)
+    }
+
+    static func dismantleNSView(_ host: HighlightedMessageTextHost, coordinator: Coordinator) {
+        host.detach()
+    }
+}
+
+@MainActor
+final class HighlightedMessageTextHost: NSView {
+    private lazy var fallbackView = ReaderPlainTextView()
+    private var installedView: ReaderPlainTextView?
+    private weak var pool: ReaderSurfacePool?
+    private var installedTabID: UUID?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentHuggingPriority(.defaultLow, for: .vertical)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is unavailable")
+    }
+
+    override func layout() {
+        super.layout()
+        installedView?.frame = bounds
+    }
+
+    func detach() {
+        installedView?.removeFromSuperview()
+        installedView = nil
+        installedTabID = nil
+        pool = nil
+    }
+
+    func update(
+        pool: ReaderSurfacePool?,
+        tabID: UUID?,
+        messageID: MessageID?,
+        text: String,
+        query: String,
+        selectedMatchIndex: Int?,
+        font: NSFont,
+        paragraphStyle: NSParagraphStyle
+    ) {
+        let nextView: ReaderPlainTextView
+        let nextTabID: UUID?
+        if let tabID, let pool {
+            nextView = pool.textView(for: tabID)
+            nextTabID = tabID
+        } else {
+            // Raw source and transient no-tab states deliberately use an
+            // unpooled fallback so only actual tabs consume LRU entries.
+            nextView = fallbackView
+            nextTabID = nil
+        }
+        if installedView !== nextView {
+            installedView?.removeFromSuperview()
+            installedView = nextView
+            addSubview(nextView)
+            nextView.translatesAutoresizingMaskIntoConstraints = true
+            nextView.autoresizingMask = [.width, .height]
+            nextView.frame = bounds
+        } else if let nextTabID, let pool {
+            pool.touch(nextTabID)
+        }
+        self.pool = pool
+        installedTabID = nextTabID
+
+        guard let installedView else { return }
+        let didRender = installedView.render(
+            messageID: messageID,
+            text: text,
+            query: query,
+            selectedMatchIndex: selectedMatchIndex,
+            font: font,
+            paragraphStyle: paragraphStyle
+        )
+        if didRender, let installedTabID, let pool = self.pool {
+            pool.invalidatePlainLayout(for: installedTabID)
+        }
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize) -> CGSize? {
+        guard let view = installedView else { return nil }
+        let width = proposal.width ?? view.bounds.width
         guard width.isFinite, width > 0 else { return nil }
-        nsView.textContainer?.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
-        nsView.frame.size.width = width
-        applyText(to: nsView)
-        guard let container = nsView.textContainer else {
+        guard let identity = view.renderedIdentity else {
             return CGSize(width: width, height: MessageTypography.bodyLineHeight)
         }
-        nsView.layoutManager?.ensureLayout(for: container)
-        let used = nsView.layoutManager?.usedRect(for: container) ?? .zero
-        return CGSize(width: width, height: max(ceil(used.height), MessageTypography.bodyLineHeight))
-    }
 
-    private func applyText(to view: NSTextView) {
-        let storage = NSMutableAttributedString(
-            string: text,
-            attributes: [
-                .font: font,
-                .foregroundColor: NSColor.labelColor,
-                .paragraphStyle: paragraphStyle,
-            ]
-        )
-        let matches = MessageFind.ranges(in: text, query: query)
-        for (offset, range) in matches.enumerated() {
-            let nsRange = NSRange(range, in: text)
-            let isSelected = offset == selectedMatchIndex
-            storage.addAttribute(
-                .backgroundColor,
-                value: isSelected ? NSColor.selectedContentBackgroundColor : NSColor.findHighlightColor,
-                range: nsRange
-            )
-            if isSelected {
-                storage.addAttribute(
-                    .foregroundColor,
-                    value: NSColor.alternateSelectedControlTextColor,
-                    range: nsRange
-                )
-            }
+        if let installedTabID,
+           let pool,
+           let height = pool.cachedPlainHeight(
+               for: installedTabID,
+               identity: identity,
+               width: width
+           ) {
+            return CGSize(width: width, height: height)
         }
-        view.textStorage?.setAttributedString(storage)
+
+        let widthChanged = abs(view.bounds.width - width) > 0.5
+            || abs((view.textContainer?.containerSize.width ?? 0) - width) > 0.5
+        if widthChanged {
+            view.frame.size.width = width
+            view.textContainer?.containerSize = NSSize(
+                width: width,
+                height: .greatestFiniteMagnitude
+            )
+        }
+        guard let container = view.textContainer else {
+            return CGSize(width: width, height: MessageTypography.bodyLineHeight)
+        }
+        view.layoutManager?.ensureLayout(for: container)
+        let used = view.layoutManager?.usedRect(for: container) ?? .zero
+        let height = max(ceil(used.height), MessageTypography.bodyLineHeight)
+        if let installedTabID, let pool = self.pool {
+            pool.recordPlainHeight(
+                height,
+                for: installedTabID,
+                identity: identity,
+                width: width,
+                revision: view.renderedRevision
+            )
+        }
+        return CGSize(width: width, height: height)
     }
 
-    private func scrollToSelection(in view: NSTextView) {
+    func scrollToSelection(
+        in text: String,
+        query: String,
+        selectedMatchIndex: Int?
+    ) {
+        guard let view = installedView,
+              let selectedMatchIndex
+        else {
+            return
+        }
         let matches = MessageFind.ranges(in: text, query: query)
-        guard let selectedMatchIndex, matches.indices.contains(selectedMatchIndex) else { return }
+        guard matches.indices.contains(selectedMatchIndex) else { return }
         let nsRange = NSRange(matches[selectedMatchIndex], in: text)
         DispatchQueue.main.async {
             view.scrollRangeToVisible(nsRange)

@@ -44,6 +44,9 @@ struct MessageListPane: View {
                 listScrollOffset: model.selectedFolderID.flatMap {
                     model.listScrollOffsets[$0]
                 },
+                hasMorePages: model.listCursor != nil,
+                isPaging: model.isPaging,
+                isLoadingList: model.isLoadingList,
                 onWarmup: { domains in
                     Task { await model.warmupFavicons(forSenderDomains: domains) }
                 },
@@ -143,6 +146,9 @@ struct MessageTableRepresentable: NSViewRepresentable {
     var trailing: [SwipeActionKind]
     var topRestDepth: CGFloat
     var listScrollOffset: CGFloat?
+    var hasMorePages: Bool
+    var isPaging: Bool
+    var isLoadingList: Bool
     var onWarmup: ([String]) -> Void
     var onSelect: (Set<MessageID>, MessageID?) -> Void
     var onOpenMessage: (MessageID, Bool) -> Void
@@ -181,6 +187,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
         private var rowIDs: [MessageID] = []
         private var renderedFolder: FolderID?
         private var pendingScrollOffset: CGFloat?
+        private var restorePrefetchRowCount: Int?
         private var canPersistScroll = false
 
         func bind(container: MessageTableContainer, parent: MessageTableRepresentable) {
@@ -239,6 +246,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
             let epochChanged = parent.epoch != epoch
             if folderChanged || epochChanged {
                 pendingScrollOffset = parent.listScrollOffset.map { max($0, 0) }
+                restorePrefetchRowCount = nil
             }
             renderedFolder = parent.currentFolder
             // SwiftUI observes AccentSource and the favicon revision; resolve
@@ -296,10 +304,57 @@ struct MessageTableRepresentable: NSViewRepresentable {
         }
 
         private func restorePendingScrollOffset(in container: MessageTableContainer) {
-            guard let offset = pendingScrollOffset,
-                  container.tableView.numberOfRows > 0
-            else { return }
-            container.restoreScrollOffset(offset)
+            guard let offset = pendingScrollOffset else { return }
+            guard container.restoreScrollOffset(offset) else {
+                // A deep target can be outside the first page's document
+                // geometry. Keep persistence disabled while a page is
+                // in-flight or can still be started; the next row update
+                // retries restoration after that page arrives.
+                guard let parent else {
+                    container.clampScrollOffset(offset)
+                    pendingScrollOffset = nil
+                    return
+                }
+                if let requestedAtCount = restorePrefetchRowCount {
+                    guard !parent.isPaging else { return }
+                    restorePrefetchRowCount = nil
+                    guard parent.rows.count > requestedAtCount else {
+                        // The restore-driven request settled without extending
+                        // the document (failure or an empty final page). Do not
+                        // retry the same cursor forever.
+                        container.clampScrollOffset(offset)
+                        pendingScrollOffset = nil
+                        return
+                    }
+                }
+                guard !parent.rows.isEmpty else {
+                    // The initial page may still be loading even though no
+                    // cursor exists yet. Keep the target until that request
+                    // settles; an actually empty exhausted list is clamped.
+                    if !parent.isLoadingList {
+                        container.clampScrollOffset(offset)
+                        pendingScrollOffset = nil
+                    }
+                    return
+                }
+                guard !parent.isPaging, !parent.isLoadingList else {
+                    // The request is already in flight (including the
+                    // initial page), so wait for its state update before
+                    // deciding whether another page is needed.
+                    return
+                }
+                guard parent.hasMorePages else {
+                    // Pagination is exhausted, so this target is genuinely
+                    // unreachable. Persist the nearest reachable position
+                    // instead of leaving scroll persistence disabled forever.
+                    container.clampScrollOffset(offset)
+                    pendingScrollOffset = nil
+                    return
+                }
+                restorePrefetchRowCount = parent.rows.count
+                parent.onPrefetch(parent.rows.count - 1)
+                return
+            }
             pendingScrollOffset = nil
         }
 
@@ -449,13 +504,37 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 ?? parent.rows[safe: tableView.selectedRow]?.id
             guard ids != parent.selectedIDs || anchor != parent.selectedID else { return }
             if opensReader, ids.count == 1, let id = ids.first {
+                // Commit the AppKit selection before opening the reader. Reader
+                // publication can rebuild surrounding SwiftUI hosts; keeping
+                // model/native selection synchronized lets the deferred
+                // responder restoration preserve arrow-key navigation.
+                parent.onSelect(ids, anchor)
                 parent.onOpenMessage(id, false)
+                restoreListFocus(after: tableView)
             } else {
                 parent.onSelect(ids, anchor)
             }
         }
 
         private var lastScrolledSelectionID: MessageID?
+        private var selectionScrollGeneration: UInt64 = 0
+        private var focusRestoreGeneration: UInt64 = 0
+
+        private func restoreListFocus(after tableView: NSTableView) {
+            focusRestoreGeneration &+= 1
+            let generation = focusRestoreGeneration
+            DispatchQueue.main.async { [weak self, weak tableView] in
+                guard let self,
+                      generation == self.focusRestoreGeneration,
+                      let tableView,
+                      let window = tableView.window
+                else { return }
+                if window.firstResponder !== tableView {
+                    window.makeFirstResponder(tableView)
+                }
+            }
+        }
+
         private func syncSelection(in tableView: NSTableView) {
             guard let parent else { return }
             let selectedIndexes = IndexSet(
@@ -466,17 +545,29 @@ struct MessageTableRepresentable: NSViewRepresentable {
             }
 
             guard let selectedID = parent.selectedID,
-                  let index = parent.rows.firstIndex(where: { $0.id == selectedID })
+                  parent.rows.contains(where: { $0.id == selectedID })
             else {
                 lastScrolledSelectionID = nil
+                selectionScrollGeneration &+= 1
                 return
             }
             // A new selection (click, deep link, restoration) is brought into
             // view exactly once; index shifts from backfill prepends and
-            // reloads must not yank an established scroll position.
+            // reloads must not yank an established scroll position. Defer the
+            // row scroll one run-loop turn so reader content can commit first.
             if lastScrolledSelectionID != selectedID {
                 lastScrolledSelectionID = selectedID
-                tableView.scrollRowToVisible(index)
+                selectionScrollGeneration &+= 1
+                let generation = selectionScrollGeneration
+                DispatchQueue.main.async { [weak self, weak tableView] in
+                    guard let self,
+                          generation == self.selectionScrollGeneration,
+                          self.parent?.selectedID == selectedID,
+                          let tableView,
+                          let index = self.parent?.rows.firstIndex(where: { $0.id == selectedID })
+                    else { return }
+                    tableView.scrollRowToVisible(index)
+                }
             }
         }
 
@@ -866,13 +957,13 @@ final class MessageTableContainer: NSView {
         // without moving the view: the clip view keeps its full-bleed frame,
         // so no row geometry and no bottom edge moves. The automatic insets
         // would derive the same band from a safe area this pane has already
-        // cleared, and overwrite it with zero. `scrollerInsets` follows the
-        // content, because the scroller belongs beside the rows, not under the
-        // title.
+        // cleared, and overwrite it with zero. NSScrollView already accounts
+        // for `contentInsets.top` when positioning the scroller thumb, so
+        // repeating `topRest` in `scrollerInsets` would displace it downward.
         let topRest = max(topRestDepth, 0)
         scrollView.automaticallyAdjustsContentInsets = false
         scrollView.contentInsets = NSEdgeInsets(top: topRest, left: 0, bottom: 0, right: 0)
-        scrollView.scrollerInsets = NSEdgeInsets(top: topRest, left: 0, bottom: 0, right: 0)
+        scrollView.scrollerInsets = NSEdgeInsets()
         scrollView.suppressSystemScrollEdgeEffect()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         let clip = scrollView.contentView
@@ -915,21 +1006,71 @@ final class MessageTableContainer: NSView {
         onScrollOffset?(max(scrollView.contentView.bounds.origin.y, 0))
     }
 
-    func restoreScrollOffset(_ offset: CGFloat) {
+    @discardableResult
+    func restoreScrollOffset(_ offset: CGFloat) -> Bool {
         let clip = scrollView.contentView
         let target = max(offset, 0)
-        guard abs(clip.bounds.origin.y - target) > .ulpOfOne else { return }
+        let tolerance: CGFloat = 0.5
+        if abs(clip.bounds.origin.y - target) <= tolerance {
+            return true
+        }
+        if target == 0 {
+            // Zero is always the list origin, even before the first page has
+            // created a document tall enough to scroll.
+            suppressScrollPersistence = true
+            clip.setBoundsOrigin(NSPoint(x: clip.bounds.origin.x, y: 0))
+            scrollView.reflectScrolledClipView(clip)
+            suppressScrollPersistence = false
+            return true
+        }
+
+        // Consult the current document geometry and ask AppKit where this
+        // clip view can actually scroll before mutating it. During an early
+        // page/layout pass, the document is shorter than the saved position
+        // and AppKit constrains the proposed bounds to a temporary maximum.
+        // Leave the request pending rather than persisting that position.
+        let documentRect = clip.documentRect
+        let maximumOriginY = documentRect.maxY - clip.bounds.height
+        guard clip.bounds.height > .ulpOfOne,
+              target >= documentRect.minY - tolerance,
+              target <= maximumOriginY + tolerance
+        else {
+            return false
+        }
+        let proposedBounds = NSRect(
+            origin: NSPoint(x: clip.bounds.origin.x, y: target),
+            size: clip.bounds.size
+        )
+        let constrainedBounds = clip.constrainBoundsRect(proposedBounds)
+        guard abs(constrainedBounds.origin.y - target) <= tolerance else {
+            return false
+        }
+
+        suppressScrollPersistence = true
+        clip.setBoundsOrigin(constrainedBounds.origin)
+        scrollView.reflectScrolledClipView(clip)
+        suppressScrollPersistence = false
+        return abs(clip.bounds.origin.y - target) <= tolerance
+    }
+    /// Moves an abandoned restore request to the furthest position currently
+    /// reachable by the document, without feeding the adjustment back into
+    /// persisted list-scroll state while restoration is being resolved.
+    func clampScrollOffset(_ offset: CGFloat) {
+        let clip = scrollView.contentView
+        let maximumOriginY = max(0, clip.documentRect.maxY - clip.bounds.height)
+        let target = min(max(offset, 0), maximumOriginY)
         suppressScrollPersistence = true
         clip.setBoundsOrigin(NSPoint(x: clip.bounds.origin.x, y: target))
         scrollView.reflectScrolledClipView(clip)
         suppressScrollPersistence = false
     }
 
+
     func updateTopRestDepth(_ depth: CGFloat) {
         let topRest = max(depth, 0)
         guard abs(scrollView.contentInsets.top - topRest) > .ulpOfOne else { return }
         scrollView.contentInsets = NSEdgeInsets(top: topRest, left: 0, bottom: 0, right: 0)
-        scrollView.scrollerInsets = NSEdgeInsets(top: topRest, left: 0, bottom: 0, right: 0)
+        scrollView.scrollerInsets = NSEdgeInsets()
     }
     @discardableResult
     func updateAccent(_ source: AccentSource) -> Bool {
@@ -1043,6 +1184,10 @@ final class MessageCellView: NSTableCellView {
         layer?.masksToBounds = false
         identifier = Self.identifier
         focusRingType = .none
+        // AppKit's native row highlight is disabled; keep the custom chrome
+        // below every text and icon subview in a stable z-order.
+        layer?.addSublayer(selectionLayer)
+        layer?.addSublayer(hoverLayer)
         hoverLayer.opacity = 0
         hoverLayer.cornerCurve = .continuous
         selectionLayer.cornerCurve = .continuous

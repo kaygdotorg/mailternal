@@ -418,30 +418,8 @@ enum MessageToolbarPolicy {
         case overflow = "Mailternal.message.overflow"
     }
 
-    /// Toolbar groups are part of the policy so AppKit cannot accidentally
-    /// split a related run of controls into separate glass capsules.
-    enum Group: String, CaseIterable, Sendable {
-        case messageActions = "Mailternal.message.actions"
-
-        var itemIdentifiers: [Identifier] {
-            [.archive, .trash, .overflow]
-        }
-    }
-
-    static let groups: [Group] = Group.allCases
-
-    static let defaultGroupIdentifiers: [Group] = groups
-    static let allowedGroupIdentifiers: [Group] = groups
-
-    static let defaultItemIdentifiers: [Identifier] = groups.flatMap {
-        $0.itemIdentifiers
-    }
-
+    static let defaultItemIdentifiers: [Identifier] = [.archive, .trash, .overflow]
     static let allowedItemIdentifiers: [Identifier] = defaultItemIdentifiers
-
-    static func itemIdentifiers(in group: Group) -> [Identifier] {
-        group.itemIdentifiers
-    }
 
     struct VisibleItem: Equatable, Sendable {
         let identifier: Identifier

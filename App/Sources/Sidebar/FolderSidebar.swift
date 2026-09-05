@@ -61,12 +61,17 @@ struct FolderSidebar: View {
                         folderNode(node)
                     }
                 } header: {
-                    sectionHeader(
-                        customRoots.isEmpty ? nil : "Folders",
-                        account: account
-                    )
+                    sectionHeader(account: account)
                 }
             }
+        }
+        // SwiftUI can retain only the duplicated floating section header when
+        // its title changes, dropping the section rows until relaunch. Rebuild
+        // that native List identity without animation when account titles
+        // change; selection remains model-owned.
+        .id(model.accountConfigs)
+        .transaction { transaction in
+            transaction.animation = nil
         }
         .listStyle(.sidebar)
         // The List keeps its own safe-area layout; the header carries the
@@ -106,28 +111,18 @@ struct FolderSidebar: View {
     }
 
     @ViewBuilder
-    private func sectionHeader(
-        _ title: String?,
-        account: AccountConfig?
-    ) -> some View {
+    private func sectionHeader(account: AccountConfig?) -> some View {
         if model.hasAccount {
-            VStack(alignment: .leading, spacing: 4) {
-                SidebarAccountTitle(
-                    title: AccountTitlePolicy.title(for: account) ?? account?.emailAddress ?? model.listTitleAccountName,
-                    accountID: account?.id,
-                    rename: $accountRename,
-                    onRename: account.map { account in
-                        { name in Task { await model.renameAccount(account.id, to: name) } }
-                    }
-                )
-                if let title {
-                    Text(title)
+            SidebarAccountTitle(
+                title: AccountTitlePolicy.title(for: account) ?? account?.emailAddress ?? model.listTitleAccountName,
+                accountID: account?.id,
+                rename: $accountRename,
+                onRename: account.map { account in
+                    { name in Task { await model.renameAccount(account.id, to: name) } }
                 }
-            }
+            )
             .padding(.top, PaneHeaderInsetPolicy.sidebarHeaderPadding)
             .padding(.bottom, PaneHeaderInsetPolicy.sidebarHeaderBottomPadding)
-        } else if let title {
-            Text(title)
         }
     }
 
@@ -482,7 +477,7 @@ private struct SidebarInline: View {
                 value: value,
                 font: .preferredFont(forTextStyle: .body),
                 identifier: nil,
-                isDoubleClickEnabled: !isEditing,
+                isDoubleClickEnabled: canEdit && !isEditing,
                 onDoubleClick: beginEditing
             )
             .opacity(isEditing ? 0 : 1)
@@ -501,7 +496,10 @@ private struct SidebarInline: View {
                 .frame(minWidth: 40)
             }
         }
-        .contentShape(Rectangle())
+        .accessibilityRenameAction(
+            isEnabled: canEdit && onCommit != nil,
+            action: beginEditing
+        )
     }
 
     private func beginEditing() {
@@ -525,6 +523,30 @@ private struct SidebarInline: View {
     private func cancel() {
         isEditing = false
         draft = ""
+    }
+}
+private struct SidebarAccessibilityRenameAction: ViewModifier {
+    let isEnabled: Bool
+    let action: () -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content.accessibilityAction(named: Text("Rename")) {
+                action()
+            }
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func accessibilityRenameAction(
+        isEnabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        modifier(SidebarAccessibilityRenameAction(isEnabled: isEnabled, action: action))
     }
 }
 
@@ -640,6 +662,23 @@ private final class InlineTextFieldView: NSTextField {
         return twin.accessibilityIdentifier() == identifier
     }
 
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isBezeled = false
+        isBordered = false
+        drawsBackground = false
+        backgroundColor = .clear
+        focusRingType = .none
+        cell?.usesSingleLineMode = true
+        cell?.lineBreakMode = .byClipping
+        textColor = .labelColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
     override var intrinsicContentSize: NSSize {
         var size = super.intrinsicContentSize
         size.width = max(size.width, 40)
@@ -649,17 +688,10 @@ private final class InlineTextFieldView: NSTextField {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard window != nil else { return }
-        isBezeled = false
-        isBordered = false
-        drawsBackground = false
-        backgroundColor = .clear
-        focusRingType = .none
-        cell?.usesSingleLineMode = true
-        cell?.lineBreakMode = .byClipping
-        textColor = .labelColor
         onAppear?()
         onAppear = nil
     }
+
 
     override func becomeFirstResponder() -> Bool {
         let became = super.becomeFirstResponder()
@@ -667,9 +699,8 @@ private final class InlineTextFieldView: NSTextField {
         return became
     }
 
-    /// The cell re-applies its own attributes to the field editor after the
-    /// field becomes first responder (which is what painted the opaque
-    /// `textBackgroundColor` band); clear it again once editing has begun.
+    /// Keep the defensive clear for AppKit versions that re-apply cell
+    /// attributes after the field editor becomes first responder.
     override func textDidBeginEditing(_ notification: Notification) {
         super.textDidBeginEditing(notification)
         clearFieldEditorBackground()
@@ -860,6 +891,7 @@ private final class SidebarDoubleClickRouter: NSObject {
         if row >= 0,
            let rowView = tableView.rowView(atRow: row, makeIfNecessary: false),
            let label = findLabel(in: rowView) {
+            guard label.isDoubleClickEnabled else { return }
             sidebarTrace("Sidebar rename double-click detected in table row")
             label.onDoubleClick?()
             return
@@ -869,6 +901,7 @@ private final class SidebarDoubleClickRouter: NSObject {
         // hierarchy. Walk the actual hit-test path as a second route.
         if let point,
            let label = findLabel(at: point, in: tableView) {
+            guard label.isDoubleClickEnabled else { return }
             sidebarTrace("Sidebar rename double-click detected in table header")
             label.onDoubleClick?()
         }
@@ -1006,6 +1039,10 @@ private struct SidebarAccountTitle: View {
                 .frame(minWidth: 40)
             }
         }
+        .accessibilityRenameAction(
+            isEnabled: accountID != nil && onRename != nil,
+            action: beginEditing
+        )
     }
     private func beginEditing() {
         guard !isEditing, onRename != nil, let accountID else { return }

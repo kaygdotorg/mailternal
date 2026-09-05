@@ -382,12 +382,8 @@ final class MainShellViewController: NSViewController {
 private extension NSToolbarItem.Identifier {
     static let sidebarToggle = NSToolbarItem.Identifier("Mailternal.sidebarToggle")
     static let readerTabs = NSToolbarItem.Identifier("Mailternal.readerTabs")
-    static let messageActions = NSToolbarItem.Identifier(MessageToolbarPolicy.Group.messageActions.rawValue)
     static let messageArchive = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.archive.rawValue)
     static let messageTrash = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.trash.rawValue)
-    static let messageFlag = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.flag.rawValue)
-    static let messageSource = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.source.rawValue)
-    static let messageColorScheme = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.colorScheme.rawValue)
     static let messageOverflow = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.overflow.rawValue)
 }
 
@@ -488,6 +484,117 @@ private final class ReaderTabHoverTrackingView: NSView {
     override func mouseEntered(with event: NSEvent) { onHoverChanged?(true) }
     override func mouseExited(with event: NSEvent) { onHoverChanged?(false) }
 }
+/// Borderless toolbar action control with independent native-semantic hover
+/// and pressed chrome. Keeping the image and intrinsic metrics on NSButton
+/// lets AppKit continue to own symbol sizing and the control's hit target.
+@MainActor
+private final class MessageToolbarButton: NSButton {
+    private var trackingArea: NSTrackingArea?
+    private var isHovered = false
+    private var isPressed = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = false
+        layer?.cornerCurve = .continuous
+        layer?.cornerRadius = 6
+        isBordered = false
+        showsBorderOnlyWhileMouseInside = false
+        setButtonType(.momentaryPushIn)
+        imagePosition = .imageOnly
+        focusRingType = .none
+        updateChrome()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+            self.trackingArea = nil
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func layout() {
+        super.layout()
+        guard let layer else { return }
+        layer.cornerRadius = min(6, min(bounds.width, bounds.height) / 2)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        updateChrome()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        updateChrome()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        isPressed = true
+        updateChrome()
+        defer {
+            isPressed = false
+            updateChrome()
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func performClick(_ sender: Any?) {
+        guard isEnabled else { return }
+        isPressed = true
+        updateChrome()
+        defer {
+            isPressed = false
+            updateChrome()
+        }
+        super.performClick(sender)
+    }
+
+    override var isEnabled: Bool {
+        didSet { updateChrome() }
+    }
+
+    override var isHighlighted: Bool {
+        didSet { updateChrome() }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateChrome()
+    }
+
+    private func updateChrome() {
+        guard let layer else { return }
+        let color: NSColor? = {
+            guard isEnabled, isHovered else { return nil }
+            return (isPressed || isHighlighted) ? .tertiarySystemFill : .quaternarySystemFill
+        }()
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.backgroundColor = color?.cgColor
+            CATransaction.commit()
+        }
+    }
+}
+
+
 
 @MainActor
 final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemValidation, NSMenuDelegate {
@@ -495,6 +602,13 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     private var modelObservationGeneration: UInt64 = 0
     private let includesSidebarToggle: Bool
     private let toggleAction: @MainActor () -> Void
+    private var readerMessageSelection: Set<MessageID> {
+        let messageID = includesSidebarToggle
+            ? model.tabs.active?.message
+            : model.selectedMessageID
+        return messageID.map { [$0] } ?? []
+    }
+
     private weak var toolbar: NSToolbar?
     private lazy var toggleItem = makeToggleItem()
     private lazy var readerTabsHosting = makeReaderTabsHosting()
@@ -509,20 +623,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     )
     private var cachedMessageActionsWidth: CGFloat?
     private var readerTabsWidthUpdateScheduled = false
-    private lazy var flagItem = makeMessageItem(
-        identifier: .messageFlag,
-        action: #selector(flagSelected(_:))
-    )
-    private lazy var sourceItem = makeMessageItem(
-        identifier: .messageSource,
-        action: #selector(toggleRawSource(_:))
-    )
-    private lazy var colorSchemeItem = makeMessageItem(
-        identifier: .messageColorScheme,
-        action: #selector(toggleEmailReadingOverride(_:))
-    )
     private lazy var overflowItem = makeOverflowItem()
-    private lazy var messageActionsGroup = makeMessageGroup(.messageActions)
     private lazy var overflowMenu: NSMenu = {
         let menu = NSMenu()
         menu.delegate = self
@@ -555,12 +656,14 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     }
 
     /// AppKit's toolbar validation is not driven by SwiftUI's observation
-    /// updates. Keep the native items in step with selection changes while
+    /// updates. Keep the native reader items in step with model changes while
     /// leaving per-menu-item validation to `validateMenuItem(_:).`
     private func observeModelChanges() {
         let generation = modelObservationGeneration
         withObservationTracking {
-            _ = model.selectedMessageIDs
+            _ = model.tabs.active?.message
+            _ = model.selectedMessageID
+
             _ = model.listRows
             _ = model.folders
             _ = model.selectedFolderID
@@ -606,8 +709,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             self?.scheduleReaderTabsWidthUpdate()
         }
         // NSToolbar installs its item views after makeToolbar returns. Cache the
-        // fixed native action width only after installation, then size tabs
-        // from split geometry on that stable value.
+        // native action widths only after installation, then size tabs from
+        // split geometry on that stable value.
         DispatchQueue.main.async { [weak self, weak toolbar] in
             guard let self, self.toolbar === toolbar else { return }
             self.cacheMessageActionsWidth()
@@ -624,7 +727,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         } else {
             identifiers += [.flexibleSpace]
         }
-        identifiers += MessageToolbarPolicy.defaultGroupIdentifiers.map(toolbarGroupIdentifier)
+        identifiers += MessageToolbarPolicy.defaultItemIdentifiers.map {
+            NSToolbarItem.Identifier($0.rawValue)
+        }
         return identifiers
     }
 
@@ -636,7 +741,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         if includesSidebarToggle {
             identifiers += [.sidebarToggle, .sidebarTrackingSeparator, .flexibleSpace, .readerTabs]
         }
-        identifiers += MessageToolbarPolicy.allowedGroupIdentifiers.map(toolbarGroupIdentifier)
+        identifiers += MessageToolbarPolicy.allowedItemIdentifiers.map {
+            NSToolbarItem.Identifier($0.rawValue)
+        }
         return identifiers
     }
 
@@ -654,18 +761,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             return toggleItem
         case .readerTabs where includesSidebarToggle:
             return readerTabsItem
-        case .messageActions:
-            return messageActionsGroup
         case .messageArchive:
             return archiveItem
         case .messageTrash:
             return trashItem
-        case .messageFlag:
-            return flagItem
-        case .messageSource:
-            return sourceItem
-        case .messageColorScheme:
-            return colorSchemeItem
         case .messageOverflow:
             return overflowItem
         default:
@@ -680,13 +779,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             item.isEnabled = includesSidebarToggle && !model.isSearchPresented
         case .readerTabs:
             configureReaderTabs()
-        case .messageActions,
-             .messageArchive, .messageTrash, .messageFlag,
-             .messageSource, .messageColorScheme:
+        case .messageArchive, .messageTrash, .messageOverflow:
             configureMessageItems()
-        case .messageOverflow:
-            configureMessageItems()
-            item.isEnabled = !model.selectedMessageIDs.isEmpty
         default:
             return item.isEnabled
         }
@@ -694,11 +788,11 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
+        overflowItem.isEnabled = !readerMessageSelection.isEmpty
         menu.removeAllItems()
         menu.addItem(NSMenuItem())
         for policyItem in MessageToolbarPolicy.overflowItems(
-            selection: model.selectedMessageIDs,
+            selection: readerMessageSelection,
             isReadStates: readStates,
             flagStates: flagStates,
             folders: model.folders,
@@ -714,7 +808,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             return menuItem.isEnabled
         }
         let policyItems = MessageToolbarPolicy.overflowItems(
-            selection: model.selectedMessageIDs,
+            selection: readerMessageSelection,
             isReadStates: readStates,
             flagStates: flagStates,
             folders: model.folders,
@@ -734,47 +828,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         Dictionary(uniqueKeysWithValues: model.listRows.map { ($0.id, $0.isRead) })
     }
 
-    private func toolbarGroupIdentifier(
-        _ group: MessageToolbarPolicy.Group
-    ) -> NSToolbarItem.Identifier {
-        NSToolbarItem.Identifier(group.rawValue)
-    }
-
-    private func messageItem(
-        for identifier: MessageToolbarPolicy.Identifier
-    ) -> NSToolbarItem? {
-        switch identifier {
-        case .archive: return archiveItem
-        case .trash: return trashItem
-        case .flag: return flagItem
-        case .source: return sourceItem
-        case .colorScheme: return colorSchemeItem
-        case .overflow: return overflowItem
-        }
-    }
-
-    private func makeMessageGroup(
-        _ group: MessageToolbarPolicy.Group
-    ) -> NSToolbarItemGroup {
-        let item = NSToolbarItemGroup(itemIdentifier: toolbarGroupIdentifier(group))
-        item.subitems = MessageToolbarPolicy.itemIdentifiers(in: group)
-            .compactMap { messageItem(for: $0) }
-        item.label = "Message Actions"
-        item.paletteLabel = item.label
-        // A bordered NSToolbarItemGroup draws separators between its subitems
-        // on macOS 26. The subitems are bordered instead: adjacent bordered
-        // items share one capsule without dividers.
-        item.isBordered = false
-        item.isEnabled = true
-        item.controlRepresentation = .expanded
-        item.selectionMode = .selectAny
-        item.autovalidates = false
-        return item
-    }
 
     private func configureMessageItems() {
         let visibleItems = MessageToolbarPolicy.visibleItems(
-            selection: model.selectedMessageIDs,
+            selection: readerMessageSelection,
             flagStates: flagStates,
             effectiveEmailReadingMode: model.effectiveEmailReadingMode,
             isShowingRawSource: model.isShowingRawSource
@@ -784,25 +841,30 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             switch visible.identifier {
             case .archive: item = archiveItem
             case .trash: item = trashItem
-            case .flag: item = flagItem
-            case .source: item = sourceItem
-            case .colorScheme: item = colorSchemeItem
             case .overflow: item = overflowItem
+            case .flag, .source, .colorScheme:
+                continue
             }
-            item.image = Self.toolbarSymbol(
-                visible.imageName,
-                accessibilityDescription: visible.title
+            Self.apply(
+                image: Self.toolbarSymbol(visible.imageName, accessibilityDescription: visible.title),
+                to: item
             )
             item.label = visible.title
             item.paletteLabel = visible.title
             item.toolTip = visible.title
             item.isEnabled = visible.isEnabled
+            if let button = item.view as? MessageToolbarButton {
+                button.setAccessibilityLabel(visible.title)
+                button.toolTip = visible.title
+                button.isEnabled = visible.isEnabled
+            }
         }
-        // Source and reading-mode state now live in More, not in the native
-        // toolbar group. Keep the group purely action-oriented.
-        overflowItem.isEnabled = !model.selectedMessageIDs.isEmpty
-        messageActionsGroup.isHidden = model.isSearchPresented || model.selectedMessageIDs.isEmpty
-        messageActionsGroup.isEnabled = !model.isSearchPresented
+        let hideActions = model.isSearchPresented || readerMessageSelection.isEmpty
+        for item in [archiveItem, trashItem, overflowItem] {
+            item.isHidden = hideActions
+            item.isEnabled = !hideActions
+            (item.view as? MessageToolbarButton)?.isEnabled = !hideActions
+        }
         toggleItem.isHidden = !includesSidebarToggle || model.isSearchPresented
         toggleItem.isEnabled = includesSidebarToggle && !model.isSearchPresented
         // The cluster width feeds the strip viewport.
@@ -871,7 +933,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         if shouldShow {
             if !toolbar.items.contains(where: { $0.itemIdentifier == .readerTabs }) {
                 let insertionIndex = toolbar.items.firstIndex {
-                    $0.itemIdentifier == .messageActions
+                    $0.itemIdentifier == .messageArchive
                 } ?? toolbar.items.count
                 toolbar.insertItem(withItemIdentifier: .readerTabs, at: insertionIndex)
             }
@@ -889,26 +951,23 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         }
     }
 
-    /// Width of the trailing native actions cluster. Measured once its item
-    /// view exists; until then the policy fallback keeps the tab strip from
-    /// disappearing (an unmeasured width must never hide the tabs).
+    /// Width of the trailing native actions. Measure each laid-out item view
+    /// and include the native spacing between adjacent toolbar items; before
+    /// layout, the conservative policy fallback keeps the tabs visible.
     private var messageActionsWidth: CGFloat {
-        // Prefer the live laid-out width: the group is measured at toolbar
-        // install with no selection, when its fitting size understates the
-        // visible cluster and the strip then overflows into the list column.
-        if let live = messageActionsGroup.view?.frame.width, live > 0 {
-            cachedMessageActionsWidth = live
-            return live
+        let actionItems = [archiveItem, trashItem, overflowItem]
+        let liveWidths = actionItems.compactMap { item -> CGFloat? in
+            guard let view = item.view else { return nil }
+            let width = view.frame.width
+            return width.isFinite && width > 0 ? width : nil
         }
-        if let cachedMessageActionsWidth { return cachedMessageActionsWidth }
-        let width = max(
-            messageActionsGroup.minSize.width,
-            messageActionsGroup.view?.fittingSize.width ?? 0
-        )
-        if width > 0 {
+        if liveWidths.count == actionItems.count {
+            let width = liveWidths.reduce(0, +)
+                + ReaderTabLayoutPolicy.toolbarSpacing * CGFloat(actionItems.count - 1)
             cachedMessageActionsWidth = width
             return width
         }
+        if let cachedMessageActionsWidth { return cachedMessageActionsWidth }
         return ReaderTabLayoutPolicy.fallbackActionsWidth
     }
 
@@ -1005,15 +1064,27 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         return nil
     }
 
-    /// Unbordered toolbar items draw their image at its intrinsic size. Craft's
-    /// reader chrome (design.md) uses plain medium-weight glyphs, so the
-    /// symbols are pinned to that configuration rather than the bordered
-    /// button default.
-    static let toolbarSymbolConfiguration = NSImage.SymbolConfiguration(pointSize: 17, weight: .medium, scale: .medium)
+    /// Craft-style action glyphs use a private borderless control so macOS
+    /// cannot merge adjacent toolbar items into one rest-state capsule.
+    /// AppKit still supplies the intrinsic control and symbol sizing; only
+    /// this button's bounds receive independent semantic hover/press chrome.
+    static func makeGlyphButton(target: AnyObject?, action: Selector?) -> NSButton {
+        let button = MessageToolbarButton(frame: .zero)
+        button.target = target
+        button.action = action
+        button.bezelStyle = .accessoryBarAction
+        return button
+    }
+
+    /// Routes an image to the item's glyph button (custom view) as well as the
+    /// item itself so palettes/overflow menus still show it.
+    static func apply(image: NSImage?, to item: NSToolbarItem) {
+        item.image = image
+        (item.view as? NSButton)?.image = image
+    }
 
     static func toolbarSymbol(_ name: String, accessibilityDescription: String?) -> NSImage? {
-        NSImage(systemSymbolName: name, accessibilityDescription: accessibilityDescription)?
-            .withSymbolConfiguration(toolbarSymbolConfiguration)
+        NSImage(systemSymbolName: name, accessibilityDescription: accessibilityDescription)
     }
 
     private func makeMessageItem(
@@ -1023,9 +1094,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         let item = NSToolbarItem(itemIdentifier: identifier)
         item.action = action
         item.target = self
-        // Unbordered: no shared capsule, so the icons sit as close together
-        // as the toolbar allows (user preference over the glass cluster).
         item.isBordered = false
+        let button = Self.makeGlyphButton(target: self, action: action)
+        item.view = button
         item.autovalidates = true
         return item
     }
@@ -1041,10 +1112,24 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         item.paletteLabel = "More"
         item.toolTip = "More message actions"
         item.isBordered = false
-        item.isEnabled = !model.selectedMessageIDs.isEmpty
+        let button = Self.makeGlyphButton(target: self, action: #selector(showOverflowMenu(_:)))
+        button.image = item.image
+        button.setAccessibilityLabel(item.label)
+        button.toolTip = item.toolTip
+        button.isEnabled = !readerMessageSelection.isEmpty
+        item.view = button
+        item.isEnabled = button.isEnabled
         item.autovalidates = false
         item.showsIndicator = false
         return item
+    }
+
+    @objc private func showOverflowMenu(_ sender: NSButton) {
+        overflowMenu.popUp(
+            positioning: nil,
+            at: NSPoint(x: 0, y: sender.bounds.maxY + 4),
+            in: sender
+        )
     }
 
     private func addMenuItem(
@@ -1105,41 +1190,27 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         return nil
     }
 
-    private func clearTransientMessageActionSelection() {
-        let identifiers: [MessageToolbarPolicy.Identifier] = [.archive, .trash, .flag]
-        let groupedIdentifiers = MessageToolbarPolicy.itemIdentifiers(in: .messageActions)
-        for identifier in identifiers {
-            guard let index = groupedIdentifiers.firstIndex(of: identifier) else { continue }
-            messageActionsGroup.setSelected(false, at: index)
-        }
-    }
 
     @objc private func trashSelected(_ sender: Any?) {
-        model.perform(.trash, on: model.selectedMessageIDs)
-        clearTransientMessageActionSelection()
+        model.perform(.trash, on: readerMessageSelection)
     }
 
-    @objc private func flagSelected(_ sender: Any?) {
-        model.perform(.toggleFlag, on: model.selectedMessageIDs)
-        clearTransientMessageActionSelection()
-    }
 
     @objc private func toggleSidebar(_ sender: Any?) {
         toggleAction()
     }
 
     @objc private func archiveSelected(_ sender: Any?) {
-        model.perform(.archive, on: model.selectedMessageIDs)
-        clearTransientMessageActionSelection()
+        model.perform(.archive, on: readerMessageSelection)
     }
 
     @objc private func toggleRawSource(_ sender: Any?) {
-        guard model.selectedMessageIDs.count == 1 else { return }
+        guard readerMessageSelection.count == 1 else { return }
         model.toggleRawSource()
     }
 
     @objc private func toggleEmailReadingOverride(_ sender: Any?) {
-        guard model.selectedMessageIDs.count == 1 else { return }
+        guard readerMessageSelection.count == 1 else { return }
         model.toggleEmailReadingOverride()
     }
 
@@ -1147,7 +1218,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         guard let action = sender.representedObject as? MessageContextMenuPolicy.Action else {
             return
         }
-        let selection = model.selectedMessageIDs
+        let selection = readerMessageSelection
         guard !selection.isEmpty else { return }
         switch action {
         case .openInNewTab:
@@ -1215,7 +1286,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func show(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
-        var toolbarToInstall: MainToolbarController?
         if let shell {
             shell.update(model: model, appearance: appearance, actions: actions)
             toolbarController?.update(model: model)
@@ -1232,24 +1302,28 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             )
             MainWindowStartupConfiguration.prepare(window)
             window.delegate = self
-            let toolbarController = MainToolbarController(
-                model: model,
-                toggleAction: { [weak shell] in shell?.toggleSidebar(nil) }
-            )
-            self.toolbarController = toolbarController
-            shellLaunchPhase("shell-toolbar-controller-ready")
             self.window = window
             MainWindowStartupConfiguration.attach(shell, to: window)
             shellLaunchPhase("shell-window-attached")
-            toolbarToInstall = toolbarController
         }
 
         guard let window else { return }
         if !didScheduleFirstFrame {
             didScheduleFirstFrame = true
             CATransaction.begin()
-            CATransaction.setCompletionBlock {
+            CATransaction.setCompletionBlock { [weak self, weak window, model] in
+                guard let self, let window, self.window === window else { return }
                 QALaunch.launchPhase("first-frame")
+                guard let shell = self.shell, self.toolbarController == nil else {
+                    self.scheduleSettledFrameIfReady()
+                    return
+                }
+                self.installToolbar(
+                    for: model,
+                    shell: shell,
+                    in: window
+                )
+                self.scheduleSettledFrameIfReady()
             }
             window.makeKeyAndOrderFront(nil)
             CATransaction.commit()
@@ -1258,19 +1332,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         NSApp.activate()
         QALaunch.launchPhase("window-front")
-
-        // The shell is already attached when the window fronts. Install the
-        // toolbar on the next main-actor turn so its native setup cannot delay
-        // the first visible frame.
-        if let toolbarToInstall {
-            Task { @MainActor [weak self, weak window, toolbarToInstall] in
-                guard let self, let window, self.window === window else { return }
-                shellLaunchPhase("shell-toolbar-install-begin")
-                window.toolbar = toolbarToInstall.makeToolbar()
-                shellLaunchPhase("shell-toolbar-install-end")
-            }
-        }
         scheduleSettledFrameIfReady()
+    }
+
+    private func installToolbar(
+        for model: AppModel,
+        shell: MainShellViewController,
+        in window: NSWindow
+    ) {
+        shellLaunchPhase("shell-toolbar-controller-begin")
+        let toolbarController = MainToolbarController(
+            model: model,
+            toggleAction: { [weak shell] in shell?.toggleSidebar(nil) }
+        )
+        self.toolbarController = toolbarController
+        shellLaunchPhase("shell-toolbar-controller-ready")
+        window.toolbar = toolbarController.makeToolbar()
+        shellLaunchPhase("shell-toolbar-install-end")
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
