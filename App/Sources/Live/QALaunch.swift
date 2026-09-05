@@ -3,7 +3,7 @@ import Foundation
 import MailternalInterfaces
 import MailternalStore
 
-/// DEBUG-only headless QA launcher. Parses `-qa-account host port security`
+/// Private QA launcher. Parses `-qa-account host port security`
 /// and optional `-qa-container`, `-qa-cache-cap`, `-qa-bench-search`,
 /// `-qa-bench-select`, `-qa-fetch-cid`, and `-qa-open-window <link>`.
 ///
@@ -40,7 +40,9 @@ enum QALaunch: Sendable {
         arguments: [String] = ProcessInfo.processInfo.arguments,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Config? {
-        #if DEBUG
+        #if !DEBUG
+        guard environment["MAILTERNAL_QA"] == "1" else { return nil }
+        #endif
         var host: String?
         var port: Int?
         var security: IMAPEndpoint.Security?
@@ -107,9 +109,6 @@ enum QALaunch: Sendable {
             fetchCID: fetchCID,
             openWindowLink: openWindowLink
         )
-        #else
-        return nil
-        #endif
     }
 
     static func parseSecurity(_ raw: String) -> IMAPEndpoint.Security? {
@@ -171,7 +170,6 @@ enum QALaunch: Sendable {
 
     @MainActor
     static func makeFacade(_ config: Config? = parse()) throws -> LiveMailFacade? {
-        #if DEBUG
         guard let config else { return nil }
         let container = MailternalContainer(root: config.containerRoot)
         let keychain = KeychainStore(service: "org.kayg.mailternal.qa", storage: .memory)
@@ -181,8 +179,5 @@ enum QALaunch: Sendable {
             enableNotifications: false,
             attachmentCacheCapBytes: config.cacheCap ?? MailStore.defaultAttachmentCacheCapBytes
         )
-        #else
-        return nil
-        #endif
     }
 }

@@ -25,12 +25,11 @@ struct MailternalApp: App {
             return MockMailFacade()
         }
         do {
-            #if DEBUG
-            if let qa = try QALaunch.makeFacade() {
-                QALaunch.log("live facade container=\(QALaunch.parse()?.containerRoot.path ?? "")")
+            let qaConfig = QALaunch.parse()
+            if let qa = try QALaunch.makeFacade(qaConfig) {
+                QALaunch.log("live facade container=\(qaConfig?.containerRoot.path ?? "")")
                 return qa
             }
-            #endif
             return try LiveMailFacade()
         } catch {
             fatalError("Could not open the Mailternal store: \(error)")

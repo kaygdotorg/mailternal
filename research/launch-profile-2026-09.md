@@ -34,10 +34,12 @@ xcodebuild -project Mailternal.xcodeproj -scheme Mailternal \
 ```
 
 Release is the notarization-shaped build: `Mailternal.debug.dylib` is absent and
-hardened runtime signing is enabled. The Release app cannot consume the Debug-
-only `-qa-container` parser, so its five runs used a fresh empty `CFFIXED_USER_HOME`
-per run. Consequently, Release folder/row/settled values are not comparable to
-the populated Debug fixture and are reported as unavailable below.
+hardened runtime signing is enabled. At the time of this initial mbp profile, the
+Release build could not consume the Debug-only `-qa-container` parser, so its
+five runs used a fresh empty `CFFIXED_USER_HOME` per run. Those historical
+Release folder/row/settled values are therefore not comparable to the populated
+Debug fixture. Release QA parity was added before the dedicated-VM measurements
+below.
 
 ## Five-launch phase table: Debug
 
@@ -59,14 +61,14 @@ retains it rather than hiding it. Store open is off the main actor, but migratio
 and the large fixture still account for roughly 7.95--9.21 seconds before the
 first page can be queried.
 
-## Five-launch phase table: Release
+## Initial five-launch phase table: Release
 
-These are exact phase markers from the plain Release binary after removing the
-Debug-only guards around phase prints. Because the Release parser deliberately
-remains Debug-only, these runs set a fresh `CFFIXED_USER_HOME` per run and do
-not publish the fixture's first page. Foundation's Application Support
-resolution was not independently verified under that override, so Release
-store timings are directional only.
+These are exact phase markers from the initial plain Release binary after
+removing the Debug-only guards around phase prints. The QA parser was still
+Debug-only for this historical run, so each launch used a fresh
+`CFFIXED_USER_HOME` and did not publish the fixture's first page. Foundation's
+Application Support resolution was not independently verified under that
+override, so these store timings are directional only.
 
 | run | app-init | did-finish-launching | window-front | first-frame | store-open | folders-snapshot | first-rows | settled-frame |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -149,18 +151,20 @@ is not observed in the first-frame samples. Favicon data is loaded by
 `warmupFavicons` asynchronously and is not part of the main list projection.
 The sync engine/IDLE work starts after account restoration and therefore follows
 the first shell; it is not part of the AppKit `orderFront` interval. Toolbar
-installation is explicitly dispatched to the next main-actor turn, although
-AppKit's internal item view installation can still overlap the first CA commit.
-No startup network request was found on the first-frame call path.
+construction and installation now start only from the first-frame Core
+Animation completion, so native toolbar setup cannot delay that frame. No
+startup network request was found on the first-frame call path.
 
 ## Decision
 
 The measured cheap wins are: keep store opening detached, order the restored
-window before awaiting live data, install/validate the toolbar after the first
-commit, and defer WebKit/favicon/sync/IDLE work until `settled-frame`. A
-`LaunchSnapshot` is the structural option for getting the remaining first-frame
-median under 100 ms; it is not implemented by this profile change because its
-gain must be measured against the exact same fixture and Release artifact.
+window before awaiting live data, construct/install/validate the toolbar only
+after the first committed frame, and defer WebKit/favicon/sync/IDLE work until
+`settled-frame`. A `LaunchSnapshot` is the structural option for getting the
+remaining first-frame median under 100 ms; it is not implemented by this
+profile because its gain must be measured against the exact same fixture and
+Release artifact.
+
 ## QA VM cold/warm
 
 The QA VM is the 4-vCPU/8-GB arm64 macOS 26.6.2 host. The populated fixture is
@@ -206,6 +210,49 @@ all complete in under 0.75 s even in these GUI runs, with the database portion
 itself under 1 ms after the first page-cache warmup. Migration of an old store
 remains required correctness work and is reported separately from launch
 latency.
+
+## Post-change dedicated-VM launch matrix
+
+After moving toolbar construction from the pre-front path into the first-frame
+Core Animation completion and enabling the private QA parser in Release builds,
+five Debug and five Release launches used the same populated, migrated fixture
+on the 4-vCPU/8-GB QA VM. Cold runs copied the fixture and ran `sudo purge`;
+warm runs immediately relaunched the same container. Values are five-run
+medians in milliseconds since exec:
+
+| build/cache | app-init | did-finish-launching | window-front | first-frame | store-open | folders-snapshot | first-rows | settled-frame |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Debug/cold | 108.0 | 9910.2 | 11906.1 | 12013.1 | 12012.5 | 15290.0 | 15621.0 | 16131.6 |
+| Debug/warm | 13.2 | 152.4 | 309.4 | 337.9 | 336.5 | 533.9 | 604.9 | 645.2 |
+| Release/cold | 137.1 | 1662.2 | 2608.3 | 2706.6 | 2706.1 | 2963.1 | 3103.3 | 3191.0 |
+| Release/warm | 18.4 | 192.2 | 416.5 | 440.1 | 439.6 | 506.2 | 590.3 | 631.1 |
+
+Release measurements stage the fixture inside the app's real sandbox container
+under `Library/Containers/org.kayg.mailternal/Data/Library/Application Support`.
+`Scripts/vm-qa.sh launch-release` reproduces this with a run-named store and a
+QA certificate copied inside the same container. All four cases published 80
+first rows. The warm Debug
+first-frame improved from 620.3 ms in the earlier VM baseline to 337.9 ms, while
+the shipped-shape warm Release first-frame remains 440.1 ms. The sub-100-ms goal
+is not met; the next structural candidate remains a lightweight launch shell or
+snapshot rather than moving data work back onto the main actor.
+
+### Dedicated-VM tab-switch gate
+
+The dedicated helper is deployed by `Scripts/deploy-vm.sh` as
+`~/tab-switch-latency-vm.sh`; it reads only the new lines appended to the
+run-named launch log and drives `ctrl-tab` between already-loaded tabs. The
+final run identity was `NightlyQA`, measured on 2026-09-05 with ten switches
+and the unchanged 100 ms budget:
+
+```text
+~/tab-switch-latency-vm.sh NightlyQA 10 100
+samples=10 max=95.9ms navigations=0 malformed=0 budget=100.0ms
+```
+
+This is a passing gate: all ten requested samples paired cleanly, no
+`html-requested` or `did-finish` navigation events were observed, and the
+maximum remained below the 100 ms budget.
 
 
 

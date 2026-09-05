@@ -36,7 +36,8 @@ first account restoration reads. The package emits matching `StoreOpen`
 
 ## VM runs
 
-Build on `agents@mbp`, deploy the Debug bundle, and use a private fixture:
+Build on `agents@mbp`, deploy the Debug bundle and QA helpers, and use a private
+fixture:
 
 ```text
 Scripts/build-mbp.sh LaunchVM app
@@ -47,12 +48,26 @@ zsh ~/vm-qa.sh launch lv-debug
 zsh ~/vm-qa.sh phases lv-debug
 ```
 
+`Scripts/deploy-vm.sh` copies `vm-qa.sh` and the dedicated tab-switch helper to
+`~/vm-qa.sh` and `~/tab-switch-latency-vm.sh`. For the tab-switch gate, leave
+two or more tabs loaded after launch, then run:
+
+```text
+zsh ~/tab-switch-latency-vm.sh NightlyQA 10 100
+```
+
+The final `NightlyQA` run on 2026-09-05 reported
+`samples=10 max=95.9ms navigations=0 malformed=0 budget=100.0ms`.
+
 `vm-qa.sh launch` removes and copies `~/mailternal-qa-base` before every run.
 For Release, rsync the Release `.app` to `~/mailternal/Mailternal-release.app`
 and run `zsh ~/vm-qa.sh launch-release lv-release`; `APP=/path/to/app` can
-override that path. A cold run includes `sudo purge` before the copy and launch;
-a warm run relaunches immediately against the same container. Keep five runs
-per cell, report medians, and retain the raw phase logs with the artifact.
+override that path. The helper stages the fixture in a run-named directory
+inside the `org.kayg.mailternal` sandbox container, passes that exact
+Application Support path to `-qa-container`, and installs the QA certificate
+inside the same container. A cold run includes `sudo purge` before the copy and
+launch; a warm run relaunches immediately against the same container. Keep five
+runs per cell, report medians, and retain the raw phase logs with the artifact.
 
 The fixture must already contain the current GRDB migration identifiers when
 the goal is launch latency. If `v10_unread_index` is absent, GRDB correctly

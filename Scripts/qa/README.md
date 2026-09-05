@@ -61,6 +61,41 @@ python3 seed.py          # IMAP APPEND/MULTIAPPEND to 127.0.0.1:1143
 
 Completion: `SELECT INBOX` reports `* 100000 EXISTS` (or more after `deliver`).
 
+## Dedicated-VM tab-switch latency
+
+Run this check on the dedicated macOS QA VM, not on the Linux build host. The VM
+must have a deployed QA build and fixture, `zsh`, and `osascript` with System
+Events automation/accessibility permission. `Scripts/deploy-vm.sh` copies both
+`vm-qa.sh` and this helper to the VM as `~/vm-qa.sh` and
+`~/tab-switch-latency-vm.sh`. Start exactly one Mailternal QA process: the
+harness targets the process name `Mailternal`, so another Mailternal process
+makes the keystrokes nondeterministic. Before measuring, leave at least two tabs
+already loaded in that process; the check switches between existing tabs and
+does not create or load them.
+
+Launch the app and load the tabs (the helper reads the launch log), then run:
+
+```
+~/vm-qa.sh launch NightlyQA
+# In the VM, wait for two or more tabs to finish loading.
+~/tab-switch-latency-vm.sh NightlyQA 10 100
+```
+
+The arguments are `[run-name] [switch-count] [budget-ms]`; all default to
+`FinalQA`, `10`, and `100`. The run log is
+`$HOME/mailternal-qa-<run-name>/launch.log`. A pass reports exactly the
+requested number of samples, `navigations=0` (no `html-requested` or
+`did-finish` events), and a maximum latency no greater than the budget. The
+default gate remains **100 ms**. Missing logs, invalid arguments, too few
+samples, navigation, malformed event pairs, or a maximum over budget exit
+nonzero.
+
+The final `NightlyQA` run on 2026-09-05 was:
+
+```text
+samples=10 max=95.9ms navigations=0 malformed=0 budget=100.0ms
+```
+
 ## Chaos
 
 Run on mbp or via the Linux wrapper (`chaos.sh` re-execs over ssh when local Docker is down):

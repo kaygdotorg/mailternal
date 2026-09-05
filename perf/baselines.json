@@ -1,4 +1,21 @@
 {
+  "tab-switch": {
+    "target_reader_commit_ms": 100,
+    "main_thread_work_budget_ms": 16,
+    "loaded_tab_html_requested": 0,
+    "loaded_tab_did_finish": 0,
+    "switches_per_run": 10,
+    "note": "Alternate two already-loaded tabs (one HTML and one plain-text); no WebKit navigation is allowed on a switch.",
+    "evidence": {
+      "run_identity": "NightlyQA",
+      "measured_on": "2026-09-05",
+      "sample_count": 10,
+      "max_latency_ms": 95.9,
+      "navigation_count": 0,
+      "malformed_count": 0,
+      "budget_ms": 100.0
+    }
+  },
   "sync_resources": {
     "fixture": "mailternal-qa-ResourceProfileLarge copied to mailternal-qa-SyncResources (1,636,773,888-byte store)",
     "scope": "single-account headless backfill",
@@ -19,18 +36,48 @@
     "fixture": "qa-vm (1,636,773,888-byte migrated SQLite store)",
     "measured_on": "2026-09-04",
     "phase_units": "milliseconds since exec",
-    "warm_n": 5,
-    "warm_median": {
-      "app_init": 14.9,
-      "did_finish_launching": 241.8,
-      "window_front": 583.3,
-      "first_frame": 620.3,
-      "store_open": 619.9,
-      "folders_snapshot": 1177.0,
-      "first_rows": 3110.7,
-      "settled_frame": 3180.6
+    "runs_per_case": 5,
+    "debug_warm_median": {
+      "app_init": 13.2,
+      "did_finish_launching": 152.4,
+      "window_front": 309.4,
+      "first_frame": 337.9,
+      "store_open": 336.5,
+      "folders_snapshot": 533.9,
+      "first_rows": 604.9,
+      "settled_frame": 645.2
     },
-    "cold_migrated_observation": {
+    "debug_cold_median": {
+      "app_init": 108.0,
+      "did_finish_launching": 9910.2,
+      "window_front": 11906.1,
+      "first_frame": 12013.1,
+      "store_open": 12012.5,
+      "folders_snapshot": 15290.0,
+      "first_rows": 15621.0,
+      "settled_frame": 16131.6
+    },
+    "release_warm_median": {
+      "app_init": 18.4,
+      "did_finish_launching": 192.2,
+      "window_front": 416.5,
+      "first_frame": 440.1,
+      "store_open": 439.6,
+      "folders_snapshot": 506.2,
+      "first_rows": 590.3,
+      "settled_frame": 631.1
+    },
+    "release_cold_median": {
+      "app_init": 137.1,
+      "did_finish_launching": 1662.2,
+      "window_front": 2608.3,
+      "first_frame": 2706.6,
+      "store_open": 2706.1,
+      "folders_snapshot": 2963.1,
+      "first_rows": 3103.3,
+      "settled_frame": 3191.0
+    },
+    "legacy_migration_observation": {
       "n": 1,
       "store_open": 45561.6,
       "folders_snapshot": 46111.6,
@@ -38,6 +85,7 @@
       "settled_frame": 46683.5,
       "note": "This copy was v1-v9 and paid the required v10_unread_index build; it is not a steady-state launch baseline."
     },
-    "root_cause": "GRDB v10_unread_index CREATE INDEX over the populated messages table; no-op migrator on v1-v13 is sub-2 ms."
+    "root_cause": "GRDB v10_unread_index CREATE INDEX over the populated messages table; no-op migrator on v1-v13 is sub-2 ms.",
+    "target_note": "Deferred toolbar construction improved warm Debug first-frame from 620.3 ms to 337.9 ms; the sub-100-ms goal remains unmet."
   }
 }
