@@ -47,6 +47,10 @@ struct PairingView: View {
     @State private var importOperationID = UUID()
     @State private var offlineTask: Task<Void, Never>?
     @State private var offlineOperationID = UUID()
+    /// Invalidates network operations when the sheet is cancelled or replaced.
+    /// PairingSession itself is one-shot and reports cancellation as a failure;
+    /// the view must prevent that stale error from resurfacing in a fresh flow.
+    @State private var sessionOperationID = UUID()
 
 
     init(
@@ -90,10 +94,14 @@ struct PairingView: View {
             }
         }
         .onDisappear {
-            // A dismissal must never leave an authenticated transport or an
-            // in-flight durable import alive.
+            // Dismissal must stop the authenticated transport and invalidate
+            // every continuation that might otherwise report into a later
+            // presentation. Keep the next presentation at the idle state:
+            // PairingSession is intentionally one-shot and represents cancel
+            // as a terminal failure.
+            cancelActiveSession()
+            session = PairingSession(deviceName: Self.defaultDeviceName)
             cancelActiveImport()
-            session.cancel()
             isScannerPresented = false
             clearOfflineTransfer()
         }
@@ -580,13 +588,21 @@ struct PairingView: View {
         guard !isWorking else { return }
         isWorking = true
         viewError = nil
+        let operationID = UUID()
+        sessionOperationID = operationID
+        let pairingSession = session
         Task { @MainActor in
+            defer {
+                if sessionOperationID == operationID {
+                    isWorking = false
+                }
+            }
             do {
-                try await session.showCode()
+                try await pairingSession.showCode()
             } catch {
+                guard sessionOperationID == operationID else { return }
                 viewError = error.localizedDescription
             }
-            isWorking = false
         }
     }
 
@@ -594,13 +610,21 @@ struct PairingView: View {
         guard !isWorking, !qrString.isEmpty else { return }
         isWorking = true
         viewError = nil
+        let operationID = UUID()
+        sessionOperationID = operationID
+        let pairingSession = session
         Task { @MainActor in
+            defer {
+                if sessionOperationID == operationID {
+                    isWorking = false
+                }
+            }
             do {
-                try await session.join(qrString: qrString)
+                try await pairingSession.join(qrString: qrString)
             } catch {
+                guard sessionOperationID == operationID else { return }
                 viewError = error.localizedDescription
             }
-            isWorking = false
         }
     }
 
@@ -608,15 +632,24 @@ struct PairingView: View {
         guard !isWorking, !selectedAccountIDs.isEmpty, session.state == .connected else { return }
         isWorking = true
         viewError = nil
+        let operationID = UUID()
+        sessionOperationID = operationID
+        let pairingSession = session
         Task { @MainActor in
+            defer {
+                if sessionOperationID == operationID {
+                    isWorking = false
+                }
+            }
             do {
                 // Bundle creation intentionally happens only after explicit Send.
                 let bundle = try await makeBundle(selectedAccountIDs, includeSettings)
-                try await session.send(bundle)
+                guard sessionOperationID == operationID else { return }
+                try await pairingSession.send(bundle)
             } catch {
+                guard sessionOperationID == operationID else { return }
                 viewError = error.localizedDescription
             }
-            isWorking = false
         }
     }
 
@@ -765,18 +798,22 @@ struct PairingView: View {
         cancelOfflineTask()
     }
 
-    private func cancelPairing() {
-        cancelActiveImport()
-        isWorking = false
+    private func cancelActiveSession() {
+        sessionOperationID = UUID()
         session.cancel()
+        isWorking = false
+    }
+
+    private func cancelPairing() {
+        // Cancellation returns to the start screen. A one-shot session cannot
+        // be restarted after `cancel()` has made it terminal.
+        resetForFreshPairing()
         isScannerPresented = false
-        viewError = nil
     }
 
     private func cancelAndDismiss() {
         cancelActiveImport()
-        isWorking = false
-        session.cancel()
+        cancelActiveSession()
         isScannerPresented = false
         clearOfflineTransfer()
         dismiss()
@@ -784,7 +821,7 @@ struct PairingView: View {
 
     private func resetForFreshPairing() {
         cancelActiveImport()
-        session.cancel()
+        cancelActiveSession()
         clearOfflineTransfer()
         session = PairingSession(deviceName: Self.defaultDeviceName)
         selectedAccountIDs = Set(accounts.map(\.id))
