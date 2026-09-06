@@ -117,8 +117,9 @@ enum Schema {
                 t.add(column: "destination_folder_id", .integer)
             }
         }
-        migrator.registerMigration("v10_unread_index") { db in
+        migrator.registerMigration("v10_unread_index", foreignKeyChecks: .immediate) { db in
             progress(10, total, "v10_unread_index")
+            openProgress("migration-v10-begin")
             // Folder unread counts run at launch and after every write. Without
             // this partial index the count visits every row of the generation
             // (107 ms warm, 1.3 s cold on a 1 GB store); with it the count is
@@ -129,9 +130,11 @@ enum Schema {
                 ON messages(generation_id) WHERE is_read = 0
                 """)
             openProgress("index-build-end")
+            openProgress("migration-v10-end")
         }
-        migrator.registerMigration("v11_keep_locally") { db in
+        migrator.registerMigration("v11_keep_locally", foreignKeyChecks: .immediate) { db in
             progress(11, total, "v11_keep_locally")
+            openProgress("migration-v11-begin")
             try db.alter(table: "folders") { t in
                 // Keep system mailboxes useful by default; custom folders opt
                 // into local history only when the user asks for it.
@@ -152,15 +155,19 @@ enum Schema {
                     ELSE 0
                 END
                 """)
+            openProgress("migration-v11-end")
         }
-        migrator.registerMigration("v12_account_enabled") { db in
+        migrator.registerMigration("v12_account_enabled", foreignKeyChecks: .immediate) { db in
             progress(12, total, "v12_account_enabled")
+            openProgress("migration-v12-begin")
             try db.alter(table: "accounts") { t in
                 t.add(column: "is_enabled", .integer).notNull().defaults(to: 1)
             }
+            openProgress("migration-v12-end")
         }
-        migrator.registerMigration("v13_folder_rename_queue") { db in
+        migrator.registerMigration("v13_folder_rename_queue", foreignKeyChecks: .immediate) { db in
             progress(13, total, "v13_folder_rename_queue")
+            openProgress("migration-v13-begin")
             try db.create(table: "folder_rename_queue") { t in
                 t.autoIncrementedPrimaryKey("id")
                 t.column("account_id", .text).notNull()
@@ -174,37 +181,51 @@ enum Schema {
             try db.execute(
                 sql: "CREATE INDEX folder_rename_queue_send_idx ON folder_rename_queue(enqueued_at, id)"
             )
+            openProgress("migration-v13-end")
         }
-        migrator.registerMigration("v14_list_sort_indexes") { db in
+        migrator.registerMigration("v14_list_sort_indexes", foreignKeyChecks: .immediate) { db in
             progress(14, total, "v14_list_sort_indexes")
+            openProgress("migration-v14-begin")
             // Every configurable keyset order has a generation-prefixed index.
             // SQLite can scan each index in either direction for the requested
             // ASC/DESC order while retaining the UID tie-breaker.
             openProgress("sort-index-build-begin")
+            openProgress("sort-index-sender-begin")
             try db.execute(sql: """
                 CREATE INDEX messages_sender_page_idx
                 ON messages(generation_id, from_display, uid)
                 """)
+            openProgress("sort-index-sender-end")
+            openProgress("sort-index-subject-begin")
             try db.execute(sql: """
                 CREATE INDEX messages_subject_page_idx
                 ON messages(generation_id, subject, uid)
                 """)
+            openProgress("sort-index-subject-end")
+            openProgress("sort-index-read-begin")
             try db.execute(sql: """
                 CREATE INDEX messages_read_page_idx
                 ON messages(generation_id, is_read, uid)
                 """)
+            openProgress("sort-index-read-end")
+            openProgress("sort-index-flagged-begin")
             try db.execute(sql: """
                 CREATE INDEX messages_flagged_page_idx
                 ON messages(generation_id, is_flagged, uid)
                 """)
+            openProgress("sort-index-flagged-end")
+            openProgress("sort-index-attachments-begin")
             try db.execute(sql: """
                 CREATE INDEX messages_attachments_page_idx
                 ON messages(generation_id, has_attachments, uid)
                 """)
+            openProgress("sort-index-attachments-end")
             openProgress("sort-index-build-end")
+            openProgress("migration-v14-end")
         }
-        migrator.registerMigration("v15_account_link_commands") { db in
+        migrator.registerMigration("v15_account_link_commands", foreignKeyChecks: .immediate) { db in
             progress(15, total, "v15_account_link_commands")
+            openProgress("migration-v15-begin")
             try db.create(table: "account_link_commands") { t in
                 t.autoIncrementedPrimaryKey("id")
                 t.column("account_id", .text).notNull()
@@ -214,6 +235,7 @@ enum Schema {
                 t.column("enqueued_at", .double).notNull()
                 t.column("completed_at", .double)
             }
+            openProgress("migration-v15-end")
         }
 
         return migrator

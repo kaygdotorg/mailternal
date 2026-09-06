@@ -30,9 +30,21 @@ used as a launch phase.
 For attribution, QA also prints shell boundaries (`shell-show-begin` and
 `shell-show-end`) and store-open subphases. Store subphases cover pool creation,
 connection pragmas, the GRDB migrator, the unread-index build when applicable,
-and the explicit `checkpoint-skipped` marker. `store-first-queries-*` covers the
-first account restoration reads. The package emits matching `StoreOpen`
-`os_signpost` events for Instruments and Console correlation.
+each v14 configurable-sort index build, and the explicit `checkpoint-skipped`
+marker. `store-first-queries-*` covers the first account restoration reads,
+including `store-qa-seed-*` and `store-fetch-accounts-*` when QA mode replaces
+the account fixture. The package emits matching `StoreOpen` `os_signpost` events
+for Instruments and Console correlation. Migration markers identify migration
+body and index-build intervals. For deferred migrations, their `*-end` markers
+precede GRDB's migration-record write, full foreign-key check, and transaction
+commit; immediate migrations v10–v15 enforce foreign keys inline, so their
+`*-end` markers precede only the record write and transaction commit.
+
+Schema migrations v10–v15 use GRDB's supported `.immediate` foreign-key mode:
+they add indexes/columns or create empty tables and do not recreate existing
+tables. This keeps foreign-key enforcement enabled without a full deferred
+`PRAGMA foreign_key_check` scan per migration. The v7 table-rebuild migration
+remains on deferred checks.
 
 ## VM runs
 
@@ -70,7 +82,8 @@ launch; a warm run relaunches immediately against the same container. Keep five
 runs per cell, report medians, and retain the raw phase logs with the artifact.
 
 The fixture must already contain the current GRDB migration identifiers when
-the goal is launch latency. If `v10_unread_index` is absent, GRDB correctly
-builds `messages_unread_idx` over the populated `messages` table at open. That
-is a one-time schema migration, not steady-state launch work; report it
-separately rather than attributing it to SQLite pool creation.
+the goal is launch latency. If `v10_unread_index` or `v14_list_sort_indexes` is
+absent, GRDB correctly builds the corresponding required indexes over the
+populated `messages` table at open. These are one-time schema migrations, not
+steady-state launch work; report each migration separately rather than
+attributing it to SQLite pool creation.

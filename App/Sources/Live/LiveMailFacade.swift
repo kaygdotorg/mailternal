@@ -225,9 +225,13 @@ final class LiveMailFacade: MailFacade {
             store = try await readyStore()
             QALaunch.launchPhase("store-first-queries-begin")
             if let qa = QALaunch.parse() {
+                QALaunch.launchPhase("store-qa-seed-begin")
                 try await seedQAAccount(qa)
+                QALaunch.launchPhase("store-qa-seed-end")
             }
+            QALaunch.launchPhase("store-fetch-accounts-begin")
             let persisted = try await store.fetchAccounts()
+            QALaunch.launchPhase("store-fetch-accounts-end")
             QALaunch.launchPhase("store-first-queries-end")
             accounts = persisted
             configsByID = Dictionary(uniqueKeysWithValues: persisted.map { ($0.id, $0) })
