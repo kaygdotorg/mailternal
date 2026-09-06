@@ -22,6 +22,9 @@
 - On `mbp`, actual repository roots live under `/Users/agents/Developer`; worktrees
   and isolated build copies live under `/Users/agents/Developer/Worktrees`.
   The QA VM is owned and launched by `kayg`, not `agents`.
+- Test builds for `kayg@mbp` go under `/Users/kayg/Applications`.
+  Keep them separate from `/Users/Shared/Mailternal`; installing a test build
+  does not authorize replacing the production app or changing real account data.
 - Never touch the `kayg` user's session or `/Users/Shared/Mailternal` without being
   asked; QA instances use their own containers.
 - **UI QA on mbp runs through CuaDriver** (`/Applications/CuaDriver.app/Contents/MacOS/cua-driver`,
