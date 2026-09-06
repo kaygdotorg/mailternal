@@ -73,10 +73,12 @@ public struct FolderSummary: Identifiable, Hashable, Sendable {
     }
 }
 
-/// The mutually exclusive phases shown by a folder's sidebar accessory.
+/// The mutually exclusive phases shown by a folder's sidebar accessory and
+/// current-folder status subtitle.
 public enum FolderActivity: Hashable, Sendable {
     case downloading
     case indexing
+    case moving
     case idle
     case halted
     case quarantinedStall
@@ -201,12 +203,56 @@ public enum FlagKind: String, Sendable, Codable, Hashable, CaseIterable {
     case flagged
 }
 
-/// Keyset pagination cursor over (internalDate DESC, uid DESC) — spec: sync.md storage.
+/// A list ordering. The store applies this ordering to the complete folder,
+/// rather than only to rows already loaded by a caller.
+public struct MailListSort: Codable, Hashable, Sendable {
+    public enum Field: String, Codable, Hashable, Sendable, CaseIterable {
+        case date
+        case sender
+        case subject
+        case read
+        case flagged
+        case attachments
+    }
+
+    public enum Direction: String, Codable, Hashable, Sendable, CaseIterable {
+        case ascending
+        case descending
+    }
+
+    public var field: Field
+    public var direction: Direction
+
+    public init(field: Field = .date, direction: Direction = .descending) {
+        self.field = field
+        self.direction = direction
+    }
+
+    public static let newest = MailListSort()
+}
+
+/// The value at the boundary of a keyset page. The case is deliberately
+/// field-specific so a cursor cannot accidentally use a subject value as a
+/// sender boundary.
+public enum MessagePageCursorValue: Hashable, Sendable, Codable {
+    case date(Date)
+    case sender(String)
+    case subject(String)
+    case read(Bool)
+    case flagged(Bool)
+    case attachments(Bool)
+}
+
+/// Keyset pagination cursor over a selected list order and the stable IMAP UID
+/// tie-breaker. Cursors are only valid with the same `sort` used to create them.
 public struct MessagePageCursor: Hashable, Sendable, Codable {
-    public var internalDate: Date
+    public var sort: MailListSort
+    public var value: MessagePageCursorValue
     public var uid: IMAPUID
-    public init(internalDate: Date, uid: IMAPUID) {
-        self.internalDate = internalDate
+
+    public init(sort: MailListSort, value: MessagePageCursorValue, uid: IMAPUID) {
+        self.sort = sort
+        self.value = value
         self.uid = uid
     }
 }

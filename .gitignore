@@ -6,3 +6,6 @@ App/Mailternal-Info.plist
 DerivedData/
 *.xcuserstate
 .DS_Store
+.env.speedflight
+/build/share/
+/Mobile/MailternalMobile.xcodeproj/

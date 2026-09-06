@@ -12,17 +12,30 @@ dispatch commands; the CLI sends the same commands over IPC; both read the same
 snapshot.
 
 - State document (`AppState`, Codable, versioned `schema: "mailternal.state.v1"`):
-  accounts, selected account/folder/message, folder list with counts, the current
-  list page, open composer drafts (when the composer exists — its document shape is
-  designed *before* its UI), search text, sync status, settings that affect the UI.
-  Everything in it is derivable from the store plus UI selection; it is never the
-  source of truth for mail.
-- `Command` (Codable, `CaseIterable` names): `select(folder|message|account)`,
-  `page(next|previous)`, `search(text)`, `mark(link, read|unread)`,
-  `flag(link, on|off)`, `archive(link)`, `trash(link)`, `undo`, `refresh`,
-  `settings.set(key, value)`, `composer.*` (later). A new `Command` case without a
-  CLI verb and a state-document effect is a compile error (exhaustive `switch` in the
-  CLI's command table and in `AppModel.apply`).
+  accounts, windows and focused surface, selected account/folder/messages, folder
+  counts, current list page, reader tabs/active tab/reading position, visible search
+  query/results, composer drafts, settings, presented dialogs/available actions,
+  sync/outbox/error state. Mail remains store-owned; transient GUI state has explicit
+  ownership in AppModel rather than hidden view-local state. Credentials are never
+  serialized; message/draft content has structured queries rather than duplication
+  in every GUI-state event.
+- `Command` (Codable, `CaseIterable` names) covers every current in-app action:
+  account lifecycle, folder selection/rename/retention, list paging and
+  multi-selection, visible search, read/unread, flag, archive/trash/arbitrary moves,
+  undo, refresh, settings, reader tabs/windows and reading position, dialogs, and
+  the composer lifecycle with SMTP. Stable identities address targets; pixel
+  coordinates and accessibility-tree scraping are not the automation interface.
+  A new command requires both CLI dispatch and application handling through
+  exhaustive switches; no in-app workflow may remain GUI-only.
+- The CLI's ordinary mail queries/commands and its explicit `ui` control namespace
+  are separate observable contracts, backed by the same runtime. Ordinary mail
+  operations must not implicitly navigate/focus the GUI or alter its tabs/visible
+  composer. Store mutations naturally update displayed mail data. Explicit UI
+  commands may change the requested GUI state.
+- Agents can query current GUI state and subscribe to an initial versioned snapshot
+  followed by ordered changes. A subscription gap or reconnect requires a fresh
+  snapshot, so stale context is detectable. No computer-use loop is required for
+  state discovery or control.
 - **Performance is a gate, not a hope** (`perf/baselines.json`, CI job): warm launch
   to all-folders ≤ 0.5 s, search p95 ≤ 5 ms, first list page ≤ 50 ms, idle footprint
   ≤ 30 MB, command dispatch overhead ≤ 1 ms. Snapshots are built on demand, never on
@@ -56,11 +69,13 @@ IMAP's UIDVALIDITY/UID is the message identity. Non-secret, cross-device, printe
   mode.
 
 ## Engine ownership
-Exactly **one sync engine per container** at any time, enforced by a lock file in the
-container. Precedence: running app > headless daemon (`mailternal engine start`) >
-per-invocation CLI engine. A CLI invocation that finds a live socket always uses it
-instead of opening the store; otherwise reads open the store directly (no engine) and
-mutations start an engine, drain the queues, and exit.
+Exactly **one engine-owning runtime process per container** at any time, enforced
+by a lock file; that process may own multiple per-account engines. Precedence:
+running app > headless daemon (`mailternal engine start`) > per-invocation CLI
+runtime. A CLI invocation that finds a live socket uses it instead of opening a
+competing runtime. Otherwise cached reads may open the store directly; operations
+requiring the network, including raw-source fetch and SMTP, use the same headless
+runtime and persisted queues. Routing through the app does not imply GUI control.
 
 ## Undo journal
 An `op_journal` table in the store records each user mutation with its inverse

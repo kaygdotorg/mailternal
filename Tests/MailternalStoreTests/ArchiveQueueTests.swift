@@ -19,7 +19,7 @@ import Testing
         let pending = try await store.snapshotMoveQueue()
         #expect(pending.count == 1)
         #expect(pending[0].uid.rawValue == 3)
-        #expect(try await store.page(in: folder, after: nil, limit: 10).rows.isEmpty)
+        #expect(try await store.page(in: folder, after: nil, limit: 10, sort: .newest).rows.isEmpty)
     }
 }
 
@@ -143,7 +143,7 @@ import Testing
         let pending = try #require(await store.snapshotMoveQueue().first)
         #expect(pending.destination == .trash)
         #expect(pending.account == account.id)
-        #expect(try await store.page(in: folder, after: nil, limit: 10).rows.isEmpty)
+        #expect(try await store.page(in: folder, after: nil, limit: 10, sort: .newest).rows.isEmpty)
     }
 }
 
@@ -170,7 +170,7 @@ import Testing
         let pending = try await store.snapshotMoveQueue()
         #expect(pending.count == 1)
         #expect(pending[0].destinationFolderID == destination)
-        #expect(try await store.page(in: source, after: nil, limit: 10).rows.isEmpty)
+        #expect(try await store.page(in: source, after: nil, limit: 10, sort: .newest).rows.isEmpty)
 
         let secondID = MessageID(rawValue: 999_999)
         do {

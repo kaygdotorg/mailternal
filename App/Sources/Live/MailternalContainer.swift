@@ -5,7 +5,7 @@ private let containerLog = Logger(subsystem: "org.kayg.mailternal", category: "C
 
 /// On-disk layout for the live store (and therefore the sync engine).
 ///
-/// One directory, the sandboxed Application Support container:
+/// On macOS this is the sandboxed Application Support container:
 ///
 ///     ~/Library/Application Support/Mailternal/
 ///       store.sqlite          — GRDB WAL database
@@ -13,18 +13,31 @@ private let containerLog = Logger(subsystem: "org.kayg.mailternal", category: "C
 ///       store.sqlite-shm
 ///       attachments/          — content-hash attachment cache
 ///
-/// Inside the sandbox that root is
-/// `~/Library/Containers/org.kayg.mailternal/Data/Library/Application Support/Mailternal/`.
-/// Engine state lives in the store; there is no second tree.
+/// On iOS the same relative layout is rooted in the app's sandbox:
+/// `Library/Application Support/Mailternal/`. It is intentionally not
+/// `Library/Caches`: the SQLite database contains the durable sync queues and
+/// cursors and must survive cache eviction. Engine state lives in the store;
+/// there is no second tree.
 struct MailternalContainer: Sendable {
     var root: URL
 
-    /// Production location under Application Support.
+    /// Production location under the platform's sandbox/Application Support.
     static var `default`: MailternalContainer {
         let bases = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-        let base = bases.first
-            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        let base: URL
+        if let applicationSupport = bases.first {
+            base = applicationSupport
+        } else {
+            #if os(iOS)
+            let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                    .appendingPathComponent("Library", isDirectory: true)
+            base = library.appendingPathComponent("Application Support", isDirectory: true)
+            #else
+            base = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
                 .appendingPathComponent("Library/Application Support", isDirectory: true)
+            #endif
+        }
         return MailternalContainer(root: base.appendingPathComponent("Mailternal", isDirectory: true))
     }
 

@@ -158,6 +158,11 @@ enum IMAPCommandFactory {
 // MARK: - FETCH assembly
 
 struct IMAPFetchAssembler {
+    /// Maximum aggregate encoded bytes retained for one FETCH response set.
+    /// The response collector accounts queued chunks before this assembler
+    /// sees them, so the two stages do not create independent body budgets.
+    static let maximumLiteralBytes = 32 << 20
+
     private var current = IMAPFetchedMessage(
         uid: nil,
         sequence: nil,
@@ -172,9 +177,17 @@ struct IMAPFetchAssembler {
     private var finished: [IMAPFetchedMessage] = []
     private var streamingKind: StreamingKind?
     private var streamingBytes = ByteBuffer()
+    private var literalBytes = 0
+    private var literalLimit = Self.maximumLiteralBytes
     private var inMessage = false
 
-    mutating func apply(_ response: FetchResponse) {
+    /// Creates an assembler with a caller-owned slice of the transport's
+    /// aggregate PEEK budget.
+    init(maximumLiteralBytes: Int = Self.maximumLiteralBytes) {
+        self.literalLimit = min(Self.maximumLiteralBytes, max(0, maximumLiteralBytes))
+    }
+
+    mutating func apply(_ response: FetchResponse) throws {
         switch response {
         case .start(let sequence):
             begin(sequence: sequence.rawValue, uid: nil)
@@ -182,7 +195,13 @@ struct IMAPFetchAssembler {
             begin(sequence: nil, uid: uid.rawValue)
         case .simpleAttribute(let attribute):
             apply(attribute)
-        case .streamingBegin(let kind, _):
+        case .streamingBegin(let kind, let byteCount):
+            guard byteCount >= 0,
+                  byteCount <= literalLimit - literalBytes
+            else {
+                throw IMAPError.responseTooLarge(limit: literalLimit)
+            }
+            literalBytes += byteCount
             streamingKind = kind
             streamingBytes.clear()
         case .streamingBytes(var buffer):
@@ -204,7 +223,6 @@ struct IMAPFetchAssembler {
             }
         }
     }
-
     mutating func take() -> [IMAPFetchedMessage] {
         if inMessage {
             finished.append(current)
@@ -212,6 +230,7 @@ struct IMAPFetchAssembler {
         }
         let result = finished
         finished = []
+        literalBytes = 0
         return result
     }
 

@@ -18,7 +18,7 @@ struct AdversarialEngineTests {
             let engine = makeEngine(store: store, world: world, dir: dir).0
             await engine.start()
             let inbox = try await waitForAdversarialInbox(store, count: 1)
-            let message = try #require(try await store.page(in: inbox.id, after: nil, limit: 10).rows.first)
+            let message = try #require(try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest).rows.first)
 
             let completedFetches = world.snapshotCompletedFetchCount()
             try await store.enqueueMove(message: message.id, to: .archive)
@@ -34,7 +34,7 @@ struct AdversarialEngineTests {
             #expect(world.mailbox("Archive").messages[1] == nil)
             await world.waitForFetchCompletion(after: completedFetches)
             try await waitUntil(timeout: .seconds(5)) {
-                try await store.page(in: inbox.id, after: nil, limit: 10).rows.count == 1
+                try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest).rows.count == 1
             }
             #expect(world.archiveCommandSnapshot().isEmpty)
             await engine.stop()
@@ -48,7 +48,7 @@ struct AdversarialEngineTests {
             let engine = makeEngine(store: store, world: world, dir: dir).0
             await engine.start()
             let inbox = try await waitForAdversarialInbox(store, count: 1)
-            let message = try #require(try await store.page(in: inbox.id, after: nil, limit: 10).rows.first)
+            let message = try #require(try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest).rows.first)
 
             // The first session advertised MOVE. Remove it only after the
             // generation is synchronized, then enqueue the operation.
@@ -85,7 +85,7 @@ struct AdversarialEngineTests {
             )
             await engine.start()
             let inbox = try await waitForAdversarialInbox(store, count: 4)
-            let rows = try await store.page(in: inbox.id, after: nil, limit: 10).rows
+            let rows = try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest).rows
             for row in rows {
                 try await store.enqueueFlag(message: row.id, flag: .seen, set: true)
             }
@@ -150,7 +150,7 @@ struct AdversarialEngineTests {
             ])
             #expect(world.mailbox("INBOX").messages[1] == nil)
             #expect(world.mailbox("Archive").messages[1] != nil)
-            #expect(try await store.page(in: inbox.id, after: nil, limit: 10).rows.isEmpty)
+            #expect(try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest).rows.isEmpty)
             await engine.stop()
         }
     }
@@ -202,7 +202,7 @@ struct AdversarialEngineTests {
             let engine = makeEngine(store: store, world: world, dir: dir, window: 100).0
             await engine.start()
             let inbox = try await waitForAdversarialInbox(store, count: 1_000, timeout: .seconds(30))
-            let rows = try await store.page(in: inbox.id, after: nil, limit: 1_000).rows
+            let rows = try await store.page(in: inbox.id, after: nil, limit: 1_000, sort: .newest).rows
             #expect(rows.count == 1_000)
             await engine.stop()
 
@@ -245,7 +245,7 @@ struct AdversarialEngineTests {
             await first.start()
             await second.start()
             let inbox = try await waitForAdversarialInbox(store, count: 1)
-            let row = try #require(try await store.page(in: inbox.id, after: nil, limit: 10).rows.first)
+            let row = try #require(try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest).rows.first)
             try await store.enqueueMove(message: row.id, to: .archive)
 
             try await waitUntil(timeout: .seconds(10)) {

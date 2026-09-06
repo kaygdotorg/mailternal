@@ -61,6 +61,7 @@ final class MockMailFacade: MailFacade {
         var folder: FolderID
         var cursor: MessagePageCursor?
         var limit: Int
+        var sort: MailListSort
         var continuation: AsyncStream<MessagePage>.Continuation
     }
 
@@ -246,25 +247,41 @@ final class MockMailFacade: MailFacade {
         byID[message]?.folder
     }
 
-
-    func page(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) async throws -> MessagePage {
-        currentPage(in: folder, after: cursor, limit: limit)
+    func page(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int,
+        sort: MailListSort
+    ) async throws -> MessagePage {
+        try currentPage(in: folder, after: cursor, limit: limit, sort: sort)
     }
 
-    func messageIDs(in folder: FolderID) async throws -> [MessageID] {
-        (messages[folder] ?? []).map(\.row.id)
+    func messageIDs(in folder: FolderID, sort: MailListSort) async throws -> [MessageID] {
+        orderedMessages(in: folder, sort: sort).map(\.row.id)
     }
 
-    func observePage(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) -> AsyncStream<MessagePage> {
+    func observePage(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int,
+        sort: MailListSort
+    ) -> AsyncStream<MessagePage> {
         let stream = AsyncStream.makeStream(of: MessagePage.self, bufferingPolicy: .bufferingNewest(8))
         let id = UUID()
         pageObservers[id] = PageObserver(
             folder: folder,
             cursor: cursor,
             limit: limit,
+            sort: sort,
             continuation: stream.continuation
         )
-        stream.continuation.yield(currentPage(in: folder, after: cursor, limit: limit))
+        do {
+            stream.continuation.yield(
+                try currentPage(in: folder, after: cursor, limit: limit, sort: sort)
+            )
+        } catch {
+            stream.continuation.finish()
+        }
         stream.continuation.onTermination = { [weak self] _ in
             Task { @MainActor in
                 self?.pageObservers.removeValue(forKey: id)
@@ -334,6 +351,17 @@ final class MockMailFacade: MailFacade {
             throw MailAccountError("Message is no longer available.")
         }
         return stored.detail
+    }
+
+    func details(_ ids: [MessageID]) async throws -> [MessageDetail] {
+        var details: [MessageDetail] = []
+        details.reserveCapacity(ids.count)
+        var seen = Set<MessageID>()
+        for id in ids where seen.insert(id).inserted {
+            guard let stored = byID[id] else { continue }
+            details.append(stored.detail)
+        }
+        return details
     }
 
     func markRead(_ ids: [MessageID]) async {
@@ -553,30 +581,136 @@ final class MockMailFacade: MailFacade {
         publishFolders()
         syncContinuation.yield(syncStatus)
         for observer in pageObservers.values {
-            observer.continuation.yield(
-                currentPage(in: observer.folder, after: observer.cursor, limit: observer.limit)
-            )
+            if let page = try? currentPage(
+                in: observer.folder,
+                after: observer.cursor,
+                limit: observer.limit,
+                sort: observer.sort
+            ) {
+                observer.continuation.yield(page)
+            }
         }
     }
 
-    private func currentPage(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) -> MessagePage {
-        let list = messages[folder] ?? []
-        let sliced: ArraySlice<StoredMessage>
-        if let cursor {
-            let start = list.firstIndex { stored in
-                if stored.row.date != cursor.internalDate {
-                    return stored.row.date < cursor.internalDate
-                }
-                return stored.uid < cursor.uid
-            } ?? list.endIndex
-            sliced = list[start...].prefix(limit)
-        } else {
-            sliced = list.prefix(limit)
+    private func orderedMessages(in folder: FolderID, sort: MailListSort) -> [StoredMessage] {
+        (messages[folder] ?? []).sorted { lhs, rhs in
+            let comparison: ComparisonResult
+            switch sort.field {
+            case .date:
+                comparison = lhs.row.date.compare(rhs.row.date)
+            case .sender:
+                comparison = lhs.row.from.compare(rhs.row.from)
+            case .subject:
+                comparison = lhs.row.subject.compare(rhs.row.subject)
+            case .read:
+                comparison = (lhs.row.isRead ? 1 : 0) == (rhs.row.isRead ? 1 : 0)
+                    ? .orderedSame
+                    : (lhs.row.isRead ? .orderedDescending : .orderedAscending)
+            case .flagged:
+                comparison = (lhs.row.isFlagged ? 1 : 0) == (rhs.row.isFlagged ? 1 : 0)
+                    ? .orderedSame
+                    : (lhs.row.isFlagged ? .orderedDescending : .orderedAscending)
+            case .attachments:
+                comparison = (lhs.row.hasAttachments ? 1 : 0) == (rhs.row.hasAttachments ? 1 : 0)
+                    ? .orderedSame
+                    : (lhs.row.hasAttachments ? .orderedDescending : .orderedAscending)
+            }
+            if comparison == .orderedSame {
+                return sort.direction == .ascending ? lhs.uid < rhs.uid : lhs.uid > rhs.uid
+            }
+            return sort.direction == .ascending
+                ? comparison == .orderedAscending
+                : comparison == .orderedDescending
         }
-        let rows = sliced.map(\.row)
+    }
+
+    private func validateCursor(
+        _ cursor: MessagePageCursor?,
+        sort: MailListSort
+    ) throws {
+        guard let cursor else { return }
+        guard cursor.sort == sort else {
+            throw MailAccountError("That page cursor uses another sort order.")
+        }
+        switch (sort.field, cursor.value) {
+        case (.date, .date(_)), (.sender, .sender(_)), (.subject, .subject(_)),
+             (.read, .read(_)), (.flagged, .flagged(_)), (.attachments, .attachments(_)):
+            return
+        default:
+            throw MailAccountError("That page cursor has an invalid sort value.")
+        }
+    }
+
+    private func isAfter(
+        _ stored: StoredMessage,
+        cursor: MessagePageCursor,
+        sort: MailListSort
+    ) throws -> Bool {
+        guard cursor.sort == sort else { throw MailAccountError("That page cursor uses another sort order.") }
+        let comparison: ComparisonResult
+        switch (sort.field, cursor.value) {
+        case (.date, .date(let date)):
+            comparison = stored.row.date.compare(date)
+        case (.sender, .sender(let sender)):
+            comparison = stored.row.from.compare(sender)
+        case (.subject, .subject(let subject)):
+            comparison = stored.row.subject.compare(subject)
+        case (.read, .read(let read)):
+            comparison = (stored.row.isRead ? 1 : 0) == (read ? 1 : 0)
+                ? .orderedSame
+                : (stored.row.isRead ? .orderedDescending : .orderedAscending)
+        case (.flagged, .flagged(let flagged)):
+            comparison = (stored.row.isFlagged ? 1 : 0) == (flagged ? 1 : 0)
+                ? .orderedSame
+                : (stored.row.isFlagged ? .orderedDescending : .orderedAscending)
+        case (.attachments, .attachments(let attachments)):
+            comparison = (stored.row.hasAttachments ? 1 : 0) == (attachments ? 1 : 0)
+                ? .orderedSame
+                : (stored.row.hasAttachments ? .orderedDescending : .orderedAscending)
+        default:
+            throw MailAccountError("That page cursor has an invalid sort value.")
+        }
+        if comparison == .orderedSame {
+            return sort.direction == .ascending ? stored.uid > cursor.uid : stored.uid < cursor.uid
+        }
+        return sort.direction == .ascending
+            ? comparison == .orderedDescending
+            : comparison == .orderedAscending
+    }
+
+    private func currentPage(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int,
+        sort: MailListSort
+    ) throws -> MessagePage {
+        try validateCursor(cursor, sort: sort)
+        let cap = max(limit, 0)
+        guard cap > 0 else { return MessagePage(rows: [], next: nil) }
+        let list = orderedMessages(in: folder, sort: sort)
+        let start: Int
+        if let cursor {
+            start = try list.firstIndex { stored in
+                try isAfter(stored, cursor: cursor, sort: sort)
+            } ?? list.endIndex
+        } else {
+            start = list.startIndex
+        }
+        let end = start + min(cap, list.endIndex - start)
+        let slice = list[start..<end]
+        let rows = slice.map(\.row)
         let next: MessagePageCursor?
-        if sliced.count == limit, let last = sliced.last {
-            next = MessagePageCursor(internalDate: last.row.date, uid: last.uid)
+        if end < list.endIndex, let last = slice.last {
+            let value: MessagePageCursorValue
+            switch sort.field {
+            case .date: value = .date(last.row.date)
+            case .sender: value = .sender(last.row.from)
+            case .subject: value = .subject(last.row.subject)
+            case .read: value = .read(last.row.isRead)
+            case .flagged: value = .flagged(last.row.isFlagged)
+            case .attachments: value = .attachments(last.row.hasAttachments)
+            }
+            next = MessagePageCursor(sort: sort, value: value, uid: last.uid)
         } else {
             next = nil
         }
@@ -585,9 +719,14 @@ final class MockMailFacade: MailFacade {
 
     private func publishObservers(in folder: FolderID) {
         for observer in pageObservers.values where observer.folder == folder {
-            observer.continuation.yield(
-                currentPage(in: observer.folder, after: observer.cursor, limit: observer.limit)
-            )
+            if let page = try? currentPage(
+                in: observer.folder,
+                after: observer.cursor,
+                limit: observer.limit,
+                sort: observer.sort
+            ) {
+                observer.continuation.yield(page)
+            }
         }
     }
 

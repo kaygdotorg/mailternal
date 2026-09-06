@@ -4,7 +4,7 @@ import SwiftUI
 import MailternalInterfaces
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case accounts, cache, appearance, actions
+    case accounts, cache, appearance, actions, sync
 
     var id: Self { self }
 
@@ -14,6 +14,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .cache: "Cache"
         case .appearance: "Appearance"
         case .actions: "Actions"
+        case .sync: "Sync"
         }
     }
 
@@ -23,6 +24,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .cache: "internaldrive"
         case .appearance: "paintbrush"
         case .actions: "hand.draw"
+        case .sync: "icloud"
         }
     }
 }
@@ -178,6 +180,7 @@ struct SettingsDetailView: View {
     let actions: ActionSettings
     let toolbarCoordinator: SettingsToolbarCoordinator
     @State private var titleBottom: CGFloat = 0
+    @State private var isPairingPresented = false
 
     private var settingsDissolvePolicy: MailWindowDissolvePolicy {
         // The H1 is fixed chrome over the form. Keep the fallback at the
@@ -199,7 +202,12 @@ struct SettingsDetailView: View {
                     AppearanceSettingsForm(appearance: appearance)
                 case .actions:
                     ActionSettingsForm(actions: actions)
-                }
+                case .sync:
+                    WorkspaceSyncSettingsView(
+                        coordinator: model.workspaceSync,
+                        onPairDevice: { isPairingPresented = true }
+                    )
+            }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             // Forms are full-height scroll surfaces beneath the fixed H1.
@@ -231,6 +239,24 @@ struct SettingsDetailView: View {
                     proxy.frame(in: .global).maxY
                         - PaneHeaderInsetPolicy.settingsTitleBottomPadding
                 } action: { titleBottom = $0 }
+        }
+        .sheet(isPresented: $isPairingPresented) {
+            PairingView(
+                accounts: model.accountConfigs,
+                makeBundle: { accountIDs, includeSettings in
+                    try await model.makePairingBundle(accountIDs, includeSettings: includeSettings)
+                },
+                importBundle: { bundle, selectedIDs, replaceExisting, importSettings in
+                    try await model.importPairingBundle(
+                        bundle,
+                        selectedAccountIDs: selectedIDs,
+                        replaceExisting: replaceExisting,
+                        importSettings: importSettings
+                    )
+                }
+            )
+            // Fit the complete invitation and its quiet zone above the footer.
+            .frame(minWidth: 560, minHeight: 600)
         }
         .tint(appearance.accent.color)
         .environment(appearance.accent)

@@ -25,12 +25,16 @@ public actor IMAPSession {
     /// folder on tagged `BAD`/`NO`/`NOMODSEQ` (spec: sync.md Change detection).
     public var recommendedDeltaPath: IMAPDeltaPath { capabilities.recommendedDeltaPath }
 
+    private static let defaultEventLoopGroup: EventLoopGroup = {
+        // A bounded process-wide pool avoids one NIO thread per account/session.
+        // It intentionally has no per-session shutdown path.
+        MultiThreadedEventLoopGroup(numberOfThreads: 4)
+    }()
+
     private let endpoint: IMAPEndpoint
     private let username: String
     private let password: String
     private let group: EventLoopGroup
-    private let ownsGroup: Bool
-    private var didShutdownGroup = false
     private var connection: IMAPConnection?
     private var tagCounter: UInt64 = 0
     private var readerTask: Task<Void, Never>?
@@ -41,6 +45,7 @@ public actor IMAPSession {
     private var idleTag: String?
     private var idleEvents: AsyncStream<IMAPMailboxEvent>.Continuation?
     private var fetchAssembler = IMAPFetchAssembler()
+    private var fetchInFlight = false
     private var taggedWaiter: (tag: String, continuation: CheckedContinuation<TaggedResponse, Error>)?
     private var greetingWaiter: CheckedContinuation<ResponsePayload, Error>?
     private var greetingPayload: ResponsePayload?
@@ -57,7 +62,9 @@ public actor IMAPSession {
     ///   - endpoint: Host, port, and implicit-TLS vs mandatory STARTTLS.
     ///   - username: AUTH/LOGIN identity.
     ///   - password: AUTH/LOGIN secret. Never logged.
-    ///   - eventLoopGroup: Shared NIO group. When `nil`, the session creates and owns a one-thread group.
+    ///   - eventLoopGroup: Injected NIO group. When `nil`, sessions share a
+    ///     bounded four-thread process-wide group; neither path is shut down by
+    ///     the session.
     public init(
         endpoint: IMAPEndpoint,
         username: String,
@@ -67,13 +74,7 @@ public actor IMAPSession {
         self.endpoint = endpoint
         self.username = username
         self.password = password
-        if let eventLoopGroup {
-            self.group = eventLoopGroup
-            self.ownsGroup = false
-        } else {
-            self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-            self.ownsGroup = true
-        }
+        self.group = eventLoopGroup ?? Self.defaultEventLoopGroup
         var continuation: AsyncStream<IMAPMailboxEvent>.Continuation!
         self.eventStream = AsyncStream { continuation = $0 }
         self.eventContinuation = continuation
@@ -92,7 +93,6 @@ public actor IMAPSession {
         self.username = username
         self.password = password
         self.group = eventLoopGroup
-        self.ownsGroup = false
         self.connection = connection
         var continuation: AsyncStream<IMAPMailboxEvent>.Continuation!
         self.eventStream = AsyncStream { continuation = $0 }
@@ -129,6 +129,13 @@ extension IMAPSession {
             }
         }
         startReader()
+        if let connection {
+            do {
+                try await connection.startReading()
+            } catch {
+                throw IMAPError.transport(String(describing: error))
+            }
+        }
         try await runConnectSequence()
         authenticated = true
     }
@@ -146,26 +153,17 @@ extension IMAPSession {
         if !alreadyClosed {
             failWaiters(IMAPError.transport("Connection closed"))
         }
+        clearFetchState()
         // Drop the socket. Do not write DONE/LOGOUT: NIOIMAP fatals on tagged
         // commands while IDLE, and a stuck write would pin stop().
         let conn = connection
         connection = nil
-        readerTask?.cancel()
-        readerTask = nil
+        // `IMAPConnection.close()` finishes the response producer before
+        // closing the socket, allowing a live reader to drain buffered values
+        // instead of abandoning them. The process-wide event-loop group is
+        // intentionally never shut down by a session.
         eventContinuation.finish()
         await conn?.close()
-        if ownsGroup, !didShutdownGroup {
-            didShutdownGroup = true
-            try? await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                group.shutdownGracefully { error in
-                    if let error {
-                        cont.resume(throwing: error)
-                    } else {
-                        cont.resume()
-                    }
-                }
-            }
-        }
     }
 
     /// `LIST` all folders, skip `\Noselect`/`\NonExistent`, map SPECIAL-USE with
@@ -235,7 +233,7 @@ extension IMAPSession {
             try await enableQResync()
         }
         var parameters: [SelectParameter] = []
-        if let qresync, qresyncEnabled || capabilities.qresync {
+        if let qresync, qresyncEnabled {
             let known = qresync.knownUIDs.flatMap { IMAPCommandFactory.uidSet($0) }
             guard let uidValidity = UIDValidity(exactly: qresync.uidValidity) else {
                 throw IMAPError.parse("UIDVALIDITY must be greater than 0")
@@ -270,9 +268,9 @@ extension IMAPSession {
         }
         return selected
     }
-
     /// `ENABLE QRESYNC`. Safe to call more than once. Surfaces tagged NO/BAD so
-    /// the engine can downgrade the folder.
+    /// the engine can downgrade the folder. A tagged `OK` alone is not enough:
+    /// the server must also return an `ENABLED QRESYNC` response.
     public func enableQResync() async throws {
         try ensureAuthenticated()
         guard capabilities.qresync else {
@@ -282,7 +280,14 @@ extension IMAPSession {
                 code: nil
             )
         }
-        _ = try await enable(tokens: ["QRESYNC"])
+        let enabled = try await enable(tokens: ["QRESYNC"])
+        guard enabled.contains(where: { $0.uppercased() == "QRESYNC" }) else {
+            throw IMAPError.taggedBAD(
+                tag: "",
+                message: "ENABLE completed without QRESYNC confirmation",
+                code: nil
+            )
+        }
         qresyncEnabled = true
     }
 
@@ -301,6 +306,10 @@ extension IMAPSession {
     }
 
     /// UID FETCH. Body items are always PEEK. Empty UID sets return `[]`.
+    /// Encoded PEEK literals are accounted for before they enter either the
+    /// response producer or assembler; the request's cap is clamped to the
+    /// transport's 32 MiB ceiling and failures throw
+    /// ``IMAPError/responseTooLarge(limit:)``.
     public func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
         try ensureAuthenticated()
         guard !request.uids.isEmpty else { return [] }
@@ -311,7 +320,21 @@ extension IMAPSession {
                 modifiers: IMAPCommandFactory.fetchModifiers(request)
               )
         else { return [] }
-        fetchAssembler = IMAPFetchAssembler()
+        guard let connection else {
+            throw IMAPError.transport("Not connected")
+        }
+        let maximumResponseBytes = min(
+            IMAPFetchAssembler.maximumLiteralBytes,
+            max(0, request.maximumResponseBytes ?? IMAPFetchAssembler.maximumLiteralBytes)
+        )
+        fetchAssembler = IMAPFetchAssembler(maximumLiteralBytes: maximumResponseBytes)
+        fetchInFlight = true
+        connection.beginFetchResponse(maximumBytes: maximumResponseBytes)
+        defer {
+            fetchInFlight = false
+            fetchAssembler = IMAPFetchAssembler()
+            connection.endFetchResponse()
+        }
         let tagged = try await send(command)
         try throwIfFailed(tagged)
         return fetchAssembler.take()
@@ -659,7 +682,15 @@ extension IMAPSession {
             applyPayload(payload)
             untaggedCollector?(payload)
         case .fetch(let fetch):
-            fetchAssembler.apply(fetch)
+            if fetchInFlight {
+                do {
+                    try fetchAssembler.apply(fetch)
+                } catch {
+                    clearFetchState()
+                    poisonConnection(error)
+                    return
+                }
+            }
             switch fetch {
             case .start, .startUID:
                 publish(.fetchHint)
@@ -681,6 +712,7 @@ extension IMAPSession {
                 waiter.continuation.resume(returning: tagged)
             }
         case .fatal(let text):
+            clearFetchState()
             publish(.bye(text.text))
             failWaiters(IMAPError.transport(text.text))
         case .authenticationChallenge:
@@ -696,10 +728,19 @@ extension IMAPSession {
             }
         }
     }
+    func clearFetchState() {
+        fetchInFlight = false
+        fetchAssembler = IMAPFetchAssembler()
+    }
 
     func handleDisconnect() {
+        clearFetchState()
         if let error = connection?.lastHandlerError {
-            failWaiters(IMAPError.parse(String(describing: error)))
+            if let error = error as? IMAPError {
+                failWaiters(error)
+            } else {
+                failWaiters(IMAPError.parse(String(describing: error)))
+            }
         } else if !closed {
             failWaiters(IMAPError.transport("Connection closed"))
         }
@@ -707,6 +748,19 @@ extension IMAPSession {
         // Parser/channel death must poison the session. Otherwise the next
         // tagged command writes into a dead NIOIMAP decoder and hangs forever.
         closed = true
+    }
+
+    func poisonConnection(_ error: Error) {
+        clearFetchState()
+        guard !closed else { return }
+        closed = true
+        failWaiters(error)
+        finishIdle()
+        let connection = self.connection
+        Task {
+            await connection?.close()
+        }
+        eventContinuation.finish()
     }
 }
 

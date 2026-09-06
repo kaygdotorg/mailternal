@@ -52,7 +52,7 @@ import Testing
         let summaries = try await store.fetchFolders(account: account.id)
         #expect(Set(summaries.map(\.path)) == ["INBOX", "Projects"])
         #expect(summaries.map(\.id).filter { $0 == work }.isEmpty)
-        #expect(try await store.page(in: work, after: nil, limit: 10).rows.isEmpty)
+        #expect(try await store.page(in: work, after: nil, limit: 10, sort: .newest).rows.isEmpty)
         #expect(try await store.search("oldpathtoken", limit: 10).isEmpty)
         #expect(try await store.ftsUnfilteredCount(matching: "oldpathtoken") == 1)
 
@@ -131,6 +131,6 @@ import Testing
         let hits = try await store.search("objectidtoken", limit: 10)
         #expect(hits.count == 1)
         #expect(try await store.generationState(generation) == .live)
-        #expect(try await store.page(in: work, after: nil, limit: 10).rows.count == 1)
+        #expect(try await store.page(in: work, after: nil, limit: 10, sort: .newest).rows.count == 1)
     }
 }

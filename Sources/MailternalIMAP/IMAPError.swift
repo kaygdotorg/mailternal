@@ -12,6 +12,10 @@ public enum IMAPError: Error, Sendable, Hashable {
     case taggedNO(tag: String, message: String, code: String?)
     /// Tagged `BAD` from the server (protocol / capability mismatch).
     case taggedBAD(tag: String, message: String, code: String?)
+    /// A FETCH response's aggregate encoded PEEK literals exceed the receive
+    /// budget. The connection is closed before any bytes beyond the budget are
+    /// accumulated.
+    case responseTooLarge(limit: Int)
     /// Wire bytes the NIOIMAP parser could not accept.
     case parse(String)
 
@@ -49,6 +53,8 @@ extension IMAPError: CustomStringConvertible {
         case .taggedBAD(let tag, let message, let code):
             let extra = code.map { " [\($0)]" } ?? ""
             return "IMAP \(tag) BAD\(extra): \(message)"
+        case .responseTooLarge(let limit):
+            return "IMAP response exceeds \(limit)-byte receive limit"
         case .parse(let message):
             return "IMAP parse: \(message)"
         }

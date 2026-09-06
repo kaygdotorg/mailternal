@@ -92,15 +92,26 @@ final class LiveMailFacade: MailFacade {
     /// Observable store-opening state used by the launch shell.
     var storeLoadState: StoreLoadState = .opening
     private var engines: [AccountID: SyncEngine] = [:]
+    /// Monotonic per-account generations invalidate engine starts that finish
+    /// after a concurrent account edit, removal, or lifecycle stop.
+    private var engineGenerations: [AccountID: UInt64] = [:]
+    /// Invalidates starts crossing a background/foreground or shutdown await.
+    private var lifecycleGeneration: UInt64 = 0
     /// One process-wide permit pool keeps account engines from multiplying
     /// their backfill connections and gives queued accounts a fair turn.
     private let backfillBudget = BackfillConnectionBudget.shared
     private var configsByID: [AccountID: AccountConfig] = [:]
+    /// Prevents two account mutations from interleaving across awaits.
+    private var accountMutationsInFlight: Set<AccountID> = []
     private var observedFolders: [AccountID: [FolderSummary]] = [:]
     private var engineTasks: [AccountID: [Task<Void, Never>]] = [:]
     private var foldersTasks: [AccountID: Task<Void, Never>] = [:]
     private var visibleFolderID: FolderID?
     private var didRestore = false
+    /// iOS suspends the live engines while the app is backgrounded. Cached
+    /// folder snapshots remain published; queued mutations stay durable in the
+    /// store and are drained after the next foreground restart.
+    private var enginesSuspendedForBackground = false
     private var qaMonitorTask: Task<Void, Never>?
     private let qaStartedAt = Date()
     private var qaFirstPageLogged = false
@@ -163,7 +174,7 @@ final class LiveMailFacade: MailFacade {
                     )
                 },
                 openProgress: { phase in
-                    QALaunch.launchSubphase("store-\(phase)")
+                    QALaunch.launchPhase("store-\(phase)")
                 }
             )
         }
@@ -212,12 +223,12 @@ final class LiveMailFacade: MailFacade {
         didRestore = true
         do {
             store = try await readyStore()
-            QALaunch.launchSubphase("store-first-queries-begin")
+            QALaunch.launchPhase("store-first-queries-begin")
             if let qa = QALaunch.parse() {
                 try await seedQAAccount(qa)
             }
             let persisted = try await store.fetchAccounts()
-            QALaunch.launchSubphase("store-first-queries-end")
+            QALaunch.launchPhase("store-first-queries-end")
             accounts = persisted
             configsByID = Dictionary(uniqueKeysWithValues: persisted.map { ($0.id, $0) })
             for account in persisted {
@@ -306,14 +317,95 @@ final class LiveMailFacade: MailFacade {
         await engines[summary.accountID]?.refreshNow()
     }
     func shutdown() async {
+        lifecycleGeneration &+= 1
         qaMonitorTask?.cancel()
         qaMonitorTask = nil
+        enginesSuspendedForBackground = false
         for id in Array(engines.keys) {
             await stopEngine(for: id)
         }
     }
 
+    /// Stops live IMAP engines before iOS suspends the process.
+    ///
+    /// The local store and its mutation queues remain available, and the last
+    /// observed folder snapshot stays published for cached UI/companion reads.
+    /// The phone scene should await this before relinquishing its background
+    /// execution time.
+    func applicationDidEnterBackground() async {
+        guard !enginesSuspendedForBackground else { return }
+        lifecycleGeneration &+= 1
+        enginesSuspendedForBackground = true
+        qaMonitorTask?.cancel()
+        qaMonitorTask = nil
+        syncContinuation.yield(SyncStatus(mode: .fullHistory, isOnline: false))
+        for id in Array(engines.keys) {
+            setState(.validating, for: id)
+            await stopEngine(for: id, preserveFolderSnapshot: true)
+        }
+        publishAggregateState()
+    }
+
+    /// Restarts the enabled engines after the phone returns to the foreground.
+    ///
+    /// Every queued mutation was committed before the engine was stopped, so
+    /// the normal engine startup/delta path drains it without a special retry
+    /// mechanism.
+    func applicationWillEnterForeground() async {
+        guard enginesSuspendedForBackground else { return }
+        lifecycleGeneration &+= 1
+        enginesSuspendedForBackground = false
+        guard didRestore, store != nil else { return }
+        for account in accounts where account.isEnabled {
+            guard engines[account.id] == nil else { continue }
+            guard (try? keychain.loadPassword(for: account.id)) != nil else {
+                setState(.authFailed(message: "The saved password is missing from the Keychain."), for: account.id)
+                startFolderObservation(account: account.id)
+                continue
+            }
+            startFolderObservation(account: account.id)
+            setState(.validating, for: account.id)
+            await startEngine(for: account)
+            startQAMonitorIfNeeded(account: account.id)
+        }
+        publishAggregateState()
+    }
+
+    private func beginAccountMutation(_ account: AccountID) throws {
+        guard accountMutationsInFlight.insert(account).inserted else {
+            throw LiveMailError("That account is already being changed.")
+        }
+    }
+
+    private func endAccountMutation(_ account: AccountID) {
+        accountMutationsInFlight.remove(account)
+    }
+
+    /// Reads the configured credential store only for an explicitly requested
+    /// account transfer, preserving injected/isolated stores used by QA.
+    func accountTransferCredential(for account: AccountID) throws -> String {
+        try keychain.loadPassword(for: account)
+    }
+
+    private func loadOptionalPassword(for account: AccountID) throws -> String? {
+        do {
+            return try keychain.loadPassword(for: account)
+        } catch KeychainStoreError.itemNotFound {
+            return nil
+        }
+    }
+
+    private func restorePassword(_ password: String?, for account: AccountID) throws {
+        if let password {
+            try keychain.savePassword(password, for: account)
+        } else {
+            try keychain.deletePassword(for: account)
+        }
+    }
+
     func addAccount(_ config: AccountConfig, password: String) async throws {
+        try beginAccountMutation(config.id)
+        defer { endAccountMutation(config.id) }
         _ = try await readyStore()
         if config.isEnabled {
             setState(.validating, for: config.id)
@@ -331,15 +423,31 @@ final class LiveMailFacade: MailFacade {
             }
         }
 
+        let existing = try await store.fetchAccount(config.id)
         var storedConfig = config
-        if let existing = try await store.fetchAccount(config.id) {
+        if let existing {
             storedConfig.accountLinkID = existing.accountLinkID
+        }
+        var previousPassword: String?
+        if let existing {
+            previousPassword = try loadOptionalPassword(for: existing.id)
         }
         do {
             try keychain.savePassword(password, for: storedConfig.id)
+        } catch {
+            setState(.connectionFailed(message: "Could not save the account."), for: storedConfig.id)
+            throw error
+        }
+        do {
             try await store.upsertAccount(storedConfig)
         } catch {
-            try? keychain.deletePassword(for: storedConfig.id)
+            do {
+                try restorePassword(previousPassword, for: storedConfig.id)
+            } catch {
+                let message = "Could not save the account, and the previous password could not be restored: \(error.localizedDescription)"
+                setState(.connectionFailed(message: message), for: storedConfig.id)
+                throw LiveMailError(message)
+            }
             let message = "Could not save the account."
             setState(.connectionFailed(message: message), for: storedConfig.id)
             throw LiveMailError(message)
@@ -363,7 +471,58 @@ final class LiveMailFacade: MailFacade {
         await startEngine(for: storedConfig)
     }
 
+    /// Adopts a transferred canonical account link while preserving this
+    /// device's local `AccountID`, mailbox rows, and caches.
+    ///
+    /// The store records an identity command atomically with the relink. Pairing
+    /// and startup finish its workspace/reader migration before acknowledging it.
+    /// Ordinary account edits intentionally retain the existing link identity.
+    func adoptAccountLinkID(
+        _ id: AccountID,
+        to accountLinkID: AccountLinkID
+    ) async throws {
+        try beginAccountMutation(id)
+        defer { endAccountMutation(id) }
+        let store = try await readyStore()
+        guard let existing = configsByID[id] ?? accounts.first(where: { $0.id == id }) else {
+            throw LiveMailError("That account is no longer available.")
+        }
+        guard existing.accountLinkID != accountLinkID else { return }
+        guard !accounts.contains(where: {
+            $0.id != id && $0.accountLinkID == accountLinkID
+        }) else {
+            throw LiveMailError("Another account already uses the transferred identity.")
+        }
+        do {
+            try await store.relinkAccount(id, to: accountLinkID)
+        } catch MailStoreError.accountNotFound {
+            throw LiveMailError("That account is no longer available.")
+        } catch MailStoreError.accountLinkIDConflict {
+            throw LiveMailError("Another account already uses the transferred identity.")
+        } catch {
+            throw LiveMailError("Could not adopt the transferred account identity.")
+        }
+        var adopted = existing
+        adopted.accountLinkID = accountLinkID
+        configsByID[id] = adopted
+        if let index = accounts.firstIndex(where: { $0.id == id }) {
+            accounts[index] = adopted
+        }
+    }
+
+    func pendingAccountLinkCommands() async throws -> [AccountLinkCommand] {
+        let store = try await readyStore()
+        return try await store.pendingAccountLinkCommands()
+    }
+
+    func completeAccountLinkCommand(_ id: Int64) async throws {
+        let store = try await readyStore()
+        try await store.completeAccountLinkCommand(id)
+    }
+
     func updateAccount(_ config: AccountConfig, password: String?) async throws {
+        try beginAccountMutation(config.id)
+        defer { endAccountMutation(config.id) }
         _ = try await readyStore()
         guard let existing = configsByID[config.id] ?? accounts.first(where: { $0.id == config.id }) else {
             throw LiveMailError("That account is no longer available.")
@@ -376,6 +535,11 @@ final class LiveMailFacade: MailFacade {
             || existing.username != storedConfig.username
             || existing.imap != storedConfig.imap
             || password != nil
+
+        var previousPassword: String?
+        if password != nil {
+            previousPassword = try loadOptionalPassword(for: existing.id)
+        }
 
         if requiresValidation {
             let validationPassword: String
@@ -395,15 +559,30 @@ final class LiveMailFacade: MailFacade {
                 throw error
             }
             if let password {
-                try keychain.savePassword(password, for: existing.id)
+                do {
+                    try keychain.savePassword(password, for: existing.id)
+                } catch {
+                    setState(.connectionFailed(message: "Could not save the account."), for: existing.id)
+                    throw error
+                }
             }
         }
 
         do {
             try await store.upsertAccount(storedConfig)
         } catch {
-            setState(.connectionFailed(message: "Could not save the account."), for: existing.id)
-            throw LiveMailError("Could not save the account.")
+            if password != nil {
+                do {
+                    try restorePassword(previousPassword, for: existing.id)
+                } catch {
+                    let message = "Could not save the account, and the previous password could not be restored: \(error.localizedDescription)"
+                    setState(.connectionFailed(message: message), for: existing.id)
+                    throw LiveMailError(message)
+                }
+            }
+            let message = "Could not save the account."
+            setState(.connectionFailed(message: message), for: existing.id)
+            throw LiveMailError(message)
         }
         configsByID[storedConfig.id] = storedConfig
         if let index = accounts.firstIndex(where: { $0.id == storedConfig.id }) {
@@ -424,6 +603,8 @@ final class LiveMailFacade: MailFacade {
     }
 
     func setAccountEnabled(_ id: AccountID, _ enabled: Bool) async throws {
+        try beginAccountMutation(id)
+        defer { endAccountMutation(id) }
         _ = try await readyStore()
         guard var config = configsByID[id] ?? accounts.first(where: { $0.id == id }) else {
             throw LiveMailError("That account is no longer available.")
@@ -456,10 +637,60 @@ final class LiveMailFacade: MailFacade {
     }
 
     func removeAccount(_ id: AccountID) async throws {
-        _ = try await readyStore()
-        await stopEngine(for: id)
-        try keychain.deletePassword(for: id)
+        try beginAccountMutation(id)
+        defer { endAccountMutation(id) }
+        let existing: AccountConfig?
+        if let inMemory = configsByID[id] ?? accounts.first(where: { $0.id == id }) {
+            existing = inMemory
+        } else {
+            existing = try await store.fetchAccount(id)
+        }
+        var previousPassword: String?
+        if existing != nil {
+            previousPassword = try loadOptionalPassword(for: id)
+        }
+
+        // Delete the durable account first. If this fails, the engine,
+        // in-memory config, and Keychain credential remain untouched.
         try await store.deleteAccount(id)
+        await stopEngine(for: id, preserveFolderSnapshot: true)
+
+        do {
+            try keychain.deletePassword(for: id)
+        } catch {
+            var restorationFailures: [String] = []
+            if let previousPassword {
+                do {
+                    try keychain.savePassword(previousPassword, for: id)
+                } catch {
+                    restorationFailures.append("password: \(error.localizedDescription)")
+                }
+            }
+            if let existing {
+                do {
+                    try await store.upsertAccount(existing)
+                } catch {
+                    restorationFailures.append("account: \(error.localizedDescription)")
+                }
+            }
+            if restorationFailures.isEmpty, let existing, existing.isEnabled {
+                startFolderObservation(account: id)
+                setState(.validating, for: id)
+                await startEngine(for: existing)
+            }
+            let message: String
+            if restorationFailures.isEmpty {
+                message = "Could not remove the account."
+            } else {
+                message = "Could not remove the account, and restoration failed: \(restorationFailures.joined(separator: "; "))."
+            }
+            throw LiveMailError(message)
+        }
+        // A foreground restart may have completed while the durable delete
+        // was suspended. Invalidate and stop that replacement before commit.
+        await stopEngine(for: id, preserveFolderSnapshot: true)
+
+
         configsByID[id] = nil
         accounts.removeAll { $0.id == id }
         observedFolders[id] = nil
@@ -474,26 +705,42 @@ final class LiveMailFacade: MailFacade {
         publishAggregateState()
     }
 
-    func page(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) async throws -> MessagePage {
+    func page(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int,
+        sort: MailListSort
+    ) async throws -> MessagePage {
         _ = try await readyStore()
-        return try await store.page(in: folder, after: cursor, limit: limit)
+        return try await store.page(in: folder, after: cursor, limit: limit, sort: sort)
     }
 
-    func messageIDs(in folder: FolderID) async throws -> [MessageID] {
+    func messageIDs(in folder: FolderID, sort: MailListSort) async throws -> [MessageID] {
         _ = try await readyStore()
-        return try await store.messageIDs(in: folder)
+        return try await store.messageIDs(in: folder, sort: sort)
     }
 
-    func observePage(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) -> AsyncStream<MessagePage> {
+    func observePage(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int,
+        sort: MailListSort
+    ) -> AsyncStream<MessagePage> {
         AsyncStream { continuation in
-            Task { @MainActor [weak self] in
+            let producer = Task { @MainActor [weak self] in
                 guard let self else {
                     continuation.finish()
                     return
                 }
                 do {
                     let store = try await self.readyStore()
-                    for await page in store.observePage(in: folder, after: cursor, limit: limit) {
+                    try Task.checkCancellation()
+                    for await page in store.observePage(
+                        in: folder,
+                        after: cursor,
+                        limit: limit,
+                        sort: sort
+                    ) {
                         guard !Task.isCancelled else { break }
                         continuation.yield(page)
                     }
@@ -502,12 +749,20 @@ final class LiveMailFacade: MailFacade {
                 }
                 continuation.finish()
             }
+            continuation.onTermination = { @Sendable _ in
+                producer.cancel()
+            }
         }
     }
 
     func detail(_ id: MessageID) async throws -> MessageDetail {
         _ = try await readyStore()
         return try await store.detail(id)
+    }
+
+    func details(_ ids: [MessageID]) async throws -> [MessageDetail] {
+        _ = try await readyStore()
+        return try await store.details(ids)
     }
     func makeDeepLink(for folder: FolderID) async throws -> MailternalDeepLink? {
         _ = try await readyStore()
@@ -526,51 +781,47 @@ final class LiveMailFacade: MailFacade {
         return try await store.resolve(link)
     }
 
-    func markRead(_ ids: [MessageID]) async {
-        guard let store = try? await readyStore() else { return }
-        try? await store.enqueueFlag(messages: ids, flag: .seen, set: true)
+    func markRead(_ ids: [MessageID]) async throws {
+        let store = try await readyStore()
+        try await store.enqueueFlag(messages: ids, flag: .seen, set: true)
     }
 
-    func markUnread(_ ids: [MessageID]) async {
-        guard let store = try? await readyStore() else { return }
-        try? await store.enqueueFlag(messages: ids, flag: .seen, set: false)
+    func markUnread(_ ids: [MessageID]) async throws {
+        let store = try await readyStore()
+        try await store.enqueueFlag(messages: ids, flag: .seen, set: false)
     }
 
-    func trash(_ ids: [MessageID]) async {
-        await moveToRole(.trash, ids: ids)
+    func trash(_ ids: [MessageID]) async throws {
+        try await moveToRole(.trash, ids: ids)
     }
 
-    func setFlagged(_ ids: [MessageID], _ flagged: Bool) async {
-        guard let store = try? await readyStore() else { return }
-        try? await store.enqueueFlag(messages: ids, flag: .flagged, set: flagged)
+    func setFlagged(_ ids: [MessageID], _ flagged: Bool) async throws {
+        let store = try await readyStore()
+        try await store.enqueueFlag(messages: ids, flag: .flagged, set: flagged)
     }
 
-    func archive(_ ids: [MessageID]) async {
-        await moveToRole(.archive, ids: ids)
+    func archive(_ ids: [MessageID]) async throws {
+        try await moveToRole(.archive, ids: ids)
     }
-    private func moveToRole(_ role: FolderRole, ids: [MessageID]) async {
-        guard let store = try? await readyStore() else { return }
+    private func moveToRole(_ role: FolderRole, ids: [MessageID]) async throws {
+        let store = try await readyStore()
         let destinations = await roleDestinations(role)
-        var grouped: [FolderID: [MessageID]] = [:]
+        var accounts: Set<AccountID> = []
         for id in ids {
-            do {
-                guard let accountID = try await store.accountID(for: id),
-                      let destination = destinations[accountID] else { continue }
-                grouped[destination, default: []].append(id)
-            } catch {
-                await logMoveError(error)
+            guard let account = try await store.accountID(for: id) else {
+                throw LiveMailError("That message is no longer available.")
             }
-        }
-        for (destination, messageIDs) in grouped {
-            do {
-                try await store.enqueueMove(messages: messageIDs, to: destination)
-                if let accountID = destinations.first(where: { $0.value == destination })?.key {
-                    await engines[accountID]?.moveNow()
-                }
-            } catch {
-                await logMoveError(error, folder: destination)
+            guard destinations[account] != nil else {
+                throw LiveMailError("This account has no \(role.rawValue) folder.")
             }
+            accounts.insert(account)
         }
+        do {
+            try await store.enqueueMove(messages: ids, to: role)
+        } catch {
+            throw await loggedMoveError(error)
+        }
+        for account in accounts { await engines[account]?.moveNow() }
     }
 
     func move(_ ids: [MessageID], to folder: FolderID) async throws -> MoveOutcome {
@@ -797,6 +1048,10 @@ final class LiveMailFacade: MailFacade {
     }
 
     private func startEngine(for config: AccountConfig) async {
+        guard !enginesSuspendedForBackground else { return }
+        let generation = engineGenerations[config.id, default: 0] &+ 1
+        engineGenerations[config.id] = generation
+        let transition = lifecycleGeneration
         let credentials = KeychainCredentialProvider(keychain: keychain)
         let qa = ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1"
             || QALaunch.parse() != nil
@@ -829,11 +1084,39 @@ final class LiveMailFacade: MailFacade {
             backfillBudget: backfillBudget
         )
         #endif
-        engines[config.id] = engine
         await engine.start()
+        guard !Task.isCancelled,
+              !enginesSuspendedForBackground,
+              lifecycleGeneration == transition,
+              engineGenerations[config.id] == generation,
+              let currentConfig = configsByID[config.id],
+              currentConfig == config
+        else {
+            await engine.stop()
+            return
+        }
+        if let prior = engines.removeValue(forKey: config.id) {
+            for task in engineTasks.removeValue(forKey: config.id) ?? [] {
+                task.cancel()
+            }
+            await prior.stop()
+            guard !Task.isCancelled,
+                  !enginesSuspendedForBackground,
+                  lifecycleGeneration == transition,
+                  engineGenerations[config.id] == generation,
+                  let replacementConfig = configsByID[config.id],
+                  replacementConfig == config
+            else {
+                await engine.stop()
+                return
+            }
+        }
+        engines[config.id] = engine
         attachEngineStreams(engine, accountID: config.id)
     }
-    private func stopEngine(for accountID: AccountID) async {
+
+    private func stopEngine(for accountID: AccountID, preserveFolderSnapshot: Bool = false) async {
+        engineGenerations[accountID, default: 0] &+= 1
         foldersTasks[accountID]?.cancel()
         foldersTasks[accountID] = nil
         for task in engineTasks.removeValue(forKey: accountID) ?? [] {
@@ -842,8 +1125,10 @@ final class LiveMailFacade: MailFacade {
         if let engine = engines.removeValue(forKey: accountID) {
             await engine.stop()
         }
-        observedFolders[accountID] = nil
-        publishFolders()
+        if !preserveFolderSnapshot {
+            observedFolders[accountID] = nil
+            publishFolders()
+        }
     }
 
     private func attachEngineStreams(_ engine: SyncEngine, accountID: AccountID) {
@@ -966,7 +1251,12 @@ final class LiveMailFacade: MailFacade {
 
     private func qaLogInbox(_ inbox: FolderSummary, footprint: Int64) async {
         if !qaFirstPageLogged {
-            if let page = try? await store.page(in: inbox.id, after: nil, limit: 80), !page.rows.isEmpty {
+            if let page = try? await store.page(
+                in: inbox.id,
+                after: nil,
+                limit: 80,
+                sort: .newest
+            ), !page.rows.isEmpty {
                 qaFirstPageLogged = true
                 QALaunch.log(
                     "first-page ready folder=\(inbox.path) rows=\(page.rows.count) count=\(inbox.totalCount) elapsed=\(qaElapsed())s footprint=\(footprint)"
@@ -1037,7 +1327,12 @@ final class LiveMailFacade: MailFacade {
         var urls: [URL] = []
         do {
             repeat {
-                let page = try await store.page(in: inbox.id, after: cursor, limit: 40)
+                let page = try await store.page(
+                    in: inbox.id,
+                    after: cursor,
+                    limit: 40,
+                    sort: .newest
+                )
                 for row in page.rows where row.hasAttachments {
                     let detail = try await store.detail(row.id)
                     guard let part = detail.attachments.first(where: { $0.contentID != nil }) else {
@@ -1135,7 +1430,7 @@ final class LiveMailFacade: MailFacade {
         case .taggedBAD(_, let message, _):
             let text = message.isEmpty ? "The server rejected the login." : message
             return (.connectionFailed(message: text), text)
-        case .parse:
+        case .parse, .responseTooLarge:
             let message = "Could not talk to \(host)."
             return (.connectionFailed(message: message), message)
         }

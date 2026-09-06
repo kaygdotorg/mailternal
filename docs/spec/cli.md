@@ -5,11 +5,15 @@
 see `automation.md`). It ships **inside the app bundle** and as a static Linux binary.
 
 ## Process model (hybrid)
-1. App running → the CLI drives it over the container socket (`automation.md`),
-   including UI state: selection, search, later the composer. "Change what's in the
-   composer from a script" is the acceptance test of this design.
-2. App not running (or Linux) → standalone: reads open the store directly; mutations
-   run a per-invocation engine or talk to `mailternal engine start`.
+1. App running → the CLI reuses its mail runtime over the container socket
+   (`automation.md`). Ordinary queries and mail commands do not navigate or focus
+   the GUI, change tabs, or alter a visible composer. Mail-data changes naturally
+   propagate to views. Explicit `ui` commands drive the complete GUI surface;
+   "Change what's in the visible composer from a script" remains an acceptance test.
+2. App not running (or Linux) → full standalone IMAP/SMTP client over the same
+   runtime: cached reads can open the store directly; operations needing the
+   network, including uncached raw source and SMTP, use a per-invocation engine or
+   `mailternal engine start`. Standalone mode is not read-only or reduced-parity.
 3. Remote agents → `--host` / `MAILTERNAL_HOST`: `user@mac` runs the Mac-side CLI over
    SSH; `https://host:port` uses the paired TLS listener. Same JSON either way.
 
@@ -32,6 +36,9 @@ mailternal mark <link> read|unread     mailternal flag <link> [--off]
 mailternal archive <link>              mailternal trash <link>
 mailternal undo
 mailternal observe                     # JSON Lines stream of state/new-mail events
+mailternal ui state                    # current structured GUI context; no side effects
+mailternal ui observe                  # initial GUI snapshot followed by state changes
+mailternal ui <action>                 # explicit complete GUI control; see automation.md
 mailternal refresh
 mailternal account add|remove|list|export|import
 mailternal settings list|get|set
@@ -42,6 +49,27 @@ mailternal setup
 ```
 `send`/`reply`/`composer.*` arrive with the composer + SMTP milestone, designed once
 for app and CLI together.
+
+## Explicit GUI control and context
+
+`ui` is the explicit GUI-control namespace; ordinary `list`, `read`, `search`,
+triage, and standalone sending must not implicitly drive a window. A CLI message
+search is not the GUI's visible search query. A standalone draft is not implicitly
+the visible composer. Explicit settings mutations still change their named settings.
+
+`ui state` exposes the current windows, focused surface, active account/folder,
+list selection and paging, reader tabs/active tab/reading position, visible search
+and results, composers, settings, presented dialogs and available actions, and
+relevant sync/outbox/error state. Credentials are never serialized into GUI state.
+Mail content is available through structured read/draft queries rather than being
+repeated in every state event.
+
+`ui observe` starts with a versioned snapshot and supplies ordered state changes.
+Reconnection or a detected event gap requires resynchronization, never silently
+stale context. Agents can inspect and drive every in-app workflow using stable
+identities and schema-discoverable commands, without screenshots or coordinates.
+Explicit UI commands require a reachable app; they do not silently become a
+different standalone mail operation when the GUI is absent.
 
 ## Output contract
 - **JSON when stdout is not a TTY, pretty text when it is** (git/gh convention). Never

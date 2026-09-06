@@ -1,6 +1,10 @@
+#if os(macOS)
 import AppKit
+#endif
+import Foundation
 import Observation
 import SwiftUI
+
 
 enum SwipeEdge {
     case leading
@@ -51,13 +55,14 @@ enum SwipeActionKind: String, CaseIterable, Codable, Identifiable {
         }
     }
 
+#if os(macOS)
     var style: NSTableViewRowAction.Style {
         switch self {
         case .archive, .trash: .destructive
         case .toggleRead, .toggleFlag: .regular
         }
     }
-    
+
     var backgroundColor: NSColor {
         switch self {
         case .archive: .systemYellow
@@ -66,6 +71,7 @@ enum SwipeActionKind: String, CaseIterable, Codable, Identifiable {
         case .toggleFlag: .systemOrange
         }
     }
+#endif
 }
 
 @MainActor
@@ -144,6 +150,25 @@ final class ActionSettings {
             leadingSwipe = Self.applying(action, at: index, to: leadingSwipe, maxCount: Self.leadingSwipeLimit)
         case .trailing:
             trailingSwipe = Self.applying(action, at: index, to: trailingSwipe, maxCount: Self.trailingSwipeLimit)
+        }
+    }
+
+    /// Stable JSON used by the shared workspace controller. The values contain
+    /// only gesture kinds, never account or message identifiers.
+    func encodedSwipeActions(for edge: SwipeEdge) -> String {
+        let values = swipeActions(for: edge).map(\.rawValue)
+        guard let data = try? JSONEncoder().encode(values) else { return "[]" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    func setSwipeActions(_ actions: [SwipeActionKind], for edge: SwipeEdge) {
+        let normalized = Self.compact(
+            actions,
+            maxCount: edge == .leading ? Self.leadingSwipeLimit : Self.trailingSwipeLimit
+        )
+        switch edge {
+        case .leading: leadingSwipe = normalized
+        case .trailing: trailingSwipe = normalized
         }
     }
 

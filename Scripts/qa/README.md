@@ -20,8 +20,8 @@ password: qa-password
 Self-signed cert (generated at first `up`, SAN includes `localhost` + `127.0.0.1`):
 
 ```
-~/mailternal-qa/certs/dovecot.crt
-~/mailternal-qa/certs/dovecot.key
+~/Developer/Worktrees/mailternal-qa/certs/dovecot.crt
+~/Developer/Worktrees/mailternal-qa/certs/dovecot.key
 ```
 
 Pin that cert or disable verification. `openssl s_client -connect 127.0.0.1:1993` then `QUIT`.
@@ -48,12 +48,12 @@ Scripts/qa/chaos.sh seed
 Scripts/qa/chaos.sh status
 ```
 
-`up` rsyncs this directory to `agents@mbp:~/mailternal-qa` (does not touch `Sources/` / `App/`) and starts `mailternal-qa-full` + `mailternal-qa-crippled` against named volume `mailternal-qa-maildata`.
+`up` rsyncs this directory to `agents@mbp:~/Developer/Worktrees/mailternal-qa` (does not touch `Sources/` / `App/`) and starts `mailternal-qa-full` + `mailternal-qa-crippled` against named volume `mailternal-qa-maildata`.
 
 On mbp directly:
 
 ```
-cd ~/mailternal-qa
+cd ~/Developer/Worktrees/mailternal-qa
 ./chaos.sh up
 python3 seed.py          # IMAP APPEND/MULTIAPPEND to 127.0.0.1:1143
 ./chaos.sh status

@@ -41,7 +41,55 @@ struct IMAPTrustIPLiteralTests {
         #expect(IMAPTrust.sniHostname(for: "127.0.0.1") == nil)
         _ = try IMAPTLS.makeClientHandler(hostname: "::1")
     }
+    
+    @Test func tlsContextsReuseAndInvalidateForTrustChanges() throws {
+        IMAPSession.resetAdditionalTrustRoots()
+        defer { IMAPSession.resetAdditionalTrustRoots() }
+
+        let system = try IMAPTLS.makeClientContext(hostname: "imap.example.com")
+        let reused = try IMAPTLS.makeClientContext(hostname: "another.example.com")
+        #expect(system === reused)
+
+        IMAPSession.installAdditionalTrustRoots(pem: [Data(qaLeafPEM.utf8)])
+        let qa = try IMAPTLS.makeClientContext(hostname: "imap.example.com")
+        #expect(system !== qa)
+        let qaReused = try IMAPTLS.makeClientContext(hostname: "another.example.com")
+        #expect(qa === qaReused)
+
+        IMAPSession.resetAdditionalTrustRoots()
+        let reset = try IMAPTLS.makeClientContext(hostname: "imap.example.com")
+        #expect(reset !== qa)
+    }
+
+    @Test func invalidOrEmptyAdditionalRootsFailClosedForIPLiteral() throws {
+        defer { IMAPSession.resetAdditionalTrustRoots() }
+        let expected = IMAPError.tls("Configured additional TLS trust roots are invalid")
+
+        for pem in [Data(), Data("not-a-certificate".utf8)] {
+            IMAPSession.installAdditionalTrustRoots(pem: [pem])
+            #expect(throws: expected) {
+                _ = try IMAPTLS.makeClientContext(hostname: "127.0.0.1")
+            }
+        }
+    }
+
+    @Test func resetRootsUsesOneSnapshotForIPPermission() throws {
+        IMAPSession.installAdditionalTrustRoots(pem: [Data(qaLeafPEM.utf8)])
+        let optedInSnapshot = IMAPTrust.additionalPEM()
+        IMAPSession.resetAdditionalTrustRoots()
+        defer { IMAPSession.resetAdditionalTrustRoots() }
+
+        try IMAPTrust.requireHostnameVerification(
+            for: "127.0.0.1",
+            additionalPEM: optedInSnapshot
+        )
+        let expected = IMAPError.tls("Connect using a hostname, not an IP address.")
+        #expect(throws: expected) {
+            _ = try IMAPTLS.makeClientContext(hostname: "127.0.0.1")
+        }
+    }
 }
+
 
 /// Any parseable leaf is enough: handler creation does not handshake.
 private let qaLeafPEM = """

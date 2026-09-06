@@ -76,7 +76,9 @@ final class ReaderPlainTextView: NSTextView {
         isHorizontallyResizable = false
         textContainerInset = .zero
         textContainer?.lineFragmentPadding = 0
-        textContainer?.widthTracksTextView = true
+        // The host measures proposed widths independently of its installed
+        // frame, then applies the actual container width during layout.
+        textContainer?.widthTracksTextView = false
         minSize = .zero
         maxSize = NSSize(
             width: CGFloat.greatestFiniteMagnitude,

@@ -9,6 +9,9 @@ import MailternalStore
 ///
 /// Password is never an argv token: `MAILTERNAL_QA_PASSWORD` or `qa-password`.
 enum QALaunch: Sendable {
+    /// First-observed process uptime used on iOS, where the macOS
+    /// `KERN_PROC_PID` start-time query is not a supported app API.
+    private static let processStartUptime = ProcessInfo.processInfo.systemUptime
     struct Config: Sendable {
         var host: String
         var port: Int
@@ -129,10 +132,12 @@ enum QALaunch: Sendable {
         }
     }
 
-    /// Milliseconds since the kernel started this process (exec time from
-    /// `kinfo_proc`), so launch phases are measured from the real start, not
-    /// from whichever object first observed the clock.
+    /// Milliseconds since process start. macOS retains the kernel start-time
+    /// measurement used by the launch QA harness. iOS does not expose that
+    /// query to app targets, so its QA-only fallback measures from the first
+    /// call in this process.
     static func millisecondsSinceProcessStart() -> Double {
+        #if os(macOS)
         var info = kinfo_proc()
         var size = MemoryLayout<kinfo_proc>.stride
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, ProcessInfo.processInfo.processIdentifier]
@@ -140,6 +145,9 @@ enum QALaunch: Sendable {
         let start = info.kp_proc.p_starttime
         let startSeconds = Double(start.tv_sec) + Double(start.tv_usec) / 1_000_000
         return (Date().timeIntervalSince1970 - startSeconds) * 1000
+        #else
+        return max(0, (ProcessInfo.processInfo.systemUptime - processStartUptime) * 1000)
+        #endif
     }
 
     /// Launch phase marker; QA-only, no cost outside `MAILTERNAL_QA=1`.
@@ -148,13 +156,9 @@ enum QALaunch: Sendable {
         log(String(format: "launch phase=%@ t=%.1fms footprint=%lld", name, millisecondsSinceProcessStart(), footprintBytes()))
     }
 
-    /// Named sub-phase marker used to attribute store and shell launch gaps.
-    static func launchSubphase(_ name: String) {
-        launchPhase(name)
-    }
-
     /// Activity Monitor "memory footprint" (`phys_footprint`), or -1 if unavailable.
     static func footprintBytes() -> Int64 {
+        #if os(macOS) || os(iOS)
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(
             MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<natural_t>.stride
@@ -166,6 +170,9 @@ enum QALaunch: Sendable {
         }
         guard kr == KERN_SUCCESS else { return -1 }
         return Int64(info.phys_footprint)
+        #else
+        return -1
+        #endif
     }
 
     @MainActor

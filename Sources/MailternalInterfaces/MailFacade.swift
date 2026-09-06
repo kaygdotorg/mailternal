@@ -34,27 +34,44 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     func setKeepLocally(_ keep: Bool, for folder: FolderID) async throws
     /// Enqueues a persisted server-side mailbox rename.
     func renameFolder(_ id: FolderID, to name: String) async throws
-    // Messages — keyset-paged for rendering; full-folder IDs are a single indexed
-    // query used by ⌘A and batch operations.
-    func page(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) async throws -> MessagePage
-    func messageIDs(in folder: FolderID) async throws -> [MessageID]
-    /// Live changes for the currently visible page window of a folder.
-    func observePage(in folder: FolderID, after cursor: MessagePageCursor?, limit: Int) -> AsyncStream<MessagePage>
-
+    // Messages — keyset-paged for rendering; `sort` applies to the complete
+    // folder and is retained by every returned cursor.
+    func page(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int,
+        sort: MailListSort
+    ) async throws -> MessagePage
+    /// Returns every message ID in the folder's current generation in the same
+    /// store-backed order as `page`.
+    func messageIDs(in folder: FolderID, sort: MailListSort) async throws -> [MessageID]
+    /// Live changes for the currently visible page window of a folder. Each
+    /// emitted page uses the requested `sort`.
+    func observePage(
+        in folder: FolderID,
+        after cursor: MessagePageCursor?,
+        limit: Int,
+        sort: MailListSort
+    ) -> AsyncStream<MessagePage>
     // Detail
     func detail(_ id: MessageID) async throws -> MessageDetail
+    /// Returns locally stored details for the requested IDs in input order.
+    /// Duplicate IDs are returned once; IDs no longer present locally are omitted.
+    /// This never fetches remote content.
+    func details(_ ids: [MessageID]) async throws -> [MessageDetail]
     /// User-facing account label for titles and other account context.
     var accountDisplayName: String? { get }
     /// Enqueues local read mutations as `UID STORE +FLAGS.SILENT (\Seen)`.
-    func markRead(_ ids: [MessageID]) async
+    /// Returns only after durable enqueue; store failures throw, not server failures.
+    func markRead(_ ids: [MessageID]) async throws
     /// Enqueues local unread mutations as `UID STORE -FLAGS.SILENT (\Seen)`.
-    func markUnread(_ ids: [MessageID]) async
+    func markUnread(_ ids: [MessageID]) async throws
     /// Enqueues local `\Flagged` mutations.
-    func setFlagged(_ ids: [MessageID], _ flagged: Bool) async
+    func setFlagged(_ ids: [MessageID], _ flagged: Bool) async throws
     /// Enqueues a move to the server's Trash folder.
-    func trash(_ ids: [MessageID]) async
-    /// Enqueues an archive move; the sync engine drains it. No-op toast-level failure is surfaced via error log.
-    func archive(_ ids: [MessageID]) async
+    func trash(_ ids: [MessageID]) async throws
+    /// Durably enqueues an archive move; missing destinations and write failures throw.
+    func archive(_ ids: [MessageID]) async throws
     /// Enqueues a move to an arbitrary folder.
     func move(_ ids: [MessageID], to folder: FolderID) async throws -> MoveOutcome
     func rawSource(_ id: MessageID) async throws -> String
@@ -62,11 +79,11 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     func fetchAttachment(_ message: MessageID, part: String) async throws -> URL
 
     // Single-id convenience variants delegate to the atomic batch operations.
-    func markRead(_ id: MessageID) async
-    func markUnread(_ id: MessageID) async
-    func trash(_ id: MessageID) async
-    func setFlagged(_ id: MessageID, _ flagged: Bool) async
-    func archive(_ id: MessageID) async
+    func markRead(_ id: MessageID) async throws
+    func markUnread(_ id: MessageID) async throws
+    func trash(_ id: MessageID) async throws
+    func setFlagged(_ id: MessageID, _ flagged: Bool) async throws
+    func archive(_ id: MessageID) async throws
     func move(_ id: MessageID, to folder: FolderID) async throws -> MoveOutcome
 
     // Search (FTS5 over synced history)
@@ -108,24 +125,24 @@ public extension MailFacade {
             continuation.finish()
         }
     }
-    func markRead(_ id: MessageID) async {
-        await markRead([id])
+    func markRead(_ id: MessageID) async throws {
+        try await markRead([id])
     }
 
-    func markUnread(_ id: MessageID) async {
-        await markUnread([id])
+    func markUnread(_ id: MessageID) async throws {
+        try await markUnread([id])
     }
 
-    func trash(_ id: MessageID) async {
-        await trash([id])
+    func trash(_ id: MessageID) async throws {
+        try await trash([id])
     }
 
-    func setFlagged(_ id: MessageID, _ flagged: Bool) async {
-        await setFlagged([id], flagged)
+    func setFlagged(_ id: MessageID, _ flagged: Bool) async throws {
+        try await setFlagged([id], flagged)
     }
 
-    func archive(_ id: MessageID) async {
-        await archive([id])
+    func archive(_ id: MessageID) async throws {
+        try await archive([id])
     }
 
     func move(_ id: MessageID, to folder: FolderID) async throws -> MoveOutcome {

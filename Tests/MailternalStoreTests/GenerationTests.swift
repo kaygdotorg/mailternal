@@ -21,7 +21,7 @@ import Testing
         #expect(try await store.generationState(live) == .live)
         #expect(try await store.generationState(replacement) == .replacement)
 
-        let before = try await store.page(in: folder, after: nil, limit: 10)
+        let before = try await store.page(in: folder, after: nil, limit: 10, sort: .newest)
         #expect(before.rows.map(\.subject) == ["old-live"])
         let liveIDBefore = try await store.liveGenerationID(for: folder)
 
@@ -32,7 +32,7 @@ import Testing
         let liveIDAfter = try await store.liveGenerationID(for: folder)
         #expect(liveIDBefore != liveIDAfter)
 
-        let after = try await store.page(in: folder, after: nil, limit: 10)
+        let after = try await store.page(in: folder, after: nil, limit: 10, sort: .newest)
         #expect(after.rows.map(\.subject) == ["new-live"])
         #expect(after.rows.count == 1)
 

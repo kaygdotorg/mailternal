@@ -15,6 +15,7 @@ struct MessageHTMLView: NSViewRepresentable {
     var onExternalLink: ((URL) -> Void)?
     var onContentHeightChange: ((CGFloat) -> Void)?
     var onDocumentScrollOffset: ((UUID, CGFloat) -> Void)?
+    var onSurfaceReady: ((UUID, MessageID) -> Void)?
     var allowRemoteImages: Bool = false
     var emailReadingMode: EmailReadingMode = .original
     var findQuery: String = ""
@@ -44,6 +45,7 @@ struct MessageHTMLView: NSViewRepresentable {
             onExternalLink: onExternalLink,
             onContentHeightChange: onContentHeightChange,
             onDocumentScrollOffset: onDocumentScrollOffset,
+            onSurfaceReady: onSurfaceReady,
             allowRemoteImages: allowRemoteImages,
             emailReadingMode: emailReadingMode,
             findQuery: findQuery,
@@ -65,6 +67,7 @@ struct MessageHTMLView: NSViewRepresentable {
             onExternalLink: onExternalLink,
             onContentHeightChange: onContentHeightChange,
             onDocumentScrollOffset: onDocumentScrollOffset,
+            onSurfaceReady: onSurfaceReady,
             allowRemoteImages: allowRemoteImages,
             emailReadingMode: emailReadingMode,
             findQuery: findQuery,
@@ -108,7 +111,6 @@ final class ReaderWebViewHost: NSView {
         installedView?.removeFromSuperview()
         installedView = nil
     }
-
     func update(
         pool: ReaderSurfacePool,
         messageID: MessageID,
@@ -119,6 +121,7 @@ final class ReaderWebViewHost: NSView {
         onExternalLink: ((URL) -> Void)?,
         onContentHeightChange: ((CGFloat) -> Void)?,
         onDocumentScrollOffset: ((UUID, CGFloat) -> Void)?,
+        onSurfaceReady: ((UUID, MessageID) -> Void)?,
         allowRemoteImages: Bool,
         emailReadingMode: EmailReadingMode,
         findQuery: String,
@@ -148,11 +151,18 @@ final class ReaderWebViewHost: NSView {
         guard let view = installedView else { return }
         let messageChanged = view.renderedMessageID != messageID
         view.onExternalLink = onExternalLink
-        view.onContentHeightChange = { [weak pool] height in
+        view.onContentHeightChange = { [weak pool, weak view] height in
             if let tabID {
                 pool?.recordContentHeight(height, for: tabID, messageID: messageID)
             }
             onContentHeightChange?(height)
+            guard let view,
+                  let tabID,
+                  view.renderedMessageID == messageID,
+                  view.isReaderSurfaceReady else {
+                return
+            }
+            onSurfaceReady?(tabID, messageID)
         }
         view.onDocumentScrollOffset = { offset in
             guard let tabID else { return }
@@ -183,6 +193,11 @@ final class ReaderWebViewHost: NSView {
             // navigation. If a load is still in flight, didFinish applies the
             // pending mode only when its navigation identity matches.
             view.updateReadingMode(emailReadingMode)
+        }
+        if let tabID,
+           view.renderedMessageID == messageID,
+           view.isReaderSurfaceReady {
+            onSurfaceReady?(tabID, messageID)
         }
 
         let queryChanged = coordinator.lastQuery != findQuery

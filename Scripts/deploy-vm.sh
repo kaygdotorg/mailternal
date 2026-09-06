@@ -5,7 +5,7 @@
 set -euo pipefail
 CHUNK="${1:?chunk}"
 VM="lume@mailternal-macos-vm.vpn.kayg.org"
-ROOT="/Users/agents/mailternal-build/$CHUNK"
+ROOT="/Users/agents/Developer/Worktrees/mailternal-build/$CHUNK"
 SRC="$ROOT/App/build/Build/Products/Debug/Mailternal.app"
 ssh agents@mbp "test -d '$SRC' || { echo 'no built app at $SRC'; exit 1; }
   ssh -o StrictHostKeyChecking=no $VM 'mkdir -p ~/mailternal ~/mailternal-qa-base'
@@ -15,5 +15,5 @@ ssh agents@mbp "test -d '$SRC' || { echo 'no built app at $SRC'; exit 1; }
   rsync -a '$ROOT/Scripts/qa/tab-switch-latency-vm.sh' $VM:~/tab-switch-latency-vm.sh &&
     ssh $VM 'chmod +x ~/tab-switch-latency-vm.sh' && echo 'tab-switch-latency-vm.sh -> vm'
   if [ '${2:-}' = fixture ]; then
-    rsync -a ~/mailternal-qa-ReaderIslands/ $VM:~/mailternal-qa-base/ && echo 'fixture -> vm'
+    rsync -a ~/Developer/Worktrees/mailternal-qa-ReaderIslands/ $VM:~/mailternal-qa-base/ && echo 'fixture -> vm'
   fi"

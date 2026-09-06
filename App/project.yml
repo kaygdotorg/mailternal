@@ -16,6 +16,14 @@ targets:
     dependencies:
       - package: MailternalCore
         product: MailternalCore
+      - package: MailternalCore
+        product: MailternalWorkspace
+      - package: MailternalCore
+        product: MailternalPairing
+      - sdk: AVFoundation.framework
+      - sdk: CoreImage.framework
+      - sdk: Network.framework
+      - sdk: CloudKit.framework
     info:
       path: Mailternal-Info.plist
       properties:
@@ -31,6 +39,11 @@ targets:
           - CFBundleURLName: org.kayg.mailternal
             CFBundleURLSchemes:
               - mailternal
+        NSCameraUsageDescription: "Mailternal uses the camera to scan a one-time pairing code."
+        NSLocalNetworkUsageDescription: "Mailternal uses your local network to securely transfer selected accounts between paired devices."
+        NSBonjourServices:
+          - _mailternal-pair._tcp
+        MailternalKeychainAccessGroup: "$(AppIdentifierPrefix)org.kayg.mailternal"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal
@@ -57,6 +70,8 @@ targets:
     platform: macOS
     sources:
       - path: Sources/Support/DeepLinkRouteQueue.swift
+      - path: Sources/Model/MessageDetailLoader.swift
+      - path: Sources/Viewer/MessageHeadersStore.swift
       - path: AppTests
       - path: Sources/Support/UILogic.swift
       - path: Sources/Support/MessageListPolicies.swift

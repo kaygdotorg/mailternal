@@ -1,0 +1,132 @@
+name: MailternalMobile
+options:
+  bundleIdPrefix: org.kayg
+  deploymentTarget:
+    iOS: "26.0"
+    watchOS: "26.0"
+  createIntermediateGroups: true
+packages:
+  MailternalCore:
+    path: ..
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: 0.0.1
+    CURRENT_PROJECT_VERSION: 1
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: VP77RTCF3K
+    ENABLE_USER_SCRIPT_SANDBOXING: true
+targets:
+  MailternalIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: iOS
+      - path: ../App/Sources/Pairing
+      - path: Companion/PhoneCompanionSession.swift
+      - path: ../App/Sources/Live/LiveMailFacade.swift
+      - path: ../App/Sources/Live/MailternalContainer.swift
+      - path: ../App/Sources/Live/LiveNotifications.swift
+      - path: ../App/Sources/Live/QAIMAPTrust.swift
+      - path: ../App/Sources/Live/QALaunch.swift
+      - path: ../App/Sources/Support/KeychainStore.swift
+      - path: ../App/Sources/Support/ActionSettings.swift
+      - path: ../App/Sources/Support/PartFetchRouting.swift
+      - path: ../App/Sources/MessageWeb/PartSchemeHandler.swift
+      - path: ../App/Sources/Support/ProviderPresets.swift
+      - path: ../App/Sources/Resources/IMAPPresets.plist
+    dependencies:
+      - package: MailternalCore
+        product: MailternalCore
+      - package: MailternalCore
+        product: MailternalCompanion
+      - package: MailternalCore
+        product: MailternalWorkspace
+      - package: MailternalCore
+        product: MailternalPairing
+      - sdk: AVFoundation.framework
+      - sdk: CoreImage.framework
+      - sdk: Network.framework
+      - target: MailternalWatch
+        embed: true
+      - sdk: UIKit.framework
+      - sdk: UserNotifications.framework
+      - sdk: Security.framework
+      - sdk: WebKit.framework
+      - sdk: WatchConnectivity.framework
+      - sdk: CloudKit.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: true
+        CODE_SIGN_ENTITLEMENTS: MailternalIOS.entitlements
+        SUPPORTS_MACCATALYST: false
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
+    info:
+      path: MailternalIOS-Info.plist
+      properties:
+        CFBundleDisplayName: Mailternal
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: "Mailternal uses the camera to scan a one-time pairing code."
+        NSLocalNetworkUsageDescription: "Mailternal uses your local network to securely transfer selected accounts between paired devices."
+        NSBonjourServices:
+          - _mailternal-pair._tcp
+        CFBundleURLTypes:
+          - CFBundleURLName: org.kayg.mailternal
+            CFBundleURLSchemes: [mailternal]
+        NSUserActivityTypes: [org.kayg.mailternal.read-message]
+        LSSupportsOpeningDocumentsInPlace: true
+        MailternalKeychainAccessGroup: "$(AppIdentifierPrefix)org.kayg.mailternal"
+  MailternalWatch:
+    type: application
+    platform: watchOS
+    sources:
+      - path: watchOS
+      - path: Companion/WatchCompanionSession.swift
+    dependencies:
+      - package: MailternalCore
+        product: MailternalCompanion
+      - sdk: WatchConnectivity.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal.ios.watchkitapp
+        TARGETED_DEVICE_FAMILY: "4"
+        GENERATE_INFOPLIST_FILE: true
+        SKIP_INSTALL: true
+    info:
+      path: MailternalWatch-Info.plist
+      properties:
+        CFBundleDisplayName: Mailternal
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: org.kayg.mailternal.ios
+        WKRunsIndependentlyOfCompanionApp: false
+        NSUserActivityTypes: [org.kayg.mailternal.read-message]
+schemes:
+  MailternalIOS:
+    shared: true
+    build:
+      targets:
+        MailternalIOS: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  MailternalWatch:
+    shared: true
+    build:
+      targets:
+        MailternalWatch: all
+    run:
+      config: Debug

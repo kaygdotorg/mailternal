@@ -257,6 +257,12 @@ public final class MessageWebView: NSView, WKNavigationDelegate, WKUIDelegate {
 
     /// The message currently rendered by this retained tab surface.
     public var renderedMessageID: MessageID? { lastRenderedMessageID }
+    /// True once this retained document has completed its current navigation.
+    /// Reader QA uses this with the outer scroll callback so a matching offset
+    /// on an old document cannot be reported as a ready tab.
+    public var isReaderSurfaceReady: Bool {
+        documentDidFinish && !pendingRender && lastRenderedMessageID != nil
+    }
 
     /// The per-surface remote-image consent used when the document was loaded.
     public var remoteImagesAreAllowed: Bool { remoteImagesAllowed }

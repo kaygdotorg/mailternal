@@ -3,10 +3,10 @@
 # Run on agents@mbp after Scripts/build-mbp.sh AppBreaker app.
 set -euo pipefail
 
-ROOT="${APPBREAKER_ROOT:-$HOME/mailternal-build/AppBreaker}"
+ROOT="${APPBREAKER_ROOT:-$HOME/Developer/Worktrees/mailternal-build/AppBreaker}"
 APP="${APP:-$ROOT/App/build/Build/Products/Debug/Mailternal.app/Contents/MacOS/Mailternal}"
-DATA="${APPBREAKER_DATA:-$HOME/mailternal-build/AppBreaker-qa}"
-LOGDIR="${APPBREAKER_LOGS:-$HOME/mailternal-build/AppBreaker-logs}"
+DATA="${APPBREAKER_DATA:-$HOME/Developer/Worktrees/mailternal-build/AppBreaker-qa}"
+LOGDIR="${APPBREAKER_LOGS:-$HOME/Developer/Worktrees/mailternal-build/AppBreaker-logs}"
 HOST="${QA_HOST:-127.0.0.1}"
 PORT="${QA_PORT:-2143}"
 SECURITY="${QA_SECURITY:-startTLS}"
@@ -15,7 +15,7 @@ IDLE_SECS="${IDLE_SECS:-20}"
 
 mkdir -p "$DATA" "$LOGDIR"
 export MAILTERNAL_QA=1
-export MAILTERNAL_QA_CERT="${MAILTERNAL_QA_CERT:-$HOME/mailternal-qa/certs/dovecot.crt}"
+export MAILTERNAL_QA_CERT="${MAILTERNAL_QA_CERT:-$HOME/Developer/Worktrees/mailternal-qa/certs/dovecot.crt}"
 export MAILTERNAL_QA_USER="${MAILTERNAL_QA_USER:-qa@mailternal.test}"
 export MAILTERNAL_QA_PASSWORD="${MAILTERNAL_QA_PASSWORD:-qa-password}"
 

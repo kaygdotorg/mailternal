@@ -206,7 +206,7 @@ private enum QAArchive {
     }
 
     static func localUIDs(_ store: MailStore, folder: FolderID, limit: Int) async throws -> [(MessageID, IMAPUID)] {
-        let page = try await store.page(in: folder, after: nil, limit: limit)
+        let page = try await store.page(in: folder, after: nil, limit: limit, sort: .newest)
         var result: [(MessageID, IMAPUID)] = []
         result.reserveCapacity(page.rows.count)
         for row in page.rows {

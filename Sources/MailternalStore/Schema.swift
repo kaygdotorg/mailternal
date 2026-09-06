@@ -12,7 +12,7 @@ enum Schema {
         progress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in },
         openProgress: @escaping @Sendable (String) -> Void = { _ in }
     ) -> DatabaseMigrator {
-        let total = 13
+        let total = 15
         var migrator = DatabaseMigrator()
         migrator.registerMigration("v1_initial") { db in
             progress(1, total, "v1_initial")
@@ -174,6 +174,46 @@ enum Schema {
             try db.execute(
                 sql: "CREATE INDEX folder_rename_queue_send_idx ON folder_rename_queue(enqueued_at, id)"
             )
+        }
+        migrator.registerMigration("v14_list_sort_indexes") { db in
+            progress(14, total, "v14_list_sort_indexes")
+            // Every configurable keyset order has a generation-prefixed index.
+            // SQLite can scan each index in either direction for the requested
+            // ASC/DESC order while retaining the UID tie-breaker.
+            openProgress("sort-index-build-begin")
+            try db.execute(sql: """
+                CREATE INDEX messages_sender_page_idx
+                ON messages(generation_id, from_display, uid)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX messages_subject_page_idx
+                ON messages(generation_id, subject, uid)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX messages_read_page_idx
+                ON messages(generation_id, is_read, uid)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX messages_flagged_page_idx
+                ON messages(generation_id, is_flagged, uid)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX messages_attachments_page_idx
+                ON messages(generation_id, has_attachments, uid)
+                """)
+            openProgress("sort-index-build-end")
+        }
+        migrator.registerMigration("v15_account_link_commands") { db in
+            progress(15, total, "v15_account_link_commands")
+            try db.create(table: "account_link_commands") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("account_id", .text).notNull()
+                    .references("accounts", onDelete: .cascade)
+                t.column("source", .text).notNull()
+                t.column("destination", .text).notNull()
+                t.column("enqueued_at", .double).notNull()
+                t.column("completed_at", .double)
+            }
         }
 
         return migrator

@@ -21,7 +21,7 @@ import Testing
         #expect(byRows.committedCount == 10)
         #expect(byRows.transactionCount == 4) // 3+3+3+1
         #expect(byRows.committedDecodedBytes == 1000)
-        #expect(try await store.page(in: folder, after: nil, limit: 20).rows.count == 10)
+        #expect(try await store.page(in: folder, after: nil, limit: 20, sort: .newest).rows.count == 10)
 
         // Replace same UIDs so we can measure a second ingest split by bytes.
         let byBytes = try await store.upsertMessages(
@@ -43,7 +43,7 @@ import Testing
         )
         #expect(result.transactionCount == 1)
         #expect(result.committedCount == 1)
-        #expect(try await store.page(in: folder, after: nil, limit: 5).rows.count == 1)
+        #expect(try await store.page(in: folder, after: nil, limit: 5, sort: .newest).rows.count == 1)
     }
 }
 

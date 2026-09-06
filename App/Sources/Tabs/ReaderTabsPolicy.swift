@@ -40,12 +40,6 @@ enum ReaderTabsPolicy {
         return Array(tabs.prefix(index + 1))
     }
 
-    /// The last reader-tab close also closes the main window on the same
-    /// command invocation. An empty reader reached by any other route may
-    /// leave the window open, so callers evaluate this after removing a tab.
-    static func shouldCloseWindow(afterClosingTabsRemaining count: Int) -> Bool {
-        count == 0
-    }
 
     static func movedIndex(from oldIndex: Int, to requestedIndex: Int, count: Int) -> Int {
         guard count > 0 else { return 0 }

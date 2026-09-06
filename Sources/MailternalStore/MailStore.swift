@@ -285,6 +285,79 @@ extension MailStore {
         }
     }
 
+    /// Replaces an account's cross-device link identity without changing its
+    /// local account ID or any mailbox/cache rows.
+    ///
+    /// The unique-link check, recovery command, and update share one writer
+    /// transaction. A crash cannot commit a relink without retaining the old
+    /// identity needed to migrate workspace and reader links on the next launch.
+    public func relinkAccount(
+        _ id: AccountID,
+        to accountLinkID: AccountLinkID
+    ) async throws {
+        try await write { db in
+            guard let source = try String.fetchOne(
+                db,
+                sql: "SELECT account_link_id FROM accounts WHERE id = ?",
+                arguments: [id.rawValue]
+            ) else {
+                throw MailStoreError.accountNotFound
+            }
+            guard source != accountLinkID.uuidString else { return }
+            if let existingID = try String.fetchOne(
+                db,
+                sql: "SELECT id FROM accounts WHERE account_link_id = ?",
+                arguments: [accountLinkID.uuidString]
+            ), existingID != id.rawValue {
+                throw MailStoreError.accountLinkIDConflict
+            }
+            try db.execute(
+                sql: """
+                    INSERT INTO account_link_commands
+                    (account_id, source, destination, enqueued_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                arguments: [id.rawValue, source, accountLinkID.uuidString, Date().timeIntervalSince1970]
+            )
+            try db.execute(
+                sql: "UPDATE accounts SET account_link_id = ? WHERE id = ?",
+                arguments: [accountLinkID.uuidString, id.rawValue]
+            )
+        }
+    }
+
+    /// Replays identity commands in commit order, including chains of relinks.
+    public func pendingAccountLinkCommands() async throws -> [AccountLinkCommand] {
+        try await read { db in
+            try Row.fetchAll(
+                db,
+                sql: "SELECT * FROM account_link_commands WHERE completed_at IS NULL ORDER BY id"
+            ).map { row in
+                guard let source = AccountLinkID(uuidString: row["source"]),
+                      let destination = AccountLinkID(uuidString: row["destination"]) else {
+                    throw MailStoreError.invalidAccountLinkCommand
+                }
+                return AccountLinkCommand(
+                    id: row["id"],
+                    accountID: AccountID(rawValue: row["account_id"]),
+                    source: source,
+                    destination: destination
+                )
+            }
+        }
+    }
+
+    /// Retains the completed command log; only unfinished commands are replayed.
+    public func completeAccountLinkCommand(_ id: Int64) async throws {
+        try await write { db in
+            try db.execute(
+                sql: "UPDATE account_link_commands SET completed_at = ? WHERE id = ? AND completed_at IS NULL",
+                arguments: [Date().timeIntervalSince1970, id]
+            )
+        }
+    }
+
+
     public func fetchAccount(_ id: AccountID) async throws -> AccountConfig? {
         try await read { db in
             try MailStore.fetchAccount(db, id: id)

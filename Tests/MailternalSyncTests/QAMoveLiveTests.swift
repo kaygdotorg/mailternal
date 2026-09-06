@@ -258,7 +258,7 @@ private enum QAMoveQA {
         folder: FolderID,
         limit: Int
     ) async throws -> [LocalMessage] {
-        let page = try await store.page(in: folder, after: nil, limit: limit)
+        let page = try await store.page(in: folder, after: nil, limit: limit, sort: .newest)
         var result: [LocalMessage] = []
         result.reserveCapacity(page.rows.count)
         for row in page.rows {

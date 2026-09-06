@@ -62,12 +62,53 @@ enum AddressFormat {
 enum Preview {
     static let maxChars = 200
 
+    /// Produces the same whitespace-normalized prefix as the previous
+    /// split/join implementation, capped in extended grapheme clusters.
     static func make(from body: String?) -> String {
         guard let body, !body.isEmpty else { return "" }
-        let collapsed = body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        if collapsed.count <= maxChars { return collapsed }
-        let end = collapsed.index(collapsed.startIndex, offsetBy: maxChars)
-        return String(collapsed[..<end])
+
+        // Stream normalized words until the bounded preview is complete. This
+        // mirrors `split(whereSeparator: \.isWhitespace).joined(separator: " ")`
+        // while avoiding allocation and traversal of an unneeded body suffix.
+        var preview = ""
+        preview.reserveCapacity(maxChars)
+        var separatorPending = false
+
+        for character in body {
+            if character.isWhitespace {
+                guard !preview.isEmpty else { continue }
+
+                // A separator is only emitted when a following word exists.
+                // Once it would fall beyond the cap, the existing prefix is
+                // already stable and the remaining body cannot affect it.
+                if preview.count >= maxChars {
+                    var candidate = preview
+                    candidate.append(" ")
+                    if candidate.count > maxChars {
+                        return preview
+                    }
+                }
+                separatorPending = true
+                continue
+            }
+
+            if separatorPending {
+                preview.append(" ")
+                separatorPending = false
+                if preview.count > maxChars {
+                    let end = preview.index(preview.startIndex, offsetBy: maxChars)
+                    return String(preview[..<end])
+                }
+            }
+
+            preview.append(character)
+            if preview.count > maxChars {
+                let end = preview.index(preview.startIndex, offsetBy: maxChars)
+                return String(preview[..<end])
+            }
+        }
+
+        return preview
     }
 }
 

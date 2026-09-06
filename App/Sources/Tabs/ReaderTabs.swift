@@ -59,41 +59,106 @@ final class ReaderTabs {
             ?? unique.first?.id
     }
 
+    /// Opens a message and publishes one explicit state-change callback. The
+    /// single-message overload keeps existing callers on the same path as a
     func open(_ message: MessageID, permanent: Bool) {
-        if let existingIndex = tabs.firstIndex(where: { $0.message == message }) {
-            let id = tabs[existingIndex].id
-            let promoted = permanent && tabs[existingIndex].isTransient
-            if promoted {
-                tabs[existingIndex].isTransient = false
-            }
-            activate(id)
-            if promoted { notify() }
-            return
-        }
+        open([message], permanent: permanent)
+    }
 
-        if !permanent, let transientIndex = tabs.firstIndex(where: \.isTransient) {
-            let tab = tabs[transientIndex]
-            tabs[transientIndex].message = message
-            scrollOffsets.removeValue(forKey: tab.id)
-            activate(tab.id)
-            notify()
-            return
+    /// Opens messages in caller-provided order while publishing only once.
+    /// Permanent opens still reuse an existing message tab and promote a
+    /// matching transient in place. Only the final message remains active, so
+    /// callers can open a large selection without repeated persistence or
+    /// reader-surface publication.
+    func open(_ messages: [MessageID], permanent: Bool) {
+        guard !messages.isEmpty else { return }
+        var state = OpenState(
+            tabs: tabs,
+            activeID: activeID,
+            mruIDs: mruIDs,
+            scrollOffsets: scrollOffsets
+        )
+        var changed = false
+        for message in messages {
+            changed = Self.openWithoutNotify(
+                message,
+                permanent: permanent,
+                state: &state
+            ) || changed
         }
-
-        let tab = ReaderTab(id: UUID(), message: message, isTransient: !permanent)
-        let index = ReaderTabsPolicy.insertionIndex(in: tabs, activeID: activeID, id: \.id)
-        tabs.insert(tab, at: index)
-        activeID = tab.id
-        touchMRU(tab.id)
+        guard changed else { return }
+        tabs = state.tabs
+        activeID = state.activeID
+        mruIDs = state.mruIDs
+        scrollOffsets = state.scrollOffsets
         notify()
     }
 
-    func activate(_ id: UUID) {
-        guard tabs.contains(where: { $0.id == id }) else { return }
+    private struct OpenState {
+        var tabs: [ReaderTab]
+        var activeID: UUID?
+        var mruIDs: [UUID]
+        var scrollOffsets: [UUID: CGFloat]
+    }
+
+    private static func openWithoutNotify(
+        _ message: MessageID,
+        permanent: Bool,
+        state: inout OpenState
+    ) -> Bool {
+        if let existingIndex = state.tabs.firstIndex(where: { $0.message == message }) {
+            let id = state.tabs[existingIndex].id
+            let promoted = permanent && state.tabs[existingIndex].isTransient
+            if promoted {
+                state.tabs[existingIndex].isTransient = false
+            }
+            let activated = activateWithoutNotify(id, state: &state)
+            return promoted || activated
+        }
+
+        if !permanent, let transientIndex = state.tabs.firstIndex(where: \.isTransient) {
+            let tab = state.tabs[transientIndex]
+            state.tabs[transientIndex].message = message
+            state.scrollOffsets.removeValue(forKey: tab.id)
+            _ = activateWithoutNotify(tab.id, state: &state)
+            return true
+        }
+
+        let tab = ReaderTab(id: UUID(), message: message, isTransient: !permanent)
+        let index = ReaderTabsPolicy.insertionIndex(
+            in: state.tabs,
+            activeID: state.activeID,
+            id: \.id
+        )
+        state.tabs.insert(tab, at: index)
+        state.activeID = tab.id
+        state.mruIDs.removeAll { $0 == tab.id }
+        state.mruIDs.insert(tab.id, at: 0)
+        return true
+    }
+
+    private static func activateWithoutNotify(
+        _ id: UUID,
+        state: inout OpenState
+    ) -> Bool {
+        guard state.tabs.contains(where: { $0.id == id }) else { return false }
+        let changed = state.activeID != id || state.mruIDs.first != id
+        state.activeID = id
+        state.mruIDs.removeAll { $0 == id }
+        state.mruIDs.insert(id, at: 0)
+        return changed
+    }
+
+    private func activateWithoutNotify(_ id: UUID) -> Bool {
+        guard tabs.contains(where: { $0.id == id }) else { return false }
         let changed = activeID != id || mruIDs.first != id
         activeID = id
         touchMRU(id)
-        if changed { notify() }
+        return changed
+    }
+
+    func activate(_ id: UUID) {
+        if activateWithoutNotify(id) { notify() }
     }
 
     func close(_ id: UUID) {

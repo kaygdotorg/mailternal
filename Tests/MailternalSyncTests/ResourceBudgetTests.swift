@@ -86,6 +86,89 @@ import MailternalStore
         #expect(requests.contains { $0.length == SyncPolicy.backfillTextPeekByteLimit })
         #expect(requests.filter { $0.specifier.uppercased() == "HEADER" }.allSatisfy { ($0.length ?? 0) <= SyncPolicy.backfillHeaderPeekByteLimit })
         #expect(requests.filter { $0.specifier.uppercased() != "HEADER" }.allSatisfy { ($0.length ?? 0) <= SyncPolicy.backfillTextPeekByteLimit })
+        let peekRanges = world.peekRequestUIDRangeSnapshot()
+        let responseLimits = world.peekRequestResponseLimitSnapshot()
+        #expect(responseLimits.count == world.peekRequestSnapshot().count)
+        #expect(responseLimits.allSatisfy {
+            guard let limit = $0 else { return false }
+            return limit > 0 && limit <= SyncPolicy.backfillWindowPeekByteBudget
+        })
+        for (sections, ranges) in zip(world.peekRequestSnapshot(), peekRanges) {
+            let perUID = sections.reduce(UInt64(0)) { $0 + UInt64(max(0, $1.length ?? 0)) }
+            let uidCount = ranges.reduce(UInt64(0)) {
+                $0 + UInt64($1.upperBound) - UInt64($1.lowerBound) + 1
+            }
+            #expect(perUID * uidCount <= UInt64(SyncPolicy.backfillWindowPeekByteBudget))
+        }
+        await engine.stop()
+    }
+}
+
+@Test func interleavedMIMEShapesShareCompatiblePeekFetches() async throws {
+    try await withSyncStore { store, dir in
+        var mailbox = populatedInbox(uidValidity: 1, count: 4, prefix: "layout")
+        for uid in UInt32(1)...UInt32(4) where uid.isMultiple(of: 2) {
+            var message = makePlainMessage(uid: uid, subject: "multipart-\(uid)")
+            let plain = IMAPBodyStructure(
+                partSpecifier: "1",
+                type: "text",
+                subtype: "plain",
+                encoding: "7bit",
+                octetCount: uid == 2 ? 5 : 8,
+                charset: "utf-8",
+                filename: nil,
+                contentID: nil,
+                children: []
+            )
+            let html = IMAPBodyStructure(
+                partSpecifier: "2",
+                type: "text",
+                subtype: "html",
+                encoding: "7bit",
+                octetCount: uid == 2 ? 12 : 15,
+                charset: "utf-8",
+                filename: nil,
+                contentID: nil,
+                children: []
+            )
+            message.structure = IMAPBodyStructure(
+                partSpecifier: "",
+                type: "multipart",
+                subtype: "alternative",
+                encoding: nil,
+                octetCount: nil,
+                charset: nil,
+                filename: nil,
+                contentID: nil,
+                children: [plain, html]
+            )
+            message.parts = [
+                "1": Data("plain".utf8),
+                "2": Data("<p>html</p>".utf8),
+            ]
+            mailbox.messages[uid] = message
+        }
+        let world = ScriptedWorld(
+            capabilities: basicCaps(),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": mailbox]
+        )
+        let (engine, _) = makeEngine(store: store, world: world, dir: dir, window: 4)
+        await engine.start()
+        try await waitUntil(timeout: .seconds(8)) {
+            try await store.fetchFolders(account: sampleConfig().id)
+                .contains { $0.role == .inbox && $0.backfill == .complete }
+        }
+        #expect(world.peekRequestSnapshot().count == 2)
+        let folder = try #require(await inboxFolder(store))
+        let page = try await store.page(in: folder.id, after: nil, limit: 10, sort: .newest)
+        #expect(page.rows.map(\.subject) == [
+            "multipart-4", "layout-3", "multipart-2", "layout-1",
+        ])
+        for row in page.rows where row.subject.hasPrefix("multipart-") {
+            let detail = try await store.detail(row.id)
+            #expect(detail.bodyText != nil)
+        }
         await engine.stop()
     }
 }

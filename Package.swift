@@ -3,12 +3,15 @@ import PackageDescription
 
 let package = Package(
     name: "MailternalCore",
-    platforms: [.macOS(.v15)], // app target enforces macOS 26; package floor kept lower for Linux/CI parity
+    platforms: [.macOS(.v15), .iOS("26.0"), .watchOS("26.0")],
     products: [
         .library(name: "MailternalCore", targets: [
             "MailternalInterfaces", "MailternalIMAP", "MailternalMIME",
             "MailternalStore", "MailternalSanitizer", "MailternalSync",
         ]),
+        .library(name: "MailternalCompanion", targets: ["MailternalCompanion"]),
+        .library(name: "MailternalWorkspace", targets: ["MailternalWorkspace"]),
+        .library(name: "MailternalPairing", targets: ["MailternalPairing"]),
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
@@ -19,6 +22,11 @@ let package = Package(
     ],
     targets: [
         .target(name: "MailternalInterfaces"),
+        .target(name: "MailternalCompanion"),
+        .target(name: "MailternalWorkspace", dependencies: ["MailternalInterfaces"]),
+        .target(name: "MailternalPairing", dependencies: [
+            "MailternalInterfaces", "MailternalWorkspace",
+        ]),
         .target(name: "MailternalIMAP", dependencies: [
             "MailternalInterfaces",
             .product(name: "NIO", package: "swift-nio"),
@@ -47,6 +55,7 @@ let package = Package(
         .testTarget(name: "MailternalMIMETests", dependencies: ["MailternalMIME"],
                     resources: [.copy("Corpus")]),
         .testTarget(name: "MailternalStoreTests", dependencies: ["MailternalStore"]),
+        .testTarget(name: "MailternalCompanionTests", dependencies: ["MailternalCompanion"]),
         .testTarget(name: "MailternalSanitizerTests", dependencies: ["MailternalSanitizer"]),
         .testTarget(name: "MailternalSyncTests", dependencies: [
             "MailternalSync", "MailternalStore", "MailternalIMAP", "MailternalInterfaces",
@@ -56,6 +65,9 @@ let package = Package(
 
 #if os(macOS)
 package.targets.append(contentsOf: [
+    .testTarget(name: "MailternalWorkspaceTests", dependencies: [
+        "MailternalWorkspace", "MailternalInterfaces",
+    ]),
     .target(
         name: "MailternalLive",
         dependencies: [
@@ -82,6 +94,14 @@ package.targets.append(contentsOf: [
             "MailternalIMAP",
             "MailternalSync",
             "MailternalStore",
+        ]
+    ),
+    .testTarget(
+        name: "MailternalPairingTests",
+        dependencies: [
+            "MailternalPairing",
+            "MailternalInterfaces",
+            "MailternalWorkspace",
         ]
     ),
 ])

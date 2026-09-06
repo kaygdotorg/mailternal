@@ -1,5 +1,12 @@
 # Mailternal — agent ground rules
 
+- **Commits go to `dev`.** Verify the current branch before every commit.
+  `main` is reserved for stable releases; promote verified changes there only
+  with explicit user approval, never as part of routine development.
+- **Keep secrets out of Git.** Before every commit, inspect all staged paths and
+  the complete staged diff for credentials, tokens, private/signing keys, private
+  configuration, and real account data. Run an available secret scanner with
+  redacted output; `.gitignore` alone is not proof that a commit is safe.
 - Read `docs/spec/*.md` and `DECISIONS.md` before changing behavior; `design.md` is
   the sole authority on how anything looks or feels.
 - **Documentation lives next to the code it describes.** A behavior change without the
@@ -12,6 +19,9 @@
   call the store from a view.
 - Builds and tests run on the remote Mac (`Scripts/build-mbp.sh`); the Linux host has
   no Swift toolchain. Use `rtk` and `code-review-graph` for reading and navigation.
+- On `mbp`, actual repository roots live under `/Users/agents/Developer`; worktrees
+  and isolated build copies live under `/Users/agents/Developer/Worktrees`.
+  The QA VM is owned and launched by `kayg`, not `agents`.
 - Never touch the `kayg` user's session or `/Users/Shared/Mailternal` without being
   asked; QA instances use their own containers.
 - **UI QA on mbp runs through CuaDriver** (`/Applications/CuaDriver.app/Contents/MacOS/cua-driver`,
@@ -20,7 +30,7 @@
   trees, screenshots (`get_desktop_state {"screenshot_out_file": …}`). Do not use `screencapture`
   from an SSH context for WebKit content and never ask for `automationmodetool`/TCC changes.
 - Use the deployed bundle or your own chunk build; own QA container per agent
-  (`cp -R ~/mailternal-qa-ReaderIslands ~/mailternal-qa-<agent>`); announce server mutations on
+  (`cp -R ~/Developer/Worktrees/mailternal-qa-ReaderIslands ~/Developer/Worktrees/mailternal-qa-<agent>` on `agents@mbp`); announce server mutations on
   hub; restore what you move.
 - **Launch timing**: `MAILTERNAL_QA=1 Mailternal -qa-account … -qa-gui` prints `launch phase=<name> t=<ms since exec>` for app-init, did-finish-launching, shell-show-begin/end, window-front, first-frame, folders-snapshot, first-rows, settled-frame, plus store-open subphases (`store-pool-open-*`, `store-pragmas-*`, `store-migrator-*`, `store-index-build-*`, `store-checkpoint-skipped`, `store-first-queries-*`). `first-frame` is the first Core Animation transaction completion after `orderFront`; `settled-frame` is the first Core Animation commit after both folders and rows are ready. The older `first-page ready` line is a 2 s poller and is not a launch metric. `vm-qa.sh launch-release` runs the Release app selected by `APP` (default `~/mailternal/Mailternal-release.app`).
 - **QA IMAP server** is the Dovecot on mbp itself: `-qa-account 127.0.0.1 1143 startTLS`

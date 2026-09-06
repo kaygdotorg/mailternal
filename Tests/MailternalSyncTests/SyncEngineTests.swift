@@ -87,7 +87,7 @@ private func nextMailEvent(
         #expect(state.baselineUID?.rawValue == 3)
         #expect(try await store.search("alpha", limit: 5).count == 1)
         #expect(try await store.search("gamma", limit: 5).count == 1)
-
+        let sweepsBeforeAppend = world.snapshotFlagSweepRanges().count
         world.updateMailbox("INBOX") { live in
             live.messages[4] = makePlainMessage(uid: 4, subject: "new", body: "delta live")
             live.uidNext = 5
@@ -102,6 +102,8 @@ private func nextMailEvent(
         try await waitUntil(timeout: .seconds(5)) {
             try await store.search("delta", limit: 5).count == 1
         }
+        // QRESYNC's UIDNEXT advance is an append, not proof of an expunge.
+        #expect(world.snapshotFlagSweepRanges().count == sweepsBeforeAppend)
         let event = try await nextMailEvent(from: firstEvent, timeout: .seconds(2))
         #expect(event.subject == "new")
         #expect(event.folder == inbox.id)
@@ -213,7 +215,7 @@ private func nextMailEvent(
             } && summaries.contains { $0.path == allMailPath }
         }
         let inboxFolder = try #require(await inboxFolder(store))
-        let firstPage = try await store.page(in: inboxFolder.id, after: nil, limit: 10)
+        let firstPage = try await store.page(in: inboxFolder.id, after: nil, limit: 10, sort: .newest)
         let message = try #require(firstPage.rows.first)
         let generation = try #require(await store.liveGeneration(for: inboxFolder.id))
         let initialState = try #require(await store.fetchSyncState(for: generation))
@@ -226,7 +228,7 @@ private func nextMailEvent(
         }
         await engine.refreshNow()
         try await waitUntil(timeout: .seconds(5)) {
-            let page = try await store.page(in: inboxFolder.id, after: nil, limit: 10)
+            let page = try await store.page(in: inboxFolder.id, after: nil, limit: 10, sort: .newest)
             let state = try await store.fetchSyncState(for: generation)
             return page.rows.first?.isRead == true && state?.deltaPath == .condstore
         }
@@ -280,7 +282,7 @@ private func nextMailEvent(
         }
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
-        let page = try await store.page(in: inbox.id, after: nil, limit: 10)
+        let page = try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest)
         #expect(page.rows.count == 2)
         await engine.stop()
     }
@@ -474,7 +476,7 @@ private func nextMailEvent(
         }
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
-        let page = try await store.page(in: inbox.id, after: nil, limit: 1)
+        let page = try await store.page(in: inbox.id, after: nil, limit: 1, sort: .newest)
         let id = try #require(page.rows.first?.id)
         let url = try await engine.fetchPart(message: id, part: "1")
         let bytes = try Data(contentsOf: url)
@@ -509,7 +511,7 @@ private func nextMailEvent(
         }
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
-        let page = try await store.page(in: inbox.id, after: nil, limit: 1)
+        let page = try await store.page(in: inbox.id, after: nil, limit: 1, sort: .newest)
         let id = try #require(page.rows.first?.id)
 
         let caches = dir.appendingPathComponent("Caches", isDirectory: true)
@@ -568,7 +570,7 @@ private func nextMailEvent(
         }
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
-        let page = try await store.page(in: inbox.id, after: nil, limit: 1)
+        let page = try await store.page(in: inbox.id, after: nil, limit: 1, sort: .newest)
         let id = try #require(page.rows.first?.id)
         let ref = try #require(await store.messageRef(id))
         let oldGeneration = ref.generation
@@ -619,14 +621,59 @@ private func nextMailEvent(
     }
 }
 
-@Test func engineIngestsOfflineMailOnReconnectWithoutRefetchingHistory() async throws {
+@Test(arguments: [
+    ["IMAP4REV1", "IDLE", "CONDSTORE"],
+    ["IMAP4REV1", "IDLE", "CONDSTORE", "QRESYNC", "ENABLE"],
+])
+func engineReconcilesOfflineFlagsWithoutUIDNEXTChange(_ tokens: [String]) async throws {
+    try await withSyncStore { store, dir in
+        var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 2, highestModSeq: 1)
+        box.messages[1] = makePlainMessage(uid: 1, subject: "cached", modSeq: 1)
+        let world = ScriptedWorld(
+            capabilities: IMAPCapabilities(tokens: tokens),
+            folders: [inboxMailbox()],
+            mailboxes: ["INBOX": box]
+        )
+        let first = makeEngine(store: store, world: world, dir: dir).0
+        await first.start()
+        try await waitUntil(timeout: .seconds(5)) {
+            try await store.fetchFolders(account: sampleConfig().id)
+                .contains { $0.role == .inbox && $0.backfill == .complete && $0.totalCount == 1 }
+        }
+        await first.stop()
+        world.updateMailbox("INBOX") { live in
+            live.messages[1]?.flags = ["\\Seen"]
+            live.messages[1]?.modSeq = 2
+            live.highestModSeq = 2
+        }
+        let second = makeEngine(store: store, world: world, dir: dir).0
+        await second.start()
+        do {
+            try await waitUntil(timeout: .seconds(3)) {
+                try await store.fetchFolders(account: sampleConfig().id)
+                    .contains { $0.role == .inbox && $0.totalCount == 1 && $0.unreadCount == 0 }
+            }
+        } catch {
+            await second.stop()
+            throw error
+        }
+        await second.stop()
+    }
+}
+
+@Test(arguments: [
+    ["IMAP4REV1", "IDLE"],
+    ["IMAP4REV1", "IDLE", "CONDSTORE"],
+    ["IMAP4REV1", "IDLE", "CONDSTORE", "QRESYNC", "ENABLE"],
+])
+func engineIngestsOfflineMailOnReconnectWithoutRefetchingHistory(_ tokens: [String]) async throws {
     try await withSyncStore { store, dir in
         var box = ScriptedMailbox(path: "INBOX", uidValidity: 1, uidNext: 4, highestModSeq: 4)
-        box.messages[1] = makePlainMessage(uid: 1, subject: "old-1", body: "alpha")
-        box.messages[2] = makePlainMessage(uid: 2, subject: "old-2", body: "beta")
-        box.messages[3] = makePlainMessage(uid: 3, subject: "old-3", body: "gamma")
+        box.messages[1] = makePlainMessage(uid: 1, subject: "old-1", body: "alpha", modSeq: 3)
+        box.messages[2] = makePlainMessage(uid: 2, subject: "old-2", body: "beta", modSeq: 3)
+        box.messages[3] = makePlainMessage(uid: 3, subject: "old-3", body: "gamma", modSeq: 3)
         let world = ScriptedWorld(
-            capabilities: basicCaps(),
+            capabilities: IMAPCapabilities(tokens: tokens),
             folders: [inboxMailbox()],
             mailboxes: ["INBOX": box]
         )
@@ -650,6 +697,8 @@ private func nextMailEvent(
         await first.stop()
 
         world.updateMailbox("INBOX") { live in
+            live.messages[1]?.flags = ["\\Seen"]
+            live.messages[1]?.modSeq = 7
             live.messages[4] = makePlainMessage(uid: 4, subject: "offline", body: "delta live")
             live.uidNext = 5
             live.highestModSeq = 8
@@ -666,6 +715,7 @@ private func nextMailEvent(
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
         #expect(inbox.totalCount == 4)
+        #expect(inbox.unreadCount == 3)
         await second.stop()
 
     }
@@ -763,7 +813,7 @@ private func nextMailEvent(
         }
         let folders = try await store.fetchFolders(account: sampleConfig().id)
         let inbox = try #require(folders.first { $0.role == .inbox })
-        let page = try await store.page(in: inbox.id, after: nil, limit: 10)
+        let page = try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest)
         #expect(page.rows.map(\.subject) == ["keep"])
         await engine.stop()
     }
@@ -869,10 +919,7 @@ private func nextMailEvent(
         )
         // Window 5...6 commits; the next metadata FETCH throws CancellationError
         // mid-window 3...4. Cursor must stay at 5 so resume cannot skip 3...4.
-        // Each message's bounded body sections share one FETCH, so the first
-        // window consumes three requests before the second metadata FETCH.
-        world.fetchError = CancellationError()
-        world.fetchErrorAfter = 4
+        world.cancelMetadataFetchContainingUID = 4
 
         let disk = FixedDisk(
             freeBytes: 50 * 1024 * 1024 * 1024,
@@ -893,10 +940,13 @@ private func nextMailEvent(
         let first = makeEngine()
         await first.start()
         try await waitUntil(timeout: .seconds(5)) {
-            try await store.fetchFolders(account: sampleConfig().id)
-                .contains { $0.role == .inbox && $0.totalCount >= 2 }
+            guard let inbox = try await store.fetchFolders(account: sampleConfig().id)
+                .first(where: { $0.role == .inbox }),
+                let generation = try await store.liveGeneration(for: inbox.id)
+            else { return false }
+            return try await store.fetchSyncState(for: generation)?.lowWaterUID?.rawValue == 5
         }
-        try await waitUntil(timeout: .seconds(2)) { world.snapshotFetchCount() >= 2 }
+        try await waitUntil(timeout: .seconds(2)) { world.didCancelMetadataFetch() }
         await first.stop()
 
         let folders = try await store.fetchFolders(account: sampleConfig().id)
@@ -1051,7 +1101,7 @@ private func nextMailEvent(
     }
     let folders = try await store.fetchFolders(account: sampleConfig().id)
     let inbox = try #require(folders.first { $0.role == .inbox })
-    let page = try await store.page(in: inbox.id, after: nil, limit: 10)
+    let page = try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest)
     let idA = try #require(page.rows.first { $0.subject == "a" }?.id)
     let idB = try #require(page.rows.first { $0.subject == "b" }?.id)
     let urlA = try await engine.fetchPart(message: idA, part: "1")
@@ -1266,7 +1316,7 @@ func staleQuarantineFallbackCannotResurrectExpungedUID(
         let authoritative = world.mailbox("INBOX")
         await engine.stop()
 
-        let page = try await store.page(in: inbox.id, after: nil, limit: 10)
+        let page = try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest)
         #expect(authoritative.exists == 2)
         #expect(authoritative.uidNext == 4)
         #expect(authoritative.messages.keys.sorted() == [1, 3])
@@ -1340,7 +1390,7 @@ func staleQuarantineFallbackCannotResurrectExpungedUID(
         let state = try #require(await store.fetchSyncState(for: generation))
         #expect(state.lowWaterUID == nil)
         #expect(try await store.uids(in: generation).isEmpty)
-        #expect(try await store.page(in: inbox.id, after: nil, limit: 10).rows.isEmpty)
+        #expect(try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest).rows.isEmpty)
         try await assertStoreInvariants(store)
     }
 }

@@ -31,6 +31,9 @@ final class ScriptedWorld: @unchecked Sendable {
     var connectAttempts = 0
     var fetchError: Error?
     var fetchErrorAfter: Int?
+    /// One-shot cancellation keyed to a metadata UID, independent of batching.
+    var cancelMetadataFetchContainingUID: UInt32?
+    private var cancelledMetadataFetch = false
     /// Metadata FETCHes containing one of these UIDs fail with a parse error
     /// and poison the scripted session, matching the real parser behavior.
     var parseFailingUIDs: Set<UInt32> = []
@@ -49,7 +52,10 @@ final class ScriptedWorld: @unchecked Sendable {
     var metadataFetchRanges: [[ClosedRange<UInt32>]] = []
     var metadataFetchPaths: [String] = []
     var peekRequests: [[IMAPPeekSection]] = []
+    var peekRequestUIDRanges: [[ClosedRange<UInt32>]] = []
+    var peekRequestResponseLimits: [Int?] = []
     var flagFetchRanges: [[ClosedRange<UInt32>]] = []
+    var flagSweepRanges: [[ClosedRange<UInt32>]] = []
     /// Pauses the first metadata FETCH after capturing its mailbox snapshot.
     /// Tests use this to interleave a deterministic expunge revision.
     var pauseMetadataFetch = false
@@ -336,15 +342,30 @@ final class ScriptedWorld: @unchecked Sendable {
         }
         if !request.peek.isEmpty {
             peekRequests.append(request.peek)
+            peekRequestUIDRanges.append(request.uids.ranges)
+            peekRequestResponseLimits.append(request.maximumResponseBytes)
         }
         if request.flags && !request.envelope && !request.bodyStructure && request.peek.isEmpty {
             flagFetchRanges.append(request.uids.ranges)
+            if request.changedSince == nil {
+                flagSweepRanges.append(request.uids.ranges)
+            }
         }
     }
     func peekRequestSnapshot() -> [[IMAPPeekSection]] {
         lock.lock()
         defer { lock.unlock() }
         return peekRequests
+    }
+    func peekRequestUIDRangeSnapshot() -> [[ClosedRange<UInt32>]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return peekRequestUIDRanges
+    }
+    func peekRequestResponseLimitSnapshot() -> [Int?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return peekRequestResponseLimits
     }
     func metadataFetchSnapshotIfPaused(
         path: String
@@ -561,10 +582,16 @@ final class ScriptedWorld: @unchecked Sendable {
         defer { lock.unlock() }
         return flagFetchRanges
     }
+    func snapshotFlagSweepRanges() -> [[ClosedRange<UInt32>]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return flagSweepRanges
+    }
 
     func resetFlagFetchRanges() {
         lock.lock()
         flagFetchRanges = []
+        flagSweepRanges = []
         lock.unlock()
     }
 
@@ -604,10 +631,17 @@ final class ScriptedWorld: @unchecked Sendable {
         return IMAPError.parse("scripted payload too large for UID \(uid)")
     }
 
-    func beginFetch() -> Error? {
+    func beginFetch(_ request: IMAPFetchRequest) -> Error? {
         lock.lock()
         defer { lock.unlock() }
         fetchCount += 1
+        if let uid = cancelMetadataFetchContainingUID,
+           request.envelope || request.bodyStructure,
+           request.uids.ranges.contains(where: { $0.contains(uid) }) {
+            cancelMetadataFetchContainingUID = nil
+            cancelledMetadataFetch = true
+            return CancellationError()
+        }
         let error: Error?
         if let after = fetchErrorAfter {
             if fetchCount >= after, let configured = fetchError {
@@ -624,6 +658,12 @@ final class ScriptedWorld: @unchecked Sendable {
         activeFetches += 1
         maxConcurrentFetches = max(maxConcurrentFetches, activeFetches)
         return nil
+    }
+
+    func didCancelMetadataFetch() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelledMetadataFetch
     }
     func noteFetchCompleted() {
         lock.lock()
@@ -815,7 +855,7 @@ actor ScriptedIMAPClient: IMAPClient {
 
     func fetch(_ request: IMAPFetchRequest) async throws -> [IMAPFetchedMessage] {
         try ensureOpen()
-        if let error = world.beginFetch() { throw error }
+        if let error = world.beginFetch(request) { throw error }
         world.noteFetch(request, path: selectedPath ?? "")
         if let error = world.metadataParseFailure(request) {
             world.noteFetchCompleted()
@@ -1296,7 +1336,7 @@ func pageSubjects(_ store: MailStore, folder: FolderID, limit: Int = 200) async 
     var subjects: [String] = []
     var seenIDs: Set<Int64> = []
     repeat {
-        let page = try await store.page(in: folder, after: cursor, limit: limit)
+        let page = try await store.page(in: folder, after: cursor, limit: limit, sort: .newest)
         for row in page.rows {
             if !seenIDs.insert(row.id.rawValue).inserted {
                 throw InvariantFailure(issues: ["duplicate page row \(row.id.rawValue)"])

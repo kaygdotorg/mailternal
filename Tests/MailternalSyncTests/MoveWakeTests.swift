@@ -49,7 +49,7 @@ func enqueuedMoveDrainsOnRefreshWithoutPeriodicTick() async throws {
         }
         let inboxFolderSummary = try #require(await inboxFolder(store))
         let message = try #require(
-            try await store.page(in: inboxFolderSummary.id, after: nil, limit: 10).rows.first
+            try await store.page(in: inboxFolderSummary.id, after: nil, limit: 10, sort: .newest).rows.first
         )
         let destination = try #require(
             try await store.fetchFolders(account: sampleConfig().id)
@@ -141,7 +141,7 @@ func moveWakePreemptsConcurrentBackfill() async throws {
         )
         _ = try await store.upsertMessages([seed])
         let message = try #require(
-            try await store.page(in: inbox.id, after: nil, limit: 10).rows.first
+            try await store.page(in: inbox.id, after: nil, limit: 10, sort: .newest).rows.first
         )
         let destination = try #require(
             try await store.fetchFolders(account: sampleConfig().id)
@@ -165,13 +165,17 @@ func moveWakePreemptsConcurrentBackfill() async throws {
         #expect((archiveFetches.first ?? .max) - fetchesAtWake <= 1)
         world.releaseMetadataFetch()
         await wake.value
+        try await waitUntil(timeout: .seconds(3)) {
+            let moving = await activityLog.movingFolders()
+            return moving.contains(inbox.id) && moving.contains(destination.id)
+        }
 
 
         try await waitUntil(timeout: .seconds(5), poll: .milliseconds(20)) {
             let rows = try await store.page(
                 in: destination.id,
                 after: nil,
-                limit: 10
+                limit: 10, sort: .newest
             ).rows
             return !rows.isEmpty
         }
@@ -184,12 +188,20 @@ func moveWakePreemptsConcurrentBackfill() async throws {
 }
 private actor ActivityLog {
     private var latest: [FolderID: FolderActivity] = [:]
+    private var observedMoving: Set<FolderID> = []
 
     func record(_ update: FolderActivityUpdate) {
         latest[update.folder] = update.activity
+        if update.activity == .moving {
+            observedMoving.insert(update.folder)
+        }
     }
 
     func snapshot() -> [FolderID: FolderActivity] {
         latest
+    }
+
+    func movingFolders() -> Set<FolderID> {
+        observedMoving
     }
 }

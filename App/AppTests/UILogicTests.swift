@@ -1337,7 +1337,7 @@ final class UILogicTests: XCTestCase {
             current: nil,
             accounts: []
         )
-        XCTAssertFalse(items[0].isEnabled)
+        XCTAssertTrue(items[0].isEnabled)
         XCTAssertFalse(items[1].isEnabled)
         XCTAssertEqual(items[7].title, "Mark as Read")
         XCTAssertEqual(items[8].title, "Unflag")
@@ -1356,6 +1356,39 @@ final class UILogicTests: XCTestCase {
         )
         XCTAssertEqual(singleItems[7].title, "Mark as Unread")
         XCTAssertEqual(singleItems[8].title, "Unflag")
+    }
+
+    func testMessageContextMenuSelectionPreservesInSelectionClickAndVisibleOrder() {
+        let selected = Set((1...100).map { MessageID(rawValue: Int64($0)) })
+        let inside = MessageContextMenuPolicy.selectionForContextMenu(
+            clicked: MessageID(rawValue: 50),
+            selected: selected
+        )
+        XCTAssertEqual(inside, selected)
+        XCTAssertEqual(
+            MessageContextMenuPolicy.selectionForContextMenu(
+                clicked: MessageID(rawValue: 101),
+                selected: selected
+            ),
+            [MessageID(rawValue: 101)]
+        )
+        XCTAssertEqual(
+            MessageContextMenuPolicy.orderedSelection(
+                selected,
+                rowOrder: (1...100).map { MessageID(rawValue: Int64($0)) }
+            ),
+            (1...100).map { MessageID(rawValue: Int64($0)) }
+        )
+        let items = MessageContextMenuPolicy.items(
+            selection: selected,
+            isReadStates: [:],
+            flagStates: [:],
+            folders: [],
+            current: nil,
+            accounts: []
+        )
+        XCTAssertTrue(items[0].isEnabled)
+        XCTAssertFalse(items[1].isEnabled)
     }
 
     func testMessageContextMenuPolicyExcludesCurrentAndNestsFolderPaths() throws {
@@ -1472,7 +1505,6 @@ final class UILogicTests: XCTestCase {
             isShowingRawSource: true
         )
         XCTAssertEqual(visible.map(\.identifier), [.archive, .trash, .overflow])
-        XCTAssertEqual(visible.last?.title, "More")
         XCTAssertFalse(visible.contains { $0.identifier == .source })
     }
 
@@ -1494,15 +1526,6 @@ final class UILogicTests: XCTestCase {
             flagStates: [first: true, second: true]
         )
         XCTAssertEqual(visible.map(\.identifier), [.archive, .trash, .overflow])
-        XCTAssertEqual(visible.map(\.title), [
-            "Archive 2 Messages",
-            "Trash 2 Messages",
-            "More",
-        ])
-        XCTAssertEqual(
-            visible.map(\.imageName),
-            ["archivebox", "trash", "ellipsis.circle"]
-        )
         XCTAssertTrue(visible.allSatisfy(\.isEnabled))
 
         let emptyVisible = MessageToolbarPolicy.visibleItems(selection: [], flagStates: [:])

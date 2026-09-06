@@ -1,8 +1,9 @@
 # Mailternal — Product Spec
 
 ## What
-A first-class Apple-native mail client for macOS and iOS/iPadOS, plus a CLI and a
-self-hostable push daemon (`mailternald`). No other platforms, ever.
+A first-class Apple-native mail client for macOS and iOS/iPadOS, an iPhone-companion
+watchOS app, plus a CLI and a self-hostable push daemon (`mailternald`).
+No other platforms, ever.
 
 Top priorities, in order: **performance, aesthetics, polish**. Mailternal follows the
 design language captured in `docs/spec/design.md` (derived from Hermternal); when in
@@ -30,7 +31,7 @@ design.md** (window shell, settings split view, virtualized message list). Where
 two documents appear to conflict, design.md governs UI architecture.
 
 ## Account scope
-- v0.0.1: exactly **one IMAP account**.
+- v0.0.1 preserves the current macOS multi-account functionality as the parity baseline.
 - Accounts can be disabled; disabling stops the engine and hides folders while retaining settings and the saved password.
 - Providers: generic IMAP, iCloud and Fastmail via app-specific passwords, plus
   Gmail via Google App Password (2-Step Verification required; setup guidance
@@ -40,8 +41,9 @@ two documents appear to conflict, design.md governs UI architecture.
   no Mailternal-owned OAuth client or web-session/scraping path. Exchange: never.
 - Account setup: manual host/port/TLS entry + provider presets (a plist, not a
   discovery subsystem). Full Thunderbird-autoconfig/RFC 6186 later.
-- **SMTP is collected only with the composer milestone (M5)**; presets may carry
-  dormant non-secret SMTP defaults until then.
+- **SMTP configuration arrives with the composer milestone (M5)**, which is
+  required before 0.0.1 can ship; presets may carry dormant non-secret defaults
+  until implementation.
 - **Transport**: implicit TLS or mandatory STARTTLS with hostname + system-trust
   validation; no insecure fallback, no plaintext auth outside TLS; capabilities
   re-fetched after STARTTLS and after auth. The Linux core enforces the same rules
@@ -68,6 +70,17 @@ swipe actions, Settings → Actions → Gestures) → reader as three floating i
   system default handler; it MUST NOT navigate the reader. A link context menu
   MUST provide only **Open Link** and **Copy Link**, while retaining text-selection
   actions such as **Copy**, **Look Up**, and **Services** when text is selected.
+- **Rapid reader navigation**: Up/Down selection MUST remain immediate. Reuse
+  prepared local details and coalesce duplicate in-flight detail reads; warm a
+  bounded adjacent-message window without marking prefetched mail read or
+  requesting raw messages, attachments, or remote images. Superseded work MUST
+  NOT replace the current selection's content. Do not debounce selection, delay
+  the loading indicator, or display an old message under a new message's header
+  to conceal load latency.
+- **Header enrichment**: ordinary reading uses the stored envelope immediately.
+  Fetch full raw headers only on explicit expanded/raw-header demand, not merely
+  to populate a Delivered date during list navigation. Preserve already-loaded
+  enrichment; a Delivered date is shown only when its real source is available.
 - Live updates via in-app IMAP IDLE + macOS local notifications (no daemon needed on
   macOS). Notifications fire only for post-activation mail — never from backfill
   (baseline rule in sync.md).
@@ -107,6 +120,15 @@ messages open in that reader; detached message windows MUST remain tab-less.
   place. `open` MUST NOT create a duplicate or change an unrelated transient
   tab. Promoting a transient MUST keep its `TabID`, position, reader scroll, and
   message, and only clear `isTransient`.
+- Choosing **Open in New Tab** from a message-list context menu MUST open every
+  selected message as a permanent tab in visible list order. A click on a row
+  already in the selection MUST preserve the full selection; a click outside it
+  MUST target only that row. Existing tabs MUST be reused (and matching
+  transients promoted in place), without duplicate message tabs. The final
+  message in visible order becomes the single active tab while the list
+  selection remains intact. The batch transition MUST persist once and retain
+  the bounded, lazy reader-surface policy rather than rendering every opened tab
+  eagerly.
 - ⌘-click MUST retain the message list's multi-selection behavior and MUST NOT
   open or promote a reader tab. While the message list has multiple selected
   rows, the reader MUST continue showing the active tab, and the active tab,
@@ -240,8 +262,66 @@ change `order` without changing `id` or `message`.
   hoverable while the pointer is over either the inactive tab or card and
   dismiss after a 150 ms grace period after leaving both.
 
+## Cross-device workspace and customization
+
+These are accepted product requirements, not a claim of implemented sync.
+
+- Apple-device workspace metadata uses iCloud; mailbox content/state still uses
+  the mail synchronization subsystem and credentials remain in Keychain.
+- Publish workspace changes immediately when connectivity permits, without
+  interrupting interactive reading on another device. Adopt automatic handoff
+  when the user resumes an inactive device.
+- Offer sync participation during onboarding and a per-device master switch plus
+  category switches under Settings → Sync. Turning a category off preserves its
+  current local settings and the cloud copy while stopping its incoming/outgoing sync.
+- When re-enabling a category, compare local and cloud settings. If they differ,
+  ask "Use this device's settings" or "Use synced settings" before replacing either
+  side. If they match, enable immediately without prompting.
+- Retain the current macOS layout and add the requested Thunderbird-style dense
+  configurable message columns and list-above-reader arrangement.
+- Customization has global defaults plus per-folder overrides. All customization
+  settings, including column visibility, order, widths, sorting, and overrides,
+  participate in iCloud sync, controlled under Settings → Sync.
+- Merge independent customization changes; for the same setting, the latest
+  explicit edit wins. Treat column order as one value. Receiving a remote value
+  must not manufacture another edit. This rare path does not need elaborate merging.
+- watchOS assists the iPhone rather than implementing independent generic IMAP
+  or introducing a content-fetching server gateway. Its initial scope is
+  notifications, recent-mail browsing, cached-message reading, quick read/unread,
+  flag, archive/trash triage, and Continue on iPhone.
+- Without a reachable phone, cached messages remain readable and triage actions
+  are persisted until reconnection. Show pending status and last synchronization;
+  do not imply that cached mail is fresh or queued actions are already applied.
+- When composer/SMTP lands in the other clients, the Watch also gains sending
+  through the iPhone: short new messages, replies/reply-all, and forwarding using
+  native text input/dictation and an explicit Send action. Hand off attachment
+  management and longer editing to the iPhone.
+
+## Sending release acceptance
+
+0.0.1 cannot ship until IMAP and the complete sending workflow work on both Mac
+and iPhone: compose, reply/reply-all, forward, attachments, saved drafts, a
+persisted outbox with visible failure/retry, and a saved Sent copy. Failures must
+never silently discard a message. Composer and SMTP remain a shared app/CLI
+milestone (`cli.md`); implementing iOS first does not defer sending beyond 0.0.1.
+Companion Watch sending arrives with that SMTP milestone through the iPhone.
+Preserve both versions of concurrently edited drafts rather than silently losing
+either. A submission whose server acceptance is uncertain must show "Delivery
+status unknown" and require explicit retry; automatically retry only definitely
+unsent transient failures.
+
+## CLI mail and GUI-control parity
+
+The CLI is a full standalone IMAP/SMTP client and a complete explicit driver for
+the GUI. Ordinary queries and mail commands must not change GUI navigation,
+focus, tabs, or visible composer state; resulting mailbox-data changes naturally
+appear in views. Explicit UI commands control every in-app action. Structured
+current-state queries and live updates expose GUI context without computer use.
+Both modes share the app's mail runtime and command contracts (`cli.md`,
+`automation.md`); neither mode is a reduced subset.
+
 ## Non-goals for 0.0.1
-Threading, multi-account, unified inbox, rules/snooze/send-later, JMAP, monetization,
+Threading, unified inbox, rules/snooze/send-later, JMAP, monetization,
 a Mailternal-owned Gmail OAuth client. The CLI, iOS and the daemon are **in** 0.0.1
 (roadmap.md); the CLI and automation architecture are specified in `cli.md`,
 `automation.md`, `pairing.md`, `docs.md`.

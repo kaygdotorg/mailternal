@@ -96,6 +96,21 @@ public enum MailternalDeepLink: Hashable, Sendable {
         }
     }
 
+    /// Replaces only the portable account identity, preserving the server locator.
+    public func replacingAccountLinkID(with account: AccountLinkID) -> Self {
+        switch self {
+        case .folder(_, let locator):
+            return .folder(accountLinkID: account, folderLocator: locator)
+        case .message(_, let locator, let uidValidity, let uid):
+            return .message(
+                accountLinkID: account,
+                folderLocator: locator,
+                uidValidity: uidValidity,
+                uid: uid
+            )
+        }
+    }
+
     public var folderLocator: FolderLocator {
         switch self {
         case .folder(_, let folderLocator), .message(_, let folderLocator, _, _):

@@ -12,9 +12,9 @@ rationale → revisit-when.
    rejected. A fork shipping its own Apple key is a competitor doing real work, not
    freeloading. Accepted knowingly.
 3. **Lifetime purchase, post-0.1.** No monetization code before there's a product.
-4. **0.0.1 is read-only, no compose, no threading.** Deliberate scope cut for a
-   performant, working first build. `\Seen` sync is the one write — a truly read-only
-   client would corrupt unread state on the user's other clients.
+4. **Original read-only first-build scope is superseded by decision 33.** The initial
+   performance-focused cut deferred compose and allowed only `\Seen` writes.
+   It is not the 0.0.1 release contract.
 5. **Text-only full-history sync; attachments on demand.** Full text history is what
    makes offline search the flagship feature; attachments dominate mailbox size and
    are rarely re-read. Separate caches: SQLite for text, content-hash files (LRU,
@@ -116,10 +116,16 @@ rationale → revisit-when.
     engines acquire connection permits from one `BackfillConnectionBudget`, capped at
     four backfill connections total; the primary sync channel counts while the
     dedicated IDLE channel does not. Each backfill window fetches metadata without
-    literals, then requests one UID/section at a time with a 1 MiB header limit, a
-    4 MiB text-part limit, and a 32 MiB aggregate PEEK-body budget. Store writes
-    commit bounded batches of at most 64 rows or 1 MiB decoded content, avoiding
-    caller-sized FTS/write arrays. A five-minute single-account headless sample on
+    literals, then groups compatible MIME sections within contiguous newest-first
+    cohorts. Requests retain the 1 MiB header and 4 MiB text-part limits; both each
+    FETCH response and retained cohort bodies are capped at 32 MiB. Literal
+    declarations are checked before receive/assembly, and the lossless response
+    stream pauses socket reads at its high watermark. Oversized responses bisect
+    the window on fresh connections before cursor advancement. Store writes
+    commit bounded batches of at most 64 rows or 1 MiB decoded content. Default
+    sessions share four NIO event loops and TLS contexts keyed to the complete
+    trust-root snapshot; injected event loops remain caller-owned.
+    A historical pre-batching five-minute single-account headless sample on
     the 1,636,773,888-byte fixture measured 119,728 KB peak RSS and 55.733% average
     CPU; the dual-account resource bound is analytical from the shared four-permit
     pool and bounded window/write budgets. Revisit: only if profiling shows a lower
@@ -130,14 +136,87 @@ rationale → revisit-when.
     capped at eight most-recently-used surfaces; opening beyond the cap evicts
     the least-recently-used surface, and every tab-close path drops its surface
     and cached height immediately. Reading-mode changes inject style into all
-    retained documents. Revisit: only if memory profiling on real newsletter
-    workloads shows eight surfaces is too high or too low.
+    retained documents. The outer reader scroll hierarchy also remains mounted;
+    restoration waits for the matching tab/message representation rather than
+    replacing the scroll view and relying on multi-second delayed retries.
+    Revisit: only if memory profiling on real newsletter workloads shows eight
+    surfaces is too high or too low.
 29. **Gate loaded reader-tab commits at 100 ms while keeping main-thread work at
     16 ms.** The initial 20 ms candidate was uncalibrated and below repeatable
     end-to-end AppKit/SwiftUI commit time even when retained surfaces performed
-    zero HTML navigations. The final uncontended dedicated-VM run measured ten
-    clean switches, 95.9 ms maximum, zero navigations, and zero malformed
-    samples. The 100 ms ceiling governs input-to-reader-commit latency; it does
-    not relax the separate 16 ms main-thread work budget. Revisit: lower the
-    ceiling after signposts isolate a consistently smaller commit phase; never
-    raise either threshold without a new measured decision.
+    zero HTML navigations. A historical dedicated-VM run measured ten
+    selection-to-reader-commit switches, 95.9 ms maximum, with zero navigations.
+    That callback measurement excludes pointer gesture arbitration and is not
+    proof of input-to-display latency. The 100 ms ceiling still governs the full
+    input-to-reader-commit path; single-click tab activation must not wait on a
+    higher-priority double-click recognizer. QA distinguishes command dispatch,
+    matching surface readiness, and restored scroll state. Neither a readiness
+    callback nor a Core Animation transaction completion claims physical display
+    presentation. The separate 16 ms main-thread work budget remains unchanged.
+    Revisit: lower the ceiling after complete input-path measurements justify it;
+    never raise either threshold without a new measured decision.
+30. **Warm a bounded, direction-aware local reader-detail window.** Cache up to
+    24 navigation details and 8 MiB of body/HTML text, separately from retained
+    tab details. Coalesce interactive loads by message identity and generation;
+    stale results cannot replace the current selection. Warm eight neighbors
+    ahead of keyboard travel and four behind through one local store batch of
+    at most 12 IDs. Refresh cached neighbors' recency before replenishing the
+    window so speculative insertion does not evict the next likely selection.
+    Ordinary envelope display does not fetch raw source; only explicit source
+    inspection does. Native text measurement does not mutate the view frame.
+    A cached-fixture VM replay of 80 Down/Up inputs at 33 ms intervals reduced
+    observed loading inputs from 73 to one and spinner exposure from about
+    1.30 s to 46 ms before the subsequent eviction-priority fix. These are
+    application/view lifecycle measurements, not physical display latency.
+    A later mixed live/replay run is not a comparable timing sample. Keep
+    genuine loading feedback: no debounce, delayed spinner, stale-body display,
+    remote fetch, or attachment warm-up. Revisit: only if measured cache misses
+    justify changing the bounded local window.
+31. **watchOS is an iPhone companion, not an independent IMAP client.** Normal
+    watchOS apps cannot use the direct TCP/TLS transport generic IMAP requires
+    (Apple TN3135); audio streaming's exception does not apply to mail. Rather
+    than introduce a content-fetching HTTPS gateway or provider-specific client,
+    the Watch initially provides reading, quick triage, and handoff through the
+    iPhone. When composer/SMTP lands in the other clients, the Watch also supports
+    sending through its iPhone companion, not direct Watch SMTP. Cached reading
+    remains available without a reachable phone; triage actions persist until
+    reconnection, with pending status and last-sync visibility, not a freshness
+    guarantee. Watch composition supports short new messages, reply/reply-all,
+    and forwarding with native input/dictation and explicit Send; attachment
+    management and longer editing hand off to iPhone. Revisit: only if supported
+    Watch networking changes or independent operation is requested.
+32. **Apple workspace metadata and all customizations sync through iCloud.**
+    Synchronize immediately when connectivity permits without interrupting
+    interactive reading; adopt handoff when resuming an inactive device. Offer
+    participation during onboarding and controls under Settings → Sync. Column
+    configuration has global defaults plus per-folder overrides; all customization
+    settings, including widths and overrides, participate rather than silently
+    remaining device-local. Workspace sync is distinct from mailbox synchronization
+    and Keychain credential sharing. A per-device master switch plus category
+    switches controls participation; disabling preserves local settings and the
+    cloud copy. Merge independent settings and use the latest explicit edit for
+    a same-setting conflict; receiving a remote value is not a new edit. Keep this
+    rare conflict path simple rather than building elaborate merge machinery.
+    Re-enabling a category with differing local/cloud settings asks which to keep:
+    "Use this device's settings" or "Use synced settings." Matching values enable
+    immediately. Revisit: only if a different ownership model is explicitly requested.
+33. **0.0.1 requires complete IMAP and sending workflows on Mac and iPhone.**
+    Current working macOS functionality is the parity baseline, not the obsolete
+    one-account/read-only scope. Compose, reply/reply-all, forward, attachments,
+    saved drafts, a persisted outbox with visible failure/retry, and a saved Sent
+    copy are release requirements. App and CLI sending retain the shared command
+    contract; companion Watch sending arrives with the same SMTP milestone.
+    Preserve both versions of conflicting drafts. No SMTP failure may silently
+    discard a message: ambiguous submission requires visible "Delivery status
+    unknown" and an explicit retry choice, not an automatic duplicate-risk resend.
+    Implementation order may put SMTP last, but cannot move it outside 0.0.1.
+    Revisit: only with explicit release-scope approval.
+34. **The CLI is a complete mail client and an explicit, state-aware GUI driver.**
+    Standalone IMAP/SMTP does not require the GUI process. When connected to the
+    app, queries and mail operations reuse its runtime without implicitly changing
+    navigation, focus, tabs, or the visible composer. Ordinary data changes still
+    propagate to views. Explicit UI commands expose every in-app action; structured
+    current-state snapshots and live updates expose GUI context so agents need no
+    screenshot/coordinate automation. All surfaces use the same mail runtime and
+    command contracts, not competing client implementations. Revisit: never reduce
+    either standalone mail parity or explicit GUI automation coverage.

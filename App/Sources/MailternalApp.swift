@@ -62,6 +62,77 @@ struct MailternalApp: App {
                     appDelegate.toggleSidebar()
                 }
                 .keyboardShortcut("s", modifiers: [.command, .option])
+                Menu("Layout") {
+                    Picker("Edit", selection: Binding(
+                        get: { model.listCustomizationTarget },
+                        set: { model.setListCustomizationTarget($0) }
+                    )) {
+                        ForEach(MailListCustomizationTarget.allCases) { target in
+                            Text(target.title).tag(target)
+                        }
+                    }
+                    .disabled(!model.canCustomizeCurrentFolder)
+                    Divider()
+                    Picker("Presentation", selection: Binding(
+                        get: {
+                            model.listCustomizationTarget == .global
+                                ? model.globalListConfiguration.presentation
+                                : model.effectiveListConfiguration.presentation
+                        },
+                        set: { model.setListPresentation($0) }
+                    )) {
+                        Text("Cards").tag(MailListPresentation.cards)
+                        Text("Columns").tag(MailListPresentation.columns)
+                    }
+                    Picker("Pane", selection: Binding(
+                        get: {
+                            model.listCustomizationTarget == .global
+                                ? model.globalListConfiguration.paneLayout
+                                : model.effectiveListConfiguration.paneLayout
+                        },
+                        set: { model.setPaneLayout($0) }
+                    )) {
+                        Text("Side by Side").tag(MailPaneLayout.sideBySide)
+                        Text("List Above Reader").tag(MailPaneLayout.listAboveReader)
+                    }
+                    Divider()
+                    Button("Reset Current Folder Overrides") {
+                        model.resetListOverrides()
+                    }
+                    .disabled(!model.canCustomizeCurrentFolder)
+                    Button("Reset All-Folder Defaults") {
+                        model.resetGlobalListSettings()
+                    }
+                }
+                Menu("Columns") {
+                    Picker("Edit", selection: Binding(
+                        get: { model.listCustomizationTarget },
+                        set: { model.setListCustomizationTarget($0) }
+                    )) {
+                        ForEach(MailListCustomizationTarget.allCases) { target in
+                            Text(target.title).tag(target)
+                        }
+                    }
+                    Divider()
+                    ForEach(MailListColumn.allCases, id: \.self) { column in
+                        Toggle(column.title, isOn: Binding(
+                            get: {
+                                !(model.listCustomizationTarget == .global
+                                    ? model.globalListConfiguration.hiddenColumns
+                                    : model.effectiveListConfiguration.hiddenColumns).contains(column)
+                            },
+                            set: { model.setListColumnVisible(column, visible: $0) }
+                        ))
+                    }
+                    Divider()
+                    Button("Reset Current Folder Overrides") {
+                        model.resetListOverrides()
+                    }
+                    .disabled(!model.canCustomizeCurrentFolder)
+                    Button("Reset All-Folder Defaults") {
+                        model.resetGlobalListSettings()
+                    }
+                }
                 Button("Refresh") {
                     appDelegate.showMainWindow()
                     Task { await model.refresh() }
@@ -89,36 +160,30 @@ struct MailternalApp: App {
             }
             CommandGroup(after: .windowArrangement) {
                 Button("Close Tab") {
-                    appDelegate.showMainWindow()
                     model.closeActiveTabOrWindow()
                 }
                 .keyboardShortcut("w", modifiers: .command)
-                .disabled(model.tabs.tabs.isEmpty && NSApp.keyWindow == nil)
                 Button("Next Tab") {
                     appDelegate.showMainWindow()
-                    model.tabs.activateNext()
-                    if let id = model.tabs.activeID { model.activateTab(id) }
+                    model.activateNextTab()
                 }
                 .keyboardShortcut(.tab, modifiers: .control)
                 .disabled(model.tabs.tabs.count < 2)
                 Button("Previous Tab") {
                     appDelegate.showMainWindow()
-                    model.tabs.activatePrevious()
-                    if let id = model.tabs.activeID { model.activateTab(id) }
+                    model.activatePreviousTab()
                 }
                 .keyboardShortcut(.tab, modifiers: [.control, .shift])
                 .disabled(model.tabs.tabs.count < 2)
                 Button("Previous Tab") {
                     appDelegate.showMainWindow()
-                    model.tabs.activatePrevious()
-                    if let id = model.tabs.activeID { model.activateTab(id) }
+                    model.activatePreviousTab()
                 }
                 .keyboardShortcut("[", modifiers: [.command, .shift])
                 .disabled(model.tabs.tabs.count < 2)
                 Button("Next Tab") {
                     appDelegate.showMainWindow()
-                    model.tabs.activateNext()
-                    if let id = model.tabs.activeID { model.activateTab(id) }
+                    model.activateNextTab()
                 }
                 .keyboardShortcut("]", modifiers: [.command, .shift])
                 .disabled(model.tabs.tabs.count < 2)
@@ -193,6 +258,14 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
         openQAMessageWindowIfRequested()
         #endif
     }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        model?.workspaceSync.didBecomeActive()
+    }
+
+    func applicationWillResignActive(_ notification: Notification) {
+        model?.workspaceSync.willResignActive()
+    }
+
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showMainWindow()
@@ -224,9 +297,9 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
 
     func showMainWindow() {
         guard let model, let appearance, let actions else { return }
-        QALaunch.launchSubphase("shell-show-begin")
+        QALaunch.launchPhase("shell-show-begin")
         MainWindowController.shared.show(model: model, appearance: appearance, actions: actions)
-        QALaunch.launchSubphase("shell-show-end")
+        QALaunch.launchPhase("shell-show-end")
     }
 
     func toggleSidebar() {

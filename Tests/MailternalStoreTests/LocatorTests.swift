@@ -96,3 +96,31 @@ import Testing
         #expect(try await store.messageID(generation: live, uid: IMAPUID(rawValue: 3)) == nil)
     }
 }
+
+@Test func maximumUIDIsGenerationScopedAndNilForEmptyOrMissingGeneration() async throws {
+    try await withStore { store, _ in
+        let (_, folder, live) = try await seedInbox(store, uidValidity: 1)
+        #expect(try await store.maximumUID(in: live) == nil)
+
+        let replacement = try await store.createReplacementGeneration(
+            folder: folder,
+            uidValidity: 2,
+            baselineUID: nil
+        )
+        #expect(try await store.maximumUID(in: replacement) == nil)
+
+        _ = try await store.upsertMessages([
+            makeMessage(generation: live, uid: 4),
+            makeMessage(generation: live, uid: 19),
+            makeMessage(generation: live, uid: 7),
+            makeMessage(generation: replacement, uid: 3),
+            makeMessage(generation: replacement, uid: 11),
+        ])
+
+        #expect(try await store.maximumUID(in: live)?.rawValue == 19)
+        #expect(try await store.maximumUID(in: replacement)?.rawValue == 11)
+
+        let missing = MailboxGeneration(folder: folder, uidValidity: 404)
+        #expect(try await store.maximumUID(in: missing) == nil)
+    }
+}

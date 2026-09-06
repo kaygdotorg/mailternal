@@ -6,31 +6,54 @@ import NIOSSL
 import NIOTLS
 
 private enum IMAPLimits {
+    /// Individual parser lines/literals remain capped independently of the
+    /// aggregate FETCH receive budget.
     static let maxBytes = 1 << 20
+    static let maximumPeekLiteralBytes = IMAPFetchAssembler.maximumLiteralBytes
+    /// The producer stops socket reads after eight responses and asks for more
+    /// once two remain. A single already-issued NIO read may overshoot this
+    /// watermark, but the parser's one-megabyte input bound caps that burst.
+    static let responseQueueLowWatermark = 2
+    static let responseQueueHighWatermark = 8
 }
 
+typealias IMAPResponseStream = NIOAsyncSequenceProducer<
+    Response,
+    NIOAsyncSequenceProducerBackPressureStrategies.HighLowWatermark,
+    ResponseCollectorDelegate
+>
+
 /// Byte-level IMAP connection: a NIO `Channel` with `IMAPClientHandler` plus a
-/// response stream. Production uses TCP + NIOSSL; tests inject an
-/// `NIOAsyncTestingChannel`.
+/// bounded, back-pressured response stream. Production uses TCP + NIOSSL; tests
+/// inject an `NIOAsyncTestingChannel`.
 final class IMAPConnection: @unchecked Sendable {
     let channel: Channel
-    let responses: AsyncStream<Response>
-    private let responseContinuation: AsyncStream<Response>.Continuation
+    let responses: IMAPResponseStream
+    private let collector: ResponseCollector
     private let tls: TLSUpgrader
     // Touched from the session actor only after construction.
     private var _isSecure: Bool
-    private(set) var lastHandlerError: Error?
+    private let errorLock = NSLock()
+    private var _lastHandlerError: Error?
 
     var isSecure: Bool { _isSecure }
+    var lastHandlerError: Error? {
+        errorLock.lock()
+        defer { errorLock.unlock() }
+        return _lastHandlerError ?? collector.lastError
+    }
 
     init(channel: Channel, tls: TLSUpgrader, isSecure: Bool, collector: ResponseCollector) {
         self.channel = channel
         self.tls = tls
         self._isSecure = isSecure
+        self.collector = collector
         self.responses = collector.stream
-        self.responseContinuation = collector.continuation
         collector.onError = { [weak self] error in
-            self?.lastHandlerError = error
+            guard let self else { return }
+            self.errorLock.lock()
+            self._lastHandlerError = error
+            self.errorLock.unlock()
         }
     }
 
@@ -45,18 +68,40 @@ final class IMAPConnection: @unchecked Sendable {
         }
     }
 
+    /// Starts demand-controlled socket reads. The collector normally leaves
+    /// `autoRead` enabled; it disables it only while the response queue is
+    /// above its high watermark and re-enables it below the low watermark.
+    func startReading() async throws {
+        try await channel.setOption(ChannelOptions.autoRead, value: true).get()
+    }
+
+    func beginFetchResponse(maximumBytes: Int) {
+        collector.beginFetchResponse(maximumBytes: maximumBytes)
+    }
+
+    func endFetchResponse() {
+        collector.endFetchResponse()
+    }
+
     func startTLS(hostname: String) async throws {
+        // TLS handshake reads must stay enabled. Normal response backpressure
+        // resumes after the upgrade has completed.
+        try await channel.setOption(ChannelOptions.autoRead, value: true).get()
         try await tls.upgrade(channel, hostname)
+        try await channel.setOption(ChannelOptions.autoRead, value: true).get()
         _isSecure = true
     }
 
     func close() async {
-        responseContinuation.finish()
+        // Finishing first wakes a suspended consumer and drains already-yielded
+        // responses in order; the channel close then prevents another read.
+        collector.finish()
         if channel.isActive {
             try? await channel.close()
         }
     }
 }
+
 
 struct TLSUpgrader: Sendable {
     var upgrade: @Sendable (Channel, String) async throws -> Void
@@ -70,33 +115,115 @@ struct TLSUpgrader: Sendable {
     static let passthrough = TLSUpgrader { _, _ in }
 }
 
+private struct IMAPTLSTrustKey: Hashable, Sendable {
+    let additionalPEM: [Data]
+}
+
+private final class IMAPTLSContextCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var contexts: [IMAPTLSTrustKey: NIOSSLContext] = [:]
+
+    func context(
+        for key: IMAPTLSTrustKey,
+        make: () throws -> NIOSSLContext
+    ) throws -> NIOSSLContext {
+        // NIOSSLContext construction can read the system trust store. Serialize
+        // cache misses so concurrent sessions never duplicate that blocking work.
+        // Callers construct contexts before entering a NIO event loop.
+        lock.lock()
+        defer { lock.unlock() }
+        if let context = contexts[key] {
+            return context
+        }
+        let context = try make()
+        contexts[key] = context
+        return context
+    }
+
+    func invalidate() {
+        lock.lock()
+        contexts.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+}
+
 enum IMAPTLS {
-    static func makeClientHandler(hostname: String) throws -> NIOSSLClientHandler {
+    private static let contextCache = IMAPTLSContextCache()
+
+    /// Drops contexts whose trust roots no longer match the effective
+    /// configuration. Called whenever QA roots are installed or reset.
+    static func invalidateContextCache() {
+        contextCache.invalidate()
+    }
+
+    /// Creates (or reuses) a context for the complete trust configuration.
+    /// This method intentionally runs before a channel initializer: loading
+    /// system anchors is blocking disk/platform work and must not run on NIO.
+    static func makeClientContext(hostname: String) throws -> NIOSSLContext {
         let host = hostname.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty else {
             throw IMAPError.tls("Missing hostname for TLS verification")
         }
-        // IP literals skip NIOSSL hostname verification (no SNI). Fail closed
-        // unless QA extra trust roots are installed — see IMAPTrust.
-        try IMAPTrust.requireHostnameVerification(for: host)
-        var configuration = TLSConfiguration.makeClientConfiguration()
-        configuration.certificateVerification = .fullVerification
-        if let extras = try IMAPTrust.additionalCertificates() {
-            // SecTrust (`trustRoots = .default` + additionalTrustRoots) rejects
-            // the QA self-signed leaf (no CA:TRUE). Forcing `.certificates`
-            // selects BoringSSL. Merge system anchors so extras extend,
-            // rather than replace, production roots.
-            configuration.trustRoots = .certificates(IMAPTrust.extendedTrustRoots(extras))
+        // Take one root snapshot and use it for both IP-literal permission and
+        // context construction. A concurrent QA-root reset can therefore
+        // never turn an opted-in IP endpoint into a nil-SNI system-only TLS
+        // context.
+        let additionalPEM = IMAPTrust.additionalPEM()
+        try IMAPTrust.requireHostnameVerification(for: host, additionalPEM: additionalPEM)
+        let key = IMAPTLSTrustKey(additionalPEM: additionalPEM)
+        return try contextCache.context(for: key) {
+            var configuration = TLSConfiguration.makeClientConfiguration()
+            configuration.certificateVerification = .fullVerification
+            if !additionalPEM.isEmpty {
+                // The QA certificate is a self-signed leaf rather than a CA
+                // certificate. BoringSSL accepts an explicitly configured
+                // trust anchor while preserving hostname verification; the
+                // Apple SecTrust path rejects this fixture before the anchor
+                // can be applied. This branch is reachable only after the
+                // explicit QA/test trust-root installation above.
+                var extras: [NIOSSLCertificate] = []
+                extras.reserveCapacity(additionalPEM.count)
+                for pem in additionalPEM {
+                    do {
+                        extras.append(contentsOf: try NIOSSLCertificate.fromPEMBytes(Array(pem)))
+                    } catch {
+                        throw IMAPError.tls("Configured additional TLS trust roots are invalid")
+                    }
+                }
+                guard !extras.isEmpty else {
+                    throw IMAPError.tls("Configured additional TLS trust roots are invalid")
+                }
+                #if os(macOS)
+                configuration.trustRoots = .certificates(IMAPTrust.extendedTrustRoots(extras))
+                #else
+                configuration.trustRoots = .certificates(extras)
+                #endif
+            }
+            return try NIOSSLContext(configuration: configuration)
         }
-        let context = try NIOSSLContext(configuration: configuration)
-        return try NIOSSLClientHandler(context: context, serverHostname: IMAPTrust.sniHostname(for: host))
+    }
+
+    static func makeClientHandler(hostname: String) throws -> NIOSSLClientHandler {
+        let host = hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+        let additionalPEM = IMAPTrust.additionalPEM()
+        let context = try makeClientContext(hostname: host)
+        return try NIOSSLClientHandler(
+            context: context,
+            serverHostname: IMAPTrust.sniHostname(for: host, additionalPEM: additionalPEM)
+        )
     }
 
     static func upgrade(channel: Channel, hostname: String) async throws {
-        let ssl = try makeClientHandler(hostname: hostname)
+        let host = hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+        let additionalPEM = IMAPTrust.additionalPEM()
+        let context = try makeClientContext(hostname: host)
+        let serverHostname = IMAPTrust.sniHostname(for: host, additionalPEM: additionalPEM)
         let handshake = HandshakeWaiter()
         try await channel.pipeline.addHandler(handshake, position: .first)
-        try await channel.pipeline.addHandler(ssl, position: .first)
+        try await channel.eventLoop.submit {
+            let ssl = try NIOSSLClientHandler(context: context, serverHostname: serverHostname)
+            try channel.pipeline.syncOperations.addHandler(ssl, position: .first)
+        }.get()
         try await handshake.wait()
     }
 }
@@ -155,35 +282,188 @@ final class HandshakeWaiter: ChannelInboundHandler, RemovableChannelHandler, @un
     }
 }
 
+final class ResponseCollectorDelegate: NIOAsyncSequenceProducerDelegate, @unchecked Sendable {
+    weak var collector: ResponseCollector?
+
+    func produceMore() {
+        collector?.resumeReading()
+    }
+
+    func didTerminate() {
+        collector?.consumerTerminated()
+    }
+}
+
 final class ResponseCollector: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = Response
 
-    let stream: AsyncStream<Response>
-    let continuation: AsyncStream<Response>.Continuation
+    let stream: IMAPResponseStream
+    private let source: IMAPResponseStream.Source
+    private let delegate: ResponseCollectorDelegate
+    private let stateLock = NSLock()
+    private var channel: Channel?
+    private var fetchLiteralBytes = 0
+    private var fetchLiteralLimit = IMAPLimits.maximumPeekLiteralBytes
+    private var fetching = false
+    private var finished = false
+    private var terminalError: Error?
     var onError: (@Sendable (Error) -> Void)?
+    var lastError: Error? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return terminalError
+    }
 
     init() {
-        var captured: AsyncStream<Response>.Continuation!
-        self.stream = AsyncStream { continuation in
-            captured = continuation
-        }
-        self.continuation = captured
+        let delegate = ResponseCollectorDelegate()
+        let sequence = IMAPResponseStream.makeSequence(
+            backPressureStrategy: .init(
+                lowWatermark: IMAPLimits.responseQueueLowWatermark,
+                highWatermark: IMAPLimits.responseQueueHighWatermark
+            ),
+            finishOnDeinit: false,
+            delegate: delegate
+        )
+        self.delegate = delegate
+        self.source = sequence.source
+        self.stream = sequence.sequence
+        delegate.collector = self
+    }
+
+    /// Starts accounting for one serialized UID FETCH response set. The
+    /// declared literal sizes are counted before they are yielded, so queued
+    /// chunks and assembler-owned chunks share the caller's aggregate budget.
+    func beginFetchResponse(maximumBytes: Int = IMAPLimits.maximumPeekLiteralBytes) {
+        stateLock.lock()
+        fetching = true
+        fetchLiteralBytes = 0
+        fetchLiteralLimit = min(
+            IMAPLimits.maximumPeekLiteralBytes,
+            max(0, maximumBytes)
+        )
+        stateLock.unlock()
+    }
+
+    func endFetchResponse() {
+        stateLock.lock()
+        fetching = false
+        fetchLiteralBytes = 0
+        fetchLiteralLimit = IMAPLimits.maximumPeekLiteralBytes
+        stateLock.unlock()
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        stateLock.lock()
+        self.channel = context.channel
+        stateLock.unlock()
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        stateLock.lock()
+        channel = nil
+        stateLock.unlock()
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        continuation.yield(unwrapInboundIn(data))
-        context.fireChannelRead(data)
+        let response = unwrapInboundIn(data)
+        if case .fetch(.streamingBegin(_, let byteCount)) = response,
+           !reserveFetchLiteralBytes(byteCount) {
+            fail(IMAPError.responseTooLarge(limit: currentFetchLimit()), channel: context.channel)
+            return
+        }
+
+        switch source.yield(response) {
+        case .produceMore:
+            break
+        case .stopProducing:
+            // NIO may have already delivered one read. The producer's own
+            // element buffer drains below the low watermark before this is
+            // re-enabled by `produceMore()`.
+            pauseReading(context: context)
+        case .dropped:
+            // A dropped value means the sole consumer terminated. Close the
+            // channel rather than silently losing a server response.
+            fail(IMAPError.transport("Response consumer terminated"), channel: context.channel)
+        }
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        onError?(error)
-        continuation.finish()
+        fail(error, channel: context.channel)
         context.fireErrorCaught(error)
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        continuation.finish()
+        finishSource()
         context.fireChannelInactive()
+    }
+
+    func finish() {
+        finishSource()
+    }
+
+    private func reserveFetchLiteralBytes(_ byteCount: Int) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard fetching, byteCount >= 0 else { return true }
+        guard byteCount <= fetchLiteralLimit - fetchLiteralBytes else {
+            return false
+        }
+        fetchLiteralBytes += byteCount
+        return true
+    }
+
+    private func currentFetchLimit() -> Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return fetchLiteralLimit
+    }
+
+    private func fail(_ error: Error, channel: Channel) {
+        stateLock.lock()
+        let shouldNotify = !finished
+        if shouldNotify {
+            terminalError = error
+        }
+        finished = true
+        stateLock.unlock()
+        guard shouldNotify else { return }
+        onError?(error)
+        source.finish()
+        channel.close(promise: nil)
+    }
+
+    private func finishSource() {
+        stateLock.lock()
+        let shouldFinish = !finished
+        finished = true
+        stateLock.unlock()
+        if shouldFinish {
+            source.finish()
+        }
+    }
+
+    private func pauseReading(context: ChannelHandlerContext) {
+        let channel = context.channel
+        channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { [weak self] error in
+            self?.fail(error, channel: channel)
+        }
+    }
+
+    func resumeReading() {
+        stateLock.lock()
+        let channel = self.channel
+        stateLock.unlock()
+        guard let channel else { return }
+        channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { [weak self] error in
+            self?.fail(error, channel: channel)
+        }
+    }
+
+    func consumerTerminated() {
+        stateLock.lock()
+        let channel = self.channel
+        stateLock.unlock()
+        channel?.close(promise: nil)
     }
 }
 
@@ -195,13 +475,25 @@ enum IMAPNetwork {
         let implicit = endpoint.security == .implicitTLS
         let collector = ResponseCollector()
         let handshake = implicit ? HandshakeWaiter() : nil
+        // Context construction may read the system trust store. Do it before
+        // entering the channel initializer, which always runs on a NIO loop.
+        let additionalPEM = IMAPTrust.additionalPEM()
+        let implicitTLSContext = implicit
+            ? try IMAPTLS.makeClientContext(hostname: endpoint.host)
+            : nil
 
         let bootstrap = ClientBootstrap(group: group)
             .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_KEEPALIVE), value: 1)
             .channelInitializer { channel in
                 channel.eventLoop.submit {
-                    if implicit {
-                        let ssl = try IMAPTLS.makeClientHandler(hostname: endpoint.host)
+                    if implicit, let implicitTLSContext {
+                        let ssl = try NIOSSLClientHandler(
+                            context: implicitTLSContext,
+                            serverHostname: IMAPTrust.sniHostname(
+                                for: endpoint.host,
+                                additionalPEM: additionalPEM
+                            )
+                        )
                         try channel.pipeline.syncOperations.addHandler(ssl)
                         if let handshake {
                             try channel.pipeline.syncOperations.addHandler(handshake)

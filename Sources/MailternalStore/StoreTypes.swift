@@ -1,6 +1,15 @@
 import Foundation
 @_exported import MailternalInterfaces
 
+/// A durable identity command whose SQLite relink has committed. Workspace and
+/// reader-link migration must finish before the command is acknowledged.
+public struct AccountLinkCommand: Hashable, Sendable {
+    public let id: Int64
+    public let accountID: AccountID
+    public let source: AccountLinkID
+    public let destination: AccountLinkID
+}
+
 // MARK: - Write budget
 
 /// Bounds a single writer transaction (spec: sync.md backfill).
@@ -424,6 +433,8 @@ public struct AttachmentPin: Hashable, Sendable {
 
 public enum MailStoreError: Error, Sendable, Equatable {
     case accountNotFound
+    case accountLinkIDConflict
+    case invalidAccountLinkCommand
     case folderNotFound
     case invalidFolderName
     case messageNotFound
@@ -431,4 +442,7 @@ public enum MailStoreError: Error, Sendable, Equatable {
     case replacementAlreadyExists
     case noReplacementGeneration
     case uidValidityMismatch
+    /// The cursor was created for another list order or carried a value whose
+    /// type does not match its sort field.
+    case invalidPageCursor
 }

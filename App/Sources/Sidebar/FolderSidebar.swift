@@ -49,7 +49,7 @@ struct FolderSidebar: View {
 
         List(selection: Binding(
             get: { model.selectedFolderID },
-            set: { model.selectFolder($0) }
+            set: { model.selectFolder($0, userInitiated: true) }
         )) {
             ForEach(accountGroups, id: \.account) { group in
                 let roots = FolderHierarchy.make(from: group.folders)
@@ -65,6 +65,11 @@ struct FolderSidebar: View {
                 }
             }
         }
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                model.noteListInteraction()
+            }
+        )
         // SwiftUI can retain only the duplicated floating section header when
         // its title changes, dropping the section rows until relaunch. Rebuild
         // that native List identity without animation when account titles
@@ -420,7 +425,7 @@ struct FolderRow: View {
     @ViewBuilder
     private var backfillAccessory: some View {
         switch folder.activity {
-        case .downloading, .indexing:
+        case .downloading, .indexing, .moving:
             ProgressView()
                 .controlSize(.small)
                 .tint(accent.color.opacity(0.8))
@@ -1017,7 +1022,7 @@ private struct SidebarAccountTitle: View {
         ZStack(alignment: .leading) {
             SidebarRenameLabel(
                 value: title,
-                font: .systemFont(ofSize: 20, weight: .semibold),
+                font: .systemFont(ofSize: 26, weight: .bold),
                 identifier: UIIdentifier.sidebarAccountTitle,
                 isDoubleClickEnabled: !isEditing,
                 onDoubleClick: beginEditing
@@ -1031,7 +1036,7 @@ private struct SidebarAccountTitle: View {
                 SidebarInlineTextField(
                     text: $rename.draft,
                     identifier: UIIdentifier.sidebarAccountTitleField,
-                    font: .systemFont(ofSize: 20, weight: .semibold),
+                    font: .systemFont(ofSize: 26, weight: .bold),
                     commitOnFocusLoss: false,
                     onCommit: commit,
                     onCancel: cancel

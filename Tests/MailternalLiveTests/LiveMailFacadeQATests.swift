@@ -80,7 +80,7 @@ private func waitForInboxPage(_ facade: LiveMailFacade) async throws {
         let inbox = lastFolders.first(where: { $0.role == .inbox })
             ?? lastFolders.first(where: { $0.path.compare("INBOX", options: [.caseInsensitive]) == .orderedSame })
         if let inbox {
-            let page = try await facade.page(in: inbox.id, after: nil, limit: 25)
+            let page = try await facade.page(in: inbox.id, after: nil, limit: 25, sort: .newest)
             if !page.rows.isEmpty { return }
         }
         try await Task.sleep(for: .milliseconds(400))

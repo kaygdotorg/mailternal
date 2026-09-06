@@ -101,6 +101,51 @@ private func deepLinkAccountConfig(_ id: String, linkID: AccountLinkID = deepLin
     }
 }
 
+@Test func accountRelinkRecoversAfterRestartWithoutLosingMail() async throws {
+    try await withStore { store, directory in
+        let (account, folder, generation) = try await seedInbox(store)
+        try await store.upsertMessages([
+            makeMessage(generation: generation, uid: 1, subject: "Retained mail")
+        ])
+        let message = try #require(await store.messageID(
+            generation: generation, uid: IMAPUID(rawValue: 1)
+        ))
+        let original = try #require(await store.makeDeepLink(account: account.id, message: message))
+        let occupied = deepLinkAccountConfig("occupied")
+        try await store.upsertAccount(occupied)
+        await #expect(throws: MailStoreError.accountLinkIDConflict) {
+            try await store.relinkAccount(account.id, to: occupied.accountLinkID)
+        }
+        #expect(try await store.pendingAccountLinkCommands().isEmpty)
+        #expect(try await store.makeDeepLink(account: account.id, message: message) == original)
+        try await store.deleteAccount(occupied.id)
+
+        try await store.relinkAccount(account.id, to: occupied.accountLinkID)
+        let reopened = try MailStore(
+            databaseURL: directory.appendingPathComponent("mail.sqlite"),
+            cachesDirectory: directory.appendingPathComponent("Caches")
+        )
+        let command = try #require(await reopened.pendingAccountLinkCommands().first)
+        #expect(command.source == original.accountLinkID)
+        let migrated = original.replacingAccountLinkID(with: command.destination)
+        guard case .message(let resolvedFolder, let resolvedMessage, let row) = try await reopened.resolve(migrated) else {
+            Issue.record("The recovered identity command did not resolve retained mail")
+            return
+        }
+        #expect(resolvedFolder == folder)
+        #expect(resolvedMessage == message)
+        #expect(row.subject == "Retained mail")
+        #expect(try await reopened.resolve(original) == nil)
+        try await reopened.completeAccountLinkCommand(command.id)
+
+        let acknowledged = try MailStore(
+            databaseURL: directory.appendingPathComponent("mail.sqlite"),
+            cachesDirectory: directory.appendingPathComponent("Caches")
+        )
+        #expect(try await acknowledged.pendingAccountLinkCommands().isEmpty)
+    }
+}
+
 @Test func crossDeviceObjectLocatorResolvesDifferentLocalIDs() async throws {
     try await withStore { first, _ in
         let accountA = deepLinkAccountConfig("device-a")

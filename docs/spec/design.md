@@ -7,10 +7,30 @@ non-normative provenance/examples only; absence of that checkout never blocks
 implementation. Performance, aesthetics, polish are the product's top priorities.
 
 ## Governing rules (from Hermternal AGENTS.md/CLAUDE.md — adopted verbatim)
-- **Native-first**: system components before custom ones; custom surfaces only when
-  approved and measured. No stacked materials. Preserve clean AppKit⇄SwiftUI seams.
+- **Native-first**: use a public AppKit or SwiftUI system component whenever it
+  supplies the required behavior. Do not recreate its sizing, adaptive appearance,
+  hover/pressed chrome, focus, or accessibility with custom drawing or gestures.
+  Custom surfaces require a documented functional gap, approval, and measurement.
+  No stacked materials. Preserve clean AppKit⇄SwiftUI seams.
 - Semantic colors and text styles everywhere; dynamic light/dark/contrast for free.
 - Respect Reduce Motion and Reduce Transparency with explicit alternate paths.
+
+## Interaction polish references
+
+When designing or reviewing interactions, consult [Jakub Krehel's UI skills](https://jakub.kr/skills)
+([source](https://github.com/jakubkrehel/skills)) for optical alignment, hit areas,
+state feedback, and motion restraint. These are supplementary design references,
+not a second design system; this document and native platform behavior govern.
+
+- Apply the principles through standard AppKit/SwiftUI components and existing
+  motion tokens. Preserve system hover, pressed, focus, selection, and disabled
+  treatment rather than copying CSS values, web controls, or animation libraries.
+- Small interactions are product quality: feedback should be immediate, transitions
+  should preserve context and tolerate interruption, and motion must have a static
+  state cue. Keep routine navigation and scrolling free of decorative delays.
+- Review the actual native surface across hover, press, keyboard focus, loading,
+  empty and disabled states, interrupted transitions, and Reduce Motion. Polish
+  must preserve accessibility, stable layout, and the existing performance gates.
 
 ## Architecture pattern
 - AppKit owns the window shell; SwiftUI owns content.
@@ -64,22 +84,43 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   depth and is opaque 32 pt below it, leaving the account title's cap-height
   band clear; the `List` ignores the container top safe area and carries a
   fixed 40 pt scroll-content inset plus the header's 12 pt optical padding.
-  The account title stands alone—never followed by a redundant “Folders”
-  label—and retains 10 pt of header air before the first folder row. The
+  The account title uses the same 26 pt bold type as the message-list folder
+  heading. It stands alone—never followed by a redundant “Folders” label—and
+  retains 10 pt of header air before the first folder row. The
   system scroll-edge pocket is suppressed on this list. Bottom ramp 48 pt,
   ending above the fixed account inset.
 - **Message list**: the pane ignores the top safe area, its large title is
   anchored at the same fixed 52 pt window depth, and the table reserves the
   title's measured frame below that anchor. Its top dissolve is independent
   of safe-area changes; the system scroll-edge pocket is suppressed on the
-  AppKit table scroll view. Bottom ramp 48 pt at the pane edge. The column
-  carries **no top chrome** — windowed-mode coverage is disclosed in the ⌘K
-  panel.
-- **Reader**: the top ramp starts exactly where the tab strip ends (46 pt: the
-  40 pt strip centred in the 52 pt titlebar) and reaches 24 pt into the pane,
-  so scrolled content dissolves under the tabs rather than behind the window
-  buttons; the subject card rests one 12 pt guard below the ramp. No bottom
-  ramp.
+  AppKit table scroll view. Bottom ramp 48 pt at the pane edge. Cards carry
+  **no column-header chrome**. The optional dense columns presentation pins a
+  24 pt native table header below the title band, outside its dissolve, and
+  uses compact status icons with full accessibility labels. Windowed-mode
+  coverage is disclosed in the ⌘K panel.
+  When multiple messages are selected, the title moves up by the subtitle's
+  measured height plus its 1 pt separation, and a secondary, tabular-number
+  “X messages selected” subtitle fades in. Selection takes precedence over
+  current-folder downloading, indexing, or moving status; otherwise show that
+  real activity, with progress only when supplied by the operation. Keep the
+  title-only header footprint: subtitle presence must not push the first row
+  or the 16 pt top dissolve down or reset the list scroll position. The resting
+  gap follows the [approved reference](https://img.kayg.org/u/iFvdoh.png), not
+  the [excess-spacing regression](https://img.kayg.org/u/iWMiiV.png); row text's
+  own 10 pt top inset is additional to the ramp, not another header band.
+  Keep one stable `Text` with `.numericText()` across subtitle updates, driven
+  by a zero-bounce `.smooth(duration: 0.24)` animation. Numeric runs roll;
+  whole-word/state changes use the content transition's fallback rather than
+  replacing the view. The same animation lifts the title for subtitle
+  presence; Reduce Motion updates immediately.
+- **Reader, side-by-side**: the top ramp starts exactly where the tab strip ends
+  (46 pt: the 40 pt strip centred in the 52 pt titlebar) and reaches 24 pt into
+  the pane. The subject glyph rests one 12 pt guard below the ramp. No bottom ramp.
+- **Reader, list above reader**: tabs and reader actions occupy one 40 pt row
+  at the top of the lower split pane. The scroll viewport below that row uses
+  a local 16 pt ramp and the same 12 pt glyph guard; it MUST NOT reserve the
+  window titlebar again. The panes meet at the native split divider with no
+  additional spacer. The sidebar toggle remains in the window titlebar.
 
 ## Component vocabulary (reuse the pattern, adapt to mail)
 - **Sidebar rows**: native `List` label rows with context menus, swipes, drag/drop
@@ -119,15 +160,43 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   right as disclosure caret, unlabeled tri-state “all folders” checkbox, account
   name, and right-aligned secondary email. Folder rows retain a checkbox, name,
   and message-count caption, with the pane's breathing-room spacing.
+- **Pair Device** lives inside **Sync** on macOS and iOS, not in a separate
+  top-level section. It remains available with iCloud workspace sync disabled:
+  explicit account handoff and ongoing workspace synchronization are distinct.
+- The macOS pairing sheet has a 560 × 600 pt minimum presentation size so the
+  complete QR code and white quiet zone are visible at the initial scroll
+  position. Longer account lists and secondary controls remain scrollable.
+- **iOS Settings** uses a native navigation stack in a clear Liquid Glass sheet.
+  One presentation material backs translucent grouped rows; do not stack a glass
+  effect on each row. Reduce Transparency uses an opaque semantic background.
+  Each settings section is a navigation row by default, including Accounts,
+  Appearance, Gestures, Sync, Mail state, and Pending actions.
+- A native **Search settings** field stays at the top of the iOS settings root.
+  Search covers setting labels and vocabulary across sections and navigates to
+  the existing controls; it never indexes passwords or mail content. Empty
+  searches restore the selected settings layout. macOS settings search is not
+  part of this surface yet.
+- Directly below search, **Flat View** is a full-row checkbox, off by default.
+  Checking it presents those same sections and controls inline. The preference
+  persists across sheet dismissal and app launches, participates in appearance
+  sync, and is retained through pairing. Older saved state defaults to off without
+  discarding navigation or reading preferences. On iOS, the checkbox drawing
+  retains native Toggle accessibility and a minimum 44 pt touch target.
 
 ## Reader envelope
 
-- Sender and recipient remain separate full-row copy targets, with optional
-  monograms controlled by **Appearance ▸ Sender icons**. One decorative,
-  deterministic hand-drawn accent route occupies the left direction column:
-  a subtly wavy vertical stroke begins at the sender row and ends in an open
-  arrowhead at the recipient row. The route has round caps/joins, no motion,
-  and is hidden from accessibility.
+- Sender and recipient remain separate content-sized copy targets, with optional
+  monograms controlled by **Appearance ▸ Sender icons**. Each pill's hover,
+  keyboard-focus and copy-feedback bounds fit its text/icon plus padding,
+  never stretch into unused reader width, and compress for narrow windows.
+  A single accent
+  connector occupies the left direction column: it leaves the sender toward
+  the left, rounds into a straight vertical segment, then rounds right into an
+  open arrowhead pointing at the recipient. Its endpoints track the measured
+  row centers, so spacing and row-height changes stretch the middle segment
+  without distorting the rounded corners. It has round caps/joins, no waviness
+  or motion, and is hidden from accessibility. Reference:
+  [rounded envelope connector](https://img.kayg.org/u/blS8vt.png).
 - The former per-row arrow-circle symbols MUST NOT appear. Sent/delivered date
   rows retain their semantic paper-plane and tray glyphs.
 
@@ -139,42 +208,76 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
 - Toasts: enter spring 0.40 bounce 0.16 (enterScale 0.94, offset −12); exit
   timingCurve(0.23,1,0.32,1) 0.20; restack 0.34/0.10; expand 0.30/0; settle
   0.32/0.22; fling 0.16; RM: enter 0.16, exit 0.12, restack easeInOut 0.18.
+- Pairing QR: one deterministic 16×16 tile-mask reveal over 0.48 s for a new
+  invitation. Keep the code stationary, retain its white quiet zone, and finish
+  with the exact unmasked QR pixels. Unrelated updates must not replay it;
+  Reduce Motion and interruption show the complete code without animation.
 
 ## Reader tab strip
 
 The reader tab strip MUST be Craft-like in finish and browser-like in
-mechanics. It MUST occupy one measured row in the window's native titlebar/
-toolbar, over the rightmost reader column, and MUST NOT add a titlebar
-accessory row or in-pane reader chrome. The row MUST remain the native unified
-toolbar height, with an 8 pt leading and no trailing content inset. The strip
-container MUST be clear so the native toolbar material shows through. It MUST
-be present whenever `tabs.tabs` is non-empty and MUST be absent in the
-empty-reader state and while global search is presented.
+mechanics. In the side-by-side layout it MUST occupy one measured row in the
+window's native unified titlebar/toolbar, over the reader column, with no
+accessory row. In the list-above-reader layout that same tab strip and its
+actions MUST move to the lower reader pane, not remain above the message list.
+Its leading viewport edge, including the leading scroll fade,
+MUST align with the subject card's measured outer left edge. The clear end of
+the trailing fade MUST meet the native action capsule's measured leading edge;
+standard image/menu items require their native accessibility geometry, not a
+guessed cluster width or an assumed `NSToolbarItem.view`. There is no extra
+outer trailing inset. Only an overflowing strip reserves a 28 pt scroll tail,
+so its last tab can become fully visible before the fade.
+The strip container MUST be clear so the native toolbar material shows through. It MUST
+be present only when at least two tabs are open, and MUST be absent while global
+search is presented. A lone tab stays active in the reader without a visible tab
+strip; hiding the strip MUST NOT close that tab or clear its message.
+The active tab MUST be revealed when the strip appears, its active identity
+changes, or its viewport/intrinsic tab widths change. Ordinary wheel scrolling
+MUST remain user-controlled; scroll offsets MUST NOT invalidate every tab body.
+The titlebar's tab view MUST use Auto Layout with a compressible preferred
+width and a required upper bound; do not pin legacy `NSToolbarItem.minSize`
+and `maxSize` to a measured viewport. Allocation flows from pane/action
+geometry to the strip; the strip's resulting frame may affect its fade but
+MUST NOT feed back into its own width allocation. Native actions have priority
+over the scrollable tab region. Keep system overflow only for genuine lack of
+space, and retain window geometry when a hosted item is detached so shrinking
+and returning to the same width restores the same controls.
+
+
+`⌘W` closes the active tab only while focus is in the reader pane. Closing the
+last tab leaves the window open with an empty reader. If there are no tabs, or
+focus is in the sidebar or message list, `⌘W` closes the window instead. Explicit
+tab-close controls close their target tab without closing the window.
+Closing the active tab MUST preserve reader command focus even when the strip
+disappears in the two-to-one transition.
 
 ### Tabs and actions
 
-- The tab viewport belongs to the toolbar's reader-tabs item. Three adjacent,
-  individual native `NSToolbarItem`s at the trailing edge expose Archive,
-  Trash, and More; Flag, Raw Source, Email Reading mode, and the remaining
-  reader actions live inside More. The sidebar toggle MUST remain in the
-  titlebar. The reader-tabs toolbar item MUST have no label or tooltip, and
-  toolbar customization MUST be disabled.
+- In side-by-side layout, the tab viewport belongs to the toolbar's reader-tabs
+  item. Three adjacent native items expose Archive, Trash, and More. In stacked
+  layout, a pane-local row contains the same tabs and three native AppKit glass
+  controls. Both presentations share the same command/menu policy and AppModel
+  mutation paths. Flag, Raw Source, Email Reading mode, and the remaining reader
+  actions live inside More. The sidebar toggle remains in the titlebar.
+  The reader-tabs toolbar item has no label or tooltip; customization is disabled.
 - Each tab MUST use its intrinsic width:
   `(leading slot + subject text width + inter-item spacing + title paddings)`,
   clamped to 72–220 pt. Subject title leading padding is 4 pt and trailing
   padding is 10 pt. Tabs MUST be separated by 8 pt and MUST NOT stretch to
   consume spare viewport width. Scrolling MUST occur beneath a fixed 28 pt
   right-edge fade at the end of the tab viewport, directly against the
-  actions cluster with no extra gap.
-- The trailing actions (Archive, Trash, More) are independent, unbordered
-  toolbar items—never an `NSToolbarItemGroup` and never a shared capsule—so
-  the glyphs sit as close as native toolbar layout allows. Each item uses a
-  private borderless control with AppKit's intrinsic control and symbol sizing;
-  custom point-size symbol configurations, image scaling, and fixed icon
-  dimensions are prohibited. The control's tracking area supplies independent
-  native-semantic hover and pressed chrome with continuous corners: hover is
-  `quaternarySystemFill`, press is `tertiarySystemFill`, and disabled state
-  remains AppKit-semantic. Hover chrome MUST surround only the hovered item.
+  actions cluster with no extra gap. Once content scrolls beneath the leading
+  edge, apply the same 28 pt alpha fade there instead of a hard vertical clip.
+  Keep the leading edge fully opaque at the start of the scroll range.
+- In the window toolbar, the trailing actions (Archive, Trash, More) are adjacent,
+  individual native `NSToolbarItem` / `NSMenuToolbarItem` controls, not a custom
+  item group or hand-drawn capsule. Leave `view` unset and enable native borders:
+  AppKit owns standard toolbar symbol sizing, hit targets, spacing, focus,
+  disabled state, and hover/pressed treatment. More uses plain `ellipsis`, not a
+  circle baked into its symbol. Do not substitute custom buttons,
+  symbol point sizes, image scaling, fixed icon dimensions, or painted tracking
+  backgrounds. The target is compact, separate glyphs with native interaction
+  chrome, as in the [Craft reference](https://img.kayg.org/u/ngKxVt.png).
   The active tab fill is `textBackgroundColor` (white / near-black); hover is
   `quaternarySystemFill`.
 - Its title MUST contain only the subject, MUST use semantic `.subheadline`, and
@@ -185,13 +288,19 @@ empty-reader state and while global search is presented.
 - Transient and permanent titles share one style (no italics): the active
   fill alone marks state, and "Keep" in the tab menu reveals a transient. A
   tab title or accessory MUST NEVER show unread or flag indicators.
+- Single-click activation MUST NOT wait for double-click recognition. A
+  double-click may keep a transient tab, but must recognize simultaneously with
+  ordinary activation rather than taking priority over the button.
 - Tab backgrounds MUST use a continuous `AppShapeScale.row` (12 pt) corner
   radius. The right-edge fade MUST be a 28 pt transparent mask drawn above
   scrolling tabs and MUST NOT capture tab input. No strip-level fill may
   obscure the toolbar material.
+- The leading mask MUST remain opaque at scroll origin and fade only after
+  content moves off the leading edge. Continuous scroll offsets MUST NOT
+  invalidate the SwiftUI tab strip; only the origin-crossing Boolean may do so.
 - The More menu MUST contain Flag, Raw Source, Email Reading mode, and every
   other reader action not named Archive or Trash. Archive and Trash MUST
-  remain directly reachable as adjacent individual toolbar items.
+  remain directly reachable beside More in either pane arrangement.
 
 ### Tab display styles
 
@@ -225,6 +334,8 @@ choices are mutually exclusive:
   NOT fetch them. It MUST NEVER fetch remote content, mark the message read,
   alter selection or either scroll position, or reflow the reader; it MUST
   overlay the reader content below the toolbar.
+- HTML-to-text preview extraction MUST be deferred until a hover card is
+  requested; tab measurement and ordinary scrolling MUST NOT parse HTML bodies.
 
 References: [Craft Tab Management](https://support.craft.do/en/introduction/navigation/tabs)
 (tab-layout image and tab-preview description); [Chrome keyboard shortcuts](https://support.google.com/chrome/answer/157179)

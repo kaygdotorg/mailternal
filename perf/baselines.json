@@ -7,12 +7,14 @@
     "switches_per_run": 10,
     "note": "Alternate two already-loaded tabs (one HTML and one plain-text); no WebKit navigation is allowed on a switch.",
     "evidence": {
-      "run_identity": "NightlyQA",
-      "measured_on": "2026-09-05",
+      "run_identity": "MainOvernight20260906",
+      "measured_on": "2026-09-06",
       "sample_count": 10,
-      "max_latency_ms": 95.9,
+      "max_latency_ms": 66.4,
       "navigation_count": 0,
       "malformed_count": 0,
+      "spinner_mounts": 0,
+      "persisted_tab_count": 103,
       "budget_ms": 100.0
     }
   },

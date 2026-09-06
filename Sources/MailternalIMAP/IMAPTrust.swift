@@ -11,34 +11,33 @@ import Glibc
 
 /// Process-wide extra TLS trust roots. Production leaves this empty.
 ///
-/// QA/testing only. Extra PEMs are installed as trust anchors. On Apple,
-/// `IMAPTLS` selects the BoringSSL backend whenever extras are present so a
-/// self-signed QA leaf is actually trusted (SecTrust rejects it). Hostname
-/// verification stays on (`certificateVerification = .fullVerification`).
+/// QA/testing only. Extra PEMs are installed as explicit trust anchors.
+/// Hostname verification stays on (`certificateVerification = .fullVerification`).
+/// On Apple platforms, the explicit-root branch uses NIOSSL's BoringSSL
+/// verifier because the QA Dovecot certificate is a self-signed leaf without
+/// CA constraints; the native SecTrust path rejects that fixture even when
+/// supplied as an additional anchor. Production leaves this list empty and
+/// therefore retains the platform/system trust backend.
 /// Thread-safe via a lock. Used by the QA Dovecot (`MAILTERNAL_QA=1`,
 /// self-signed `~/mailternal-qa/certs/dovecot.crt`).
 ///
-/// On Apple, `trustRoots = .default` plus `additionalTrustRoots` is evaluated
-/// by SecTrust, which rejects this self-signed leaf (no CA:TRUE). When extras
-/// are present the handler therefore uses the BoringSSL path with
-/// **system anchors + extras**, so production roots stay in effect.
+/// On macOS, the explicit-root branch combines exported system anchors with
+/// the extra PEMs. iOS cannot export system roots in this module, so its
+/// QA-only explicit-root branch uses the installed PEMs as the complete
+/// NIOSSL trust set. This path is entered only after an explicit test root is
+/// installed and never disables certificate or hostname verification.
 ///
 /// ## IP-literal endpoints
 /// `NIOSSLClientHandler(serverHostname:)` uses one string for SNI **and**
 /// hostname verification, and rejects IP literals (`cannotUseIPAddressInSNI`).
-/// Passing `serverHostname: nil` disables hostname verification entirely:
-/// the chain is still checked, but any trusted certificate can MITM the IP
-/// (violates product.md: hostname + system-trust, no insecure fallback).
+/// The explicit QA fixture uses loopback (`127.0.0.1`/`::1`) and includes a
+/// `localhost` DNS SAN, so that narrowly scoped endpoint uses `localhost` for
+/// SNI and hostname verification while TCP still connects to loopback.
+/// Other IP literals fail closed, even when an extra trust root is installed.
 ///
-/// Option (a) — `NIOSSLCustomVerificationCallback` that re-implements chain
-/// evaluation **and** IP-SAN matching — is not a clean NIOSSL fit: the
-/// callback *replaces* NIOSSL's verifier rather than adding a SAN check, and
-/// Apple SecTrust rejects the QA self-signed Dovecot leaf (the reason extras
-/// already force BoringSSL). So we **fail closed** (option b): IP-literal
-/// endpoints throw `IMAPError.tls` ("use a hostname") unless extra QA trust
-/// roots are installed via ``IMAPSession/installAdditionalTrustRoots(pem:)``.
-/// Production must use a DNS hostname so `.fullVerification` applies. The QA
-/// `127.0.0.1` + extras path is unchanged.
+/// This keeps certificate-chain and hostname verification enabled for
+/// production DNS endpoints and the explicit QA loopback endpoint. There is
+/// no insecure `serverHostname: nil` fallback for an accepted connection.
 enum IMAPTrust {
     private final class Storage: @unchecked Sendable {
         let lock = NSLock()
@@ -52,6 +51,19 @@ enum IMAPTrust {
         storage.lock.lock()
         storage.pemBlobs = pem
         storage.lock.unlock()
+        // Contexts contain the complete trust store and cannot be reused after
+        // QA roots change. Invalidation is separate from this lock so a TLS
+        // handler can never observe a partially updated root list.
+        IMAPTLS.invalidateContextCache()
+    }
+
+    /// A value snapshot used as the TLS-context cache key. The PEM bytes are
+    /// deliberately part of the key, rather than only an installation flag:
+    /// replacing a certificate invalidates the old trust configuration.
+    static func additionalPEM() -> [Data] {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        return storage.pemBlobs
     }
 
     /// True after ``IMAPSession/installAdditionalTrustRoots(pem:)`` with a
@@ -62,19 +74,6 @@ enum IMAPTrust {
         return !storage.pemBlobs.isEmpty
     }
 
-    static func additionalCertificates() throws -> [NIOSSLCertificate]? {
-        storage.lock.lock()
-        let blobs = storage.pemBlobs
-        storage.lock.unlock()
-        if blobs.isEmpty { return nil }
-        var certs: [NIOSSLCertificate] = []
-        certs.reserveCapacity(blobs.count)
-        for blob in blobs {
-            certs.append(contentsOf: try NIOSSLCertificate.fromPEMBytes(Array(blob)))
-        }
-        return certs.isEmpty ? nil : certs
-    }
-
     /// System anchors plus the extra PEMs. Used only when extras are installed.
     static func extendedTrustRoots(_ extras: [NIOSSLCertificate]) -> [NIOSSLCertificate] {
         extras + cachedSystemAnchors()
@@ -82,31 +81,46 @@ enum IMAPTrust {
 
     static func cachedSystemAnchors() -> [NIOSSLCertificate] {
         storage.lock.lock()
+        defer { storage.lock.unlock() }
         if let cached = storage.systemAnchors {
-            storage.lock.unlock()
             return cached
         }
-        storage.lock.unlock()
         let loaded = systemAnchorCertificates()
-        storage.lock.lock()
         storage.systemAnchors = loaded
-        storage.lock.unlock()
         return loaded
     }
-
-    /// IPv4/IPv6 literals cannot be sent as SNI. Hostname verification then
-    /// relies on the IP SAN once the chain is trusted (QA cert includes 127.0.0.1).
+    /// DNS names are used directly for SNI and hostname verification.
     static func sniHostname(for host: String) -> String? {
         isIPAddress(host) ? nil : host
     }
 
-    /// Production IP literals are refused so NIOSSL cannot skip hostname
-    /// verification. QA extras (`installAdditionalTrustRoots`) opt in.
-    static func requireHostnameVerification(for host: String) throws {
+    /// An explicitly installed QA fixture is permitted only for the
+    /// loopback endpoint used by the bundled Dovecot service. The fixture
+    /// contains a `localhost` DNS SAN, so use that name for SNI and hostname
+    /// verification while TCP still connects to loopback.
+    static func sniHostname(for host: String, additionalPEM: [Data]) -> String? {
+        guard isQALoopback(host), !additionalPEM.isEmpty else {
+            return sniHostname(for: host)
+        }
+        return "localhost"
+    }
+
+    /// Production IP literals and arbitrary IP-based accounts are refused so
+    /// NIOSSL cannot silently skip hostname verification. QA extras opt into
+    /// only the bundled loopback fixture.
+    static func requireHostnameVerification(for host: String, additionalPEM: [Data]) throws {
         guard isIPAddress(host) else { return }
-        guard additionalTrustRootsInstalled else {
+        guard isQALoopback(host), !additionalPEM.isEmpty else {
             throw IMAPError.tls("Connect using a hostname, not an IP address.")
         }
+    }
+
+    private static func isQALoopback(_ host: String) -> Bool {
+        var candidate = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if candidate.hasPrefix("["), candidate.hasSuffix("]"), candidate.count > 2 {
+            candidate = String(candidate.dropFirst().dropLast())
+        }
+        return candidate == "127.0.0.1" || candidate == "::1"
     }
 
     static func isIPAddress(_ host: String) -> Bool {
@@ -120,12 +134,13 @@ enum IMAPTrust {
             return inet_pton(AF_INET, cstr, &v4) == 1 || inet_pton(AF_INET6, cstr, &v6) == 1
         }
     }
+
 }
 
 extension IMAPSession {
-    /// QA/testing only — extends, never replaces, system trust; hostname
-    /// verification stays on. Process-wide extra PEM anchors (thread-safe).
-    /// Production callers must not invoke this.
+    /// QA/testing only — installs explicit PEM trust anchors while retaining
+    /// certificate and hostname verification. Production callers must not
+    /// invoke this.
     public static func installAdditionalTrustRoots(pem: [Data]) {
         IMAPTrust.setAdditionalPEM(pem)
     }
@@ -136,7 +151,7 @@ extension IMAPSession {
     }
 }
 
-#if canImport(Security)
+#if os(macOS)
 private func systemAnchorCertificates() -> [NIOSSLCertificate] {
     var anchors: CFArray?
     let status = SecTrustCopyAnchorCertificates(&anchors)

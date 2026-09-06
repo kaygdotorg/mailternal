@@ -111,7 +111,7 @@ struct QAIntegrationTests {
                 var seen = 0
                 var quarantined = 0
                 repeat {
-                    let page = try await store.page(in: horrors.id, after: cursor, limit: 50)
+                    let page = try await store.page(in: horrors.id, after: cursor, limit: 50, sort: .newest)
                     for row in page.rows {
                         let detail = try await store.detail(row.id)
                         seen += 1
@@ -123,7 +123,7 @@ struct QAIntegrationTests {
                 #expect(seen == horrorsSummary.totalCount)
                 _ = quarantined
 
-                let page = try await store.page(in: inbox.id, after: nil, limit: 40)
+                let page = try await store.page(in: inbox.id, after: nil, limit: 40, sort: .newest)
                 let unread = try #require(page.rows.first { !$0.isRead })
                 let ref = try #require(await store.messageRef(unread.id))
                 let side = IMAPSession(
@@ -138,7 +138,7 @@ struct QAIntegrationTests {
                 await engine.refreshNow()
                 try await waitUntil(timeout: .seconds(20), poll: .milliseconds(200)) {
                     let detail = try await store.detail(unread.id)
-                    let page = try await store.page(in: inbox.id, after: nil, limit: 80)
+                    let page = try await store.page(in: inbox.id, after: nil, limit: 80, sort: .newest)
                     return detail.envelope.subject == unread.subject
                         && page.rows.contains { $0.id == unread.id && $0.isRead }
                 }

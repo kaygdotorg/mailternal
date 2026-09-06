@@ -204,6 +204,97 @@ import Testing
     }
 }
 
+@Test func overBudgetFetchPoisonsOnlyItsSession() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let fetching = Task {
+            try await imap.session.fetch(
+                IMAPFetchRequest(
+                    uids: IMAPUIDSet(uid: 1),
+                    peek: [.text],
+                    maximumResponseBytes: 0
+                )
+            )
+        }
+        _ = try await imap.expectCommand(containing: "UID FETCH")
+        do {
+            try await imap.writeServer("* 1 FETCH (UID 1 BODY[TEXT] {1}\r\nx)")
+        } catch {
+            // The transport closes as soon as it sees the over-budget literal.
+        }
+        do {
+            _ = try await fetching.value
+            Issue.record("over-budget FETCH should fail")
+        } catch let error as IMAPError {
+            #expect(error == .responseTooLarge(limit: 0))
+        } catch {
+            Issue.record("over-budget FETCH returned \(error)")
+        }
+
+        do {
+            _ = try await imap.session.listFolders()
+            Issue.record("a poisoned session must reject later commands")
+        } catch let error as IMAPError {
+            #expect(error == .transport("Session is closed"))
+        } catch {
+            Issue.record("closed session returned \(error)")
+        }
+    }
+
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let fetching = Task {
+            try await imap.session.fetch(
+                IMAPFetchRequest(uids: IMAPUIDSet(uid: 2), flags: true)
+            )
+        }
+        let (tag, _) = try await imap.expectCommand(containing: "UID FETCH")
+        try await imap.writeServer("* 2 FETCH (UID 2 FLAGS (\\Seen))")
+        try await imap.ok(tag)
+        let messages = try await fetching.value
+        #expect(messages.count == 1)
+        #expect(messages.first?.uid == 2)
+    }
+}
+
+@Test func unsolicitedFetchesPublishHintsWithoutEnteringFetchResults() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        var events = imap.session.events.makeAsyncIterator()
+        try await imap.writeServer("* 7 FETCH (UID 7 BODY[TEXT] {1}\r\nx)")
+        let beforeHint = await events.next()
+        #expect(beforeHint == .fetchHint)
+
+        let firstFetch = Task {
+            try await imap.session.fetch(
+                IMAPFetchRequest(uids: IMAPUIDSet(uid: 1), flags: true)
+            )
+        }
+        let (firstTag, _) = try await imap.expectCommand(containing: "UID FETCH")
+        try await imap.writeServer("* 1 FETCH (UID 1 FLAGS (\\Seen))")
+        try await imap.ok(firstTag)
+        let firstResult = try await firstFetch.value
+        #expect(firstResult.count == 1)
+        #expect(firstResult.first?.uid == 1)
+
+        try await imap.writeServer("* 8 FETCH (UID 8 BODY[TEXT] {1}\r\ny)")
+        let afterHint = await events.next()
+        #expect(afterHint == .fetchHint)
+
+        let secondFetch = Task {
+            try await imap.session.fetch(
+                IMAPFetchRequest(uids: IMAPUIDSet(uid: 2), flags: true)
+            )
+        }
+        let (secondTag, _) = try await imap.expectCommand(containing: "UID FETCH")
+        try await imap.writeServer("* 2 FETCH (UID 2 FLAGS (\\Seen))")
+        try await imap.ok(secondTag)
+        let secondResult = try await secondFetch.value
+        #expect(secondResult.count == 1)
+        #expect(secondResult.first?.uid == 2)
+    }
+}
+
 @Test func taggedNOOnStoreSeen() async throws {
     try await ScriptedIMAP.run(security: .implicitTLS) { imap in
         try await imap.connectImplicit()

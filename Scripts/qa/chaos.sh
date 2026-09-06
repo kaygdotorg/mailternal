@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 QA_SSH="${QA_SSH:-agents@mbp}"
-QA_REMOTE_DIR="${QA_REMOTE_DIR:-mailternal-qa}"
+QA_REMOTE_DIR="${QA_REMOTE_DIR:-Developer/Worktrees/mailternal-qa}"
 COMPOSE_PROJECT="mailternal-qa"
 USER_IMAP="qa@mailternal.test"
 PASS_IMAP="qa-password"

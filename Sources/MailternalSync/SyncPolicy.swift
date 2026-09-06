@@ -14,9 +14,9 @@ enum SyncPolicy: Sendable {
     /// all account engines in one process. The primary sync connection counts
     /// toward this limit; the dedicated INBOX IDLE socket does not.
     static let globalBackfillConnections = 4
-    /// Maximum encoded PEEK payload retained for one UID while assembling a
-    /// message. Body requests are partial so a large text part cannot make the
-    /// in-flight ingest state unbounded.
+    /// Maximum encoded PEEK payload in one bounded metadata cohort/FETCH
+    /// response set. SyncEngine also caps each retained UID at this value
+    /// when a MIME tree has more text leaves than fit in one request.
     static let backfillWindowPeekByteBudget = 32 * 1024 * 1024
     /// Keep each text-part response small enough that decoded and sanitized
     /// strings fit beside the encoded PEEK payload under the window budget.
@@ -264,12 +264,14 @@ enum SyncPolicy: Sendable {
         }
     }
 
-    /// Transport failures are retryable at the session level. Parser failures
-    /// are intentionally non-transport so the engine can isolate their UID.
+    /// Transport failures are retryable at the session level. A response that
+    /// exceeds the bounded PEEK budget is deliberately *not* a session failure:
+    /// SyncEngine bisects that request while keeping the durable cursor closed.
     static func isTransport(_ error: Error) -> Bool {
         guard let error = error as? IMAPError else { return false }
         switch error {
         case .transport, .tls: return true
+        case .responseTooLarge: return false
         default: return false
         }
     }
@@ -432,7 +434,7 @@ struct SyncSettings: Sendable {
         specialUseDelta: SyncPolicy.specialUseDelta,
         otherFolderDelta: SyncPolicy.otherFolderDelta,
         seenPoll: .seconds(2),
-        diskURL: FileManager.default.homeDirectoryForCurrentUser,
+        diskURL: URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true),
         periodicTick: .seconds(15),
         cleanupTick: .seconds(30),
         reconnect: IMAPReconnectBackoff(),

@@ -11,11 +11,11 @@ struct ReaderTabItem: View {
     let width: CGFloat
 
     let onHoverChanged: (Bool) -> Void
-    /// Optional owner hook lets the strip restore focus after closing its
-    /// active tab while keeping the model as the source of truth.
-    var onClose: ((UUID) -> Void)? = nil
-    /// The owner assigns this focus value only when a tab is closed. Keeping
-    /// the binding here avoids stealing focus during ordinary activation.
+    /// Optional owner hook records the user's activation boundary before the
+    /// model swaps the active retained reader surface.
+    var onTabCommand: (() -> Void)? = nil
+    /// Reflects keyboard focus in the strip. Close commands restore native
+    /// reader focus through the model's window-owned close transition.
     var focusedTabID: FocusState<UUID?>.Binding
 
 
@@ -23,9 +23,7 @@ struct ReaderTabItem: View {
     @State private var isHovered = false
 
     private var isActive: Bool { model.tabs.activeID == tab.id }
-    private var isTransient: Bool {
-        model.tabs.tabs.first(where: { $0.id == tab.id })?.isTransient ?? tab.isTransient
-    }
+    private var isTransient: Bool { tab.isTransient }
     private var displaySubject: String {
         subject.isEmpty ? "No Subject" : subject
     }
@@ -96,11 +94,7 @@ struct ReaderTabItem: View {
 
 
     private func closeTab() {
-        if let onClose {
-            onClose(tab.id)
-        } else {
-            model.tabs.close(tab.id)
-        }
+        model.closeReaderTab(tab.id)
     }
 
 
@@ -110,6 +104,8 @@ struct ReaderTabItem: View {
 
             if ReaderTabStylePolicy.showsSubject(for: style) {
                 Button {
+                    model.noteReaderInteraction()
+                    onTabCommand?()
                     model.activateTab(tab.id)
                 } label: {
                     titleLabel
@@ -117,11 +113,12 @@ struct ReaderTabItem: View {
                 .buttonStyle(.plain)
                 .focusEffectDisabled(true)
                 .focused(focusedTabID, equals: tab.id)
-                .highPriorityGesture(
+                // Keeping a transient tab must not delay single-click
+                // activation while the double-click interval expires.
+                .simultaneousGesture(
                     TapGesture(count: 2)
                         .onEnded {
                             if isTransient { model.tabs.keep(tab.id) }
-                            model.activateTab(tab.id)
                         }
                 )
             }
@@ -146,9 +143,11 @@ struct ReaderTabItem: View {
         .onContinuousHover { phase in
             switch phase {
             case .active:
+                guard !isHovered else { return }
                 isHovered = true
                 onHoverChanged(true)
             case .ended:
+                guard isHovered else { return }
                 isHovered = false
                 onHoverChanged(false)
             }

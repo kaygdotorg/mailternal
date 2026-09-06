@@ -141,23 +141,31 @@ extension MailStore {
         }
     }
 
-    /// Keyset page over the folder's live generation, ordered
-    /// `(internalDate DESC, uid DESC)`. Bodies are not selected.
+    /// Keyset page over the folder's live generation in `sort` order. Bodies
+    /// are not selected. The UID is always the final stable tie-breaker.
     public func page(
         in folder: FolderID,
         after cursor: MessagePageCursor?,
-        limit: Int
+        limit: Int,
+        sort: MailListSort
     ) async throws -> MessagePage {
         try await read { db in
-            try MailStore.fetchPage(db, folder: folder, after: cursor, limit: limit)
+            try MailStore.fetchPage(
+                db,
+                folder: folder,
+                after: cursor,
+                limit: limit,
+                sort: sort
+            )
         }
     }
 
     /// Returns every message ID in the folder's current live generation in the
-    /// same newest-first order as `page`. The generation pointer on `folders`
-    /// makes this a single indexed read without paging or materializing rows.
-    public func messageIDs(in folder: FolderID) async throws -> [MessageID] {
+    /// same store-backed order as `page`. This is one indexed read: it does not
+    /// materialize or sort the mailbox in Swift.
+    public func messageIDs(in folder: FolderID, sort: MailListSort) async throws -> [MessageID] {
         try await read { db in
+            let spec = MailStore.sortSpec(sort)
             let values = try Int64.fetchAll(
                 db,
                 sql: """
@@ -165,7 +173,7 @@ extension MailStore {
                     FROM messages m
                     JOIN folders f ON f.live_generation_id = m.generation_id
                     WHERE f.id = ? AND f.retired = 0
-                    ORDER BY m.internal_date DESC, m.uid DESC
+                    ORDER BY m.\(spec.column) \(spec.order), m.uid \(spec.order)
                     """,
                 arguments: [folder.rawValue]
             )
@@ -173,14 +181,21 @@ extension MailStore {
         }
     }
 
-    /// `EXPLAIN QUERY PLAN` for the pagination SELECT. Locks the keyset index.
+    /// `EXPLAIN QUERY PLAN` for the selected pagination order.
     public func explainPageQueryPlan(
         in folder: FolderID,
         after cursor: MessagePageCursor?,
-        limit: Int
+        limit: Int,
+        sort: MailListSort
     ) async throws -> String {
         try await read { db in
-            try MailStore.explainPage(db, folder: folder, after: cursor, limit: limit)
+            try MailStore.explainPage(
+                db,
+                folder: folder,
+                after: cursor,
+                limit: limit,
+                sort: sort
+            )
         }
     }
 
@@ -188,10 +203,17 @@ extension MailStore {
     public func observePage(
         in folder: FolderID,
         after cursor: MessagePageCursor?,
-        limit: Int
+        limit: Int,
+        sort: MailListSort
     ) -> AsyncStream<MessagePage> {
         observe { db in
-            try MailStore.fetchPage(db, folder: folder, after: cursor, limit: limit)
+            try MailStore.fetchPage(
+                db,
+                folder: folder,
+                after: cursor,
+                limit: limit,
+                sort: sort
+            )
         }
     }
 
@@ -214,6 +236,37 @@ extension MailStore {
             }
         }
         return result.detail
+    }
+
+    /// Returns locally stored details in input order using one database read.
+    ///
+    /// Duplicate IDs are decoded once, missing rows are omitted, and decode or
+    /// database errors are propagated. This path never performs remote work or
+    /// schema backfills.
+    public func details(_ ids: [MessageID]) async throws -> [MessageDetail] {
+        let uniqueIDs: [MessageID] = {
+            var uniqueIDs: [MessageID] = []
+            uniqueIDs.reserveCapacity(ids.count)
+            var seen = Set<MessageID>()
+            for id in ids where seen.insert(id).inserted {
+                uniqueIDs.append(id)
+            }
+            return uniqueIDs
+        }()
+        guard !uniqueIDs.isEmpty else { return [] }
+
+        return try await read { db in
+            var details: [MessageDetail] = []
+            details.reserveCapacity(uniqueIDs.count)
+            for id in uniqueIDs {
+                do {
+                    details.append(try MailStore.fetchDetailWithStorage(db, id: id).detail)
+                } catch MailStoreError.messageNotFound {
+                    continue
+                }
+            }
+            return details
+        }
     }
 
     public func messageID(generation: MailboxGeneration, uid: IMAPUID) async throws -> MessageID? {
@@ -322,12 +375,111 @@ extension MailStore {
         }
     }
 
+    /// Returns the highest stored UID for `generation`.
+    ///
+    /// The aggregate is evaluated against the messages generation/UID
+    /// uniqueness index, so this does not materialize the generation's UIDs.
+    /// A missing or empty generation returns `nil`.
+    public func maximumUID(in generation: MailboxGeneration) async throws -> IMAPUID? {
+        try await read { db in
+            guard let genID = try MailStore.generationID(db, generation) else { return nil }
+            let value: Int64? = try Int64.fetchOne(
+                db,
+                sql: "SELECT MAX(uid) FROM messages WHERE generation_id = ?",
+                arguments: [genID]
+            )
+            return value.map { IMAPUID(rawValue: UInt32($0)) }
+        }
+    }
+
+    private static func sortSpec(_ sort: MailListSort) -> (column: String, order: String) {
+        // These identifiers are selected exclusively from this allowlist; no
+        // caller-provided sort value is ever interpolated into SQL.
+        switch sort.field {
+        case .date:
+            return ("internal_date", sort.direction == .ascending ? "ASC" : "DESC")
+        case .sender:
+            return ("from_display", sort.direction == .ascending ? "ASC" : "DESC")
+        case .subject:
+            return ("subject", sort.direction == .ascending ? "ASC" : "DESC")
+        case .read:
+            return ("is_read", sort.direction == .ascending ? "ASC" : "DESC")
+        case .flagged:
+            return ("is_flagged", sort.direction == .ascending ? "ASC" : "DESC")
+        case .attachments:
+            return ("has_attachments", sort.direction == .ascending ? "ASC" : "DESC")
+        }
+    }
+
+    private static func validateCursor(
+        _ cursor: MessagePageCursor?,
+        sort: MailListSort
+    ) throws {
+        guard let cursor else { return }
+        guard cursor.sort == sort else { throw MailStoreError.invalidPageCursor }
+        switch (sort.field, cursor.value) {
+        case (.date, .date(_)), (.sender, .sender(_)), (.subject, .subject(_)),
+             (.read, .read(_)), (.flagged, .flagged(_)), (.attachments, .attachments(_)):
+            return
+        default:
+            throw MailStoreError.invalidPageCursor
+        }
+    }
+
+    private static func addCursorPredicate(
+        to sql: inout String,
+        arguments: inout StatementArguments,
+        cursor: MessagePageCursor?,
+        sort: MailListSort
+    ) throws {
+        guard let cursor else { return }
+        try validateCursor(cursor, sort: sort)
+        let comparison = sort.direction == .ascending ? ">" : "<"
+        let value: any DatabaseValueConvertible
+        switch (sort.field, cursor.value) {
+        case (.date, .date(let date)):
+            value = date.timeIntervalSince1970
+        case (.sender, .sender(let text)), (.subject, .subject(let text)):
+            value = text
+        case (.read, .read(let state)), (.flagged, .flagged(let state)),
+             (.attachments, .attachments(let state)):
+            value = state
+        default:
+            throw MailStoreError.invalidPageCursor
+        }
+        let spec = sortSpec(sort)
+        sql += " AND (m.\(spec.column) \(comparison) ? OR (m.\(spec.column) = ? AND m.uid \(comparison) ?))"
+        arguments += [value, value, Int64(cursor.uid.rawValue)]
+    }
+
+    private static func cursor(from row: Row, sort: MailListSort) -> MessagePageCursor {
+        let uid: Int64 = row["uid"]
+        let value: MessagePageCursorValue
+        switch sort.field {
+        case .date:
+            value = .date(Date(timeIntervalSince1970: row["internal_date"]))
+        case .sender:
+            value = .sender(row["from_display"])
+        case .subject:
+            value = .subject(row["subject"])
+        case .read:
+            value = .read(row["is_read"])
+        case .flagged:
+            value = .flagged(row["is_flagged"])
+        case .attachments:
+            value = .attachments(row["has_attachments"])
+        }
+        return MessagePageCursor(sort: sort, value: value, uid: IMAPUID(rawValue: UInt32(uid)))
+    }
+
     static func fetchPage(
         _ db: Database,
         folder: FolderID,
         after cursor: MessagePageCursor?,
-        limit: Int
+        limit: Int,
+        sort: MailListSort
     ) throws -> MessagePage {
+        try validateCursor(cursor, sort: sort)
         let cap = max(limit, 0)
         if cap == 0 { return MessagePage(rows: [], next: nil) }
 
@@ -350,26 +502,15 @@ extension MailStore {
             WHERE f.id = ? AND f.retired = 0
             """
         var arguments: StatementArguments = [folder.rawValue]
-        if let cursor {
-            let t = cursor.internalDate.timeIntervalSince1970
-            let uid = Int64(cursor.uid.rawValue)
-            sql += " AND (m.internal_date < ? OR (m.internal_date = ? AND m.uid < ?))"
-            arguments += [t, t, uid]
-        }
-        sql += " ORDER BY m.internal_date DESC, m.uid DESC LIMIT ?"
+        try addCursorPredicate(to: &sql, arguments: &arguments, cursor: cursor, sort: sort)
+        let spec = sortSpec(sort)
+        sql += " ORDER BY m.\(spec.column) \(spec.order), m.uid \(spec.order) LIMIT ?"
         arguments += [cap + 1]
         let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
         let hasMore = rows.count > cap
         let slice = hasMore ? Array(rows.prefix(cap)) : rows
         let mapped = slice.map { MailStore.messageRow(from: $0, preview: $0["preview"]) }
-        var next: MessagePageCursor?
-        if hasMore, let last = slice.last {
-            let uid: Int64 = last["uid"]
-            next = MessagePageCursor(
-                internalDate: Date(timeIntervalSince1970: last["internal_date"]),
-                uid: IMAPUID(rawValue: UInt32(uid))
-            )
-        }
+        let next = hasMore ? slice.last.map { MailStore.cursor(from: $0, sort: sort) } : nil
         return MessagePage(rows: mapped, next: next)
     }
 
@@ -377,8 +518,10 @@ extension MailStore {
         _ db: Database,
         folder: FolderID,
         after cursor: MessagePageCursor?,
-        limit: Int
+        limit: Int,
+        sort: MailListSort
     ) throws -> String {
+        try validateCursor(cursor, sort: sort)
         let cap = max(limit, 0)
         var sql = """
             SELECT m.id, m.from_display, m.subject, m.preview, m.internal_date, m.uid,
@@ -397,13 +540,9 @@ extension MailStore {
             WHERE f.id = ? AND f.retired = 0
             """
         var arguments: StatementArguments = [folder.rawValue]
-        if let cursor {
-            let t = cursor.internalDate.timeIntervalSince1970
-            let uid = Int64(cursor.uid.rawValue)
-            sql += " AND (m.internal_date < ? OR (m.internal_date = ? AND m.uid < ?))"
-            arguments += [t, t, uid]
-        }
-        sql += " ORDER BY m.internal_date DESC, m.uid DESC LIMIT ?"
+        try addCursorPredicate(to: &sql, arguments: &arguments, cursor: cursor, sort: sort)
+        let spec = sortSpec(sort)
+        sql += " ORDER BY m.\(spec.column) \(spec.order), m.uid \(spec.order) LIMIT ?"
         arguments += [cap + 1]
         let rows = try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
         return rows.map { row -> String in

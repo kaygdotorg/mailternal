@@ -362,6 +362,10 @@ public struct IMAPFetchRequest: Sendable, Hashable {
     public var peek: [IMAPPeekSection]
     /// Optional `CHANGEDSINCE` modifier (CONDSTORE / QRESYNC flag deltas).
     public var changedSince: UInt64?
+    /// Maximum aggregate encoded PEEK bytes accepted for this response set.
+    /// `nil` uses the transport's 32 MiB ceiling; smaller values reserve space
+    /// for a caller's surrounding fetch cohort.
+    public var maximumResponseBytes: Int?
 
     /// Creates a fetch request. Every body section in `peek` is encoded with PEEK.
     public init(
@@ -374,7 +378,8 @@ public struct IMAPFetchRequest: Sendable, Hashable {
         rfc822Size: Bool = false,
         modSeq: Bool = false,
         peek: [IMAPPeekSection] = [],
-        changedSince: UInt64? = nil
+        changedSince: UInt64? = nil,
+        maximumResponseBytes: Int? = nil
     ) {
         self.uids = uids
         self.envelope = envelope
@@ -386,6 +391,7 @@ public struct IMAPFetchRequest: Sendable, Hashable {
         self.modSeq = modSeq
         self.peek = peek
         self.changedSince = changedSince
+        self.maximumResponseBytes = maximumResponseBytes
     }
 
     /// Envelopes + BODYSTRUCTURE + FLAGS + INTERNALDATE for a UID window (backfill metadata).

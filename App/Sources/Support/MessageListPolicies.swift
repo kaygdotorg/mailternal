@@ -226,6 +226,24 @@ enum MessageContextMenuPolicy {
         }
     }
 
+    /// Retains a multi-row selection when the context-menu click lands on one
+    /// of its rows; a click outside the selection targets only that row.
+    static func selectionForContextMenu(
+        clicked: MessageID,
+        selected: Set<MessageID>
+    ) -> Set<MessageID> {
+        selected.contains(clicked) ? selected : [clicked]
+    }
+
+    /// AppKit stores selections as a set, so context-menu actions explicitly
+    /// recover the message-list's visible order before opening reader tabs.
+    static func orderedSelection<S: Sequence>(
+        _ selection: Set<MessageID>,
+        rowOrder: S
+    ) -> [MessageID] where S.Element == MessageID {
+        rowOrder.filter(selection.contains)
+    }
+
     static func items(
         selection: Set<MessageID>,
         isReadStates: [MessageID: Bool],
@@ -243,7 +261,7 @@ enum MessageContextMenuPolicy {
         let canMoveToJunk = folders.contains { $0.role == .junk } && currentFolder?.role != .junk
 
         return [
-            Item(title: "Open in New Tab", action: .openInNewTab, isEnabled: count == 1),
+            Item(title: "Open in New Tab", action: .openInNewTab),
             Item(title: "Open in New Window", action: .openInNewWindow, isEnabled: count == 1),
             separator,
             Item(title: "Reply", action: .reply, isEnabled: false, toolTip: composerToolTip),
@@ -468,7 +486,7 @@ enum MessageToolbarPolicy {
             VisibleItem(
                 identifier: .overflow,
                 title: "More",
-                imageName: "ellipsis.circle",
+                imageName: "ellipsis",
                 isEnabled: enabled
             ),
         ]

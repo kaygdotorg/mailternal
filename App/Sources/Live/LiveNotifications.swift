@@ -1,8 +1,14 @@
+#if os(macOS)
 import AppKit
+#elseif os(iOS)
+import UIKit
+#endif
 import UserNotifications
 import MailternalSync
 
-/// Local new-mail banners and the dock badge. `NSUserNotification` is dead.
+/// Local new-mail banners and the app badge. `NSUserNotification` is dead.
+/// The notification service is shared by the macOS and iOS live facades; only
+/// the frontmost-app check differs because iOS has no `NSApplication`.
 final class LiveNotificationService: NSObject, UNUserNotificationCenterDelegate {
     private var requested = false
     private let enabled: Bool
@@ -25,7 +31,14 @@ final class LiveNotificationService: NSObject, UNUserNotificationCenterDelegate 
     @MainActor
     func postNewMail(_ event: NewMailEvent, folderVisible: Bool) {
         guard enabled else { return }
-        if NSApp.isActive && folderVisible { return }
+        #if os(macOS)
+        let applicationIsActive = NSApp.isActive
+        #elseif os(iOS)
+        let applicationIsActive = UIApplication.shared.applicationState == .active
+        #else
+        let applicationIsActive = false
+        #endif
+        if applicationIsActive && folderVisible { return }
         let content = UNMutableNotificationContent()
         content.title = event.from.isEmpty ? "New mail" : event.from
         content.body = event.subject
@@ -52,3 +65,4 @@ final class LiveNotificationService: NSObject, UNUserNotificationCenterDelegate 
         completionHandler([.banner, .list, .sound])
     }
 }
+

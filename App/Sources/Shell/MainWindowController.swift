@@ -13,11 +13,13 @@ private let readerToolbarSignpostLog = OSLog(
 
 @inline(__always)
 private func shellLaunchPhase(_ name: String) {
-    QALaunch.launchSubphase(name)
+    QALaunch.launchPhase(name)
     os_signpost(.event, log: mainWindowSignpostLog, name: "shell-launch", "%{public}s", name)
 }
 
 
+/// Both pane arrangements retain the same model, selection, and reader tabs.
+/// Only the native split orientation changes; mail mutations stay on AppModel.
 struct MainSplitRoot: View {
     @Bindable var model: AppModel
     let appearance: AppearanceSettings
@@ -40,14 +42,34 @@ struct MainSplitRoot: View {
     }
     var body: some View {
         ZStack {
-        NavigationSplitView(columnVisibility: $model.columnVisibility) {
-            FolderSidebar(model: model)
-        } content: {
-            MessageListPane(model: model)
-        } detail: {
-            MessageViewer(model: model)
+        Group {
+            switch model.listPaneLayout {
+            case .sideBySide:
+                NavigationSplitView(columnVisibility: $model.columnVisibility) {
+                    FolderSidebar(model: model)
+                } content: {
+                    MessageListPane(model: model)
+                } detail: {
+                    MessageViewer(model: model)
+                }
+                .navigationSplitViewStyle(.balanced)
+            case .listAboveReader:
+                NavigationSplitView(columnVisibility: $model.columnVisibility) {
+                    FolderSidebar(model: model)
+                } detail: {
+                    VSplitView {
+                        MessageListPane(model: model)
+                            .frame(minHeight: 180)
+                        VStack(spacing: 0) {
+                            ReaderPaneChrome(model: model)
+                            MessageViewer(model: model)
+                        }
+                        .frame(minHeight: 200)
+                    }
+                }
+                .navigationSplitViewStyle(.balanced)
+            }
         }
-        .navigationSplitViewStyle(.balanced)
         .animation(MailMotion.sidebarToggle, value: model.columnVisibility)
         .background {
             MainSplitVisibilityBridge(
@@ -113,6 +135,52 @@ private struct StoreMigrationOverlay: View {
         }
     }
 }
+/// Reader-scoped chrome follows the lower split pane, rather than remaining
+/// in the window titlebar above the message list.
+private struct ReaderPaneChrome: View {
+    @Bindable var model: AppModel
+
+    var body: some View {
+        if model.tabs.active != nil && !model.isSearchPresented {
+            HStack(spacing: 0) {
+                if model.tabs.tabs.count > 1 {
+                    ReaderTabBar(model: model)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    Spacer(minLength: 0)
+                }
+                ReaderPaneActions(model: model)
+                    .fixedSize()
+            }
+            .frame(height: ReaderTabLayoutPolicy.rowHeight)
+            .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
+            .accessibilityIdentifier("reader-pane-toolbar")
+        }
+    }
+}
+
+private struct ReaderPaneActions: NSViewRepresentable {
+    let model: AppModel
+
+    func makeCoordinator() -> MainToolbarController {
+        MainToolbarController(model: model, includesSidebarToggle: false, isPaneLocal: true)
+    }
+
+    func makeNSView(context: Context) -> NSStackView {
+        context.coordinator.makePaneActions()
+    }
+
+    func updateNSView(_ nsView: NSStackView, context: Context) {
+        context.coordinator.update(model: model)
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize, nsView: NSStackView, context: Context
+    ) -> CGSize? {
+        nsView.fittingSize
+    }
+}
+
 struct MainOverlayRoot: View {
     @Bindable var model: AppModel
     let appearance: AppearanceSettings
@@ -326,6 +394,10 @@ final class MainShellViewController: NSViewController {
     }
 
     func update(model: AppModel, appearance: AppearanceSettings, actions: ActionSettings) {
+        let modelChanged = self.model !== model
+        let appearanceChanged = self.appearance !== appearance
+        let actionsChanged = self.actions !== actions
+        guard modelChanged || appearanceChanged || actionsChanged else { return }
         self.model = model
         self.appearance = appearance
         self.actions = actions
@@ -339,7 +411,6 @@ final class MainShellViewController: NSViewController {
         overlayHosting?.rootView = MainOverlayRoot(model: model, appearance: appearance, actions: actions)
         backgroundHosting?.rootView = WindowBackdropRoot(appearance: appearance)
     }
-
     private func makeOverlay() {
         let hosting = OverlayHostingView(
             rootView: MainOverlayRoot(model: model, appearance: appearance, actions: actions)
@@ -389,15 +460,38 @@ private extension NSToolbarItem.Identifier {
 
 @MainActor
 private final class ReaderTabsHostingView: NSHostingView<ReaderTabBar> {
+    var onWindowChange: ((NSWindow) -> Void)?
+    private lazy var widthLimit = widthAnchor.constraint(lessThanOrEqualToConstant: 0)
+    private lazy var preferredWidth = widthAnchor.constraint(equalToConstant: 0)
+
+    required init(rootView: ReaderTabBar) {
+        super.init(rootView: rootView)
+        preferredWidth.priority = .defaultLow
+        NSLayoutConstraint.activate([
+            widthLimit,
+            preferredWidth,
+            heightAnchor.constraint(equalToConstant: ReaderTabLayoutPolicy.rowHeight)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let window { onWindowChange?(window) }
+    }
+
     var desiredWidth: CGFloat = 0 {
         didSet {
             guard abs(oldValue - desiredWidth) > 0.5 else { return }
-            invalidateIntrinsicContentSize()
+            widthLimit.constant = desiredWidth
+            preferredWidth.constant = desiredWidth
         }
     }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: desiredWidth, height: ReaderTabLayoutPolicy.rowHeight)
+        NSSize(width: NSView.noIntrinsicMetric, height: ReaderTabLayoutPolicy.rowHeight)
     }
 }
 
@@ -484,115 +578,6 @@ private final class ReaderTabHoverTrackingView: NSView {
     override func mouseEntered(with event: NSEvent) { onHoverChanged?(true) }
     override func mouseExited(with event: NSEvent) { onHoverChanged?(false) }
 }
-/// Borderless toolbar action control with independent native-semantic hover
-/// and pressed chrome. Keeping the image and intrinsic metrics on NSButton
-/// lets AppKit continue to own symbol sizing and the control's hit target.
-@MainActor
-private final class MessageToolbarButton: NSButton {
-    private var trackingArea: NSTrackingArea?
-    private var isHovered = false
-    private var isPressed = false
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.masksToBounds = false
-        layer?.cornerCurve = .continuous
-        layer?.cornerRadius = 6
-        isBordered = false
-        showsBorderOnlyWhileMouseInside = false
-        setButtonType(.momentaryPushIn)
-        imagePosition = .imageOnly
-        focusRingType = .none
-        updateChrome()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea {
-            removeTrackingArea(trackingArea)
-            self.trackingArea = nil
-        }
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(area)
-        trackingArea = area
-    }
-
-    override func layout() {
-        super.layout()
-        guard let layer else { return }
-        layer.cornerRadius = min(6, min(bounds.width, bounds.height) / 2)
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHovered = true
-        updateChrome()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovered = false
-        updateChrome()
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        guard isEnabled else { return }
-        isPressed = true
-        updateChrome()
-        defer {
-            isPressed = false
-            updateChrome()
-        }
-        super.mouseDown(with: event)
-    }
-
-    override func performClick(_ sender: Any?) {
-        guard isEnabled else { return }
-        isPressed = true
-        updateChrome()
-        defer {
-            isPressed = false
-            updateChrome()
-        }
-        super.performClick(sender)
-    }
-
-    override var isEnabled: Bool {
-        didSet { updateChrome() }
-    }
-
-    override var isHighlighted: Bool {
-        didSet { updateChrome() }
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        updateChrome()
-    }
-
-    private func updateChrome() {
-        guard let layer else { return }
-        let color: NSColor? = {
-            guard isEnabled, isHovered else { return nil }
-            return (isPressed || isHighlighted) ? .tertiarySystemFill : .quaternarySystemFill
-        }()
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer.backgroundColor = color?.cgColor
-            CATransaction.commit()
-        }
-    }
-}
 
 
 
@@ -601,15 +586,18 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     private var model: AppModel
     private var modelObservationGeneration: UInt64 = 0
     private let includesSidebarToggle: Bool
+    private let isPaneLocal: Bool
+    private var paneButtons: [MessageToolbarPolicy.Identifier: NSButton] = [:]
     private let toggleAction: @MainActor () -> Void
     private var readerMessageSelection: Set<MessageID> {
-        let messageID = includesSidebarToggle
+        let messageID = includesSidebarToggle || isPaneLocal
             ? model.tabs.active?.message
             : model.selectedMessageID
         return messageID.map { [$0] } ?? []
     }
 
     private weak var toolbar: NSToolbar?
+    private weak var layoutWindow: NSWindow?
     private lazy var toggleItem = makeToggleItem()
     private lazy var readerTabsHosting = makeReaderTabsHosting()
     private lazy var readerTabsItem = makeReaderTabsItem()
@@ -634,19 +622,24 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     init(
         model: AppModel,
         includesSidebarToggle: Bool = true,
+        isPaneLocal: Bool = false,
         toggleAction: @escaping @MainActor () -> Void = {}
     ) {
         self.model = model
         self.includesSidebarToggle = includesSidebarToggle
+        self.isPaneLocal = isPaneLocal
         self.toggleAction = toggleAction
         super.init()
         observeModelChanges()
+        observeReaderTabsChanges()
     }
 
     func update(model: AppModel) {
+        guard self.model !== model else { return }
         self.model = model
         modelObservationGeneration &+= 1
         observeModelChanges()
+        observeReaderTabsChanges()
         if includesSidebarToggle {
             readerTabsHosting.rootView = ReaderTabBar(model: model)
         }
@@ -655,31 +648,71 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         toolbar?.validateVisibleItems()
     }
 
+    /// The same command/menu owner backs native pane buttons and titlebar
+    /// items. Only presentation changes; mutations still go through AppModel.
+    func makePaneActions() -> NSStackView {
+        let archive = NSButton(
+            image: NSImage(), target: self, action: #selector(archiveSelected(_:))
+        )
+        let trash = NSButton(
+            image: NSImage(), target: self, action: #selector(trashSelected(_:))
+        )
+        let more = NSPopUpButton(frame: .zero, pullsDown: true)
+        menuNeedsUpdate(overflowMenu)
+        more.menu = overflowMenu
+        (more.cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
+        paneButtons = [.archive: archive, .trash: trash, .overflow: more]
+        for (identifier, button) in paneButtons {
+            button.bezelStyle = .glass
+            button.imagePosition = .imageOnly
+            button.setAccessibilityIdentifier(identifier.rawValue)
+        }
+        configureMessageItems()
+        let stack = NSStackView(views: [archive, trash, more])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = ReaderTabLayoutPolicy.toolbarSpacing
+        stack.setHuggingPriority(.required, for: .horizontal)
+        return stack
+    }
+
     /// AppKit's toolbar validation is not driven by SwiftUI's observation
-    /// updates. Keep the native reader items in step with model changes while
-    /// leaving per-menu-item validation to `validateMenuItem(_:).`
+    /// updates. Keep native message actions in step with only the state they
+    /// consume, without rebuilding the reader-tabs item for list/menu changes.
     private func observeModelChanges() {
         let generation = modelObservationGeneration
         withObservationTracking {
             _ = model.tabs.active?.message
             _ = model.selectedMessageID
-
             _ = model.listRows
-            _ = model.folders
-            _ = model.selectedFolderID
             _ = model.isShowingRawSource
             _ = model.emailReadingOverride
             _ = model.appearance.emailReadingMode
             _ = model.isSearchPresented
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.modelObservationGeneration == generation else { return }
+                self.configureMessageItems()
+                self.toolbar?.validateVisibleItems()
+                self.observeModelChanges()
+            }
+        }
+    }
+
+    private func observeReaderTabsChanges() {
+        let generation = modelObservationGeneration
+        withObservationTracking {
             _ = model.tabs.activeID
             _ = model.tabs.tabs.count
+            _ = model.isSearchPresented
+            _ = model.listPaneLayout
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.modelObservationGeneration == generation else { return }
                 self.configureMessageItems()
                 self.configureReaderTabs()
                 self.toolbar?.validateVisibleItems()
-                self.observeModelChanges()
+                self.observeReaderTabsChanges()
             }
         }
     }
@@ -699,18 +732,57 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.scheduleReaderTabsWidthUpdate()
+            MainActor.assumeIsolated { self?.scheduleReaderTabsWidthUpdate() }
         }
         NotificationCenter.default.addObserver(
             forName: NSSplitView.didResizeSubviewsNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.scheduleReaderTabsWidthUpdate()
+            MainActor.assumeIsolated { self?.scheduleReaderTabsWidthUpdate() }
         }
-        // NSToolbar installs its item views after makeToolbar returns. Cache the
-        // native action widths only after installation, then size tabs from
-        // split geometry on that stable value.
+        NotificationCenter.default.addObserver(
+            forName: MessageSubjectRegion.geometryDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let window = notification.object as? NSWindow else { return }
+            MainActor.assumeIsolated {
+                guard self?.readerTabsHosting.window === window else { return }
+                self?.scheduleReaderTabsWidthUpdate()
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didEndLiveResizeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleReaderTabsWidthUpdate() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleReaderTabsWidthUpdate() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didDeminiaturizeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleReaderTabsWidthUpdate() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeScreenNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleReaderTabsWidthUpdate() }
+        }
+        // NSToolbar installs its item views after makeToolbar returns. Resolve
+        // the native action boundary after installation; the earlier fallback
+        // remains provisional.
         DispatchQueue.main.async { [weak self, weak toolbar] in
             guard let self, self.toolbar === toolbar else { return }
             self.cacheMessageActionsWidth()
@@ -781,6 +853,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             configureReaderTabs()
         case .messageArchive, .messageTrash, .messageOverflow:
             configureMessageItems()
+            // With autovalidates enabled, AppKit owns isEnabled and applies
+            // the Boolean returned by validation; assigning isEnabled above
+            // is therefore not sufficient for the image action items.
+            return !model.isSearchPresented && !readerMessageSelection.isEmpty
         default:
             return item.isEnabled
         }
@@ -788,9 +864,13 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        overflowItem.isEnabled = !readerMessageSelection.isEmpty
+        if !isPaneLocal { overflowItem.isEnabled = !readerMessageSelection.isEmpty }
         menu.removeAllItems()
-        menu.addItem(NSMenuItem())
+        let header = NSMenuItem()
+        if isPaneLocal {
+            header.image = Self.toolbarSymbol("ellipsis", accessibilityDescription: "More")
+        }
+        menu.addItem(header)
         for policyItem in MessageToolbarPolicy.overflowItems(
             selection: readerMessageSelection,
             isReadStates: readStates,
@@ -836,6 +916,16 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             effectiveEmailReadingMode: model.effectiveEmailReadingMode,
             isShowingRawSource: model.isShowingRawSource
         )
+        if isPaneLocal {
+            for visible in visibleItems {
+                guard let button = paneButtons[visible.identifier] else { continue }
+                button.image = Self.toolbarSymbol(visible.imageName, accessibilityDescription: visible.title)
+                button.toolTip = visible.title
+                button.setAccessibilityLabel(visible.title)
+                button.isEnabled = visible.isEnabled && !model.isSearchPresented
+            }
+            return
+        }
         for visible in visibleItems {
             let item: NSToolbarItem
             switch visible.identifier {
@@ -845,25 +935,17 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             case .flag, .source, .colorScheme:
                 continue
             }
-            Self.apply(
-                image: Self.toolbarSymbol(visible.imageName, accessibilityDescription: visible.title),
-                to: item
-            )
+            item.image = Self.toolbarSymbol(visible.imageName, accessibilityDescription: visible.title)
             item.label = visible.title
             item.paletteLabel = visible.title
             item.toolTip = visible.title
             item.isEnabled = visible.isEnabled
-            if let button = item.view as? MessageToolbarButton {
-                button.setAccessibilityLabel(visible.title)
-                button.toolTip = visible.title
-                button.isEnabled = visible.isEnabled
-            }
         }
         let hideActions = model.isSearchPresented || readerMessageSelection.isEmpty
+            || (includesSidebarToggle && model.listPaneLayout == .listAboveReader)
         for item in [archiveItem, trashItem, overflowItem] {
             item.isHidden = hideActions
             item.isEnabled = !hideActions
-            (item.view as? MessageToolbarButton)?.isEnabled = !hideActions
         }
         toggleItem.isHidden = !includesSidebarToggle || model.isSearchPresented
         toggleItem.isEnabled = includesSidebarToggle && !model.isSearchPresented
@@ -896,6 +978,11 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         // let NSHostingView install an opaque layer or size itself from the
         // SwiftUI root's intrinsic content.
         hosting.sizingOptions = []
+        hosting.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        hosting.onWindowChange = { [weak self] window in
+            self?.layoutWindow = window
+            self?.scheduleReaderTabsWidthUpdate()
+        }
         hosting.translatesAutoresizingMaskIntoConstraints = false
         hosting.clipsToBounds = false
         hosting.wantsLayer = true
@@ -911,10 +998,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         item.label = ""
         item.paletteLabel = ""
         item.isBordered = false
-        item.minSize = NSSize(width: 0, height: ReaderTabLayoutPolicy.rowHeight)
-        item.maxSize = NSSize(width: 0, height: ReaderTabLayoutPolicy.rowHeight)
         item.isEnabled = false
         item.autovalidates = false
+        item.visibilityPriority = .low
         return item
     }
 
@@ -924,7 +1010,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             log: readerToolbarSignpostLog,
             name: "configureReaderTabs"
         )
-        let shouldShow = !model.tabs.tabs.isEmpty && !model.isSearchPresented
+        guard includesSidebarToggle else { return }
+        let shouldShow = model.tabs.tabs.count > 1 && !model.isSearchPresented
+            && model.listPaneLayout == .sideBySide
         guard let toolbar else {
             readerTabsItem.isHidden = !shouldShow
             readerTabsItem.isEnabled = shouldShow
@@ -971,6 +1059,54 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         return ReaderTabLayoutPolicy.fallbackActionsWidth
     }
 
+    /// Leading edge of the first visible native reader action. The tab
+    /// viewport ends here so its 28pt fade terminates directly against the
+    /// native action capsule instead of inheriting toolbar-item margins.
+    private func messageActionsLeading(in contentView: NSView) -> CGFloat? {
+        guard let window = contentView.window,
+              let frameView = contentView.superview else { return nil }
+        // Standard image/menu items do not expose NSToolbarItem.view. Their
+        // native accessibility frames include the real control/capsule insets.
+        func leading(in view: NSView, insideToolbar: Bool) -> CGFloat? {
+            guard view !== contentView, view !== readerTabsHosting,
+                  !view.isHiddenOrHasHiddenAncestor else { return nil }
+            let insideToolbar = insideToolbar || view.accessibilityRole() == .toolbar
+            let role = view.accessibilityRole()
+            if insideToolbar, role == .button || role == .menuButton {
+                let label = view.accessibilityLabel()
+                if label == archiveItem.label || label == trashItem.label || label == overflowItem.label {
+                    let frame = contentView.convert(
+                        window.convertFromScreen(view.accessibilityFrame()),
+                        from: nil
+                    )
+                    if !frame.isEmpty { return frame.minX }
+                }
+            }
+            var result: CGFloat?
+            for child in view.subviews {
+                if let edge = leading(in: child, insideToolbar: insideToolbar) {
+                    result = min(result ?? edge, edge)
+                }
+            }
+            return result
+        }
+        return leading(in: frameView, insideToolbar: false)
+    }
+    /// Returns the laid-out custom strip in window-content coordinates so
+    /// focus-sensitive interaction routing can distinguish tabs from actions.
+    func readerTabsFrame(in contentView: NSView) -> CGRect? {
+        if model.listPaneLayout == .listAboveReader {
+            return ReaderTabBar.frame(in: contentView)
+        }
+        guard readerTabsHosting.window === contentView.window,
+              !readerTabsHosting.isHidden,
+              readerTabsHosting.bounds.width > 0 else {
+            return nil
+        }
+        let frame = readerTabsHosting.convert(readerTabsHosting.bounds, to: contentView)
+        return frame.width > 0 && frame.height > 0 ? frame : nil
+    }
+
     private func cacheMessageActionsWidth() {
         _ = messageActionsWidth
     }
@@ -992,31 +1128,42 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             name: "updateReaderTabsWidth"
         )
         guard includesSidebarToggle,
-              let window = readerTabsHosting.window,
-              let contentView = window.contentView,
-              readerTabsHosting.superview != nil
+              let window = readerTabsHosting.window ?? layoutWindow,
+              let contentView = window.contentView
         else { return }
         let actionWidth = messageActionsWidth
-        let detailOrigin = detailColumnOrigin(in: contentView, contentView: contentView) ?? 0
-        let detailWidth = max(0, contentView.bounds.maxX - detailOrigin)
-        // NSToolbar adds inter-item spacing; without this slack the strip
-        // overflows the toolbar and is shifted left into the list column.
+        let hostingFrame = readerTabsHosting.window === window
+            ? readerTabsHosting.convert(readerTabsHosting.bounds, to: contentView)
+            : .zero
+        let cardOrigin = MessageSubjectRegion.cardFrame(in: contentView)?.minX
+            ?? ((detailColumnOrigin(in: contentView, contentView: contentView) ?? 0)
+                + MessageViewerLayoutPolicy.horizontalPadding)
+        let fallbackActionLeading = contentView.bounds.maxX
+            - actionWidth
+            - ReaderTabLayoutPolicy.toolbarSpacing
+        let trailingEdge = messageActionsLeading(in: contentView)
+            ?? fallbackActionLeading
+        let nativeGap = hostingFrame.width > 0 && !readerTabsItem.isHidden
+            ? max(0, trailingEdge - hostingFrame.maxX)
+            : ReaderTabLayoutPolicy.toolbarSpacing
+        // Allocation flows from the pane and native actions into the strip.
+        // Its resulting frame affects only the painted fade, never its own
+        // width constraint, so compression cannot feed back into allocation.
         let tabViewportWidth = max(
             0,
-            detailWidth - actionWidth - ReaderTabLayoutPolicy.toolbarSpacing * 2
+            min(contentView.bounds.maxX, trailingEdge) - cardOrigin
+                - ReaderTabLayoutPolicy.toolbarSpacing
         )
-        let hidden = model.tabs.tabs.isEmpty
+        let hidden = model.tabs.tabs.count < 2
             || model.isSearchPresented
             || tabViewportWidth < ReaderTabLayoutPolicy.minimumTabWidth
+            || model.listPaneLayout == .listAboveReader
         readerTabsItem.isHidden = hidden
         readerTabsItem.isEnabled = !hidden
         readerTabsHosting.desiredWidth = hidden ? 0 : tabViewportWidth
-        let size = NSSize(
-            width: hidden ? 0 : tabViewportWidth,
-            height: ReaderTabLayoutPolicy.rowHeight
-        )
-        readerTabsItem.minSize = size
-        readerTabsItem.maxSize = size
+        if abs(readerTabsHosting.rootView.trailingGap - nativeGap) > 0.5 {
+            readerTabsHosting.rootView.trailingGap = nativeGap
+        }
     }
 
 
@@ -1064,24 +1211,6 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         return nil
     }
 
-    /// Craft-style action glyphs use a private borderless control so macOS
-    /// cannot merge adjacent toolbar items into one rest-state capsule.
-    /// AppKit still supplies the intrinsic control and symbol sizing; only
-    /// this button's bounds receive independent semantic hover/press chrome.
-    static func makeGlyphButton(target: AnyObject?, action: Selector?) -> NSButton {
-        let button = MessageToolbarButton(frame: .zero)
-        button.target = target
-        button.action = action
-        button.bezelStyle = .accessoryBarAction
-        return button
-    }
-
-    /// Routes an image to the item's glyph button (custom view) as well as the
-    /// item itself so palettes/overflow menus still show it.
-    static func apply(image: NSImage?, to item: NSToolbarItem) {
-        item.image = image
-        (item.view as? NSButton)?.image = image
-    }
 
     static func toolbarSymbol(_ name: String, accessibilityDescription: String?) -> NSImage? {
         NSImage(systemSymbolName: name, accessibilityDescription: accessibilityDescription)
@@ -1092,12 +1221,13 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         action: Selector
     ) -> NSToolbarItem {
         let item = NSToolbarItem(itemIdentifier: identifier)
+        // Let NSToolbar create the control: AppKit owns adaptive symbol size,
+        // hit target, focus, hover, pressed state, and inter-item spacing.
         item.action = action
         item.target = self
-        item.isBordered = false
-        let button = Self.makeGlyphButton(target: self, action: action)
-        item.view = button
+        item.isBordered = true
         item.autovalidates = true
+        item.visibilityPriority = .high
         return item
     }
 
@@ -1105,32 +1235,20 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         let item = NSMenuToolbarItem(itemIdentifier: .messageOverflow)
         item.menu = overflowMenu
         item.image = Self.toolbarSymbol(
-            "ellipsis.circle",
+            "ellipsis",
             accessibilityDescription: "More message actions"
         )
         item.label = "More"
         item.paletteLabel = "More"
         item.toolTip = "More message actions"
-        item.isBordered = false
-        let button = Self.makeGlyphButton(target: self, action: #selector(showOverflowMenu(_:)))
-        button.image = item.image
-        button.setAccessibilityLabel(item.label)
-        button.toolTip = item.toolTip
-        button.isEnabled = !readerMessageSelection.isEmpty
-        item.view = button
-        item.isEnabled = button.isEnabled
+        item.isBordered = true
+        item.isEnabled = !readerMessageSelection.isEmpty
         item.autovalidates = false
         item.showsIndicator = false
+        item.visibilityPriority = .high
         return item
     }
 
-    @objc private func showOverflowMenu(_ sender: NSButton) {
-        overflowMenu.popUp(
-            positioning: nil,
-            at: NSPoint(x: 0, y: sender.bounds.maxY + 4),
-            in: sender
-        )
-    }
 
     private func addMenuItem(
         _ policyItem: MessageContextMenuPolicy.Item,
@@ -1222,13 +1340,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         guard !selection.isEmpty else { return }
         switch action {
         case .openInNewTab:
-            guard selection.count == 1, let id = selection.first else { return }
-            model.openMessage(id, permanent: true)
-        case .markRead, .markUnread:
-            model.perform(.toggleRead, on: selection)
-        case .moveToJunk:
-            guard let junk = model.folders.first(where: { $0.role == .junk }) else { return }
-            model.move(ids: selection, to: junk.id)
+            model.openMessages(Array(selection), permanent: true)
         case .moveTo(let folder):
             model.move(ids: selection, to: folder)
         case .openInNewWindow:
@@ -1244,6 +1356,11 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             toggleEmailReadingOverride(nil)
         case .flag, .unflag:
             model.perform(.toggleFlag, on: selection)
+        case .markRead, .markUnread:
+            model.perform(.toggleRead, on: selection)
+        case .moveToJunk:
+            guard let junk = model.folders.first(where: { $0.role == .junk }) else { return }
+            model.move(ids: selection, to: junk.id)
         case .delete, .archive, .reply, .replyAll, .forward:
             break
         }
@@ -1254,6 +1371,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     static let shared = MainWindowController()
     private var shell: MainShellViewController?
     private var toolbarController: MainToolbarController?
+    private var readerInteractionModel: AppModel?
+    private var readerInteractionMonitor: Any?
     private var didScheduleFirstFrame = false
     private var didScheduleSettledFrame = false
     private var launchDataPhases: Set<String> = []
@@ -1308,6 +1427,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
 
         guard let window else { return }
+        readerInteractionModel = model
+        installReaderInteractionMonitor(for: window)
         if !didScheduleFirstFrame {
             didScheduleFirstFrame = true
             CATransaction.begin()
@@ -1334,6 +1455,104 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         QALaunch.launchPhase("window-front")
         scheduleSettledFrameIfReady()
     }
+    /// Restore focus to a real, stable native view after a tab replacement.
+    func focusReader() {
+        guard let window, window === NSApp.keyWindow,
+              let contentView = window.contentView,
+              let anchor = MessageViewer.focusAnchor(in: contentView),
+              window.makeFirstResponder(anchor) else { return }
+        readerInteractionModel?.noteReaderInteraction()
+    }
+
+    func focusMessageList() {
+        guard let window, window === NSApp.keyWindow,
+              let contentView = window.contentView,
+              let table = Self.findView(
+                  withAccessibilityIdentifier: UIIdentifier.messageTable,
+                  in: contentView
+              ),
+              window.makeFirstResponder(table) else { return }
+        readerInteractionModel?.noteListInteraction()
+    }
+
+    /// Native text/WebKit responders and toolbar hosts are tested against
+    /// visible pane bounds; the geometry anchor is a sibling, not an ancestor.
+    func isReaderFocused(in window: NSWindow) -> Bool {
+        guard window === self.window,
+              let contentView = window.contentView,
+              let responder = window.firstResponder as? NSView,
+              responder.window === window else { return false }
+        let frame = responder.convert(responder.visibleRect, to: contentView)
+        guard !frame.isEmpty else { return false }
+        if let reader = MessageViewer.focusAnchor(in: contentView),
+           reader.convert(reader.bounds, to: contentView).contains(frame) {
+            return true
+        }
+        return toolbarController?.readerTabsFrame(in: contentView)?.contains(frame) == true
+    }
+
+    private func installReaderInteractionMonitor(for window: NSWindow) {
+        guard readerInteractionMonitor == nil else { return }
+        readerInteractionMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self, weak window] event in
+            guard let self,
+                  let window,
+                  event.window === window,
+                  let contentView = window.contentView else {
+                return event
+            }
+            let point = contentView.convert(event.locationInWindow, from: nil)
+            let readerFrame = MessageViewer.focusAnchor(in: contentView).map {
+                $0.convert($0.bounds, to: contentView)
+            }
+            let tabFrame = self.toolbarController?.readerTabsFrame(in: contentView)
+            if readerFrame?.contains(point) == true || tabFrame?.contains(point) == true {
+                self.readerInteractionModel?.noteReaderInteraction()
+            } else if Self.frame(
+                of: UIIdentifier.messageTable,
+                in: contentView
+            )?.contains(point) == true || Self.frame(
+                of: UIIdentifier.sidebar,
+                in: contentView
+            )?.contains(point) == true {
+                self.readerInteractionModel?.noteListInteraction()
+            }
+            return event
+        }
+    }
+
+    private static func frame(of identifier: String, in view: NSView) -> CGRect? {
+        guard let target = findView(
+            withAccessibilityIdentifier: identifier,
+            in: view
+        ) else {
+            return nil
+        }
+        let frame = target.convert(target.bounds, to: view)
+        return frame.width > 0 && frame.height > 0 ? frame : nil
+    }
+
+    private static func findView(
+        withAccessibilityIdentifier identifier: String,
+        in view: NSView
+    ) -> NSView? {
+        if view.accessibilityIdentifier() == identifier {
+            return view
+        }
+        for subview in view.subviews.reversed() {
+            if let match = findView(
+                withAccessibilityIdentifier: identifier,
+                in: subview
+            ) {
+                return match
+            }
+        }
+        return nil
+    }
+
+
+
 
     private func installToolbar(
         for model: AppModel,

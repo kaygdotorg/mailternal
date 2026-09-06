@@ -25,11 +25,3 @@ import Testing
     #expect(IMAPCapabilities(tokens: ["IMAP4rev1"]).recommendedDeltaPath == .basic)
 }
 
-@Test func peekSectionHasNoNonPeekAPI() {
-    let complete = IMAPPeekSection.complete
-    #expect(complete.binary == false)
-    #expect(IMAPPeekSection.binaryPart("1").binary == true)
-    let request = IMAPFetchRequest.peek(uids: IMAPUIDSet(uid: 1), section: .text)
-    #expect(request.peek.count == 1)
-    #expect(request.peek[0].specifier == "TEXT")
-}

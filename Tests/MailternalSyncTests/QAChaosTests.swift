@@ -198,7 +198,7 @@ struct QAChaosTests {
                 return inbox.totalCount >= beforeRestart / 2
             }
 
-            let page = try await store.page(in: afterUV.id, after: nil, limit: 1)
+            let page = try await store.page(in: afterUV.id, after: nil, limit: 1, sort: .newest)
             if let row = page.rows.first {
                 try await store.enqueueFlag(message: row.id, flag: .seen, set: true)
             }
@@ -295,7 +295,7 @@ struct QAChaosTests {
                 return inbox.totalCount >= min(beforeRestart.totalCount, 200)
             }
 
-            let page = try await store.page(in: beforeRestart.id, after: nil, limit: 1)
+            let page = try await store.page(in: beforeRestart.id, after: nil, limit: 1, sort: .newest)
             if let row = page.rows.first {
                 try await store.enqueueFlag(message: row.id, flag: .seen, set: true)
             }

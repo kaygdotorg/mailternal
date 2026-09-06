@@ -68,11 +68,11 @@ import GRDB
     )
 
     let events = progress.values
-    #expect(events.count == 13)
-    #expect(events.first?.completed == 1)
-    #expect(events.last?.completed == 13)
-    #expect(events.allSatisfy { $0.total == 13 })
-    #expect(events.map(\.identifier).contains("v10_unread_index"))
+    let final = try #require(events.last)
+    #expect(final.total > 0)
+    #expect(events.map(\.completed) == Array(1...final.total))
+    #expect(events.allSatisfy { $0.total == final.total })
+    #expect(Set(events.map(\.identifier)).count == events.count)
 }
 
 private final class MigrationProgressCapture: @unchecked Sendable {

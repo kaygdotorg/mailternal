@@ -334,7 +334,13 @@ public actor SyncEngine {
     private var statusWaiters: [UUID: AsyncStream<SyncStatus>.Continuation] = [:]
     private var activityWaiters: [UUID: AsyncStream<FolderActivityUpdate>.Continuation] = [:]
     private var currentActivities: [FolderID: FolderActivity] = [:]
+    /// Number of regular sync operations currently touching each folder.
     private var activityOwners: [FolderID: Int] = [:]
+    /// The latest regular phase is kept separately from visible `.moving`
+    /// state so a concurrent move can restore downloading/indexing exactly.
+    private var activityPhases: [FolderID: FolderActivity] = [:]
+    private var terminalActivities: [FolderID: FolderActivity] = [:]
+    private var movingActivityOwners: [FolderID: Int] = [:]
     private var mailWaiters: [UUID: AsyncStream<NewMailEvent>.Continuation] = [:]
     private var failureWaiters: [UUID: AsyncStream<SyncFailure>.Continuation] = [:]
     private var lastFailure: SyncFailure?
@@ -352,15 +358,6 @@ public actor SyncEngine {
     /// for a retired folder.
     private var discoveryReady = false
 
-    /// Backfill PEEK bodies are fetched one UID/section at a time. The request
-    /// limits and aggregate window budget live in `SyncPolicy`.
-    /// Speculative sections keep the common single-part message on the
-    /// metadata round trip. Any text parts not present in that response are
-    /// fetched in bounded grouped requests below.
-    private static let speculativePeeks: [IMAPPeekSection] = [
-        .header,
-        .part("1"),
-    ]
 
     /// - Parameter qaAmpleDisk: QA/testing only. When `true`, disk policy sees a
     ///   spacious synthetic volume so a nearly-full host cannot halt INBOX
@@ -728,7 +725,36 @@ public actor SyncEngine {
         activityWaiters.removeValue(forKey: id)
     }
 
+    /// Records an observed phase while retaining the operation ownership that
+    /// determines whether the folder is truly idle. Moving is token-backed and
+    /// is therefore resolved separately by `beginMovingActivity`.
     private func publishActivity(_ activity: FolderActivity, for folder: FolderID) {
+        switch activity {
+        case .downloading, .indexing:
+            activityPhases[folder] = activity
+        case .halted, .quarantinedStall:
+            terminalActivities[folder] = activity
+        case .idle:
+            activityPhases.removeValue(forKey: folder)
+            terminalActivities.removeValue(forKey: folder)
+        case .moving:
+            // Move lifecycles must go through begin/endMovingActivity so a
+            // concurrent backfill can restore its underlying phase.
+            break
+        }
+        publishResolvedActivity(for: folder)
+    }
+
+    private func publishResolvedActivity(for folder: FolderID) {
+        let activity: FolderActivity
+        if movingActivityOwners[folder, default: 0] > 0 {
+            activity = .moving
+        } else if activityOwners[folder, default: 0] > 0 {
+            activity = activityPhases[folder] ?? .downloading
+        } else {
+            activity = terminalActivities[folder] ?? .idle
+        }
+        guard currentActivities[folder] != activity else { return }
         currentActivities[folder] = activity
         let update = FolderActivityUpdate(folder: folder, activity: activity)
         for continuation in activityWaiters.values {
@@ -738,6 +764,11 @@ public actor SyncEngine {
 
     private func beginActivity(for folder: FolderID) {
         activityOwners[folder, default: 0] += 1
+        activityPhases[folder] = .downloading
+        // A new real attempt supersedes the last terminal outcome. If it
+        // subsequently halts or stalls, that outcome is recorded anew.
+        terminalActivities.removeValue(forKey: folder)
+        publishResolvedActivity(for: folder)
     }
 
     private func endActivity(for folder: FolderID) {
@@ -747,17 +778,36 @@ public actor SyncEngine {
             return
         }
         activityOwners.removeValue(forKey: folder)
-        if currentActivities[folder] == .downloading || currentActivities[folder] == .indexing {
-            publishActivity(.idle, for: folder)
+        activityPhases.removeValue(forKey: folder)
+        publishResolvedActivity(for: folder)
+    }
+
+    private func beginMovingActivity(for folder: FolderID) {
+        movingActivityOwners[folder, default: 0] += 1
+        publishResolvedActivity(for: folder)
+    }
+
+    private func endMovingActivity(for folder: FolderID) {
+        guard let count = movingActivityOwners[folder] else { return }
+        if count > 1 {
+            movingActivityOwners[folder] = count - 1
+            return
         }
+        movingActivityOwners.removeValue(forKey: folder)
+        publishResolvedActivity(for: folder)
     }
 
     private func clearActiveActivities() {
+        let knownFolders = Set(currentActivities.keys)
+            .union(activityOwners.keys)
+            .union(activityPhases.keys)
+            .union(movingActivityOwners.keys)
+            .union(terminalActivities.keys)
         activityOwners.removeAll()
-        for (folder, activity) in currentActivities
-            where activity == .downloading || activity == .indexing
-        {
-            publishActivity(.idle, for: folder)
+        activityPhases.removeAll()
+        movingActivityOwners.removeAll()
+        for folder in knownFolders {
+            publishResolvedActivity(for: folder)
         }
     }
 
@@ -1107,13 +1157,15 @@ public actor SyncEngine {
         if !keepLocally, state.backfillPhase == .walking {
             state.backfillPhase = .idle
         }
-        if let mod = selected.highestModSeq {
-            state.highestModseq = max(state.highestModseq ?? 0, mod)
+        // SELECT reports the server's current token, not changes applied to
+        // our cached rows. A restart must retain the last committed token or
+        // its first delta would skip flags changed while we were offline.
+        if isFresh, let mod = selected.highestModSeq {
+            state.highestModseq = mod
         }
         try await store.saveSyncState(state)
 
-        let storedUIDs = try await store.uids(in: generation, range: nil)
-        let maxStored = storedUIDs.last?.rawValue ?? 0
+        let maxStored = try await store.maximumUID(in: generation)?.rawValue ?? 0
         let uidNext = selected.uidNext ?? 1
 
         // Empty store → current UIDNEXT so the first delta does not fetch
@@ -1299,7 +1351,6 @@ public actor SyncEngine {
         }
         beginActivity(for: folderID)
         defer { endActivity(for: folderID) }
-        publishActivity(.downloading, for: folderID)
         do {
             var state = try await store.fetchSyncState(for: record.generation)
                 ?? FolderSyncState(generation: record.generation, baselineUID: record.baseline)
@@ -1613,8 +1664,8 @@ public actor SyncEngine {
         let uidSet = uidSetOverride ?? IMAPUIDSet(window)
         let meta: [IMAPFetchedMessage]
         do {
-            // Keep the common single-part message on this metadata round
-            // trip. Missing nested text parts are fetched below in chunks.
+            // Metadata is literal-free. BODYSTRUCTURE octets then choose
+            // conservative partial limits for the grouped PEEK requests below.
             meta = try await channel.fetch(
                 in: record.path,
                 expectedUIDValidity: capturedGeneration.uidValidity,
@@ -1625,7 +1676,8 @@ public actor SyncEngine {
                     flags: true,
                     internalDate: true,
                     uid: true,
-                    peek: qresyncEnabled ? Self.speculativePeeks : []
+                    rfc822Size: true,
+                    maximumResponseBytes: 0
                 )
             )
         } catch is CancellationError {
@@ -1665,13 +1717,11 @@ public actor SyncEngine {
         let canNotify = notify && record.role == .inbox && !record.isReplacement
 
 
-        func textSpecifiers(_ fetched: IMAPFetchedMessage) -> [String] {
+        func textNeeds(_ fetched: IMAPFetchedMessage) -> [MessageAssembler.TextNeed] {
             var seen = Set<String>()
-            return (fetched.bodyStructure.map {
-                MessageAssembler.textNeeds($0).map(\.specifier)
-            } ?? []).filter { specifier in
-                let upper = specifier.uppercased()
-                guard specifier.unicodeScalars.allSatisfy({
+            return (fetched.bodyStructure.map(MessageAssembler.textNeeds) ?? []).filter { need in
+                let upper = need.specifier.uppercased()
+                guard need.specifier.unicodeScalars.allSatisfy({
                     $0 == "." || ("0"..."9").contains($0)
                 }), seen.insert(upper).inserted else {
                     return false
@@ -1680,109 +1730,317 @@ public actor SyncEngine {
             }
         }
 
-        // Keep body responses batched to avoid one round trip per UID, while
-        // bounding the retained response set by the same aggregate peek budget
-        // used for each message. Messages with the same text-part shape share
-        // one FETCH; the metadata window remains the durable batching unit.
-        var index = 0
-        while index < ordered.count {
-            try Task.checkCancellation()
-            let first = ordered[index]
-            guard let firstUID = first.uid, firstUID > 0 else {
-                index += 1
-                continue
-            }
-            let firstSpecifiers = textSpecifiers(first)
-            // Batch body FETCHes to avoid one network round trip per UID.
-            // Every returned UID remains capped by the per-message budget.
-            let chunkLimit = 32
-            var end = index + 1
-            while end < ordered.count, end - index < chunkLimit,
-                  textSpecifiers(ordered[end]) == firstSpecifiers {
-                end += 1
-            }
-            let group = Array(ordered[index..<end])
-            let uids = group.compactMap(\.uid).filter { $0 > 0 }
-            var bodyByUID: [UInt32: [IMAPPeekedPart]] = Dictionary(
-                uniqueKeysWithValues: group.compactMap { fetched in
-                    guard let uid = fetched.uid else { return nil }
-                    return (uid, fetched.parts)
-                }
-            )
-            let needsBody = group.contains { fetched in
-                let have = Set(fetched.parts.map { $0.specifier.uppercased() })
-                return textSpecifiers(fetched).contains { specifier in
-                    let upper = specifier.uppercased()
-                    return !have.contains(upper)
-                        && !(upper == "1" && (have.contains("TEXT") || have.contains("")))
-                }
-            }
-            var didHitPeekLimit: Set<UInt32> = []
-            let header = IMAPPeekSection(
-                specifier: "HEADER",
-                origin: 0,
-                length: SyncPolicy.backfillHeaderPeekByteLimit
-            )
-            let peekSections = [header] + firstSpecifiers.map {
-                IMAPPeekSection(
-                    specifier: $0,
-                    origin: 0,
-                    length: SyncPolicy.backfillTextPeekByteLimit
+        func hasPart(_ specifier: String, in parts: [IMAPPeekedPart]) -> Bool {
+            let upper = specifier.uppercased()
+            let available = Set(parts.map { $0.specifier.uppercased() })
+            return available.contains(upper)
+                || (upper == "1" && (available.contains("TEXT") || available.contains("")))
+        }
+
+        // Metadata carries no literals. Build a bounded plan for the missing
+        // header/text sections instead: messages with the same section layout
+        // share a FETCH whose section lengths are widened to group maxima.
+        var layoutIndices: [String: [Int]] = [:]
+        var layoutSections: [String: [IMAPPeekSection]] = [:]
+        var indexLayoutKey: [Int: String] = [:]
+        var truncationRulesByUID: [UInt32: [String: (threshold: Int, sentinel: Bool)]] = [:]
+        for (index, fetched) in ordered.enumerated() {
+            guard let uid = fetched.uid, uid > 0 else { continue }
+            var missing: [(specifier: String, length: Int, capped: Bool)] = []
+            var truncationRules: [String: (threshold: Int, sentinel: Bool)] = [:]
+            if !hasPart("HEADER", in: fetched.parts) {
+                missing.append((
+                    specifier: "HEADER",
+                    length: SyncPolicy.backfillHeaderPeekByteLimit,
+                    capped: true
+                ))
+                truncationRules["HEADER"] = (
+                    threshold: SyncPolicy.backfillHeaderPeekByteLimit,
+                    sentinel: false
                 )
             }
-            let requestedLengths = Dictionary(
-                uniqueKeysWithValues: peekSections.map {
-                    ($0.specifier.uppercased(), $0.length ?? 0)
+            for need in textNeeds(fetched) where !hasPart(need.specifier, in: fetched.parts) {
+                let octets = max(0, need.octets)
+                // Ask for one sentinel octet beyond a positive advertised
+                // size. A dishonest under-report is then marked truncated
+                // rather than silently committed as complete.
+                let sentinel = octets > 0 && octets < SyncPolicy.backfillTextPeekByteLimit
+                let length = sentinel
+                    ? octets + 1
+                    : SyncPolicy.backfillTextPeekByteLimit
+                missing.append((
+                    specifier: need.specifier,
+                    length: length,
+                    capped: true
+                ))
+                truncationRules[need.specifier.uppercased()] = (
+                    threshold: sentinel ? octets : length,
+                    sentinel: sentinel
+                )
+            }
+            guard !missing.isEmpty else { continue }
+            truncationRulesByUID[uid] = truncationRules
+            let key = missing.map {
+                "\($0.specifier.uppercased()):\($0.capped ? 1 : 0)"
+            }.joined(separator: "|")
+            layoutIndices[key, default: []].append(index)
+            indexLayoutKey[index] = key
+            if let current = layoutSections[key] {
+                layoutSections[key] = zip(current, missing).map { currentSection, requested in
+                    IMAPPeekSection(
+                        specifier: currentSection.specifier,
+                        origin: 0,
+                        length: max(currentSection.length ?? 0, requested.length)
+                    )
                 }
-            )
-            if needsBody {
-                do {
-                let fetchedParts = try await channel.fetch(
+            } else {
+                layoutSections[key] = missing.map {
+                    IMAPPeekSection(specifier: $0.specifier, origin: 0, length: $0.length)
+                }
+            }
+        }
+
+        /// A response-too-large failure is retried by the enclosing bounded
+        /// window bisection. That path opens a fresh channel before each
+        /// retry, which matters because a transport may close the connection
+        /// after rejecting an oversized response.
+        func fetchPeek(
+            uids: [UInt32],
+            sections: [IMAPPeekSection],
+            maximumResponseBytes: Int
+        ) async throws -> [IMAPFetchedMessage] {
+            do {
+                return try await channel.fetch(
                     in: record.path,
                     expectedUIDValidity: capturedGeneration.uidValidity,
                     IMAPFetchRequest(
                         uids: SyncPolicy.uidSet(uids: uids),
                         uid: true,
-                        peek: peekSections
+                        peek: sections,
+                        maximumResponseBytes: maximumResponseBytes
                     )
                 )
-                for response in fetchedParts {
-                    guard let uid = response.uid, uid > 0 else { continue }
-                    for var part in response.parts {
-                        if let length = requestedLengths[part.specifier.uppercased()],
-                           part.data.count >= length {
-                            didHitPeekLimit.insert(uid)
+            } catch let error as IMAPError {
+                guard case .responseTooLarge = error else { throw error }
+                throw MetadataWindowFetchFailure(underlying: error)
+            }
+        }
+
+        let layoutKeys = layoutIndices.keys.sorted {
+            (layoutIndices[$0]?.first ?? .max) < (layoutIndices[$1]?.first ?? .max)
+        }
+        // Cohorts stay contiguous and newest-first; layout groups only
+        // optimize FETCHes inside a cohort, then assembly restores UID order.
+        // Planned section sizes bound each request. The remaining-response
+        // reservation below also bounds actual retained body data; transport
+        // keeps its parser/assembler queue copies separately bounded.
+        var cohorts: [[Int]] = []
+        var currentCohort: [Int] = []
+        var currentCohortBytes = 0
+        for index in ordered.indices {
+            guard ordered[index].uid.map({ $0 > 0 }) == true else { continue }
+            let bytes = indexLayoutKey[index].flatMap { layoutSections[$0] }?.reduce(0) {
+                min(
+                    SyncPolicy.backfillWindowPeekByteBudget + 1,
+                    $0 + max(0, $1.length ?? 0)
+                )
+            } ?? 0
+            if !currentCohort.isEmpty,
+               currentCohortBytes + bytes > SyncPolicy.backfillWindowPeekByteBudget {
+                cohorts.append(currentCohort)
+                currentCohort.removeAll(keepingCapacity: true)
+                currentCohortBytes = 0
+            }
+            currentCohortBytes = min(
+                SyncPolicy.backfillWindowPeekByteBudget + 1,
+                currentCohortBytes + bytes
+            )
+            currentCohort.append(index)
+        }
+        if !currentCohort.isEmpty {
+            cohorts.append(currentCohort)
+        }
+
+        for cohort in cohorts {
+            let cohortSet = Set(cohort)
+            let bodyUIDs = Set(
+                cohort.compactMap { index -> UInt32? in
+                    guard indexLayoutKey[index] != nil else { return nil }
+                    return ordered[index].uid
+                }
+            )
+            var bodyByUID: [UInt32: [IMAPPeekedPart]] = Dictionary(
+                uniqueKeysWithValues: cohort.compactMap { index in
+                    guard let uid = ordered[index].uid else { return nil }
+                    return (uid, ordered[index].parts)
+                }
+            )
+            var retainedEncodedBytes = bodyByUID.reduce(0) { total, partsByUID in
+                total + partsByUID.value.reduce(0) { $0 + $1.data.count }
+            }
+            var didHitPeekLimit: Set<UInt32> = []
+
+            for key in layoutKeys {
+                guard let groupIndices = layoutIndices[key]?.filter({ cohortSet.contains($0) }),
+                      !groupIndices.isEmpty,
+                      let sections = layoutSections[key]
+                else { continue }
+
+                var sectionChunks: [[IMAPPeekSection]] = []
+                var currentSections: [IMAPPeekSection] = []
+                var currentSectionBytes = 0
+                for section in sections {
+                    let sectionBytes = max(0, section.length ?? 0)
+                    if !currentSections.isEmpty,
+                       currentSectionBytes + sectionBytes > SyncPolicy.backfillWindowPeekByteBudget {
+                        sectionChunks.append(currentSections)
+                        currentSections.removeAll(keepingCapacity: true)
+                        currentSectionBytes = 0
+                    }
+                    currentSections.append(section)
+                    currentSectionBytes += sectionBytes
+                }
+                if !currentSections.isEmpty {
+                    sectionChunks.append(currentSections)
+                }
+                let uids = groupIndices.compactMap { ordered[$0].uid }
+
+                for sectionChunk in sectionChunks {
+                    let remainingResponseBytes = max(
+                        0,
+                        SyncPolicy.backfillWindowPeekByteBudget - retainedEncodedBytes
+                    )
+                    let perUIDPlannedBytes = sectionChunk.reduce(0) {
+                        min(
+                            SyncPolicy.backfillWindowPeekByteBudget + 1,
+                            $0 + max(0, $1.length ?? 0)
+                        )
+                    }
+                    let uidCount = uids.count
+                    let plannedResponseBytes: Int
+                    if uidCount == 0 || perUIDPlannedBytes == 0 {
+                        plannedResponseBytes = 0
+                    } else if perUIDPlannedBytes > SyncPolicy.backfillWindowPeekByteBudget / uidCount {
+                        plannedResponseBytes = SyncPolicy.backfillWindowPeekByteBudget + 1
+                    } else {
+                        plannedResponseBytes = perUIDPlannedBytes * uidCount
+                    }
+                    guard remainingResponseBytes > 0, plannedResponseBytes > 0 else {
+                        if bodyUIDs.count == 1 {
+                            didHitPeekLimit.formUnion(uids)
+                            continue
                         }
-                        let used = bodyByUID[uid]?.reduce(0) { $0 + $1.data.count } ?? 0
-                        let room = max(0, SyncPolicy.backfillWindowPeekByteBudget - used)
-                        guard room > 0 else {
-                            didHitPeekLimit.insert(uid)
-                            break
+                        throw MetadataWindowFetchFailure(
+                            underlying: IMAPError.responseTooLarge(
+                                limit: SyncPolicy.backfillWindowPeekByteBudget
+                            )
+                        )
+                    }
+                    let maximumResponseBytes = min(
+                        remainingResponseBytes,
+                        plannedResponseBytes
+                    )
+                    let fetchedParts: [IMAPFetchedMessage]
+                    do {
+                        fetchedParts = try await fetchPeek(
+                            uids: uids,
+                            sections: sectionChunk,
+                            maximumResponseBytes: maximumResponseBytes
+                        )
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch SyncChannelError.staleMailbox {
+                        // A shared channel was re-selected or UIDVALIDITY
+                        // changed. Never turn that race into missing-body
+                        // quarantine; retry the window against its generation.
+                        return .invalidated
+                    } catch let failure as MetadataWindowFetchFailure {
+                        throw failure
+                    } catch let error as IMAPError {
+                        if case .parse = error {
+                            // The parser closes the response stream after a
+                            // malformed literal. Bisect before any cursor
+                            // commit so only the poison UID is quarantined.
+                            throw MetadataWindowFetchFailure(underlying: error)
                         }
-                        if part.data.count > room {
-                            part.data = Data(part.data.prefix(room))
-                            didHitPeekLimit.insert(uid)
+                        if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
+                            return .halted
                         }
-                        bodyByUID[uid, default: []].append(part)
+                        if SyncPolicy.isTransport(error) { throw error }
+                        // Tagged body failures are not successful empty
+                        // responses. Route them through bounded isolation.
+                        throw MetadataWindowFetchFailure(underlying: error)
+                    } catch {
+                        if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
+                            return .halted
+                        }
+                        await logSync(
+                            "body peek \(record.path)",
+                            detail: String(describing: error),
+                            folder: record.id
+                        )
+                        if SyncPolicy.isTransport(error) { throw error }
+                        continue
+                    }
+                    let requestedLengths = Dictionary(
+                        uniqueKeysWithValues: sectionChunk.map {
+                            ($0.specifier.uppercased(), $0.length ?? 0)
+                        }
+                    )
+                    for response in fetchedParts {
+                        guard let uid = response.uid, uid > 0 else { continue }
+                        for var part in response.parts {
+                            guard requestedLengths[part.specifier.uppercased()] != nil else {
+                                continue
+                            }
+                            if let rule = truncationRulesByUID[uid]?[part.specifier.uppercased()] {
+                                let reached = rule.sentinel
+                                    ? part.data.count > rule.threshold
+                                    : part.data.count >= rule.threshold
+                                if reached {
+                                    didHitPeekLimit.insert(uid)
+                                }
+                            }
+                            let usedForUID = bodyByUID[uid]?.reduce(0) {
+                                $0 + $1.data.count
+                            } ?? 0
+                            let aggregateRoom = max(
+                                0,
+                                SyncPolicy.backfillWindowPeekByteBudget - retainedEncodedBytes
+                            )
+                            let uidRoom = max(
+                                0,
+                                SyncPolicy.backfillWindowPeekByteBudget - usedForUID
+                            )
+                            if aggregateRoom == 0 {
+                                if bodyUIDs.count == 1 {
+                                    didHitPeekLimit.insert(uid)
+                                    continue
+                                }
+                                throw MetadataWindowFetchFailure(
+                                    underlying: IMAPError.responseTooLarge(
+                                        limit: SyncPolicy.backfillWindowPeekByteBudget
+                                    )
+                                )
+                            }
+                            guard uidRoom > 0 else {
+                                didHitPeekLimit.insert(uid)
+                                continue
+                            }
+                            let room = min(aggregateRoom, uidRoom)
+                            if part.data.count > room {
+                                part.data = Data(part.data.prefix(room))
+                                didHitPeekLimit.insert(uid)
+                            }
+                            bodyByUID[uid, default: []].append(part)
+                            retainedEncodedBytes += part.data.count
+                        }
                     }
                 }
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if (stopping || Task.isCancelled) && SyncPolicy.isTransport(error) {
-                    return .halted
-                }
-                await logSync(
-                    "body peek \(record.path)",
-                    detail: String(describing: error),
-                    folder: record.id
-                )
-                if SyncPolicy.isTransport(error) { throw error }
             }
-            }
-
-            for fetched in group {
+            for index in cohort {
                 try Task.checkCancellation()
+                let fetched = ordered[index]
                 guard let uid = fetched.uid, uid > 0 else { continue }
                 guard folders[record.id]?.keepLocally == true else { return .halted }
                 if let expectedExpungeRevision,
@@ -1824,7 +2082,6 @@ public actor SyncEngine {
                     }
                 }
             }
-            index = end
         }
         if !pending.isEmpty {
             let batch = pending
@@ -2130,10 +2387,14 @@ public actor SyncEngine {
     private func runDelta(record: inout FolderRecord, channel: SyncChannel, notify: Bool) async throws {
         let selected: IMAPSelectedMailbox
         let vanished: [UInt32]
+        var qresyncSelectWasRequested = false
+        var qresyncRequestedModseq: UInt64?
         switch record.deltaPath {
         case .qresync:
             let qresync: IMAPQResyncSelect?
             if let mod = record.highestModseq, mod > 0 {
+                qresyncSelectWasRequested = true
+                qresyncRequestedModseq = mod
                 qresync = IMAPQResyncSelect(
                     uidValidity: record.generation.uidValidity,
                     modificationSequence: mod,
@@ -2151,8 +2412,27 @@ public actor SyncEngine {
         guard folders[record.id]?.keepLocally == true else { return }
         try await store.updateServerMessageCount(selected.exists, for: record.id)
 
-        let observedExpunge = selected.exists < record.serverMessageCount || !vanished.isEmpty
         let uidNextChanged = selected.uidNext.map { $0 != record.lastUidNext } ?? false
+        let existsDecreased = selected.exists < record.serverMessageCount
+        let qresyncReturnedUsableModseq = qresyncRequestedModseq.map { requested in
+            selected.highestModSeq.map { returned in returned >= requested } ?? false
+        } ?? false
+        let qresyncTokenInvalid = qresyncSelectWasRequested && !qresyncReturnedUsableModseq
+        let qresyncVanishedIsAuthoritative = qresyncSelectWasRequested
+            && qresyncReturnedUsableModseq
+            && selected.uidValidity == record.generation.uidValidity
+            && !selected.noModSeq
+            && !vanished.isEmpty
+        // A QRESYNC VANISHED response is the lossless answer for known UIDs
+        // only when the server returned a usable HIGHESTMODSEQ for the token
+        // that was requested. Without that proof, retain general reconciliation
+        // (and persist a downgrade below) even for an apparent append.
+        let expungeReconciliationUncertain = !qresyncVanishedIsAuthoritative
+            && (qresyncTokenInvalid
+                || !vanished.isEmpty
+                || existsDecreased
+                || (selected.exists == record.serverMessageCount && uidNextChanged))
+        let observedExpunge = existsDecreased || !vanished.isEmpty
         // Invalidate an in-flight FETCH before any path-specific await. UIDNEXT
         // identifies the selected mailbox even when a removed UID was never
         // written locally, so this also covers an expunge+append with unchanged
@@ -2166,6 +2446,8 @@ public actor SyncEngine {
         case .qresync:
             if selected.noModSeq {
                 try await persistDowngrade(&record, reason: .noModSeq, channel: channel)
+            } else if qresyncTokenInvalid {
+                try await persistDowngrade(&record, reason: .malformed, channel: channel)
             }
             let generationChanged = selected.uidValidity != record.generation.uidValidity
             try await maybeReplace(selected: selected, record: &record)
@@ -2183,11 +2465,11 @@ public actor SyncEngine {
                         uids: vanished.map { IMAPUID(rawValue: $0) }
                     )
                 }
-                // A QRESYNC SELECT can race an in-flight EXPUNGE burst
-                // delivered on the IDLE socket. If EXISTS moved backwards,
-                // UIDNEXT advanced without VANISHED, or QRESYNC carried a
-                // VANISHED set, sweep stored UIDs as the lossless fallback.
-                if observedExpunge || uidNextChanged {
+                // An authoritative QRESYNC VANISHED set already deleted the
+                // removed UIDs above. Sweep only when SELECT left an expunge
+                // genuinely uncertain (including equal EXISTS + UIDNEXT
+                // advance, which can hide append+expunge).
+                if expungeReconciliationUncertain {
                     try await reconcileExpunges(
                         record: record,
                         selected: selected,
@@ -2195,7 +2477,9 @@ public actor SyncEngine {
                         revisionAlreadyAdvanced: revisionAlreadyAdvanced
                     )
                 }
-                if let mod = record.highestModseq, await folderHasMessages(record) {
+                if (!qresyncSelectWasRequested || qresyncReturnedUsableModseq),
+                   let mod = record.highestModseq,
+                   await folderHasMessages(record) {
                     let flags = try await channel.fetch(
                         in: record.path,
                         expectedUIDValidity: record.generation.uidValidity,
@@ -2719,8 +3003,21 @@ public actor SyncEngine {
 
             // Keep the gate over the whole server sequence (and its local
             // acknowledgement), so stop cannot close the channel between
-            // fallback phases.
+            // fallback phases. Both affected folders expose the real move;
+            // token ownership lets a concurrent backfill restore its phase
+            // instead of leaving a stale `.moving` or falsely publishing idle.
             guard !stopping else { return affectedFolders }
+            let movingFolders = op.folder == target.id
+                ? [op.folder]
+                : [op.folder, target.id]
+            for folderID in movingFolders {
+                beginMovingActivity(for: folderID)
+            }
+            defer {
+                for folderID in movingFolders {
+                    endMovingActivity(for: folderID)
+                }
+            }
             beginWriteOperation()
             defer { endWriteOperation() }
             let capabilities = await channel.capabilities()
@@ -2777,12 +3074,11 @@ public actor SyncEngine {
                 // The source generation can change after the queue snapshot but
                 // before the atomic MOVE/COPY select. Refresh it now so stale
                 // queue rows are logged and dropped against the new generation,
-                // rather than waiting for the periodic folder delta.
+                // rather than waiting for the periodic folder delta. If startup
+                // has not prepared this folder yet, retain the operation until
+                // a confirmed replacement can drop and log it atomically.
                 try await delta(folderID: op.folder, channel: channel, notify: true)
                 try await store.dropStaleMove(folder: op.folder)
-                for candidate in batch {
-                    try await store.deleteMoveOp(candidate)
-                }
             } catch let error as IMAPError {
                 if error.isTaggedNO || error.isTaggedBAD {
                     if useMove || phase == "COPY" {

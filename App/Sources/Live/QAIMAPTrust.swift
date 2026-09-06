@@ -15,8 +15,17 @@ enum QAIMAPTrust {
 
     /// Throws if the QA cert cannot be loaded. Used by the smoke test.
     static func install() throws {
-        let path = ProcessInfo.processInfo.environment["MAILTERNAL_QA_CERT"]
+        let environment = ProcessInfo.processInfo.environment
+        #if os(macOS)
+        let path = environment["MAILTERNAL_QA_CERT"]
             ?? NSHomeDirectory() + "/mailternal-qa/certs/dovecot.crt"
+        #else
+        // An iOS app cannot read the macOS QA fixture under the user's home
+        // directory. Device/simulator QA must provide an explicit fixture URL.
+        guard let path = environment["MAILTERNAL_QA_CERT"], !path.isEmpty else {
+            throw LiveMailError("MAILTERNAL_QA_CERT is required for iOS QA.")
+        }
+        #endif
         let url = URL(fileURLWithPath: path)
         let data = try Data(contentsOf: url)
         guard !data.isEmpty else {

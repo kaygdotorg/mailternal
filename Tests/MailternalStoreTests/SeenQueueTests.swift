@@ -24,7 +24,7 @@ import Testing
         #expect(pending.count == 2)
         #expect(Set(pending.map(\.uid.rawValue)) == [3, 4])
 
-        let page = try await store.page(in: folder, after: nil, limit: 10)
+        let page = try await store.page(in: folder, after: nil, limit: 10, sort: .newest)
         #expect(page.rows[0].isRead)
 
         let uid3 = pending.first { $0.uid.rawValue == 3 }!
@@ -87,7 +87,7 @@ import Testing
         #expect(pending[0].set == false)
         #expect(try await store.fetchErrorLog().isEmpty)
 
-        let row = try #require(try await store.page(in: folder, after: nil, limit: 1).rows.first)
+        let row = try #require(try await store.page(in: folder, after: nil, limit: 1, sort: .newest).rows.first)
         #expect(!row.isRead)
     }
 }
@@ -105,7 +105,7 @@ import Testing
         _ = try await store.upsertMessages([
             makeMessage(generation: generation, uid: 3, subject: "still unread on server", isRead: false),
         ])
-        let page = try await store.page(in: folder, after: nil, limit: 1)
+        let page = try await store.page(in: folder, after: nil, limit: 1, sort: .newest)
         #expect(page.rows[0].isRead)
         #expect(page.rows[0].subject == "still unread on server")
     }
@@ -145,7 +145,7 @@ import Testing
         #expect(pending.count == 2)
         #expect(pending.first(where: { $0.flag == .seen })?.set == true)
         #expect(pending.first(where: { $0.flag == .flagged })?.set == false)
-        let row = try await store.page(in: folder, after: nil, limit: 1).rows[0]
+        let row = try await store.page(in: folder, after: nil, limit: 1, sort: .newest).rows[0]
         #expect(row.isRead)
         #expect(!row.isFlagged)
         _ = account
@@ -178,7 +178,7 @@ import Testing
             generation: generation,
             deltas: [FlagDelta(uid: IMAPUID(rawValue: 8), flags: MessageFlags())]
         )
-        let row = try await store.page(in: folder, after: nil, limit: 1).rows[0]
+        let row = try await store.page(in: folder, after: nil, limit: 1, sort: .newest).rows[0]
         #expect(row.isRead)
         #expect(row.isFlagged)
     }

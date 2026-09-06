@@ -158,8 +158,9 @@ enum FolderRenamePolicy {
         UIIdentifier.sidebarFolderRenameField(id)
     }
 }
-/// Presentation policy for the folder activity accessory. The active states
-/// use a standard spinner; only the halted state has a symbolic glyph.
+/// Presentation policy for folder activity in both the sidebar accessory and
+/// the message-list subtitle. Active work uses a standard spinner; halted and
+/// stalled states remain text-only except for the halted sidebar glyph.
 enum FolderActivityPolicy {
     static func symbolName(for activity: FolderActivity) -> String? {
         activity == .halted ? "pause.circle" : nil
@@ -174,6 +175,44 @@ enum FolderActivityPolicy {
         return Int((clamped * 100).rounded())
     }
 
+    /// Selection is deliberately resolved before folder activity. The number
+    /// uses the user's locale while `monospacedDigit()` keeps changing counts
+    /// from shifting the rest of the status line.
+    static func selectionSubtitle(for count: Int) -> String {
+        String(localized: "\(count.formatted(.number)) messages selected")
+    }
+
+    /// The current-folder title is quiet when no real work is in flight.
+    /// Terminal halted/stalled states are included because they are truthful
+    /// persisted outcomes, unlike a fabricated progress estimate.
+    static func subtitle(for activity: FolderActivity) -> String? {
+        switch activity {
+        case .downloading:
+            "Downloading messages"
+        case .indexing:
+            "Indexing messages"
+        case .moving:
+            "Moving messages"
+        case .halted:
+            "Sync halted"
+        case .quarantinedStall:
+            "Sync stalled on quarantined message"
+        case .idle:
+            nil
+        }
+    }
+
+    /// Adds the real persisted backfill percentage when the folder provides
+    /// one. Moving and terminal outcomes intentionally remain label-only.
+    static func subtitle(for folder: FolderSummary) -> String? {
+        guard let label = subtitle(for: folder.activity) else { return nil }
+        guard (folder.activity == .downloading || folder.activity == .indexing),
+              let percentage = percentage(for: folder) else {
+            return label
+        }
+        return "\(label) — \(percentage)%"
+    }
+
     static func tooltip(for folder: FolderSummary) -> String? {
         let label: String
         switch folder.activity {
@@ -181,6 +220,8 @@ enum FolderActivityPolicy {
             label = "Downloading messages"
         case .indexing:
             label = "Indexing messages"
+        case .moving:
+            return "Moving messages"
         case .idle, .halted, .quarantinedStall:
             return nil
         }
@@ -191,13 +232,7 @@ enum FolderActivityPolicy {
     }
 
     static func accessibilityLabel(for activity: FolderActivity) -> String? {
-        switch activity {
-        case .downloading: "Downloading messages"
-        case .indexing: "Indexing messages"
-        case .halted: "Sync halted"
-        case .quarantinedStall: "Sync stalled on quarantined message"
-        case .idle: nil
-        }
+        subtitle(for: activity)
     }
 }
 
@@ -329,11 +364,13 @@ enum MessageViewerLayoutPolicy {
     /// keeps the whole pane; only plain text is measured.
     static let plainTextMeasureCharacters = 72
 
-    /// Document-space inset that places the first subject glyph one guard
-    /// below the reader dissolve: the 46 pt tab-strip edge, its 24 pt ramp,
-    /// then 12 pt of clear reading space.
-    static func readerTopInset(safeAreaTop _: CGFloat = 0) -> CGFloat {
-        MailWindowDissolvePolicy.viewer.restDepth(safeAreaTop: 0) + fadeGuard
+    /// Places the first subject glyph one guard below this reader's dissolve.
+    /// Pane-local chrome sits outside the viewport and adds no titlebar inset.
+    static func readerTopInset(
+        safeAreaTop _: CGFloat = 0,
+        dissolve: MailWindowDissolvePolicy = .viewer
+    ) -> CGFloat {
+        dissolve.restDepth(safeAreaTop: 0) + fadeGuard
     }
 
     /// Height of the HTML page island from its document measurement. Invalid
@@ -459,6 +496,14 @@ struct MailWindowDissolvePolicy: Equatable, Sendable {
         bottomReach: nil,
         bottomReservedHeight: 0
     )
+    /// The lower reader starts below its own fixed controls, not below the
+    /// window titlebar. Its short ramp keeps only the normal card clearance.
+    static let paneViewer = Self(
+        topOrigin: .measured(0),
+        topReach: 16,
+        bottomReach: nil,
+        bottomReservedHeight: 0
+    )
     /// The traffic lights live in this column's band, so the ramp starts just
     /// below the titlebar safe area and spends its ink in the open air there.
     /// It is short so it is fully opaque above the account title.
@@ -468,10 +513,10 @@ struct MailWindowDissolvePolicy: Equatable, Sendable {
         bottomReach: 48,
         bottomReservedHeight: 0
     )
-    /// The list's ramp begins at the folder title's bottom edge (measured
-    /// per layout; see MessageListPane) and is short so the first row rests
-    /// close under the title and rows dissolve quickly as they pass it.
-    static let messageListTopReach: CGFloat = 24
+    /// Keep only a small measured resting margin below the title-only header.
+    /// Row text owns its separate 10 pt top inset; subtitle presence is
+    /// measured inside the fixed header and must not increase this reach.
+    static let messageListTopReach: CGFloat = 16
     static let messageList = Self(
         topOrigin: .windowTop,
         topReach: messageListTopReach,

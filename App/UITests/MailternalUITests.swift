@@ -135,8 +135,8 @@ final class MailternalUITests: XCTestCase {
             "Enter should dismiss search after opening the result"
         )
         XCTAssertTrue(
-            element(UIIdentifier.readerTabBar).waitForExistence(timeout: 8),
-            "Enter should open the result in the reader"
+            element(UIIdentifier.messageSubject).waitForExistence(timeout: 8),
+            "Enter should open the result in the reader without requiring a visible single-tab strip"
         )
     }
 
@@ -345,6 +345,269 @@ final class MailternalUITests: XCTestCase {
         XCTAssertTrue(
             waitUntil(timeout: 5) { !self.headerRow("Message-ID").exists },
             "collapsing details hides them again"
+        )
+    }
+
+    func testContextMenuDoesNotReplaceCurrentReader() {
+        signInToMock()
+        let table = messageTable()
+        let originalRow = table.tableRows.element(boundBy: 1)
+        let otherRow = table.tableRows.element(boundBy: 2)
+        XCTAssertTrue(otherRow.waitForExistence(timeout: 10))
+        originalRow.click()
+        let subject = element(UIIdentifier.messageSubject)
+        XCTAssertTrue(subject.waitForExistence(timeout: 8))
+        let originalSubject = subject.label
+
+        otherRow.rightClick()
+        let openInTab = app.menuItems["Open in New Tab"]
+        XCTAssertTrue(openInTab.waitForExistence(timeout: 5))
+        XCTAssertEqual(subject.label, originalSubject, "Opening a context menu must not navigate the reader")
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertEqual(subject.label, originalSubject, "Dismissing the menu must retain the open message")
+
+        otherRow.rightClick()
+        XCTAssertTrue(openInTab.waitForExistence(timeout: 5))
+        openInTab.click()
+        XCTAssertTrue(waitUntil(timeout: 8) {
+            subject.exists && subject.label != originalSubject
+        }, "Only the explicit Open in New Tab action should navigate to the other message")
+    }
+    func testListAboveReaderKeepsReaderChromeLocalAndPreservesTabs() {
+        signInToMock()
+        selectPaneLayout("Side by Side")
+
+        let table = messageTable()
+        let originalRow = table.tableRows.element(boundBy: 1)
+        let otherRow = table.tableRows.element(boundBy: 2)
+        XCTAssertTrue(originalRow.waitForExistence(timeout: 10), "second Inbox row")
+        XCTAssertTrue(otherRow.waitForExistence(timeout: 10), "third Inbox row")
+        originalRow.click()
+
+        let subject = element(UIIdentifier.messageSubject)
+        XCTAssertTrue(subject.waitForExistence(timeout: 8), "reader subject")
+        let originalSubject = subject.label
+
+        otherRow.rightClick()
+        let openInTab = app.menuItems["Open in New Tab"]
+        XCTAssertTrue(openInTab.waitForExistence(timeout: 5), "reader context menu")
+        openInTab.click()
+        XCTAssertTrue(
+            waitUntil(timeout: 8) { subject.exists && subject.label != originalSubject },
+            "Open in New Tab should activate the second reader tab"
+        )
+
+        let activeSubject = subject.label
+        let tabsBefore = readerTabLabels()
+        XCTAssertEqual(tabsBefore.count, 2, "both opened messages should remain represented by tabs")
+
+        defer {
+            if mainWindow.exists {
+                selectPaneLayout("Side by Side")
+            }
+        }
+        selectPaneLayout("List Above Reader")
+
+        let paneToolbar = element("reader-pane-toolbar")
+        let localTabBar = paneToolbar.descendants(matching: .any)[UIIdentifier.readerTabBar]
+        XCTAssertTrue(
+            waitUntil(timeout: 8) {
+                paneToolbar.exists
+                    && localTabBar.exists
+                    && table.exists
+                    && subject.exists
+                    && self.mainWindow.toolbars.firstMatch.frame.maxY <= paneToolbar.frame.minY + 1
+                    && subject.frame.minY >= paneToolbar.frame.maxY - 1
+            },
+            "List Above Reader should place reader chrome below the list"
+        )
+        let localSubjectGap = subject.frame.minY - paneToolbar.frame.maxY
+        XCTAssertGreaterThanOrEqual(localSubjectGap, -1, "subject should not overlap local reader chrome")
+        XCTAssertLessThanOrEqual(
+            localSubjectGap,
+            paneToolbar.frame.height,
+            "subject should keep a compact local gap below reader chrome"
+        )
+        XCTAssertEqual(subject.label, activeSubject, "changing pane layout must preserve the active subject")
+        XCTAssertEqual(readerTabLabels(in: paneToolbar), tabsBefore, "changing pane layout must preserve reader tabs")
+
+        selectPaneLayout("Side by Side")
+        let topTabBar = element(UIIdentifier.readerTabBar)
+        XCTAssertTrue(
+            waitUntil(timeout: 8) {
+                !paneToolbar.exists
+                    && topTabBar.exists
+                    && table.exists
+                    && subject.exists
+                    && topTabBar.frame.maxY <= subject.frame.minY + 1
+                    && subject.label == activeSubject
+            },
+            "switching back should restore the top reader toolbar"
+        )
+        XCTAssertEqual(readerTabLabels(in: topTabBar), tabsBefore, "restoring the layout must preserve reader tabs")
+    }
+
+    func testResizingWindowBackToStartingWidthRestoresReaderToolbar() {
+        signInToMock()
+        selectPaneLayout("Side by Side")
+
+        let table = messageTable()
+        let originalRow = table.tableRows.element(boundBy: 1)
+        let otherRow = table.tableRows.element(boundBy: 2)
+        XCTAssertTrue(originalRow.waitForExistence(timeout: 10), "second Inbox row")
+        XCTAssertTrue(otherRow.waitForExistence(timeout: 10), "third Inbox row")
+        originalRow.click()
+
+        let subject = element(UIIdentifier.messageSubject)
+        XCTAssertTrue(subject.waitForExistence(timeout: 8), "reader subject")
+        let originalSubject = subject.label
+        otherRow.rightClick()
+        let openInTab = app.menuItems["Open in New Tab"]
+        XCTAssertTrue(openInTab.waitForExistence(timeout: 5), "reader context menu")
+        openInTab.click()
+        XCTAssertTrue(
+            waitUntil(timeout: 8) { subject.exists && subject.label != originalSubject },
+            "Open in New Tab should activate the second reader tab"
+        )
+
+        let activeSubject = subject.label
+        let tabsBefore = readerTabLabels()
+        XCTAssertEqual(tabsBefore.count, 2, "both opened messages should remain represented by tabs")
+        let archive = nativeReaderAction("Archive")
+        let trash = nativeReaderAction("Trash")
+        let more = nativeReaderAction("More")
+        for action in [archive, trash, more] {
+            XCTAssertTrue(action.waitForExistence(timeout: 5), "native reader action should be present before resize")
+        }
+
+        let initialWidth = mainWindow.frame.width
+        let minimumWidth = MainWindowLayoutPolicy.minimumContentSize.width
+        let baselineWidth = minimumWidth + 240
+        if initialWidth < baselineWidth {
+            resizeMainWindowWidth(to: baselineWidth)
+            XCTAssertTrue(
+                waitUntil(timeout: 8) { self.mainWindow.exists && self.mainWindow.frame.width >= baselineWidth - 2 },
+                "window should reach a stable starting width"
+            )
+        }
+        let startingWidth = mainWindow.frame.width
+        let targetWidth = max(minimumWidth, startingWidth * 0.72)
+        defer {
+            if mainWindow.exists {
+                resizeMainWindowWidth(to: initialWidth)
+            }
+        }
+
+        resizeMainWindowWidth(to: targetWidth)
+        XCTAssertTrue(
+            waitUntil(timeout: 8) { self.mainWindow.exists && self.mainWindow.frame.width < startingWidth - 2 },
+            "native coordinate drag should shrink the window"
+        )
+        let shrunkWidth = mainWindow.frame.width
+        XCTAssertLessThan(shrunkWidth, startingWidth - 1, "resize must produce a smaller native window")
+
+        resizeMainWindowWidth(to: startingWidth)
+        XCTAssertTrue(
+            waitUntil(timeout: 8) {
+                guard self.mainWindow.exists else { return false }
+                return abs(self.mainWindow.frame.width - startingWidth) <= 1
+                    && self.nativeReaderAction("Archive").isHittable
+                    && self.nativeReaderAction("Trash").isHittable
+                    && self.nativeReaderAction("More").isHittable
+            },
+            "returning to the starting width should restore native reader actions without expansion"
+        )
+        XCTAssertEqual(mainWindow.frame.width, startingWidth, accuracy: 1, "window should return to its exact starting width")
+        XCTAssertEqual(subject.label, activeSubject, "resizing must preserve the active subject")
+        XCTAssertEqual(readerTabLabels(), tabsBefore, "resizing must preserve reader tabs")
+    }
+
+
+    func testReaderBlankSpaceCommandWClosesLastTabBeforeWindow() {
+        signInToMock()
+        let row = messageTable().tableRows.element(boundBy: 1)
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.click()
+        XCTAssertTrue(element(UIIdentifier.messageSubject).waitForExistence(timeout: 8))
+
+        // A pane click must establish reader intent even when AppKit leaves
+        // the old table as first responder beneath non-focusable SwiftUI.
+        element(UIIdentifier.messageViewer)
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.85))
+            .click()
+        app.typeKey("w", modifierFlags: .command)
+        XCTAssertTrue(waitUntil(timeout: 5) {
+            self.mainWindow.exists && !self.element(UIIdentifier.messageSubject).exists
+        }, "Closing the final reader tab must leave an empty, open main window")
+
+        app.typeKey("w", modifierFlags: .command)
+        XCTAssertTrue(waitUntil(timeout: 5) { !self.mainWindow.exists },
+                      "With no tabs, Command W closes the window")
+    }
+
+    func testMessageListCommandWClosesWindowWithReaderOpen() {
+        signInToMock()
+        let row = messageTable().tableRows.element(boundBy: 1)
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.click()
+        XCTAssertTrue(element(UIIdentifier.messageSubject).waitForExistence(timeout: 8))
+        row.click()
+        app.typeKey("w", modifierFlags: .command)
+        XCTAssertTrue(waitUntil(timeout: 5) { !self.mainWindow.exists },
+                      "A list-focused close must close the window, not a reader tab")
+    }
+
+    private func selectPaneLayout(_ title: String) {
+        activateMainWindow()
+        let viewMenu = app.menuBars.menuBarItems["View"]
+        XCTAssertTrue(viewMenu.waitForExistence(timeout: 5), "View menu")
+        viewMenu.click()
+
+        let layoutMenu = app.menuItems["Layout"]
+        XCTAssertTrue(layoutMenu.waitForExistence(timeout: 5), "Layout menu")
+        layoutMenu.click()
+
+        let paneMenu = app.menuItems["Pane"]
+        XCTAssertTrue(paneMenu.waitForExistence(timeout: 5), "Pane layout menu")
+        paneMenu.click()
+
+        let choice = app.menuItems[title]
+        XCTAssertTrue(choice.waitForExistence(timeout: 5), "pane layout choice")
+        choice.click()
+    }
+
+    private func readerTabLabels(in root: XCUIElement? = nil) -> [String] {
+        let predicate = NSPredicate(
+            format: "identifier BEGINSWITH %@ AND identifier != %@",
+            "reader-tab-",
+            UIIdentifier.readerTabBar
+        )
+        let query: XCUIElementQuery
+        if let root {
+            query = root.descendants(matching: .any).matching(predicate)
+        } else {
+            query = app.descendants(matching: .any).matching(predicate)
+        }
+        return query.allElementsBoundByIndex.map { $0.label }
+    }
+
+    private func nativeReaderAction(_ label: String) -> XCUIElement {
+        mainWindow.toolbars.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label)).firstMatch
+    }
+
+    private func resizeMainWindowWidth(to targetWidth: CGFloat) {
+        let currentWidth = mainWindow.frame.width
+        let delta = targetWidth - currentWidth
+        guard abs(delta) > 1 else { return }
+        let source = mainWindow.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.998, dy: 0.998)
+        )
+        let destination = source.withOffset(CGVector(dx: delta, dy: 0))
+        source.press(
+            forDuration: 0.15,
+            thenDragTo: destination,
+            withVelocity: .slow,
+            thenHoldForDuration: 0.1
         )
     }
 

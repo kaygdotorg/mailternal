@@ -49,6 +49,39 @@ final class ReaderTabsPolicyTests: XCTestCase {
         XCTAssertEqual(tabs.tabs.count, 1)
         XCTAssertEqual(tabs.activeID, first.id)
     }
+    func testBatchOpenInVisibleOrderReusesExistingTabsAndPromotesTransient() {
+        let selected = (1...100).map { message(Int64($0)) }
+        let anchor = ReaderTab(message: message(1_000), isTransient: false)
+        let transient = ReaderTab(message: message(20), isTransient: true)
+        let existing = ReaderTab(message: message(40), isTransient: false)
+        let tabs = ReaderTabs(
+            tabs: [anchor, transient, existing],
+            activeID: anchor.id,
+            mruIDs: [anchor.id, transient.id, existing.id]
+        )
+        var changeCount = 0
+        tabs.onChange = { changeCount += 1 }
+
+        tabs.open(selected, permanent: true)
+        XCTAssertEqual(changeCount, 1)
+
+        XCTAssertEqual(tabs.tabs.count, 101)
+        XCTAssertEqual(
+            tabs.tabs.map(\.message).filter { selected.contains($0) },
+            selected
+        )
+        XCTAssertEqual(
+            tabs.tabs.first { $0.message == message(20) }?.id,
+            transient.id
+        )
+        XCTAssertFalse(tabs.tabs.first { $0.message == message(20) }?.isTransient ?? true)
+        XCTAssertEqual(
+            tabs.tabs.first { $0.message == message(40) }?.id,
+            existing.id
+        )
+        XCTAssertEqual(tabs.active?.message, message(100))
+    }
+
 
     func testCloseOthersAndCloseToRight() {
         let tabs = ReaderTabs(tabs: (1...4).map { ReaderTab(message: message(Int64($0)), isTransient: false) })
@@ -139,14 +172,6 @@ final class ReaderTabsPolicyTests: XCTestCase {
         XCTAssertEqual(tab.message, messageID)
     }
 
-    func testClosingLastReaderTabRequestsWindowClose() {
-        XCTAssertTrue(
-            ReaderTabsPolicy.shouldCloseWindow(afterClosingTabsRemaining: 0)
-        )
-        XCTAssertFalse(
-            ReaderTabsPolicy.shouldCloseWindow(afterClosingTabsRemaining: 1)
-        )
-    }
 
     func testDropDestinationAdjustsForSourceBeforeTarget() {
         XCTAssertEqual(

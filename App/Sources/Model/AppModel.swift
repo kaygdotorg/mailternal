@@ -23,59 +23,30 @@ private enum MailModelRouteError: LocalizedError {
     }
 }
 
+/// Selects which durable workspace scope receives list customizations made by
+/// the native table and View commands.
+enum MailListCustomizationTarget: String, CaseIterable, Identifiable, Sendable {
+    case currentFolder
+    case global
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .currentFolder: "Current Folder"
+        case .global: "All Folders"
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class AppModel {
-    private struct MessageDetailCache {
-        private static let capacity = ReaderSurfacePool.defaultCapacity
-        private var values: [MessageID: MessageDetail] = [:]
-        private var mruIDs: [MessageID] = []
-
-        mutating func value(for id: MessageID) -> MessageDetail? {
-            guard let value = values[id] else { return nil }
-            touch(id)
-            return value
-        }
-
-        mutating func insert(
-            _ value: MessageDetail,
-            for id: MessageID,
-            protectedIDs: Set<MessageID> = []
-        ) {
-            values[id] = value
-            touch(id)
-            trim(protectedIDs: protectedIDs)
-        }
-
-        mutating func removeValue(for id: MessageID) {
-            values.removeValue(forKey: id)
-            mruIDs.removeAll { $0 == id }
-        }
-
-        mutating func removeValues(notIn retainedIDs: Set<MessageID>) {
-            let obsoleteIDs = values.keys.filter { !retainedIDs.contains($0) }
-            for id in obsoleteIDs {
-                removeValue(for: id)
-            }
-        }
-
-        mutating func removeAll(keepingCapacity: Bool) {
-            values.removeAll(keepingCapacity: keepingCapacity)
-            mruIDs.removeAll(keepingCapacity: keepingCapacity)
-        }
-
-        private mutating func trim(protectedIDs: Set<MessageID>) {
-            while mruIDs.count > Self.capacity,
-                  let evictedIndex = mruIDs.lastIndex(where: { !protectedIDs.contains($0) }) {
-                let evictedID = mruIDs.remove(at: evictedIndex)
-                values.removeValue(forKey: evictedID)
-            }
-        }
-
-        private mutating func touch(_ id: MessageID) {
-            mruIDs.removeAll { $0 == id }
-            mruIDs.insert(id, at: 0)
-        }
+    private struct QATabCommandState {
+        let serial: UInt64
+        let messageID: MessageID
+        var surfaceReady = false
+        var scrollOffset: CGFloat?
     }
 
     /// Detail entries for tabs whose native surfaces are still retained are
@@ -92,10 +63,11 @@ final class AppModel {
 
     /// Retains fetched content while a reader tab is inactive, so activating
     /// a loaded tab does not issue another facade.detail request.
-    @ObservationIgnored private var detailCache = MessageDetailCache()
+    @ObservationIgnored private let detailLoader: MessageDetailLoader
     let facade: any MailFacade
     let appearance: AppearanceSettings
     let actions: ActionSettings
+    let workspaceSync: MacWorkspaceCoordinator
     let toasts = ToastPresenter()
     @ObservationIgnored private let faviconStore: FaviconStore
     private var faviconImages: [String: NSImage] = [:]
@@ -118,6 +90,16 @@ final class AppModel {
     /// anchor so a single-message reader survives ordinary list updates.
     var selectedMessageIDs: Set<MessageID> = []
     var selectedMessageID: MessageID?
+    /// AppKit can leave the list table as first responder when a click lands
+    /// on a non-focusable SwiftUI reader surface. Keep the user's last pane
+    /// interaction separately so ⌘W follows the visible focus contract.
+    @ObservationIgnored private var readerInteractionActive = false
+    /// The responder present when the last logical pane interaction was
+    /// classified. AppKit can retain the same table responder for both a
+    /// reader-background click and a later list click, so the marker and this
+    /// snapshot must be evaluated as a pair.
+    @ObservationIgnored private weak var interactionResponder: NSResponder?
+
     var detail: MessageDetail? {
         didSet {
             guard EmailReadingOverridePolicy.resetsOverride(
@@ -193,17 +175,76 @@ final class AppModel {
     @ObservationIgnored private var streamsStarted = false
     @ObservationIgnored private var markedRead: Set<MessageID> = []
     @ObservationIgnored private var qaSelectionSequence: UInt64 = 0
+    @ObservationIgnored private var qaTabCommandSequence: UInt64 = 0
+    @ObservationIgnored private var qaPendingTabCommands: [UUID: QATabCommandState] = [:]
     @ObservationIgnored private var tabSaveTask: Task<Void, Never>?
     @ObservationIgnored private var tabRestoreTask: Task<Void, Never>?
     @ObservationIgnored private var tabExistenceTask: Task<Void, Never>?
+    @ObservationIgnored private var deepLinkPrefetchTask: Task<Void, Never>?
+    @ObservationIgnored private var detailPrefetchAnchor: (id: MessageID, movingBackward: Bool)?
     @ObservationIgnored private var tabsRestored = false
     @ObservationIgnored private var isSyncingTabSelection = false
 #if DEBUG
     @ObservationIgnored private var qaContextMenuDumped = false
 #endif
+    @ObservationIgnored private var listLayoutObservationGeneration: UInt64 = 0
+    @ObservationIgnored private var activeListSort: MailListSort = .newest
+    /// Native table edits target the current folder by default. Commands can
+    /// switch this to global defaults before changing order, widths, or sort.
+    var listCustomizationTarget: MailListCustomizationTarget = .currentFolder
 
     var selectedFolder: FolderSummary? {
         folders.first { $0.id == selectedFolderID }
+    }
+    /// Complete server folder identity used for durable layout keys. Folder
+    /// IDs are intentionally excluded so settings can sync across devices.
+    var effectiveListScope: MailListScope {
+        listScope(for: selectedFolder)
+    }
+
+    /// Effective list presentation, columns, widths, and sort for the visible
+    /// folder after global values and its optional override are resolved.
+    var effectiveListConfiguration: MailListConfiguration {
+        workspaceSync.listLayout.configuration(for: effectiveListScope)
+    }
+
+    /// The pane arrangement consumed by the native main-window shell.
+    var listPaneLayout: MailPaneLayout {
+        effectiveListConfiguration.paneLayout
+    }
+
+    var globalListConfiguration: MailListConfiguration {
+        workspaceSync.listLayout.configuration(for: .global)
+    }
+
+    var canCustomizeCurrentFolder: Bool {
+        selectedFolder != nil && effectiveListScope != .global
+    }
+
+    private func listScope(for folder: FolderSummary?) -> MailListScope {
+        guard let folder,
+              let account = accountConfigs.first(where: { $0.id == folder.accountID })
+        else {
+            return .global
+        }
+        return .folder(account: account.accountLinkID, path: folder.path)
+    }
+
+    private var listMutationScope: MailListScope {
+        switch listCustomizationTarget {
+        case .global:
+            return .global
+        case .currentFolder:
+            return effectiveListScope
+        }
+    }
+    private func listScope(for folderID: FolderID?) -> MailListScope {
+        guard let folderID else { return .global }
+        return listScope(for: folders.first { $0.id == folderID })
+    }
+
+    private func listConfiguration(for folderID: FolderID?) -> MailListConfiguration {
+        workspaceSync.listLayout.configuration(for: listScope(for: folderID))
     }
 
     /// Display name shown by the message-list title when it is flipped to the
@@ -246,25 +287,158 @@ final class AppModel {
         self.appearance = appearance
         self.actions = actions
         self.faviconStore = faviconStore
+        self.detailLoader = MessageDetailLoader(fetch: { id in
+            try await facade.detail(id)
+        }, fetchBatch: { ids in
+            try await facade.details(ids)
+        })
         let pool = ReaderSurfacePool()
         self.readerSurfacePool = pool
         self.tabs = ReaderTabs()
         accountState = facade.accountState
         accountStates = facade.accountStates
         accountConfigs = facade.accounts
+        self.workspaceSync = MacWorkspaceCoordinator(
+            appearance: appearance,
+            actions: actions,
+            storageURL: MacWorkspaceCoordinator.defaultStorageURL
+        )
         tabs.onChange = { [weak self] in
             self?.scheduleTabsPersistence()
         }
         pool.onEvict = { [weak self] _ in
             guard let self else { return }
-            self.detailCache.removeValues(notIn: self.retainedDetailMessageIDs)
+            self.detailLoader.setProtectedMessageIDs(self.retainedDetailMessageIDs)
         }
         tabs.onClose = { [weak self, weak pool] id in
             pool?.drop(id)
             guard let self else { return }
-            self.detailCache.removeValues(notIn: self.retainedDetailMessageIDs)
+            self.detailLoader.setProtectedMessageIDs(self.retainedDetailMessageIDs)
+        }
+        workspaceSync.bind(to: self)
+    }
+
+    /// Changes the scope used by native table edits. The choice itself is
+    /// session-local; the resulting settings are durable workspace values.
+    func setListCustomizationTarget(_ target: MailListCustomizationTarget) {
+        guard target != .currentFolder || canCustomizeCurrentFolder else {
+            listCustomizationTarget = .global
+            return
+        }
+        listCustomizationTarget = target
+    }
+
+    /// Persists the pane arrangement for the scope currently selected by View
+    /// commands. MainWindowController consumes `listPaneLayout` separately.
+    func setPaneLayout(_ layout: MailPaneLayout) {
+        persistListChange { [store = workspaceSync.listLayout] scope in
+            try await store.setPaneLayout(layout, for: scope)
         }
     }
+
+    func setGlobalPaneLayout(_ layout: MailPaneLayout) {
+        persistListChange(in: .global) { [store = workspaceSync.listLayout] scope in
+            try await store.setPaneLayout(layout, for: scope)
+        }
+    }
+
+    func setListPresentation(_ presentation: MailListPresentation) {
+        persistListChange { [store = workspaceSync.listLayout] scope in
+            try await store.setPresentation(presentation, for: scope)
+        }
+    }
+
+    func setGlobalListPresentation(_ presentation: MailListPresentation) {
+        persistListChange(in: .global) { [store = workspaceSync.listLayout] scope in
+            try await store.setPresentation(presentation, for: scope)
+        }
+    }
+
+    func setListColumnOrder(_ order: [MailListColumn]) {
+        persistListChange { [store = workspaceSync.listLayout] scope in
+            try await store.setColumnOrder(order, for: scope)
+        }
+    }
+
+    func setGlobalListColumnOrder(_ order: [MailListColumn]) {
+        persistListChange(in: .global) { [store = workspaceSync.listLayout] scope in
+            try await store.setColumnOrder(order, for: scope)
+        }
+    }
+
+    func setListColumnVisible(_ column: MailListColumn, visible: Bool) {
+        persistListChange { [store = workspaceSync.listLayout] scope in
+            try await store.setColumnVisible(column, visible: visible, for: scope)
+        }
+    }
+
+    func setGlobalListColumnVisible(_ column: MailListColumn, visible: Bool) {
+        persistListChange(in: .global) { [store = workspaceSync.listLayout] scope in
+            try await store.setColumnVisible(column, visible: visible, for: scope)
+        }
+    }
+
+    func setListColumnWidth(_ column: MailListColumn, width: Double) {
+        persistListChange { [store = workspaceSync.listLayout] scope in
+            try await store.setColumnWidth(column, width: width, for: scope)
+        }
+    }
+
+    func setGlobalListColumnWidth(_ column: MailListColumn, width: Double) {
+        persistListChange(in: .global) { [store = workspaceSync.listLayout] scope in
+            try await store.setColumnWidth(column, width: width, for: scope)
+        }
+    }
+
+    func setListSort(_ sort: MailListSort) {
+        persistListChange { [store = workspaceSync.listLayout] scope in
+            try await store.setSort(sort, for: scope)
+        }
+    }
+
+    func setGlobalListSort(_ sort: MailListSort) {
+        persistListChange(in: .global) { [store = workspaceSync.listLayout] scope in
+            try await store.setSort(sort, for: scope)
+        }
+    }
+
+    func resetListOverrides() {
+        guard case .folder = effectiveListScope else { return }
+        persistListChange(in: effectiveListScope) { [store = workspaceSync.listLayout] scope in
+            try await store.resetOverrides(for: scope)
+        }
+    }
+
+    func resetGlobalListSettings() {
+        persistListChange(in: .global) { [store = workspaceSync.listLayout] scope in
+            try await store.resetOverrides(for: scope)
+        }
+    }
+
+    private func persistListChange(
+        _ operation: @escaping @MainActor (MailListScope) async throws -> Void
+    ) {
+        persistListChange(in: listMutationScope, operation)
+    }
+
+    private func persistListChange(
+        in scope: MailListScope,
+        _ operation: @escaping @MainActor (MailListScope) async throws -> Void
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await operation(scope)
+            } catch {
+                toasts.post(
+                    title: "Couldn’t save list layout",
+                    detail: error.localizedDescription,
+                    severity: .error
+                )
+            }
+        }
+    }
+
     /// malformed URLs can never reach account or folder selection.
     func openURL(_ url: URL) {
         guard let link = MailternalDeepLink(url: url) else {
@@ -377,10 +551,11 @@ final class AppModel {
             selectedMessageID = nil
             detail = nil
             rawSource = nil
-            isShowingRawSource = false
+            deepLinkPrefetchTask?.cancel()
+            deepLinkPrefetchTask = nil
+            messageDeepLinks.removeAll()
             listRows = []
             listCursor = nil
-            messageDeepLinks.removeAll()
             listEpoch += 1
             return
         }
@@ -391,21 +566,26 @@ final class AppModel {
         folderID: FolderID,
         messageID: MessageID
     ) async throws {
+        let sort = listConfiguration(for: folderID).sort
         var cursor: MessagePageCursor?
         var loaded: [MessageRow] = []
         repeat {
             let page = try await facade.page(
                 in: folderID,
                 after: cursor,
-                limit: MessageListPrefetch.pageSize
+                limit: MessageListPrefetch.pageSize,
+                sort: sort
             )
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  listConfiguration(for: folderID).sort == sort
+            else { return }
             loaded.append(contentsOf: page.rows)
             if page.rows.contains(where: { $0.id == messageID }) {
                 guard !Task.isCancelled else { return }
                 prepareFolderForRoute(folderID)
                 listRows = loaded
                 listCursor = page.next
+                activeListSort = sort
                 openMessage(messageID, permanent: false)
                 return
             }
@@ -416,6 +596,70 @@ final class AppModel {
         // resolved row before paging reaches it; do not select a substitute.
         throw MailModelRouteError.messageUnavailable
     }
+    private func observeListLayout() {
+        listLayoutObservationGeneration &+= 1
+        let generation = listLayoutObservationGeneration
+        let scope = effectiveListScope
+        withObservationTracking {
+            _ = workspaceSync.listLayout.configuration(for: scope)
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.listLayoutObservationGeneration == generation,
+                      self.streamsStarted
+                else { return }
+                let sort = self.effectiveListConfiguration.sort
+                if sort != self.activeListSort {
+                    self.restartList(for: sort)
+                }
+                self.observeListLayout()
+            }
+        }
+    }
+
+    private func restartList(for sort: MailListSort) {
+        activeListSort = sort
+        observeTask?.cancel()
+        pageTask?.cancel()
+        observeTask = nil
+        pageTask = nil
+        isPaging = false
+        listRows = []
+        listCursor = nil
+        listEpoch += 1
+        guard let folder = selectedFolderID else {
+            isLoadingList = false
+            return
+        }
+        isLoadingList = true
+        observeListPages(in: folder, sort: sort, epoch: listEpoch)
+    }
+
+    private func observeListPages(in folder: FolderID, sort: MailListSort, epoch: UInt64) {
+        observeTask = Task { [weak self] in
+            guard let self else { return }
+            for await page in facade.observePage(
+                in: folder,
+                after: nil,
+                limit: MessageListPrefetch.pageSize,
+                sort: sort
+            ) {
+                guard !Task.isCancelled,
+                      selectedFolderID == folder,
+                      listEpoch == epoch,
+                      activeListSort == sort
+                else { return }
+                applyFirstPage(page, sort: sort)
+                isLoadingList = false
+            }
+            if selectedFolderID == folder,
+               listEpoch == epoch,
+               activeListSort == sort {
+                isLoadingList = false
+            }
+        }
+    }
+
 
     func start() {
         guard !streamsStarted else { return }
@@ -426,13 +670,34 @@ final class AppModel {
                 await live.waitUntilStoreReady()
                 await live.restorePersistedAccounts()
             }
+            do {
+                try await recoverPairedAccountLinks()
+            } catch {
+                streamsStarted = false
+                toasts.post(
+                    title: "Couldn’t restore paired account links",
+                    detail: error.localizedDescription,
+                    severity: .error
+                )
+                return
+            }
+            workspaceSync.start()
+            observeListLayout()
             accountConfigs = facade.accounts
             accountStates = facade.accountStates
             applyAccountState(facade.accountState)
             Task { [weak self] in
                 guard let self else { return }
                 for await accounts in facade.accountsStream {
+                    let previousScope = effectiveListScope
                     self.accountConfigs = accounts
+                    guard selectedFolderID != nil, previousScope != effectiveListScope else { continue }
+                    let sort = effectiveListConfiguration.sort
+                    if sort != activeListSort {
+                        restartList(for: sort)
+                    } else {
+                        observeListLayout()
+                    }
                 }
             }
             Task { [weak self] in
@@ -444,7 +709,9 @@ final class AppModel {
             Task { [weak self] in
                 guard let self else { return }
                 for await folders in facade.foldersStream {
+                    let previousScope = effectiveListScope
                     self.folders = folders
+                    let scopeChanged = selectedFolderID != nil && previousScope != effectiveListScope
                     if !qaLaunchFoldersLogged && !folders.isEmpty {
                         qaLaunchFoldersLogged = true
                         QALaunch.launchPhase("folders-snapshot")
@@ -459,6 +726,14 @@ final class AppModel {
                         selectFolder(first.id)
                     } else if selectedFolderID != nil {
                         selectFolder(nil)
+                    }
+                    if scopeChanged {
+                        let sort = effectiveListConfiguration.sort
+                        if sort != activeListSort {
+                            restartList(for: sort)
+                        } else {
+                            observeListLayout()
+                        }
                     }
                     self.restoreTabsIfNeeded()
                 }
@@ -503,9 +778,11 @@ final class AppModel {
             selectedFolderID = nil
             selectedMessageIDs.removeAll()
             selectedMessageID = nil
-            detailCache.removeAll(keepingCapacity: false)
+            detailLoader.invalidateAll()
             detail = nil
             listRows = []
+            deepLinkPrefetchTask?.cancel()
+            deepLinkPrefetchTask = nil
             messageDeepLinks.removeAll()
             SettingsWindowController.shared.show(model: self, appearance: appearance, actions: actions)
         case .authFailed(let message):
@@ -523,9 +800,12 @@ final class AppModel {
             foldersSnapshotReady = false
         }
     }
-
-    func selectFolder(_ id: FolderID?) {
+    func selectFolder(_ id: FolderID?, userInitiated: Bool = false) {
+        if userInitiated {
+            noteListInteraction()
+        }
         guard selectedFolderID != id else { return }
+        detailPrefetchAnchor = nil
         selectedFolderID = id
         (facade as? LiveMailFacade)?.reportVisibleFolder(id)
         selectedMessageIDs.removeAll()
@@ -535,23 +815,18 @@ final class AppModel {
         }
         listRows = []
         listCursor = nil
+        detailLoader.cancelPrefetch()
+        deepLinkPrefetchTask?.cancel()
+        deepLinkPrefetchTask = nil
         messageDeepLinks.removeAll()
         isLoadingList = id != nil
         listEpoch += 1
+        activeListSort = effectiveListConfiguration.sort
         observeTask?.cancel()
         pageTask?.cancel()
+        observeListLayout()
         guard let id else { return }
-        observeTask = Task { [weak self] in
-            guard let self else { return }
-            for await page in facade.observePage(in: id, after: nil, limit: MessageListPrefetch.pageSize) {
-                guard !Task.isCancelled, selectedFolderID == id else { return }
-                applyFirstPage(page)
-                isLoadingList = false
-            }
-            if selectedFolderID == id {
-                isLoadingList = false
-            }
-        }
+        observeListPages(in: id, sort: activeListSort, epoch: listEpoch)
     }
 
     func loadMoreIfNeeded(near row: Int) {
@@ -564,14 +839,30 @@ final class AppModel {
         isPaging = true
         pageTask?.cancel()
         let cursor = listCursor
+        let sort = activeListSort
+        let epoch = listEpoch
         pageTask = Task { [weak self] in
             guard let self else { return }
             defer { isPaging = false }
             do {
-                let page = try await facade.page(in: folder, after: cursor, limit: MessageListPrefetch.pageSize)
-                guard !Task.isCancelled, selectedFolderID == folder else { return }
+                let page = try await facade.page(
+                    in: folder,
+                    after: cursor,
+                    limit: MessageListPrefetch.pageSize,
+                    sort: sort
+                )
+                guard !Task.isCancelled,
+                      selectedFolderID == folder,
+                      listEpoch == epoch,
+                      activeListSort == sort
+                else { return }
                 appendPage(page)
             } catch {
+                guard !Task.isCancelled,
+                      selectedFolderID == folder,
+                      listEpoch == epoch,
+                      activeListSort == sort
+                else { return }
                 isLoadingList = false
                 toasts.post(title: "Couldn’t load messages", detail: error.localizedDescription)
             }
@@ -599,14 +890,23 @@ final class AppModel {
     func selectAllMessages() {
         guard let folder = selectedFolderID else { return }
         let epoch = listEpoch
+        let sort = activeListSort
         Task { [weak self] in
             guard let self else { return }
             do {
-                let ids = try await facade.messageIDs(in: folder)
-                guard !Task.isCancelled, selectedFolderID == folder, listEpoch == epoch else { return }
+                let ids = try await facade.messageIDs(in: folder, sort: sort)
+                guard !Task.isCancelled,
+                      selectedFolderID == folder,
+                      listEpoch == epoch,
+                      activeListSort == sort
+                else { return }
                 selectMessages(Set(ids), anchor: selectedMessageID)
             } catch {
-                guard !Task.isCancelled, selectedFolderID == folder, listEpoch == epoch else { return }
+                guard !Task.isCancelled,
+                      selectedFolderID == folder,
+                      listEpoch == epoch,
+                      activeListSort == sort
+                else { return }
                 toasts.post(title: "Couldn’t select messages", detail: error.localizedDescription)
             }
         }
@@ -650,8 +950,8 @@ final class AppModel {
             return readerSurfacePool.remoteImagesAllowed(for: tabID)
         } ?? false
         allowRemoteImages = retainedRemoteImages
-        isLoadingDetail = true
-        if let cached = detailCache.value(for: id) {
+        scheduleAdjacentDetailPrefetch()
+        if let cached = detailLoader.cachedDetail(for: id) {
             presentDetail(
                 cached,
                 id: id,
@@ -661,11 +961,12 @@ final class AppModel {
             )
             return
         }
-        Task { [weak self] in
+        isLoadingDetail = true
+        Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let loaded = try await facade.detail(id)
-                presentDetail(
+                let loaded = try await self.detailLoader.load(id)
+                self.presentDetail(
                     loaded,
                     id: id,
                     selection: qaSelection,
@@ -673,18 +974,27 @@ final class AppModel {
                     signpostID: signpostID
                 )
             } catch {
-                os_signpost(
-                    .end,
-                    log: appModelSignpostLog,
-                    name: "loadMessageDetail",
-                    signpostID: signpostID,
-                    "result=error"
+                self.endDetailSignpost(
+                    signpostID,
+                    result: "error"
                 )
                 guard !Task.isCancelled,
-                      isReaderRequestCurrent(id) else { return }
-                closeUnavailableTab(messageID: id)
+                      self.qaSelectionSequence == qaSelection,
+                      self.isReaderRequestCurrent(id) else { return }
+                self.closeUnavailableTab(messageID: id)
             }
         }
+    }
+
+    private func endDetailSignpost(_ signpostID: OSSignpostID, result: String) {
+        os_signpost(
+            .end,
+            log: appModelSignpostLog,
+            name: "loadMessageDetail",
+            signpostID: signpostID,
+            "result=%{public}s",
+            result
+        )
     }
 
     private func presentDetail(
@@ -694,20 +1004,9 @@ final class AppModel {
         source: String,
         signpostID: OSSignpostID
     ) {
-        detailCache.insert(
-            loaded,
-            for: id,
-            protectedIDs: retainedDetailMessageIDs
-        )
-        os_signpost(
-            .end,
-            log: appModelSignpostLog,
-            name: "loadMessageDetail",
-            signpostID: signpostID,
-            "result=%{public}s",
-            source
-        )
-        guard isReaderRequestCurrent(id) else { return }
+        endDetailSignpost(signpostID, result: source)
+        guard qaSelectionSequence == selection,
+              isReaderRequestCurrent(id) else { return }
         detail = loaded
         isLoadingDetail = false
         let senderDomains = loaded.envelope.from.compactMap { address in
@@ -737,6 +1036,7 @@ final class AppModel {
     }
 
     private func clearReaderSelection() {
+        detailPrefetchAnchor = nil
         detail = nil
         isLoadingDetail = false
         rawSource = nil
@@ -761,11 +1061,19 @@ final class AppModel {
                 return
             }
             do {
+                let sort = activeListSort
+                let epoch = listEpoch
                 let page = try await facade.page(
                     in: folder,
                     after: nil,
-                    limit: count
+                    limit: count,
+                    sort: sort
                 )
+                guard !Task.isCancelled,
+                      selectedFolderID == folder,
+                      listEpoch == epoch,
+                      activeListSort == sort
+                else { return }
                 let ids = page.rows.prefix(count).map(\.id)
                 guard !ids.isEmpty else {
                     QALaunch.log("selection-perf bench unavailable reason=no-messages")
@@ -814,7 +1122,9 @@ final class AppModel {
         listRows[index] = row
         markedRead.insert(id)
         Task { [weak self] in
-            await self?.facade.markRead(id)
+            guard let self else { return }
+            do { try await facade.markRead(id) }
+            catch { await reportMutationFailure(error, ids: [id]) }
         }
     }
 
@@ -842,10 +1152,15 @@ final class AppModel {
                 listRows[index].isRead = shouldRead
             }
             Task { [weak self] in
-                if shouldRead {
-                    await self?.facade.markRead(orderedIDs)
-                } else {
-                    await self?.facade.markUnread(orderedIDs)
+                guard let self else { return }
+                do {
+                    if shouldRead {
+                        try await facade.markRead(orderedIDs)
+                    } else {
+                        try await facade.markUnread(orderedIDs)
+                    }
+                } catch {
+                    await reportMutationFailure(error, ids: ids)
                 }
             }
         case .toggleFlag:
@@ -856,8 +1171,34 @@ final class AppModel {
                 listRows[index].isFlagged = shouldFlag
             }
             Task { [weak self] in
-                await self?.facade.setFlagged(orderedIDs, shouldFlag)
+                guard let self else { return }
+                do { try await facade.setFlagged(orderedIDs, shouldFlag) }
+                catch { await reportMutationFailure(error, ids: ids) }
             }
+        }
+    }
+
+    /// Reconcile failed optimism from the current store, not a stale row copy
+    /// that could overwrite a newer user edit.
+    private func reportMutationFailure(_ error: Error, ids: Set<MessageID>) async {
+        toasts.post(title: "Couldn’t save message changes", detail: error.localizedDescription, severity: .error)
+        markedRead.subtract(ids)
+        let sort = activeListSort
+        guard let folder = selectedFolderID,
+              let page = try? await facade.page(
+                  in: folder,
+                  after: nil,
+                  limit: max(1, listRows.count),
+                  sort: sort
+              ),
+              selectedFolderID == folder,
+              activeListSort == sort
+        else { return }
+        let stored = Dictionary(uniqueKeysWithValues: page.rows.map { ($0.id, $0) })
+        for index in listRows.indices where ids.contains(listRows[index].id) {
+            guard let row = stored[listRows[index].id] else { continue }
+            listRows[index].isRead = row.isRead
+            listRows[index].isFlagged = row.isFlagged
         }
     }
 
@@ -1018,68 +1359,190 @@ final class AppModel {
         }
         move(ids: ids, to: folder)
     }
+    /// Activates an adjacent tab from a keyboard command without first
+    /// publishing an intermediate ``ReaderTabs`` state. The command marker is
+    /// emitted before the reader selection changes so QA measures the command
+    /// itself, not the later SwiftUI commit.
+    func activateNextTab() {
+        activateAdjacentTab(forward: true)
+    }
+
+    /// See ``activateNextTab()``.
+    func activatePreviousTab() {
+        activateAdjacentTab(forward: false)
+    }
+
+    private func activateAdjacentTab(forward: Bool) {
+        guard let id = ReaderTabsPolicy.adjacentID(
+            in: tabs.tabs,
+            activeID: tabs.activeID,
+            forward: forward,
+            id: \.id
+        ), let tab = tabs.tabs.first(where: { $0.id == id }) else {
+            return
+        }
+        noteQATabCommand(tabID: id, messageID: tab.message)
+        activateTab(id)
+    }
+
+    /// QA-only command boundary for reader tab switching. A command records
+    /// intent before activation; readiness is emitted only after both the
+    /// expected native surface and the outer scroll offset report completion.
+    func noteQATabCommand(tabID: UUID, messageID: MessageID) {
+        guard ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" else {
+            return
+        }
+        qaTabCommandSequence &+= 1
+        let serial = qaTabCommandSequence
+        qaPendingTabCommands.removeAll(keepingCapacity: true)
+        QALaunch.log(
+            "selection-perf event=tab-command serial=\(serial) tab=\(tabID.uuidString) message=\(messageID.rawValue) t=\(DispatchTime.now().uptimeNanoseconds)"
+        )
+        guard tabs.activeID != tabID else {
+            QALaunch.log(
+                "selection-perf event=tab-noop serial=\(serial) tab=\(tabID.uuidString) message=\(messageID.rawValue) t=\(DispatchTime.now().uptimeNanoseconds)"
+            )
+            return
+        }
+        qaPendingTabCommands[tabID] = QATabCommandState(
+            serial: serial,
+            messageID: messageID
+        )
+    }
+
+    /// The HTML/TextKit bridge calls this after the requested tab's native
+    /// surface is installed and rendered. It never accepts a stale message.
+    func noteQASurfaceReady(tabID: UUID, messageID: MessageID) {
+        guard ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1",
+              var pending = qaPendingTabCommands[tabID],
+              pending.messageID == messageID else {
+            return
+        }
+        pending.surfaceReady = true
+        qaPendingTabCommands[tabID] = pending
+        scheduleQAReaderReadyCheck(tabID: tabID, messageID: messageID)
+    }
+
+    /// The outer scroll bridge calls this after it has applied the persisted
+    /// native offset to the current reader document.
+    func noteQAScrollRestored(tabID: UUID, messageID: MessageID, offset: CGFloat) {
+        guard ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1",
+              var pending = qaPendingTabCommands[tabID],
+              pending.messageID == messageID else {
+            return
+        }
+        pending.scrollOffset = offset
+        qaPendingTabCommands[tabID] = pending
+        scheduleQAReaderReadyCheck(tabID: tabID, messageID: messageID)
+    }
+
+    private func scheduleQAReaderReadyCheck(tabID: UUID, messageID: MessageID) {
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            self?.finishQAReaderReadyCheck(tabID: tabID, messageID: messageID)
+        }
+    }
+
+    private func finishQAReaderReadyCheck(tabID: UUID, messageID: MessageID) {
+        guard let pending = qaPendingTabCommands[tabID],
+              pending.messageID == messageID,
+              pending.surfaceReady,
+              let offset = pending.scrollOffset,
+              tabs.activeID == tabID,
+              tabs.active?.message == messageID,
+              detail?.id == messageID else {
+            return
+        }
+        qaPendingTabCommands.removeValue(forKey: tabID)
+        let safeOffset = offset.isFinite ? max(offset, 0) : 0
+        QALaunch.log(
+            "selection-perf event=reader-ready serial=\(pending.serial) tab=\(tabID.uuidString) message=\(messageID.rawValue) offset=\(String(format: "%.1f", safeOffset)) t=\(DispatchTime.now().uptimeNanoseconds)"
+        )
+    }
 
     func openMessage(_ id: MessageID, permanent: Bool) {
-        // Explicit opens are never dropped: a transient open reuses the one
-        // transient tab, a permanent open promotes or inserts (ReaderTabs.open).
-        let existingTabID = tabs.tabs.first(where: { $0.message == id })?.id
-        tabs.open(id, permanent: permanent)
-        let activeTabID = tabs.activeID
-        let pooledRemoteImages = activeTabID.map {
-            readerSurfacePool.remoteImagesAllowed(for: $0)
-        } ?? false
+        openMessages([id], permanent: permanent)
+    }
+
+    /// Opens messages in visible-list order as one reader transition. Every
+    /// message gets the normal permanent-open deduplication/promotion rules,
+    /// while only the final tab is activated, loaded, retained, and persisted.
+    func openMessages(_ ids: [MessageID], permanent: Bool) {
+        let preservedSelection = ids.count > 1 ? Set(ids) : nil
+        guard let finalID = ids.last else { return }
+        let existingTabID = tabs.tabs.first(where: { $0.message == finalID })?.id
+        tabs.open(ids, permanent: permanent)
+        guard let activeTabID = tabs.activeID,
+              let activeMessageID = tabs.active?.message else {
+            return
+        }
+        let pooledRemoteImages = readerSurfacePool.remoteImagesAllowed(for: activeTabID)
         let retainedRemoteImages = activeTabID == existingTabID
             ? pooledRemoteImages
             : false
-        if let activeID = activeTabID {
-            readerSurfacePool.retain(activeID)
-        }
-        if let folder = folderContaining(id), selectedFolderID != folder {
+        readerSurfacePool.retain(activeTabID)
+        detailLoader.setProtectedMessageIDs(retainedDetailMessageIDs)
+
+        if let folder = folderContaining(activeMessageID), selectedFolderID != folder {
             selectFolder(folder)
         }
-        if let folder = folderContaining(id),
-           listRows.contains(where: { $0.id == id }) {
-            let selectionMatches = selectedMessageIDs == [id]
-                && selectedMessageID == id
-            let detailMatches = detail?.id == id
+        if let folder = folderContaining(activeMessageID),
+           listRows.contains(where: { $0.id == activeMessageID }) {
+            let selectionMatches = selectedMessageIDs == [activeMessageID]
+                && selectedMessageID == activeMessageID
+            let detailMatches = detail?.id == activeMessageID
             if !selectionMatches || (!detailMatches && !isLoadingDetail) {
-                syncSelection(to: id, folder: folder)
+                syncSelection(to: activeMessageID, folder: folder)
+            }
+            if let preservedSelection {
+                selectedMessageIDs = preservedSelection
+                selectedMessageID = activeMessageID
             }
             restoreRemoteImagesAllowed(
                 retainedRemoteImages,
                 tabID: activeTabID,
-                messageID: id
+                messageID: activeMessageID
             )
             return
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                guard let link = try await self.facade.makeDeepLink(for: id),
+                guard let link = try await self.facade.makeDeepLink(for: activeMessageID),
                       let destination = try await self.facade.resolve(link),
                       case .message(let folder, _, let row) = destination else {
-                    guard !Task.isCancelled else { return }
-                    self.closeUnavailableTab(messageID: id)
+                    guard !Task.isCancelled,
+                          self.tabs.tabs.contains(where: {
+                              $0.id == activeTabID && $0.message == activeMessageID
+                          }) else { return }
+                    self.closeUnavailableTab(messageID: activeMessageID)
                     return
                 }
                 guard !Task.isCancelled else { return }
                 if self.selectedFolderID != folder {
                     self.selectFolder(folder)
                 }
-                if !self.listRows.contains(where: { $0.id == id }) {
+                if !self.listRows.contains(where: { $0.id == activeMessageID }) {
                     self.listRows.insert(row, at: 0)
                 }
                 guard self.tabs.activeID == activeTabID,
-                      self.tabs.active?.message == id else { return }
-                self.syncSelection(to: id, folder: folder)
+                      self.tabs.active?.message == activeMessageID else { return }
+                self.syncSelection(to: activeMessageID, folder: folder)
+                if let preservedSelection {
+                    self.selectedMessageIDs = preservedSelection
+                    self.selectedMessageID = activeMessageID
+                }
                 self.restoreRemoteImagesAllowed(
                     retainedRemoteImages,
                     tabID: activeTabID,
-                    messageID: id
+                    messageID: activeMessageID
                 )
             } catch {
-                guard !Task.isCancelled else { return }
-                self.closeUnavailableTab(messageID: id)
+                guard !Task.isCancelled,
+                      self.tabs.tabs.contains(where: {
+                          $0.id == activeTabID && $0.message == activeMessageID
+                      }) else { return }
+                self.closeUnavailableTab(messageID: activeMessageID)
             }
         }
     }
@@ -1105,6 +1568,7 @@ final class AppModel {
         }
         tabs.activate(id)
         readerSurfacePool.retain(id)
+        detailLoader.setProtectedMessageIDs(retainedDetailMessageIDs)
         let retainedRemoteImages = readerSurfacePool.remoteImagesAllowed(for: id)
         if let folder = folderContaining(tab.message),
            listRows.contains(where: { $0.id == tab.message }),
@@ -1173,30 +1637,84 @@ final class AppModel {
         return account.isEnabled
     }
 
-    /// ⌘W closes a reader tab while one exists; otherwise AppKit closes the
-    /// main window through its normal close-window action. Closing the final
-    /// tab performs both steps during this same invocation.
+    /// ⌘W is focus-sensitive: a focused reader closes its active tab, while
+    /// the same command outside the reader delegates to the focused window's
+    /// normal close action. The last reader tab leaves the main window open
+    /// with an empty reader.
     func closeActiveTabOrWindow() {
-        if let activeID = tabs.activeID {
-            tabs.close(activeID)
-            if let active = tabs.active {
-                activateTab(active.id)
-            } else {
-                clearReaderSelection()
-                selectedMessageIDs.removeAll()
-                selectedMessageID = nil
-                if ReaderTabsPolicy.shouldCloseWindow(afterClosingTabsRemaining: tabs.tabs.count) {
-                    NSApp.keyWindow?.performClose(nil)
-                }
-            }
+        let window = NSApp.keyWindow
+            ?? NSApp.mainWindow
+            ?? MainWindowController.shared.window
+        guard let window,
+              window === MainWindowController.shared.window else {
+            window?.performClose(nil)
+            return
+        }
+        guard tabs.activeID != nil else {
+            window.performClose(nil)
+            return
+        }
+        let currentResponder = window.firstResponder
+        let closesReader: Bool
+        if currentResponder === interactionResponder {
+            // The current responder did not change, so the logical pane
+            // marker is authoritative (including a non-focusable reader
+            // background that leaves the table first responder).
+            closesReader = readerInteractionActive
         } else {
-            NSApp.keyWindow?.performClose(nil)
+            // A real responder transition is stronger than a stale marker.
+            closesReader = MainWindowController.shared.isReaderFocused(in: window)
+        }
+        guard closesReader else {
+            window.performClose(nil)
+            return
+        }
+        closeActiveReaderTab()
+    }
+
+
+    /// Records a click in the reader pane for focus-sensitive window commands.
+    func noteReaderInteraction() {
+        readerInteractionActive = true
+        interactionResponder = (NSApp.keyWindow ?? NSApp.mainWindow)?.firstResponder
+    }
+
+    /// Records a user interaction in the list/sidebar region. Selection
+    /// updates originating from tab activation do not call this hook.
+    func noteListInteraction() {
+        readerInteractionActive = false
+        interactionResponder = (NSApp.keyWindow ?? NSApp.mainWindow)?.firstResponder
+    }
+
+    /// Closes a tab from an explicit reader-tab close affordance. This path
+    /// must not depend on first-responder focus because the close button lives
+    /// in the toolbar rather than in the reader pane.
+    /// Active-tab closure restores native pane focus even when the strip
+    /// disappears at one tab; its SwiftUI lifecycle does not own this step.
+    func closeReaderTab(_ id: UUID) {
+        let wasActive = tabs.activeID == id
+        tabs.close(id)
+        guard wasActive else { return }
+        if let active = tabs.active {
+            activateTab(active.id)
+            MainWindowController.shared.focusReader()
+        } else {
+            clearReaderSelection()
+            selectedMessageIDs.removeAll()
+            selectedMessageID = nil
+            MainWindowController.shared.focusMessageList()
         }
     }
 
+    private func closeActiveReaderTab() {
+        guard let activeID = tabs.activeID else { return }
+        closeReaderTab(activeID)
+    }
+
+
     @discardableResult
     func messageRemoved(_ id: MessageID) -> Bool {
-        detailCache.removeValue(for: id)
+        detailLoader.invalidate(id)
         guard tabs.messageRemoved(id) else { return false }
         toasts.post(title: "Message was deleted")
         if selectedMessageID == id {
@@ -1215,7 +1733,7 @@ final class AppModel {
     /// state. Remove its tab without a toast and leave the reader empty when
     /// no other tab remains.
     private func closeUnavailableTab(messageID: MessageID) {
-        detailCache.removeValue(for: messageID)
+        detailLoader.invalidate(messageID)
         guard let tabID = tabs.tabs.first(where: { $0.message == messageID })?.id else {
             return
         }
@@ -1263,6 +1781,69 @@ final class AppModel {
         selectedMessageID = id
         guard !alreadySelected else { return }
         loadMessageDetail(id)
+    }
+
+    /// Finish an in-flight restore before changing the identities it resolves.
+    func preparePairingAccountLinks() async {
+        await tabRestoreTask?.value
+        tabSaveTask?.cancel()
+        await tabSaveTask?.value
+    }
+
+    /// Startup runs this before restoring tabs. Import runs it before ACK.
+    func recoverPairedAccountLinks() async throws {
+        try await finishPairingAccountLinkCommands(
+            facade: facade,
+            workspace: workspaceSync.controller
+        ) { command in
+            try self.remapPersistedReaderLinks(from: command.source, to: command.destination)
+        }
+    }
+
+    private func remapPersistedReaderLinks(
+        from source: AccountLinkID,
+        to destination: AccountLinkID
+    ) throws {
+        tabSaveTask?.cancel()
+        func remap(_ raw: String) -> String {
+            guard let link = MailternalDeepLink(string: raw),
+                  link.accountLinkID == source,
+                  let value = link.replacingAccountLinkID(with: destination).formattedString else {
+                return raw
+            }
+            return value
+        }
+        if FileManager.default.fileExists(atPath: tabsPersistenceURL.path) {
+            var snapshot: ReaderTabsSnapshot
+            do {
+                let data = try Data(contentsOf: tabsPersistenceURL)
+                snapshot = try JSONDecoder().decode(ReaderTabsSnapshot.self, from: data)
+            } catch {
+                // Reader restoration is ancillary. Preserve unreadable bytes
+                // rather than repeatedly blocking the durable account relink.
+                let quarantine = tabsPersistenceURL.appendingPathExtension("unreadable-\(UUID().uuidString)")
+                try FileManager.default.moveItem(at: tabsPersistenceURL, to: quarantine)
+                toasts.post(title: "Couldn’t restore reader tabs", detail: error.localizedDescription)
+                messageDeepLinks = messageDeepLinks.mapValues(remap)
+                return
+            }
+            var changed = false
+            snapshot.tabs = snapshot.tabs.map { entry in
+                let link = remap(entry.link)
+                guard link != entry.link else { return entry }
+                changed = true
+                return ReaderTabsSnapshot.Entry(
+                    id: entry.id,
+                    link: link,
+                    isTransient: entry.isTransient,
+                    scrollOffset: entry.scrollOffset
+                )
+            }
+            if changed {
+                try JSONEncoder().encode(snapshot).write(to: tabsPersistenceURL, options: .atomic)
+            }
+        }
+        messageDeepLinks = messageDeepLinks.mapValues(remap)
     }
 
     private var tabsPersistenceURL: URL {
@@ -1579,11 +2160,11 @@ final class AppModel {
     }
 
 
-    private func applyFirstPage(_ page: MessagePage) {
-        prefetchDeepLinks(for: page.rows)
+    private func applyFirstPage(_ page: MessagePage, sort: MailListSort) {
 #if DEBUG
         dumpQAContextMenuIfRequested(firstRow: page.rows.first)
 #endif
+        guard sort == activeListSort else { return }
         if listRows.isEmpty {
             if !page.rows.isEmpty {
                 QALaunch.launchPhase("first-rows n=\(page.rows.count)")
@@ -1591,37 +2172,149 @@ final class AppModel {
             }
             listRows = page.rows
             listCursor = page.next
+            scheduleDeepLinkPrefetch()
+            scheduleAdjacentDetailPrefetch()
             return
         }
+        guard sort == .newest else {
+            // For non-newest orders, the observed page is authoritative. A
+            // later notification can move rows anywhere in the complete
+            // folder, so retaining older materialized rows would create a
+            // client-side reorder and an invalid keyset boundary.
+            let previousRows = Dictionary(uniqueKeysWithValues: listRows.map { ($0.id, $0) })
+            for row in page.rows {
+                if let previous = previousRows[row.id],
+                   messageRowContentChanged(previous, row) {
+                    detailLoader.invalidate(row.id)
+                }
+            }
+            listRows = page.rows
+            listCursor = page.next
+            scheduleDeepLinkPrefetch()
+            scheduleAdjacentDetailPrefetch()
+            if let selectedMessageID,
+               selectedMessageIDs.count == 1,
+               let previous = previousRows[selectedMessageID],
+               let current = page.rows.first(where: { $0.id == selectedMessageID }),
+               messageRowContentChanged(previous, current) {
+                detail = nil
+                loadMessageDetail(selectedMessageID)
+            }
+            return
+        }
+        let previousRows = Dictionary(uniqueKeysWithValues: listRows.map { ($0.id, $0) })
         let incoming = Dictionary(uniqueKeysWithValues: page.rows.map { ($0.id, $0) })
+        let changedIDs = page.rows.compactMap { row -> MessageID? in
+            guard let previous = previousRows[row.id],
+                  messageRowContentChanged(previous, row) else { return nil }
+            detailLoader.invalidate(row.id)
+            return row.id
+        }
         listRows = listRows.map { incoming[$0.id] ?? $0 }
         let existing = Set(listRows.map(\.id))
         let prepend = page.rows.filter { !existing.contains($0.id) }
         if !prepend.isEmpty {
             listRows.insert(contentsOf: prepend, at: 0)
-
         }
         if listCursor == nil {
             listCursor = page.next
         }
+        if let selectedMessageID,
+           selectedMessageIDs.count == 1,
+           changedIDs.contains(selectedMessageID) {
+            detail = nil
+            loadMessageDetail(selectedMessageID)
+        } else if !prepend.isEmpty {
+            scheduleAdjacentDetailPrefetch()
+        }
     }
 
     private func appendPage(_ page: MessagePage) {
-        prefetchDeepLinks(for: page.rows)
         let existing = Set(listRows.map(\.id))
-        listRows.append(contentsOf: page.rows.filter { !existing.contains($0.id) })
+        let appended = page.rows.filter { !existing.contains($0.id) }
+        listRows.append(contentsOf: appended)
         listCursor = page.next
+        if !appended.isEmpty {
+            scheduleAdjacentDetailPrefetch()
+        }
     }
 
-    private func prefetchDeepLinks(for rows: [MessageRow]) {
-        for row in rows where messageDeepLinks[row.id] == nil {
-            let id = row.id
-            Task { [weak self] in
-                guard let self else { return }
-                guard let link = try? await facade.makeDeepLink(for: id),
-                      let value = link.formattedString else { return }
-                messageDeepLinks[id] = value
+    /// Read/flag changes update list chrome only: MessageDetail contains
+    /// neither flag, so invalidating it would reload an unchanged reader and
+    /// reapply automatic read marking on every flag reconciliation.
+    private func messageRowContentChanged(_ old: MessageRow, _ new: MessageRow) -> Bool {
+        old.from != new.from
+            || old.senderAddress != new.senderAddress
+            || old.subject != new.subject
+            || old.preview != new.preview
+            || old.date != new.date
+            || old.hasAttachments != new.hasAttachments
+            || old.folderName != new.folderName
+            || old.accountName != new.accountName
+            || old.folderID != new.folderID
+    }
+
+    private func scheduleAdjacentDetailPrefetch() {
+        let anchorIndex: Int
+        if let selected = selectedMessageID,
+           selectedMessageIDs == [selected],
+           let index = listRows.firstIndex(where: { $0.id == selected }) {
+            anchorIndex = index
+        } else {
+            guard !listRows.isEmpty else { return }
+            anchorIndex = 0
+        }
+        let movingBackward: Bool
+        if selectedMessageIDs.count == 1,
+           let previous = detailPrefetchAnchor,
+           let previousIndex = listRows.firstIndex(where: { $0.id == previous.id }) {
+            movingBackward = previousIndex == anchorIndex
+                ? previous.movingBackward
+                : anchorIndex < previousIndex
+        } else {
+            movingBackward = false
+        }
+        detailPrefetchAnchor = (listRows[anchorIndex].id, movingBackward)
+        // Keep eight messages ahead of travel and four behind, including
+        // after a direction reversal; neither the batch nor cache grows.
+        let start = max(0, anchorIndex - (movingBackward ? 8 : 4))
+        let end = min(listRows.count, anchorIndex + (movingBackward ? 5 : 9))
+        let ahead = listRows[(anchorIndex + 1)..<end].map(\.id)
+        let behind = listRows[start..<anchorIndex].reversed().map(\.id)
+        detailLoader.prefetch(movingBackward ? behind + ahead : ahead + behind)
+    }
+
+    /// Canonical links are useful for drag-out and copy, but neither is needed
+    /// to paint the first rows. One cancellable, delayed batch avoids creating
+    /// a main-actor task per row while retaining the synchronous local-ID drag
+    /// fallback until canonical values arrive.
+    private func scheduleDeepLinkPrefetch() {
+        let epoch = listEpoch
+        let ids = listRows.map(\.id).filter { messageDeepLinks[$0] == nil }
+        guard !ids.isEmpty else { return }
+        deepLinkPrefetchTask?.cancel()
+        deepLinkPrefetchTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(500))
+            } catch {
+                return
             }
+            guard let self,
+                  !Task.isCancelled,
+                  self.listEpoch == epoch else {
+                return
+            }
+            var resolved: [MessageID: String] = [:]
+            for id in ids {
+                guard !Task.isCancelled, self.listEpoch == epoch else { return }
+                guard let link = try? await self.facade.makeDeepLink(for: id),
+                      let value = link.formattedString else {
+                    continue
+                }
+                resolved[id] = value
+            }
+            guard !Task.isCancelled, self.listEpoch == epoch else { return }
+            self.messageDeepLinks.merge(resolved, uniquingKeysWith: { _, new in new })
         }
     }
 #if DEBUG
