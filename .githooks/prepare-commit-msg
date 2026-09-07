@@ -1,0 +1,16 @@
+#!/bin/sh
+# Git runs this hook even with --no-verify. Validate effective identities,
+# including --author and GIT_AUTHOR_* / GIT_COMMITTER_* overrides.
+set -eu
+
+for role in AUTHOR COMMITTER; do
+    identity=$(git var "GIT_${role}_IDENT")
+    case "$identity" in
+        'K Gopal Krishna <mail@kayg.org> '*) ;;
+        *)
+            printf '%s\n' "Commit rejected: $role must be K Gopal Krishna <mail@kayg.org>." >&2
+            printf '%s\n' 'Check repository user.name/user.email and author/committer environment overrides.' >&2
+            exit 1
+            ;;
+    esac
+done

@@ -3,6 +3,12 @@
 - **Commits go to `dev`.** Verify the current branch before every commit.
   `main` is reserved for stable releases; promote verified changes there only
   with explicit user approval, never as part of routine development.
+- **Commit identity is `K Gopal Krishna <mail@kayg.org>`.** Verify both
+  `git var GIT_AUTHOR_IDENT` and `git var GIT_COMMITTER_IDENT` before committing.
+  On clone setup, configure `git config --local user.useConfigOnly true` and
+  `git config --local core.hooksPath .githooks`; the versioned identity hook
+  rejects incorrect authors and committers, including environment overrides.
+  Keep this hook enabled.
 - **Keep secrets out of Git.** Before every commit, inspect all staged paths and
   the complete staged diff for credentials, tokens, private/signing keys, private
   configuration, and real account data. Run an available secret scanner with
