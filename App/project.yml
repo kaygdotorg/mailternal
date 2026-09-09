@@ -14,8 +14,17 @@ targets:
     sources:
       - path: Sources
     dependencies:
+      - target: MailternalCLI
+        link: false
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/MacOS
       - package: MailternalCore
         product: MailternalCore
+      - package: MailternalCore
+        product: MailternalAutomation
       - package: MailternalCore
         product: MailternalWorkspace
       - package: MailternalCore
@@ -47,6 +56,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal
+        EXECUTABLE_NAME: MailternalApp
         MARKETING_VERSION: 0.0.1
         CURRENT_PROJECT_VERSION: 1
         SWIFT_VERSION: "6.0"
@@ -65,6 +75,22 @@ targets:
           ENABLE_TESTABILITY: true
           ENABLE_APP_SANDBOX: false
           CODE_SIGN_ENTITLEMENTS: Mailternal-Debug.entitlements
+  MailternalCLI:
+    type: tool
+    platform: macOS
+    sources:
+      - path: ../Sources/mailternal
+    dependencies:
+      - package: MailternalCore
+        product: MailternalAutomation
+    settings:
+      base:
+        PRODUCT_NAME: mailternal
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        SKIP_INSTALL: true
   MailternalAppTests:
     type: bundle.unit-test
     platform: macOS
@@ -79,6 +105,7 @@ targets:
       - path: Sources/Support/QRCodePolicy.swift
       - path: Sources/Viewer/QRCodeCard.swift
       - path: Sources/Support/AppearanceSettings.swift
+      - path: Sources/Support/AutomationPreferences.swift
       - path: Sources/Support/ActionSettings.swift
       - path: Sources/Shell/WindowBackdrop.swift
       - path: Sources/Support/PartFetchRouting.swift
@@ -87,6 +114,7 @@ targets:
       - path: Sources/MessageWeb/MessageReadingPolicy.swift
       - path: Sources/Sidebar/FolderHierarchy.swift
       - path: Sources/Mock/MockMailFacade.swift
+      - path: Sources/Composer/MailComposerModel.swift
       - path: Sources/Support/AccountTitlePolicy.swift
       - path: Sources/Support/CacheTreePolicy.swift
       - path: Sources/Support/ProviderPresets.swift
@@ -96,6 +124,8 @@ targets:
     dependencies:
       - package: MailternalCore
         product: MailternalCore
+      - package: MailternalCore
+        product: MailternalAutomation
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.kayg.mailternal.apptests

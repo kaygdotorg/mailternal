@@ -20,7 +20,9 @@ enum PairingBundleValidation {
         var ids = Set<AccountID>()
         for account in bundle.accounts {
             guard ids.insert(account.id).inserted,
-                  account.credential.utf8.count <= maximumEncodedBytes else { return false }
+                  (account.smtpCredential?.utf8.count ?? 0) <= maximumEncodedBytes else {
+                return false
+            }
         }
         return true
     }

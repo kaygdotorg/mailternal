@@ -41,9 +41,9 @@ two documents appear to conflict, design.md governs UI architecture.
   no Mailternal-owned OAuth client or web-session/scraping path. Exchange: never.
 - Account setup: manual host/port/TLS entry + provider presets (a plist, not a
   discovery subsystem). Full Thunderbird-autoconfig/RFC 6186 later.
-- **SMTP configuration arrives with the composer milestone (M5)**, which is
-  required before 0.0.1 can ship; presets may carry dormant non-secret defaults
-  until implementation.
+- **SMTP configuration** is available in account settings and through the shared
+  command/CLI surface. It supports an account-scoped outgoing password or explicit
+  reuse of the IMAP password; settings persist no secret values.
 - **Transport**: implicit TLS or mandatory STARTTLS with hostname + system-trust
   validation; no insecure fallback, no plaintext auth outside TLS; capabilities
   re-fetched after STARTTLS and after auth. The Linux core enforces the same rules
@@ -288,14 +288,17 @@ These are accepted product requirements, not a claim of implemented sync.
 - watchOS assists the iPhone rather than implementing independent generic IMAP
   or introducing a content-fetching server gateway. Its initial scope is
   notifications, recent-mail browsing, cached-message reading, quick read/unread,
-  flag, archive/trash triage, and Continue on iPhone.
-- Without a reachable phone, cached messages remain readable and triage actions
-  are persisted until reconnection. Show pending status and last synchronization;
-  do not imply that cached mail is fresh or queued actions are already applied.
-- When composer/SMTP lands in the other clients, the Watch also gains sending
-  through the iPhone: short new messages, replies/reply-all, and forwarding using
-  native text input/dictation and an explicit Send action. Hand off attachment
-  management and longer editing to the iPhone.
+  flag, archive/trash triage, Continue on iPhone, and short sending through the
+  iPhone's persisted command queue.
+- Without a reachable phone, cached messages remain readable and triage and
+  sending actions are persisted until reconnection. Show pending status and last
+  synchronization; do not imply that cached mail is fresh, SMTP has accepted a
+  message, or a queued action is already applied.
+- Sending supports short new messages, replies/reply-all, and forwarding using
+  native text input/dictation and an explicit Send action. The Watch sends only
+  a bounded wire envelope; the iPhone creates the draft, retains attachments,
+  performs SMTP submission, and exposes authoritative outbox state back to the
+  Watch. Attachment management and longer editing remain on the iPhone.
 
 ## Sending release acceptance
 

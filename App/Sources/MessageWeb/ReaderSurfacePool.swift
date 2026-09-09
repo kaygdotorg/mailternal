@@ -30,9 +30,9 @@ struct ReaderPlainTextRenderIdentity {
 
 /// TextKit surface retained alongside a tab's WebKit surface.
 ///
-/// The text view owns the rendered identity and revision. The pool owns the
-/// corresponding width/height entry so geometry is evicted with the tab even
-/// when the native view is temporarily detached from the outer ScrollView.
+/// The text view owns the rendered identity and revision. The pool retains a
+/// bounded set of proposed-width measurements, evicted with the tab, so SwiftUI
+/// can probe narrow and placed widths without repeatedly reflowing TextKit.
 @MainActor
 final class ReaderPlainTextView: NSTextView {
     private let ownedTextStorage: NSTextStorage
@@ -170,6 +170,11 @@ final class ReaderPlainTextView: NSTextView {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        // Detaching/reparenting a retained surface produces appearance
+        // callbacks even when its semantic appearance has not changed.
+        guard window != nil,
+              let renderedIdentity,
+              renderedIdentity.appearanceName != effectiveAppearance.name.rawValue else { return }
         invalidateRenderedStyle()
     }
 }
@@ -203,9 +208,8 @@ final class ReaderSurfacePool {
         var webView: MessageWebView?
         var textView: ReaderPlainTextView?
         var plainLayoutIdentity: ReaderPlainTextRenderIdentity?
-        var plainLayoutWidth: CGFloat?
         var plainLayoutRevision: UInt64?
-        var plainLayoutHeight: CGFloat?
+        var plainLayoutHeights: [(width: CGFloat, height: CGFloat)] = []
     }
     private struct ContentHeight {
         let messageID: MessageID
@@ -337,10 +341,10 @@ final class ReaderSurfacePool {
               let textView = entry.textView,
               let cachedIdentity = entry.plainLayoutIdentity,
               cachedIdentity.matches(identity),
-              let cachedWidth = entry.plainLayoutWidth,
-              abs(cachedWidth - width) <= 0.5,
               entry.plainLayoutRevision == textView.renderedRevision,
-              let height = entry.plainLayoutHeight
+              let height = entry.plainLayoutHeights.first(where: {
+                  abs($0.width - width) <= 0.5
+              })?.height
         else {
             return nil
         }
@@ -365,10 +369,22 @@ final class ReaderSurfacePool {
         else {
             return
         }
-        entry.plainLayoutIdentity = identity
-        entry.plainLayoutWidth = width
-        entry.plainLayoutRevision = revision
-        entry.plainLayoutHeight = height
+        if entry.plainLayoutRevision != revision
+            || entry.plainLayoutIdentity?.matches(identity) != true {
+            entry.plainLayoutHeights.removeAll(keepingCapacity: true)
+            entry.plainLayoutIdentity = identity
+            entry.plainLayoutRevision = revision
+        }
+        if let index = entry.plainLayoutHeights.firstIndex(where: {
+            abs($0.width - width) <= 0.5
+        }) {
+            entry.plainLayoutHeights[index] = (width, height)
+        } else {
+            if entry.plainLayoutHeights.count == 8 {
+                entry.plainLayoutHeights.removeFirst()
+            }
+            entry.plainLayoutHeights.append((width, height))
+        }
     }
 
     /// Applies a reading-mode change to every retained HTML document without
@@ -396,9 +412,8 @@ final class ReaderSurfacePool {
 
     private func clearPlainLayout(in entry: Entry) {
         entry.plainLayoutIdentity = nil
-        entry.plainLayoutWidth = nil
         entry.plainLayoutRevision = nil
-        entry.plainLayoutHeight = nil
+        entry.plainLayoutHeights.removeAll(keepingCapacity: true)
     }
 
     private func evictIfNeeded() {

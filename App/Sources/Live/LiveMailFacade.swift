@@ -4,6 +4,7 @@ import MailternalIMAP
 import MailternalInterfaces
 import MailternalStore
 import MailternalSync
+import MailternalSMTP
 
 /// Progress for the detached SQLite open and migration operation.
 ///
@@ -84,9 +85,36 @@ final class LiveMailFacade: MailFacade {
 
     private let container: MailternalContainer
     private let keychain: KeychainStore
+    private let smtp: SMTPClient
     private let notifications: LiveNotificationService
     private var store: MailStore!
-    private let storeTask: Task<MailStore, Error>
+    private let attachmentCacheCapBytes: Int64
+    /// Construction does no database work. The macOS owner resolves its lease
+    /// before first access; all callers then share one detached migration task.
+    @ObservationIgnored private lazy var storeTask: Task<MailStore, Error> = Task.detached(
+        priority: .userInitiated
+    ) { [container = self.container, storeProgress = self.storeProgress,
+         attachmentCacheCapBytes = self.attachmentCacheCapBytes] in
+        defer { storeProgress.continuation.finish() }
+        try container.prepare()
+        return try MailStore(
+            databaseURL: container.databaseURL,
+            cachesDirectory: container.attachmentsDirectory,
+            attachmentCacheCapBytes: attachmentCacheCapBytes,
+            migrationProgress: { completed, total, identifier in
+                storeProgress.continuation.yield(
+                    StoreMigrationProgress(
+                        completed: completed,
+                        total: total,
+                        identifier: identifier
+                    )
+                )
+            },
+            openProgress: { phase in
+                QALaunch.launchPhase("store-\(phase)")
+            }
+        )
+    }
     private let storeProgress: StoreOpenProgress
     @ObservationIgnored private var storeProgressTask: Task<Void, Never>?
     /// Observable store-opening state used by the launch shell.
@@ -95,6 +123,8 @@ final class LiveMailFacade: MailFacade {
     /// Monotonic per-account generations invalidate engine starts that finish
     /// after a concurrent account edit, removal, or lifecycle stop.
     private var engineGenerations: [AccountID: UInt64] = [:]
+    private var outgoingWorkers: [AccountID: OutgoingDelivery] = [:]
+    private var outgoingTasks: [AccountID: Task<Void, Never>] = [:]
     /// Invalidates starts crossing a background/foreground or shutdown await.
     private var lifecycleGeneration: UInt64 = 0
     /// One process-wide permit pool keeps account engines from multiplying
@@ -152,32 +182,13 @@ final class LiveMailFacade: MailFacade {
         QAIMAPTrust.installIfRequested()
         self.container = container
         self.keychain = keychain
+        self.smtp = try QAIMAPTrust.smtpClient()
+        self.attachmentCacheCapBytes = attachmentCacheCapBytes
         self.testClientFactory = clientFactory
         self.notifications = LiveNotificationService(enabled: enableNotifications)
 
         let storeProgress = StoreOpenProgress()
         self.storeProgress = storeProgress
-        self.storeTask = Task.detached(priority: .userInitiated) {
-            defer { storeProgress.continuation.finish() }
-            try container.prepare()
-            return try MailStore(
-                databaseURL: container.databaseURL,
-                cachesDirectory: container.attachmentsDirectory,
-                attachmentCacheCapBytes: attachmentCacheCapBytes,
-                migrationProgress: { completed, total, identifier in
-                    storeProgress.continuation.yield(
-                        StoreMigrationProgress(
-                            completed: completed,
-                            total: total,
-                            identifier: identifier
-                        )
-                    )
-                },
-                openProgress: { phase in
-                    QALaunch.launchPhase("store-\(phase)")
-                }
-            )
-        }
 
         let accountsStreamValue = AsyncStream.makeStream(
             of: [AccountConfig].self,
@@ -229,6 +240,7 @@ final class LiveMailFacade: MailFacade {
                 try await seedQAAccount(qa)
                 QALaunch.launchPhase("store-qa-seed-end")
             }
+            try await store.recoverOutgoing(at: Date())
             QALaunch.launchPhase("store-fetch-accounts-begin")
             let persisted = try await store.fetchAccounts()
             QALaunch.launchPhase("store-fetch-accounts-end")
@@ -236,6 +248,7 @@ final class LiveMailFacade: MailFacade {
             accounts = persisted
             configsByID = Dictionary(uniqueKeysWithValues: persisted.map { ($0.id, $0) })
             for account in persisted {
+                startOutgoing(for: account)
                 guard account.isEnabled else {
                     setState(.none, for: account.id)
                     continue
@@ -257,10 +270,11 @@ final class LiveMailFacade: MailFacade {
         }
     }
 
-    /// Waits for the detached database open and migration task.
+    /// Starts or joins the detached database open and migration task.
     ///
-    /// The launch shell uses this before restoring accounts so account reads
-    /// cannot race the migration. Store work remains off the main actor.
+    /// The macOS launch shell resolves runtime ownership before calling this;
+    /// competing launches must not migrate the same new database. Store work
+    /// remains off the main actor and account restoration awaits completion.
     func waitUntilStoreReady() async {
         _ = try? await readyStore()
     }
@@ -325,17 +339,16 @@ final class LiveMailFacade: MailFacade {
         qaMonitorTask?.cancel()
         qaMonitorTask = nil
         enginesSuspendedForBackground = false
+        for id in Array(outgoingWorkers.keys) {
+            await stopOutgoing(for: id)
+        }
         for id in Array(engines.keys) {
             await stopEngine(for: id)
         }
     }
 
-    /// Stops live IMAP engines before iOS suspends the process.
-    ///
-    /// The local store and its mutation queues remain available, and the last
-    /// observed folder snapshot stays published for cached UI/companion reads.
-    /// The phone scene should await this before relinquishing its background
-    /// execution time.
+    /// Stops live IMAP and outgoing delivery workers before iOS suspends the
+    /// process. Queued outgoing work remains durable for foreground recovery.
     func applicationDidEnterBackground() async {
         guard !enginesSuspendedForBackground else { return }
         lifecycleGeneration &+= 1
@@ -343,6 +356,9 @@ final class LiveMailFacade: MailFacade {
         qaMonitorTask?.cancel()
         qaMonitorTask = nil
         syncContinuation.yield(SyncStatus(mode: .fullHistory, isOnline: false))
+        for id in Array(outgoingWorkers.keys) {
+            await stopOutgoing(for: id)
+        }
         for id in Array(engines.keys) {
             setState(.validating, for: id)
             await stopEngine(for: id, preserveFolderSnapshot: true)
@@ -350,17 +366,14 @@ final class LiveMailFacade: MailFacade {
         publishAggregateState()
     }
 
-    /// Restarts the enabled engines after the phone returns to the foreground.
-    ///
-    /// Every queued mutation was committed before the engine was stopped, so
-    /// the normal engine startup/delta path drains it without a special retry
-    /// mechanism.
+    /// Restarts enabled IMAP and outgoing workers after foregrounding.
     func applicationWillEnterForeground() async {
         guard enginesSuspendedForBackground else { return }
         lifecycleGeneration &+= 1
         enginesSuspendedForBackground = false
         guard didRestore, store != nil else { return }
         for account in accounts where account.isEnabled {
+            startOutgoing(for: account)
             guard engines[account.id] == nil else { continue }
             guard (try? keychain.loadPassword(for: account.id)) != nil else {
                 setState(.authFailed(message: "The saved password is missing from the Keychain."), for: account.id)
@@ -383,6 +396,15 @@ final class LiveMailFacade: MailFacade {
 
     private func endAccountMutation(_ account: AccountID) {
         accountMutationsInFlight.remove(account)
+    }
+
+    func accountTransferSMTPCredential(for account: AccountID) throws -> String? {
+        guard let config = configsByID[account] ?? accounts.first(where: { $0.id == account }),
+              let smtp = config.smtp,
+              let reference = smtp.credentialReference else {
+            return nil
+        }
+        return try keychain.loadSMTPPassword(for: account, reference: reference)
     }
 
     /// Reads the configured credential store only for an explicitly requested
@@ -408,6 +430,9 @@ final class LiveMailFacade: MailFacade {
     }
 
     func addAccount(_ config: AccountConfig, password: String) async throws {
+        guard config.smtp?.credentialReference == nil else {
+            throw LiveMailError("Configure SMTP with its password after adding the account.")
+        }
         try beginAccountMutation(config.id)
         defer { endAccountMutation(config.id) }
         _ = try await readyStore()
@@ -457,6 +482,7 @@ final class LiveMailFacade: MailFacade {
             throw LiveMailError(message)
         }
 
+        await stopOutgoing(for: storedConfig.id)
         if engines[storedConfig.id] != nil {
             await stopEngine(for: storedConfig.id)
         }
@@ -473,6 +499,7 @@ final class LiveMailFacade: MailFacade {
         startFolderObservation(account: storedConfig.id)
         setState(.validating, for: storedConfig.id)
         await startEngine(for: storedConfig)
+        startOutgoing(for: storedConfig)
     }
 
     /// Adopts a transferred canonical account link while preserving this
@@ -527,13 +554,16 @@ final class LiveMailFacade: MailFacade {
     func updateAccount(_ config: AccountConfig, password: String?) async throws {
         try beginAccountMutation(config.id)
         defer { endAccountMutation(config.id) }
-        _ = try await readyStore()
-        guard let existing = configsByID[config.id] ?? accounts.first(where: { $0.id == config.id }) else {
+        guard let existing = configsByID[config.id]
+            ?? accounts.first(where: { $0.id == config.id }) else {
             throw LiveMailError("That account is no longer available.")
         }
         var storedConfig = config
         storedConfig.accountLinkID = existing.accountLinkID
         storedConfig.isEnabled = existing.isEnabled
+        guard storedConfig.smtp == existing.smtp else {
+            throw LiveMailError("Use configureSMTP to change SMTP settings.")
+        }
         let requiresValidation =
             existing.emailAddress != storedConfig.emailAddress
             || existing.username != storedConfig.username
@@ -572,6 +602,7 @@ final class LiveMailFacade: MailFacade {
             }
         }
 
+        await stopOutgoing(for: existing.id)
         do {
             try await store.upsertAccount(storedConfig)
         } catch {
@@ -583,6 +614,9 @@ final class LiveMailFacade: MailFacade {
                     setState(.connectionFailed(message: message), for: existing.id)
                     throw LiveMailError(message)
                 }
+            }
+            if existing.isEnabled {
+                startOutgoing(for: existing)
             }
             let message = "Could not save the account."
             setState(.connectionFailed(message: message), for: existing.id)
@@ -599,25 +633,34 @@ final class LiveMailFacade: MailFacade {
         }
         guard requiresValidation else {
             setState(.active, for: existing.id)
+            startOutgoing(for: storedConfig)
             return
         }
         await stopEngine(for: existing.id)
         startFolderObservation(account: existing.id)
         await startEngine(for: storedConfig)
+        startOutgoing(for: storedConfig)
     }
 
     func setAccountEnabled(_ id: AccountID, _ enabled: Bool) async throws {
         try beginAccountMutation(id)
         defer { endAccountMutation(id) }
-        _ = try await readyStore()
+        let store = try await readyStore()
         guard var config = configsByID[id] ?? accounts.first(where: { $0.id == id }) else {
             throw LiveMailError("That account is no longer available.")
         }
         guard config.isEnabled != enabled else { return }
+        let wasEnabled = config.isEnabled
+        if !enabled {
+            await stopOutgoing(for: id)
+        }
         config.isEnabled = enabled
         do {
             try await store.upsertAccount(config)
         } catch {
+            if wasEnabled {
+                startOutgoing(for: config)
+            }
             throw LiveMailError("Could not save the account.")
         }
         configsByID[id] = config
@@ -629,6 +672,7 @@ final class LiveMailFacade: MailFacade {
             setState(.none, for: id)
             return
         }
+        startOutgoing(for: config)
         if (try? keychain.loadPassword(for: id)) == nil {
             setState(.authFailed(message: "The saved password is missing from the Keychain."), for: id)
             startFolderObservation(account: id)
@@ -643,6 +687,7 @@ final class LiveMailFacade: MailFacade {
     func removeAccount(_ id: AccountID) async throws {
         try beginAccountMutation(id)
         defer { endAccountMutation(id) }
+        let store = try await readyStore()
         let existing: AccountConfig?
         if let inMemory = configsByID[id] ?? accounts.first(where: { $0.id == id }) {
             existing = inMemory
@@ -653,14 +698,21 @@ final class LiveMailFacade: MailFacade {
         if existing != nil {
             previousPassword = try loadOptionalPassword(for: id)
         }
+        var previousSMTPPassword: String?
+        let previousSMTPReference = existing?.smtp?.credentialReference
+        if let previousSMTPReference {
+            previousSMTPPassword = try? keychain.loadSMTPPassword(for: id, reference: previousSMTPReference)
+        }
 
-        // Delete the durable account first. If this fails, the engine,
-        // in-memory config, and Keychain credential remain untouched.
-        try await store.deleteAccount(id)
+        // Stop both transports before changing durable account state. The
+        // outgoing owner is awaited before ownership or credentials change.
+        await stopOutgoing(for: id)
         await stopEngine(for: id, preserveFolderSnapshot: true)
-
         do {
             try keychain.deletePassword(for: id)
+            if let previousSMTPReference {
+                try keychain.deleteSMTPPassword(for: id, reference: previousSMTPReference)
+            }
         } catch {
             var restorationFailures: [String] = []
             if let previousPassword {
@@ -670,29 +722,72 @@ final class LiveMailFacade: MailFacade {
                     restorationFailures.append("password: \(error.localizedDescription)")
                 }
             }
-            if let existing {
+            if let previousSMTPReference, let previousSMTPPassword {
                 do {
-                    try await store.upsertAccount(existing)
+                    try keychain.saveSMTPPassword(
+                        previousSMTPPassword,
+                        for: id,
+                        reference: previousSMTPReference
+                    )
                 } catch {
-                    restorationFailures.append("account: \(error.localizedDescription)")
+                    restorationFailures.append("SMTP credential: \(error.localizedDescription)")
                 }
             }
             if restorationFailures.isEmpty, let existing, existing.isEnabled {
                 startFolderObservation(account: id)
                 setState(.validating, for: id)
                 await startEngine(for: existing)
+                startOutgoing(for: existing)
             }
-            let message: String
-            if restorationFailures.isEmpty {
-                message = "Could not remove the account."
-            } else {
-                message = "Could not remove the account, and restoration failed: \(restorationFailures.joined(separator: "; "))."
+            let message = restorationFailures.isEmpty
+                ? "Could not remove the account."
+                : "Could not remove the account, and restoration failed: \(restorationFailures.joined(separator: "; "))."
+            throw LiveMailError(message)
+        }
+        do {
+            try await store.deleteAccount(id)
+        } catch {
+            var restorationFailures: [String] = []
+            if let previousPassword {
+                do {
+                    try keychain.savePassword(previousPassword, for: id)
+                } catch {
+                    restorationFailures.append("password: \(error.localizedDescription)")
+                }
             }
+            if let previousSMTPReference, let previousSMTPPassword {
+                do {
+                    try keychain.saveSMTPPassword(
+                        previousSMTPPassword,
+                        for: id,
+                        reference: previousSMTPReference
+                    )
+                } catch {
+                    restorationFailures.append("SMTP credential: \(error.localizedDescription)")
+                }
+            }
+            if restorationFailures.isEmpty, let existing {
+                try? await store.upsertAccount(existing)
+                configsByID[id] = existing
+                if let index = accounts.firstIndex(where: { $0.id == id }) {
+                    accounts[index] = existing
+                }
+                if existing.isEnabled {
+                    startFolderObservation(account: id)
+                    setState(.validating, for: id)
+                    await startEngine(for: existing)
+                    startOutgoing(for: existing)
+                }
+            }
+            let message = restorationFailures.isEmpty
+                ? "Could not remove the account."
+                : "Could not remove the account, and restoration failed: \(restorationFailures.joined(separator: "; "))."
             throw LiveMailError(message)
         }
         // A foreground restart may have completed while the durable delete
         // was suspended. Invalidate and stop that replacement before commit.
         await stopEngine(for: id, preserveFolderSnapshot: true)
+        await stopOutgoing(for: id)
 
 
         configsByID[id] = nil
@@ -707,6 +802,319 @@ final class LiveMailFacade: MailFacade {
             await container.wipeAttachmentFiles()
         }
         publishAggregateState()
+    }
+
+    func configureSMTP(
+        _ accountID: AccountID,
+        configuration: SMTPConfiguration?,
+        password: String?
+    ) async throws {
+        try beginAccountMutation(accountID)
+        defer { endAccountMutation(accountID) }
+        let store = try await readyStore()
+        var existingConfig = configsByID[accountID] ?? accounts.first(where: { $0.id == accountID })
+        if existingConfig == nil { existingConfig = try await store.fetchAccount(accountID) }
+        guard let existing = existingConfig else {
+            throw LiveMailError("That account is no longer available.")
+        }
+        guard password == nil || configuration != nil else {
+            throw LiveMailError("An SMTP password requires SMTP configuration.")
+        }
+
+        let oldReference = existing.smtp?.credentialReference
+        await stopOutgoing(for: accountID)
+        var savedReference: String?
+        var updated = existing
+        do {
+            var nextConfiguration = configuration
+            let validationPassword: String?
+            if var next = nextConfiguration {
+                if let password {
+                    guard !password.isEmpty else {
+                        throw LiveMailError("An SMTP password is required.")
+                    }
+                    // Never replace the credential referenced by durable
+                    // configuration. A crash before commit must leave it usable.
+                    next.credentialReference = UUID().uuidString.lowercased()
+                    validationPassword = password
+                } else if let reference = next.credentialReference {
+                    guard reference == oldReference else {
+                        throw LiveMailError("A new SMTP credential requires its password.")
+                    }
+                    validationPassword = try keychain.loadSMTPPassword(
+                        for: accountID,
+                        reference: reference
+                    )
+                } else {
+                    validationPassword = try keychain.loadPassword(for: accountID)
+                }
+                nextConfiguration = next
+            } else {
+                guard password == nil else {
+                    throw LiveMailError("An SMTP password requires SMTP configuration.")
+                }
+                validationPassword = nil
+            }
+
+            if existing.isEnabled,
+               let next = nextConfiguration,
+               let validationPassword {
+                try await smtp.validate(
+                    configuration: next,
+                    password: validationPassword
+                )
+            }
+
+            if let password, let reference = nextConfiguration?.credentialReference {
+                try keychain.saveSMTPPassword(password, for: accountID, reference: reference)
+                savedReference = reference
+            }
+            updated.smtp = nextConfiguration
+            try await store.upsertAccount(updated)
+        } catch {
+            if let savedReference {
+                try? keychain.deleteSMTPPassword(for: accountID, reference: savedReference)
+            }
+            if existing.isEnabled {
+                startOutgoing(for: existing)
+            }
+            throw error
+        }
+
+        configsByID[accountID] = updated
+        if let index = accounts.firstIndex(where: { $0.id == accountID }) {
+            accounts[index] = updated
+        }
+        // Cleanup is post-commit: failure must not roll back configuration or
+        // delete its newly committed credential.
+        if let oldReference, oldReference != updated.smtp?.credentialReference {
+            try? keychain.deleteSMTPPassword(for: accountID, reference: oldReference)
+        }
+        if updated.isEnabled {
+            startOutgoing(for: updated)
+        }
+    }
+
+    func createDraft(
+        id: UUID,
+        accountID: AccountID,
+        content: DraftContent
+    ) async throws -> MailDraft {
+        let store = try await readyStore()
+        return try await store.createDraft(id: id, accountID: accountID, content: content, at: Date())
+    }
+
+    func createReplyDraft(
+        id: UUID,
+        messageID: MessageID,
+        replyAll: Bool
+    ) async throws -> MailDraft {
+        let store = try await readyStore()
+        guard let accountID = try await store.accountID(for: messageID),
+              let account = configsByID[accountID] ?? accounts.first(where: { $0.id == accountID }),
+              let detail = try? await store.detail(messageID) else {
+            throw OutgoingMailError.draftNotFound
+        }
+        let identity = account.emailAddress
+        let recipients = replyRecipients(
+            detail.envelope,
+            accountIdentity: identity,
+            replyAll: replyAll
+        )
+        let parentID = detail.envelope.rfcMessageID
+        var references = detail.envelope.references
+        if let parentID, !references.contains(where: {
+            $0.caseInsensitiveCompare(parentID) == .orderedSame
+        }) {
+            references.append(parentID)
+        }
+        let content = DraftContent(
+            from: MailAddress(displayName: account.displayName, address: identity),
+            to: recipients.to,
+            cc: recipients.cc,
+            subject: replySubject(detail.envelope.subject),
+            plainText: detail.bodyText ?? "",
+            html: detail.sanitizedHTML,
+            inReplyTo: parentID,
+            references: references
+        )
+        return try await store.createDraft(id: id, accountID: accountID, content: content, at: Date())
+    }
+
+    func createForwardDraft(id: UUID, messageID: MessageID) async throws -> MailDraft {
+        let store = try await readyStore()
+        guard let accountID = try await store.accountID(for: messageID),
+              let account = configsByID[accountID] ?? accounts.first(where: { $0.id == accountID }),
+              let detail = try? await store.detail(messageID) else {
+            throw OutgoingMailError.draftNotFound
+        }
+        var attachments: [DraftAttachment] = []
+        attachments.reserveCapacity(detail.attachments.count)
+        for attachment in detail.attachments {
+            let sourceURL = try await fetchAttachment(messageID, part: attachment.id)
+            let filename = attachment.filename ?? "attachment-\(attachments.count + 1)"
+            attachments.append(
+                try await store.importDraftAttachment(
+                    id: UUID(),
+                    accountID: accountID,
+                    sourceURL: sourceURL,
+                    filename: filename,
+                    mimeType: attachment.mimeType
+                )
+            )
+        }
+        let content = DraftContent(
+            from: MailAddress(displayName: account.displayName, address: account.emailAddress),
+            subject: forwardSubject(detail.envelope.subject),
+            plainText: detail.bodyText ?? "",
+            html: detail.sanitizedHTML,
+            attachments: attachments
+        )
+        return try await store.createDraft(id: id, accountID: accountID, content: content, at: Date())
+    }
+
+    func saveDraft(
+        id: UUID,
+        expectedRevision: Int64,
+        content: DraftContent
+    ) async throws -> DraftSaveResult {
+        let store = try await readyStore()
+        return try await store.saveDraft(
+            id: id,
+            expectedRevision: expectedRevision,
+            content: content,
+            at: Date()
+        )
+    }
+
+    func deleteDraft(id: UUID, expectedRevision: Int64) async throws {
+        let store = try await readyStore()
+        try await store.deleteDraft(id: id, expectedRevision: expectedRevision)
+    }
+
+    func draft(id: UUID) async throws -> MailDraft? {
+        let store = try await readyStore()
+        return try await store.draft(id: id)
+    }
+
+    func drafts(accounts: Set<AccountID>?, limit: Int) async throws -> [DraftSummary] {
+        let store = try await readyStore()
+        return try await store.drafts(accounts: accounts, limit: limit)
+    }
+
+    func importDraftAttachment(
+        id: UUID,
+        accountID: AccountID,
+        sourceURL: URL,
+        filename: String,
+        mimeType: String
+    ) async throws -> DraftAttachment {
+        let store = try await readyStore()
+        return try await store.importDraftAttachment(
+            id: id,
+            accountID: accountID,
+            sourceURL: sourceURL,
+            filename: filename,
+            mimeType: mimeType
+        )
+    }
+
+    func draftAttachmentURL(id: UUID, accountID: AccountID) async throws -> URL {
+        let store = try await readyStore()
+        return try await store.draftAttachmentURL(id: id, accountID: accountID)
+    }
+
+    func enqueueSubmission(
+        id: UUID,
+        draftID: UUID,
+        expectedRevision: Int64
+    ) async throws -> OutboxRecord {
+        let store = try await readyStore()
+        guard let draft = try await store.draft(id: draftID),
+              let account = configsByID[draft.accountID]
+                ?? accounts.first(where: { $0.id == draft.accountID }),
+              account.isEnabled,
+              account.smtp != nil else {
+            throw OutgoingMailError.invalidContent("Configure SMTP before sending.")
+        }
+        _ = try outgoingPassword(for: account)
+        let record = try await store.enqueueSubmission(
+            id: id,
+            draftID: draftID,
+            expectedRevision: expectedRevision,
+            at: Date()
+        )
+        outgoingWorkers[record.accountID]?.notify()
+        return record
+    }
+
+    func retrySubmission(
+        id: UUID,
+        acknowledgeDuplicateRisk: Bool
+    ) async throws -> OutboxRecord {
+        let store = try await readyStore()
+        guard let current = try await store.outbox(id: id),
+              let account = configsByID[current.accountID]
+                ?? accounts.first(where: { $0.id == current.accountID }),
+              account.isEnabled,
+              account.smtp != nil else {
+            throw OutgoingMailError.invalidContent("Configure SMTP before retrying.")
+        }
+        _ = try outgoingPassword(for: account)
+        let record = try await store.retrySubmission(
+            id: id,
+            acknowledgeDuplicateRisk: acknowledgeDuplicateRisk,
+            at: Date()
+        )
+        outgoingWorkers[record.accountID]?.notify()
+        return record
+    }
+
+    func cancelSubmission(id: UUID) async throws -> OutboxRecord {
+        let store = try await readyStore()
+        guard let current = try await store.outbox(id: id) else {
+            throw OutgoingMailError.submissionNotFound
+        }
+        if let worker = outgoingWorkers[current.accountID] {
+            return try await worker.cancel(id: id)
+        }
+        return try await store.cancelSubmission(id: id)
+    }
+
+    func outbox(id: UUID) async throws -> OutboxRecord? {
+        let store = try await readyStore()
+        return try await store.outbox(id: id)
+    }
+
+    func outbox(accounts: Set<AccountID>?, limit: Int) async throws -> [OutboxSummary] {
+        let store = try await readyStore()
+        return try await store.outbox(accounts: accounts, limit: limit)
+    }
+
+    func observeOutgoing(
+        accounts: Set<AccountID>?,
+        limit: Int
+    ) -> AsyncStream<OutgoingState> {
+        AsyncStream { continuation in
+            let task = Task { @MainActor [weak self] in
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
+                do {
+                    let store = try await self.readyStore()
+                    for await state in store.observeOutgoing(accounts: accounts, limit: limit) {
+                        guard !Task.isCancelled else { break }
+                        continuation.yield(state)
+                    }
+                } catch {
+                    // Query failures leave the stream empty; mutations surface
+                    // their errors through the throwing facade methods.
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
     }
 
     func page(
@@ -996,9 +1404,33 @@ final class LiveMailFacade: MailFacade {
         return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    func search(_ query: String, limit: Int) async throws -> [MessageRow] {
+    func search(
+        _ query: String,
+        limit: Int,
+        accountLinks: Set<AccountLinkID>?
+    ) async throws -> [MessageRow] {
         _ = try await readyStore()
-        return try await store.search(query, limit: limit)
+        return try await store.search(query, limit: limit, accountLinks: accountLinks)
+    }
+
+    func messageMutationStates(_ ids: [MessageID]) async throws -> [MessageMutationState] {
+        _ = try await readyStore()
+        return try await store.messageMutationStates(ids)
+    }
+
+    func canUndo(allowedAccountLinks: Set<AccountLinkID>?) async throws -> Bool {
+        _ = try await readyStore()
+        return try await store.canUndo(allowedAccountLinks: allowedAccountLinks)
+    }
+
+    func undo(allowedAccountLinks: Set<AccountLinkID>?) async throws {
+        _ = try await readyStore()
+        try await store.undo(allowedAccountLinks: allowedAccountLinks)
+        // A pending move undo is fulfilled by the mutation drainer once the
+        // original server operation returns its exact destination identity.
+        for engine in engines.values {
+            await engine.moveNow()
+        }
     }
 
     func refresh() async {
@@ -1032,6 +1464,123 @@ final class LiveMailFacade: MailFacade {
 
     private func publishAggregateState() {
         accountState = aggregateState
+    }
+
+    private func outgoingPassword(for account: AccountConfig) throws -> String {
+        guard let smtp = account.smtp else {
+            throw OutgoingMailError.invalidContent("Configure SMTP before sending.")
+        }
+        let password: String
+        if let reference = smtp.credentialReference {
+            password = try keychain.loadSMTPPassword(for: account.id, reference: reference)
+        } else {
+            password = try keychain.loadPassword(for: account.id)
+        }
+        guard !password.isEmpty else {
+            throw OutgoingMailError.invalidContent("The SMTP credential is empty.")
+        }
+        return password
+    }
+
+    private func startOutgoing(for config: AccountConfig) {
+        guard !enginesSuspendedForBackground,
+              config.isEnabled, config.smtp != nil, outgoingWorkers[config.id] == nil else {
+            return
+        }
+        let keychain = self.keychain
+        let workerConfig = config
+        let worker = OutgoingDelivery(
+            accountID: config.id,
+            store: store,
+            smtp: smtp,
+            credentials: {
+                guard let smtp = workerConfig.smtp else {
+                    throw OutgoingMailError.invalidContent("SMTP is not configured.")
+                }
+                let password: String
+                if let reference = smtp.credentialReference {
+                    password = try keychain.loadSMTPPassword(
+                        for: workerConfig.id,
+                        reference: reference
+                    )
+                } else {
+                    password = try keychain.loadPassword(for: workerConfig.id)
+                }
+                guard !password.isEmpty else {
+                    throw OutgoingMailError.invalidContent("The SMTP credential is empty.")
+                }
+                return (configuration: smtp, password: password)
+            },
+            saveSentCopy: { record, submission in
+                let password = try keychain.loadPassword(for: workerConfig.id)
+                try await IMAPSentCopy.save(
+                    record,
+                    submission: submission,
+                    account: workerConfig,
+                    password: password
+                )
+            },
+            reportError: { [weak self] _ in
+                guard let self else { return }
+                await self.noteOutgoingFailure(for: workerConfig.id)
+            }
+        )
+        outgoingWorkers[config.id] = worker
+        outgoingTasks[config.id] = Task { [weak self, worker] in
+            do {
+                try await worker.run()
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.noteOutgoingFailure(for: workerConfig.id)
+            }
+        }
+    }
+
+    private func stopOutgoing(for accountID: AccountID) async {
+        let worker = outgoingWorkers.removeValue(forKey: accountID)
+        let task = outgoingTasks.removeValue(forKey: accountID)
+        await worker?.stop()
+        task?.cancel()
+        _ = await task?.result
+    }
+
+    private func noteOutgoingFailure(for accountID: AccountID) {
+        QALaunch.log("outgoing worker stopped for account \(accountID.rawValue)")
+    }
+
+    private func replyRecipients(
+        _ envelope: Envelope,
+        accountIdentity: String,
+        replyAll: Bool
+    ) -> (to: [MailAddress], cc: [MailAddress]) {
+        let identity = accountIdentity.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var seen = Set<String>()
+        var to: [MailAddress] = []
+        var cc: [MailAddress] = []
+        func append(_ address: MailAddress, toCC: Bool) {
+            let value = address.address.trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = value.lowercased()
+            guard !value.isEmpty, key != identity, seen.insert(key).inserted else { return }
+            if toCC { cc.append(address) } else { to.append(address) }
+        }
+        for address in (envelope.replyTo.isEmpty ? envelope.from : envelope.replyTo) {
+            append(address, toCC: false)
+        }
+        if replyAll {
+            for address in envelope.to { append(address, toCC: false) }
+            for address in envelope.cc { append(address, toCC: true) }
+        }
+        return (to, cc)
+    }
+
+    private func replySubject(_ subject: String) -> String {
+        let value = subject.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.lowercased().hasPrefix("re:") ? value : "Re: \(value)"
+    }
+
+    private func forwardSubject(_ subject: String) -> String {
+        let value = subject.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.lowercased().hasPrefix("fwd:") ? value : "Fwd: \(value)"
     }
 
     private func validate(_ config: AccountConfig, password: String) async throws {
@@ -1194,14 +1743,21 @@ final class LiveMailFacade: MailFacade {
     }
 
     private func seedQAAccount(_ qa: QALaunch.Config) async throws {
-        if let existing = try? await store.fetchAccounts() {
-            for account in existing where account.id != qa.accountID {
-                try? keychain.deletePassword(for: account.id)
-                try? await store.deleteAccount(account.id)
+        let existing = try await store.fetchAccounts()
+        for account in existing where account.id != qa.accountID {
+            await stopOutgoing(for: account.id)
+            try? keychain.deletePassword(for: account.id)
+            if let reference = account.smtp?.credentialReference {
+                try? keychain.deleteSMTPPassword(for: account.id, reference: reference)
             }
+            try await store.deleteAccount(account.id)
         }
         try keychain.savePassword(qa.password, for: qa.accountID)
-        try await store.upsertAccount(qa.accountConfig)
+        var config = qa.accountConfig
+        // QA restarts restore fixture credentials, not outgoing settings. Keep
+        // the persisted endpoint so queued/uncertain delivery can be exercised.
+        config.smtp = existing.first(where: { $0.id == qa.accountID })?.smtp
+        try await store.upsertAccount(config)
         QALaunch.log(
             "seeded account \(qa.username) \(qa.host):\(qa.port) \(qa.security.rawValue) db=\(container.databaseURL.path)"
         )
@@ -1309,7 +1865,7 @@ final class LiveMailFacade: MailFacade {
             samples.reserveCapacity(21)
             for i in 0..<21 {
                 let started = Date()
-                let hits = (try? await search(term, limit: 25)) ?? []
+                let hits = (try? await search(term, limit: 25, accountLinks: nil)) ?? []
                 let ms = Date().timeIntervalSince(started) * 1000
                 if i > 0 { samples.append(ms) }
                 if i == 0 {

@@ -13,7 +13,17 @@ struct MessageListPane: View {
         // The header keeps its title-only bottom edge. Status appears inside
         // that footprint by lifting the H1, not by moving the rows or fade.
         // The first row rests at the ramp's end in both states.
-        .messageList.withTopOrigin(max(titleBottom, MailWindowTopDissolvePolicy.titlebarDepth))
+        let policy = MailWindowDissolvePolicy.messageList
+            .withTopOrigin(max(titleBottom, MailWindowTopDissolvePolicy.titlebarDepth))
+        guard model.listPaneLayout == .listAboveReader else {
+            return policy
+        }
+        // The stacked list meets the lower reader's tab row at the split
+        // divider. A short ramp keeps the last row readable until that edge;
+        // zero clear tail makes alpha reach zero exactly at the boundary.
+        return policy
+            .withBottomReach(MailWindowDissolvePolicy.stackedMessageListBottomReach)
+            .withBottomClearTail(0)
     }
 
     private var listTitle: String {
@@ -53,8 +63,10 @@ struct MessageListPane: View {
         ZStack(alignment: .top) {
             MessageTableRepresentable(
                 rows: model.listRows,
+                rowContentRevision: model.listContentRevision,
                 selectedID: model.selectedMessageID,
                 selectedIDs: model.selectedMessageIDs,
+                isSelectionPending: model.isListSelectionPending,
                 messageLinks: model.messageDeepLinks,
                 folders: model.folders,
                 accounts: model.accountConfigs,
@@ -95,6 +107,8 @@ struct MessageListPane: View {
                 onAction: { kind, ids in model.perform(kind, on: ids) },
                 onMove: { ids, folder in model.move(ids: ids, to: folder) },
                 onOpenMessageWindow: { model.openMessageWindow($0) },
+                onReply: { id, all in Task { await model.composer.reply(to: id, all: all) } },
+                onForward: { id in Task { await model.composer.forward(id) } },
                 onListScroll: { folder, offset in
                     guard model.selectedFolderID == folder else { return }
                     model.listScrollOffsets[folder] = offset
@@ -127,6 +141,8 @@ struct MessageListPane: View {
                     Text(listTitle)
                         .font(.system(size: 26, weight: .bold))
                         .foregroundStyle(.primary)
+                        .contentTransition(.numericText())
+                        .animation(titleAnimation, value: listTitle)
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
                         .lineLimit(2)
@@ -255,12 +271,30 @@ extension MailListColumn {
         case .date: 132
         }
     }
+
+    /// Keep malformed or unbounded workspace values from expanding the table
+    /// beyond a usable native column geometry. Persistence validates positivity;
+    /// the view also enforces AppKit's display bounds at the rendering seam.
+    var minimumWidth: CGFloat {
+        self == .subject ? 80 : 36
+    }
+
+    var maximumWidth: CGFloat {
+        self == .subject ? 2_000 : 800
+    }
+
+    func normalizedWidth(_ width: CGFloat) -> CGFloat {
+        guard width.isFinite else { return defaultWidth }
+        return min(max(width, minimumWidth), maximumWidth)
+    }
 }
 
 struct MessageTableRepresentable: NSViewRepresentable {
     var rows: [MessageRow]
+    var rowContentRevision: UInt64
     var selectedID: MessageID?
     var selectedIDs: Set<MessageID>
+    var isSelectionPending: Bool
     var messageLinks: [MessageID: String]
     var folders: [FolderSummary]
     var accounts: [AccountConfig]
@@ -290,6 +324,8 @@ struct MessageTableRepresentable: NSViewRepresentable {
     var onAction: (SwipeActionKind, Set<MessageID>) -> Void
     var onMove: (Set<MessageID>, FolderID) -> Void
     var onOpenMessageWindow: (MessageID) -> Void
+    var onReply: (MessageID, Bool) -> Void
+    var onForward: (MessageID) -> Void
     var onListScroll: (FolderID, CGFloat) -> Void
     var onColumnOrder: ([MailListColumn]) -> Void
     var onColumnWidth: (MailListColumn, Double) -> Void
@@ -315,6 +351,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
         private var showsSenderIcons = false
         private var faviconRevision: UInt64 = 0
         private var warmedDomains = Set<String>()
+        private var reflectingModelSelection = false
         weak var container: MessageTableContainer?
         fileprivate weak var tableView: MessageTableKeyView?
         private var epoch: UInt64 = 0
@@ -325,6 +362,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
         private var canPersistScroll = false
         private var configuration = MailListConfiguration.default
         private var applyingColumns = false
+        private var rowContentRevision: UInt64 = 0
 
         private var rowLineCount: Int {
             configuration.presentation == .columns ? 1 : lineCount
@@ -334,6 +372,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
             self.parent = parent
             self.container = container
             tableView = container.tableView
+            rowContentRevision = parent.rowContentRevision
             configuration = parent.configuration
             lineCount = MessageListLayout.normalizedLineCount(parent.lineCount)
             showsSenderIcons = parent.showsSenderIcons
@@ -386,6 +425,11 @@ struct MessageTableRepresentable: NSViewRepresentable {
 
         func update(container: MessageTableContainer, parent: MessageTableRepresentable) {
             self.parent = parent
+            // Reloads and inserts can emit native selection notifications.
+            // They reflect a model snapshot, not a new user selection command.
+            let wasReflecting = reflectingModelSelection
+            reflectingModelSelection = true
+            defer { reflectingModelSelection = wasReflecting }
             canPersistScroll = false
             let configurationChanged = configuration != parent.configuration
             let columnsChanged = configuration.presentation != parent.configuration.presentation
@@ -403,6 +447,8 @@ struct MessageTableRepresentable: NSViewRepresentable {
             let table = container.tableView
             let folderChanged = renderedFolder != parent.currentFolder
             let epochChanged = parent.epoch != epoch
+            let rowContentChanged = parent.rowContentRevision != rowContentRevision
+            rowContentRevision = parent.rowContentRevision
             if folderChanged || epochChanged {
                 pendingScrollOffset = parent.listScrollOffset.map { max($0, 0) }
                 restorePrefetchRowCount = nil
@@ -429,11 +475,23 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 rowIDs = newIDs
                 let added = IndexSet(integersIn: oldCount..<newIDs.count)
                 table.insertRows(at: added, withAnimation: [])
+                // Pagination and existing-row changes may arrive in one SwiftUI update.
+                if accentChanged || showsSenderIconsChanged {
+                    reloadVisibleRows(in: table)
+                } else if rowContentChanged {
+                    reloadVisibleRowsWithChangedContent(in: table, parent: parent)
+                }
             } else if newIDs != rowIDs {
                 rowIDs = newIDs
                 table.reloadData()
             } else if accentChanged || showsSenderIconsChanged {
                 reloadVisibleRows(in: table)
+            } else if rowContentChanged {
+                // Same-ID reconciliation can change read/flag state or
+                // envelope text. Only inspect visible reused cells when the
+                // model reports a row-content mutation; scroll-only updates
+                // leave the virtualized table untouched.
+                reloadVisibleRowsWithChangedContent(in: table, parent: parent)
             }
 
             if faviconChanged {
@@ -525,6 +583,42 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 columnIndexes: IndexSet(integersIn: 0..<table.numberOfColumns)
             )
         }
+        private func reloadVisibleRowsWithChangedContent(
+            in table: NSTableView,
+            parent: MessageTableRepresentable
+        ) {
+            let visible = table.rows(in: table.visibleRect)
+            guard visible.length > 0, table.numberOfColumns > 0 else { return }
+            var staleRows = IndexSet()
+            for row in visible.location..<(visible.location + visible.length) {
+                guard let rowModel = parent.rows[safe: row] else { continue }
+                let hasStaleCell = (0..<table.numberOfColumns).contains { column in
+                    guard let view = table.view(
+                        atColumn: column,
+                        row: row,
+                        makeIfNecessary: false
+                    ) else {
+                        return false
+                    }
+                    if let cell = view as? MessageCellView {
+                        return !cell.isRendering(rowModel)
+                    }
+                    if let cell = view as? MessageColumnCellView {
+                        return !cell.isRendering(rowModel)
+                    }
+                    return false
+                }
+                if hasStaleCell {
+                    staleRows.insert(row)
+                }
+            }
+            guard !staleRows.isEmpty else { return }
+            table.reloadData(
+                forRowIndexes: staleRows,
+                columnIndexes: IndexSet(integersIn: 0..<table.numberOfColumns)
+            )
+        }
+
         private func reloadRowsWithFavicons(
             in table: NSTableView,
             parent: MessageTableRepresentable
@@ -630,6 +724,8 @@ struct MessageTableRepresentable: NSViewRepresentable {
             rowActionsForRow row: Int,
             edge: NSTableView.RowActionEdge
         ) -> [NSTableViewRowAction] {
+            // Column mode reserves horizontal gestures for native table scrolling.
+            guard configuration.presentation != .columns else { return [] }
             guard let rowModel = parent?.rows[safe: row] else { return [] }
             let kinds: [SwipeActionKind]
             switch edge {
@@ -687,6 +783,9 @@ struct MessageTableRepresentable: NSViewRepresentable {
             parent.onColumnOrder(order)
         }
 
+        /// Keep the customization target synchronous with the native resize
+        /// notification. AppModel resolves the current global/folder scope at
+        /// callback time, so delaying this callback could write a later scope.
         func tableViewColumnDidResize(_ notification: Notification) {
             guard !applyingColumns,
                   configuration.presentation == .columns,
@@ -696,15 +795,19 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 .compactMap { $0 as? NSTableColumn }
                 .first
             guard let column,
-                  let field = MailListColumn(rawValue: column.identifier.rawValue),
-                  column.width.isFinite,
-                  column.width > 0
+                  let field = MailListColumn(rawValue: column.identifier.rawValue)
             else { return }
-            parent.onColumnWidth(field, Double(column.width))
+
+            let width = field.normalizedWidth(column.width)
+            if abs(column.width - width) > 0.5 {
+                column.width = width
+            }
+            parent.onColumnWidth(field, Double(width))
         }
 
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard let tableView, let parent else { return }
+            guard !reflectingModelSelection else { return }
             // A contextual click may cause NSTableView to move its native
             // highlight before asking for the menu. Keep that transient
             // AppKit selection out of the model: menu invocations carry their
@@ -720,6 +823,11 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 if selectionEvent.shift { modifiers.insert(.shift) }
             }
             let isUserSelectionEvent = MessageTableSelectionPolicy.classification(for: selectionEvent) == .user
+            if isUserSelectionEvent {
+                // Cancel any older deferred reveal before it can move the
+                // viewport behind the user's newer native arrow selection.
+                selectionScrollGeneration &+= 1
+            }
             let isMouseSelectionEvent = MessageTableSelectionPolicy.isMouseSelection(selectionEvent)
             let clickedID = isMouseSelectionEvent
                 ? parent.rows[safe: tableView.clickedRow]?.id
@@ -743,11 +851,9 @@ struct MessageTableRepresentable: NSViewRepresentable {
                 ?? parent.rows[safe: tableView.selectedRow]?.id
             guard ids != parent.selectedIDs || anchor != parent.selectedID else { return }
             if opensReader, ids.count == 1, let id = ids.first {
-                // Commit the AppKit selection before opening the reader. Reader
-                // publication can rebuild surrounding SwiftUI hosts; keeping
-                // model/native selection synchronized lets the deferred
-                // responder restoration preserve arrow-key navigation.
-                parent.onSelect(ids, anchor)
+                // Queue selection and preview together. While the latest
+                // intent is pending, keep AppKit's newer native selection
+                // instead of reflecting an older completed preview.
                 parent.onOpenMessages([id], false)
                 restoreListFocus(after: tableView)
             } else {
@@ -776,10 +882,13 @@ struct MessageTableRepresentable: NSViewRepresentable {
 
         private func syncSelection(in tableView: NSTableView) {
             guard let parent else { return }
+            guard !parent.isSelectionPending else { return }
             let selectedIndexes = IndexSet(
                 parent.rows.indices.filter { parent.selectedIDs.contains(parent.rows[$0].id) }
             )
             if tableView.selectedRowIndexes != selectedIndexes {
+                // A full-folder selection includes unloaded rows. Reflecting
+                // its visible indexes must not write that subset back to the model.
                 tableView.selectRowIndexes(selectedIndexes, byExtendingSelection: false)
             }
 
@@ -966,7 +1075,13 @@ struct MessageTableRepresentable: NSViewRepresentable {
             case .openInNewWindow:
                 guard selection.count == 1, let id = selection.first else { return }
                 parent.onOpenMessageWindow(id)
-            case .reply, .replyAll, .forward, .viewRawSource, .toggleEmailReadingOverride:
+            case .reply, .replyAll:
+                guard selection.count == 1, let id = selection.first else { return }
+                parent.onReply(id, invocation.action == .replyAll)
+            case .forward:
+                guard selection.count == 1, let id = selection.first else { return }
+                parent.onForward(id)
+            case .viewRawSource, .toggleEmailReadingOverride:
                 break
             case .markRead, .markUnread:
                 parent.onAction(.toggleRead, selection)
@@ -1027,6 +1142,8 @@ fileprivate enum MessageTableKeyCommand {
 fileprivate final class MessageTableKeyView: NSTableView {
     var onKeyCommand: ((MessageTableKeyCommand) -> Void)?
     var onListInteraction: (() -> Void)?
+    /// QA-only input-handler timing; asynchronous rendering is measured separately.
+    private static let profilesNavigation = ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1"
     fileprivate private(set) var receivedContextMenuEvent = false
     fileprivate private(set) var contextMenuRow: Int?
     private var contextMenuSelection: IndexSet?
@@ -1099,6 +1216,19 @@ fileprivate final class MessageTableKeyView: NSTableView {
     }
 
     override func keyDown(with event: NSEvent) {
+        let started = Self.profilesNavigation ? ProcessInfo.processInfo.systemUptime : 0
+        defer {
+            if Self.profilesNavigation, event.keyCode == 125 || event.keyCode == 126 {
+                let finished = ProcessInfo.processInfo.systemUptime
+                QALaunch.log(String(
+                    format: "navigation-profile phase=down key=%d row=%ld repeat=%d handler_us=%.1f event_age_us=%.1f t_us=%.0f",
+                    Int(event.keyCode), selectedRow, event.isARepeat ? 1 : 0,
+                    (finished - started) * 1_000_000,
+                    (started - event.timestamp) * 1_000_000,
+                    finished * 1_000_000
+                ))
+            }
+        }
         onListInteraction?()
         defer { pendingSelectionEvent = nil }
         pendingSelectionEvent = selectionEvent(for: event, phase: .down)
@@ -1131,6 +1261,13 @@ fileprivate final class MessageTableKeyView: NSTableView {
         defer { pendingSelectionEvent = nil }
         pendingSelectionEvent = selectionEvent(for: event, phase: .up)
         super.keyUp(with: event)
+        if Self.profilesNavigation, event.keyCode == 125 || event.keyCode == 126 {
+            QALaunch.log(String(
+                format: "navigation-profile phase=up key=%d row=%ld t_us=%.0f",
+                Int(event.keyCode), selectedRow,
+                ProcessInfo.processInfo.systemUptime * 1_000_000
+            ))
+        }
     }
 
     private enum KeyPhase {
@@ -1287,11 +1424,10 @@ final class MessageTableContainer: NSView {
         for item in configuration.columnOrder {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(item.rawValue))
             column.title = item.title
-            column.minWidth = item == .subject ? 80 : 36
-            column.maxWidth = item == .subject ? 2_000 : 800
-            column.width = max(
-                CGFloat(configuration.columnWidths[item] ?? Double(item.defaultWidth)),
-                column.minWidth
+            column.minWidth = item.minimumWidth
+            column.maxWidth = item.maximumWidth
+            column.width = item.normalizedWidth(
+                CGFloat(configuration.columnWidths[item] ?? Double(item.defaultWidth))
             )
             column.resizingMask = [.userResizingMask, .autoresizingMask]
             column.isHidden = configuration.hiddenColumns.contains(item)
@@ -1439,6 +1575,7 @@ private protocol MessageTableChromeCell: AnyObject {
     func setHovered(_ hovered: Bool)
     func refreshChrome()
     func updateAccentColor(_ color: NSColor?)
+    func isRendering(_ row: MessageRow) -> Bool
 }
 
 @MainActor
@@ -1523,6 +1660,7 @@ final class MessageCellView: NSTableCellView, MessageTableChromeCell {
     private var accentColor: NSColor?
     private var isSelectedRow = false
     private var isHovered = false
+    private var renderedRow: MessageRow?
     private var lineCount = MessageListLayout.defaultLineCount
     private var fromLeadingConstraint: NSLayoutConstraint!
     private var senderGlyphWidthConstraint: NSLayoutConstraint!
@@ -1632,6 +1770,9 @@ final class MessageCellView: NSTableCellView, MessageTableChromeCell {
         isSelectedRow = selected
         refreshChrome()
     }
+    func isRendering(_ row: MessageRow) -> Bool {
+        renderedRow == row
+    }
 
     func setHovered(_ hovered: Bool) {
         isHovered = hovered
@@ -1688,6 +1829,7 @@ final class MessageCellView: NSTableCellView, MessageTableChromeCell {
         showsSenderIcons: Bool = false,
         favicon: NSImage? = nil
     ) {
+        renderedRow = row
         let normalizedLineCount = MessageListLayout.normalizedLineCount(lineCount)
         if self.lineCount != normalizedLineCount {
             self.lineCount = normalizedLineCount
@@ -1756,6 +1898,7 @@ final class MessageColumnCellView: NSTableCellView, MessageTableChromeCell {
     private var accentColor: NSColor?
     private var isSelectedRow = false
     private var isHovered = false
+    private var renderedRow: MessageRow?
 
     static func identifier(for column: MailListColumn) -> NSUserInterfaceItemIdentifier {
         NSUserInterfaceItemIdentifier("MessageColumn.\(column.rawValue)")
@@ -1818,6 +1961,7 @@ final class MessageColumnCellView: NSTableCellView, MessageTableChromeCell {
         showsSenderIcon: Bool,
         favicon: NSImage?
     ) {
+        renderedRow = row
         let iconName: String?
         let iconDescription: String
         let value: String
@@ -1883,6 +2027,9 @@ final class MessageColumnCellView: NSTableCellView, MessageTableChromeCell {
         labelLeadingConstraint.constant = isIconVisible ? 32 : 8
         setAccessibilityLabel("\(column.title): \(value)")
         setAccessibilityRole(.staticText)
+    }
+    func isRendering(_ row: MessageRow) -> Bool {
+        renderedRow == row
     }
 
     func updateSelection(_ selected: Bool) {

@@ -150,10 +150,10 @@ enum QALaunch: Sendable {
         #endif
     }
 
-    /// Launch phase marker; QA-only, no cost outside `MAILTERNAL_QA=1`.
-    static func launchPhase(_ name: String) {
+    /// Launch phase marker; the marker name is evaluated only in QA mode.
+    static func launchPhase(_ name: @autoclosure () -> String) {
         guard ProcessInfo.processInfo.environment["MAILTERNAL_QA"] == "1" else { return }
-        log(String(format: "launch phase=%@ t=%.1fms footprint=%lld", name, millisecondsSinceProcessStart(), footprintBytes()))
+        log(String(format: "launch phase=%@ t=%.1fms footprint=%lld", name(), millisecondsSinceProcessStart(), footprintBytes()))
     }
 
     /// Activity Monitor "memory footprint" (`phys_footprint`), or -1 if unavailable.

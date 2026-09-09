@@ -264,9 +264,9 @@ enum MessageContextMenuPolicy {
             Item(title: "Open in New Tab", action: .openInNewTab),
             Item(title: "Open in New Window", action: .openInNewWindow, isEnabled: count == 1),
             separator,
-            Item(title: "Reply", action: .reply, isEnabled: false, toolTip: composerToolTip),
-            Item(title: "Reply All", action: .replyAll, isEnabled: false, toolTip: composerToolTip),
-            Item(title: "Forward", action: .forward, isEnabled: false, toolTip: composerToolTip),
+            Item(title: "Reply", action: .reply, isEnabled: count == 1),
+            Item(title: "Reply All", action: .replyAll, isEnabled: count == 1),
+            Item(title: "Forward", action: .forward, isEnabled: count == 1),
             separator,
             Item(
                 title: shouldMarkRead ? "Mark as Read" : "Mark as Unread",
@@ -294,7 +294,6 @@ enum MessageContextMenuPolicy {
         ]
     }
 
-    private static let composerToolTip = "Available with the composer"
     private static let separator = Item(title: "")
 
     private static func moveMenu(
@@ -569,8 +568,14 @@ enum MessageToolbarPolicy {
             action: .toggleEmailReadingOverride,
             isEnabled: selection.count == 1
         )
-        return [mark, flag, junk, move, open, MessageContextMenuPolicy.Item(title: ""),
-                copyLink, copySubject, raw, colorScheme]
+        let replyItems = contextItems.filter { item in
+            switch item.action {
+            case .reply?, .replyAll?, .forward?: true
+            default: false
+            }
+        }
+        return replyItems + [MessageContextMenuPolicy.Item(title: ""), mark, flag, junk, move, open,
+                            MessageContextMenuPolicy.Item(title: ""), copyLink, copySubject, raw, colorScheme]
     }
 }
 

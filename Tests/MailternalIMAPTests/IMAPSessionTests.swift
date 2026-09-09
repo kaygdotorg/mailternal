@@ -342,6 +342,65 @@ import Testing
     }
 }
 
+@Test func copyUIDPreservesParallelRangeOrder() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let copying = Task {
+            try await imap.session.copy(uids: IMAPUIDSet(ranges: [7...9, 20...20]), to: "Archive")
+        }
+        let (tag, _) = try await imap.expectCommand(containing: "UID COPY")
+        try await imap.writeServer("\(tag) OK [COPYUID 900 7:9,20 101,301:303] copied")
+        let mapping = try #require(await copying.value)
+        #expect(mapping.destinationUIDValidity == 900)
+        #expect(mapping.destinationUID(for: IMAPUID(rawValue: 7)) == IMAPUID(rawValue: 101))
+        #expect(mapping.destinationUID(for: IMAPUID(rawValue: 8)) == IMAPUID(rawValue: 301))
+        #expect(mapping.destinationUID(for: IMAPUID(rawValue: 9)) == IMAPUID(rawValue: 302))
+        #expect(mapping.destinationUID(for: IMAPUID(rawValue: 20)) == IMAPUID(rawValue: 303))
+        #expect(mapping.destinationUID(for: IMAPUID(rawValue: 10)) == nil)
+    }
+}
+
+@Test func moveRetainsUntaggedCOPYUIDBeforeExpunge() async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let moving = Task { try await imap.session.move(uids: IMAPUIDSet(uid: 7), to: "Archive") }
+        let (tag, _) = try await imap.expectCommand(containing: "UID MOVE")
+        try await imap.writeServer("* OK [COPYUID 901 7 401] moving")
+        try await imap.writeServer("* 1 EXPUNGE")
+        try await imap.ok(tag)
+        let mapping = try #require(await moving.value)
+        #expect(mapping.destinationUIDValidity == 901)
+        #expect(mapping.destinationUID(for: IMAPUID(rawValue: 7)) == IMAPUID(rawValue: 401))
+    }
+}
+
+@Test(arguments: ["", "[COPYUID 902 7:8 501] "])
+func successfulMoveWithoutUsableMappingIsNotRetryable(_ code: String) async throws {
+    try await ScriptedIMAP.run(security: .implicitTLS) { imap in
+        try await imap.connectImplicit()
+        let moving = Task { try await imap.session.move(uids: IMAPUIDSet(uid: 7), to: "Archive") }
+        let (tag, _) = try await imap.expectCommand(containing: "UID MOVE")
+        try await imap.writeServer("\(tag) OK \(code)moved")
+        #expect(try await moving.value == nil)
+    }
+}
+
+@Test func copyUIDMappingDoesNotExpandLargeRangesOrAcceptAmbiguity() throws {
+    let complete = try #require(IMAPCopyUIDMapping(
+        destinationUIDValidity: 903,
+        sourceUIDs: [1...UInt32.max],
+        destinationUIDs: [1...UInt32.max]
+    ))
+    let last = IMAPUID(rawValue: UInt32.max)
+    #expect(complete.destinationUID(for: last) == last)
+    let ambiguous = try #require(IMAPCopyUIDMapping(
+        destinationUIDValidity: 903,
+        sourceUIDs: [7...7, 7...7],
+        destinationUIDs: [501...502]
+    ))
+    #expect(ambiguous.destinationUID(for: IMAPUID(rawValue: 7)) == nil)
+}
+
 @Test func closeDuringIdleDropsSocketWithoutLogout() async throws {
     try await ScriptedIMAP.run(security: .implicitTLS) { imap in
         try await imap.connectImplicit()

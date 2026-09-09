@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import MailternalAutomation
 import MailternalInterfaces
 import MailternalPairing
 import UniformTypeIdentifiers
@@ -22,6 +23,8 @@ struct PairingView: View {
     let accounts: [AccountConfig]
     let makeBundle: @MainActor (Set<AccountID>, Bool) async throws -> PairingBundle
     let importBundle: @MainActor (PairingBundle, Set<AccountID>, Bool, Bool) async throws -> Void
+    let bridge: PairingAutomationBridge
+    let onCommand: @MainActor (PairingUIAction) -> Void
 
     @State private var session: PairingSession
     @State private var selectedAccountIDs: Set<AccountID>
@@ -51,16 +54,21 @@ struct PairingView: View {
     /// PairingSession itself is one-shot and reports cancellation as a failure;
     /// the view must prevent that stale error from resurfacing in a fresh flow.
     @State private var sessionOperationID = UUID()
+    @State private var automationGeneration: UUID?
 
 
     init(
         accounts: [AccountConfig],
         makeBundle: @escaping @MainActor (Set<AccountID>, Bool) async throws -> PairingBundle,
-        importBundle: @escaping @MainActor (PairingBundle, Set<AccountID>, Bool, Bool) async throws -> Void
+        importBundle: @escaping @MainActor (PairingBundle, Set<AccountID>, Bool, Bool) async throws -> Void,
+        bridge: PairingAutomationBridge,
+        onCommand: @escaping @MainActor (PairingUIAction) -> Void
     ) {
         self.accounts = accounts
         self.makeBundle = makeBundle
         self.importBundle = importBundle
+        self.bridge = bridge
+        self.onCommand = onCommand
         let deviceName = PairingView.defaultDeviceName
         _session = State(initialValue: PairingSession(deviceName: deviceName))
         _selectedAccountIDs = State(initialValue: Set(accounts.map(\.id)))
@@ -82,7 +90,7 @@ struct PairingView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel", role: .cancel) {
-                        cancelAndDismiss()
+                        dispatch(.dismiss)
                     }
                     .accessibilityLabel("Cancel pairing")
                 }
@@ -93,7 +101,17 @@ struct PairingView: View {
                 transaction.animation = nil
             }
         }
+        .onAppear {
+            installAutomation()
+        }
+        .onChange(of: automationStateToken) { _, _ in
+            publishAutomationSnapshot()
+        }
         .onDisappear {
+            if let generation = automationGeneration {
+                bridge.uninstall(generation)
+                automationGeneration = nil
+            }
             // Dismissal must stop the authenticated transport and invalidate
             // every continuation that might otherwise report into a later
             // presentation. Keep the next presentation at the idle state:
@@ -108,7 +126,7 @@ struct PairingView: View {
         .sheet(isPresented: $isScannerPresented) {
             PairingCameraScannerView { code in
                 isScannerPresented = false
-                join(code)
+                dispatch(.join(qrString: code))
             }
             .ignoresSafeArea(edges: .bottom)
         }
@@ -205,7 +223,7 @@ struct PairingView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 10) {
                         Button {
-                            showCode()
+                            dispatch(.showCode)
                         } label: {
                             Label("Show QR", systemImage: "qrcode")
                         }
@@ -214,7 +232,7 @@ struct PairingView: View {
                         .accessibilityHint("Advertise a one-time pairing invitation")
 
                         Button {
-                            isScannerPresented = true
+                            dispatch(.scanCode)
                         } label: {
                             Label("Scan QR", systemImage: "qrcode.viewfinder")
                         }
@@ -224,7 +242,7 @@ struct PairingView: View {
                     }
                     #if os(macOS)
                     Button {
-                        isImageImporterPresented = true
+                        dispatch(.scanImage)
                     } label: {
                         Label("Scan an image file instead", systemImage: "photo.on.rectangle")
                     }
@@ -251,18 +269,24 @@ struct PairingView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Toggle("Include workspace settings", isOn: $includeSettings)
+                Toggle("Include workspace settings", isOn: includeSettingsBinding)
                     .disabled(isWorking)
                 PairingAccountSelectionList(
                     title: "Accounts to export",
                     accounts: accounts,
                     selectedIDs: $selectedAccountIDs,
-                    emptyMessage: "No accounts are configured on this device."
+                    emptyMessage: "No accounts are configured on this device.",
+                    onSelectionChange: { dispatch(.setSelectedAccounts($0)) }
                 )
                 .disabled(isWorking)
 
                 Button {
-                    exportOfflineBundle()
+                    dispatch(
+                        .exportOfflineBundle(
+                            accountIDs: selectedAccountIDs.sorted { $0.rawValue < $1.rawValue },
+                            includeSettings: includeSettings
+                        )
+                    )
                 } label: {
                     Label(isWorking ? "Preparing encrypted file…" : "Export encrypted file", systemImage: "square.and.arrow.up")
                 }
@@ -286,7 +310,7 @@ struct PairingView: View {
 
                 Divider()
                 Button {
-                    isFileImporterPresented = true
+                    dispatch(.chooseOfflineFile)
                 } label: {
                     Label("Import encrypted file", systemImage: "square.and.arrow.down")
                 }
@@ -295,13 +319,13 @@ struct PairingView: View {
                 .accessibilityHint("Choose a Mailternal pairing file to decrypt")
 
                 if offlineImportData != nil {
-                    SecureField("Generated passphrase", text: $offlinePassphrase)
+                    SecureField("Generated passphrase", text: offlinePassphraseBinding)
                         .textContentType(.password)
                         .textFieldStyle(.roundedBorder)
                         .disabled(isWorking)
                         .accessibilityHint("Enter the passphrase conveyed separately from the file")
                     Button {
-                        decryptOfflineBundle()
+                        dispatch(.decryptOfflineBundle)
                     } label: {
                         Label(isWorking ? "Decrypting…" : "Decrypt and review", systemImage: "lock.open")
                     }
@@ -341,7 +365,7 @@ struct PairingView: View {
 
                     HStack(spacing: 10) {
                         Button {
-                            scanDifferentCode()
+                            dispatch(.scanDifferentCode)
                         } label: {
                             Label("Scan a different QR", systemImage: "qrcode.viewfinder")
                         }
@@ -350,7 +374,7 @@ struct PairingView: View {
 
                     #if os(macOS)
                     Button {
-                        scanDifferentImage()
+                        dispatch(.scanDifferentImage)
                     } label: {
                         Label("Use image file", systemImage: "photo.on.rectangle")
                     }
@@ -365,7 +389,7 @@ struct PairingView: View {
             if let viewError {
                 errorBanner(viewError)
             }
-            PairingCancelButton(action: cancelPairing)
+            PairingCancelButton(action: { dispatch(.cancel) })
         }
     }
 
@@ -384,7 +408,7 @@ struct PairingView: View {
                     Text("Choose what to do next. Either device may send or wait to receive.")
                         .font(.subheadline)
 
-                    Toggle("Include workspace settings", isOn: $includeSettings)
+                    Toggle("Include workspace settings", isOn: includeSettingsBinding)
                         .disabled(isWorking)
                         .accessibilityHint("This is separate from ongoing iCloud sync participation")
                     Text("Imported settings are a one-time choice and do not change your ongoing iCloud sync preference.")
@@ -395,12 +419,18 @@ struct PairingView: View {
                         title: "Accounts to send",
                         accounts: accounts,
                         selectedIDs: $selectedAccountIDs,
-                        emptyMessage: "No accounts are configured on this device. You can still wait to receive accounts."
+                        emptyMessage: "No accounts are configured on this device. You can still wait to receive accounts.",
+                        onSelectionChange: { dispatch(.setSelectedAccounts($0)) }
                     )
                         .disabled(isWorking)
 
                     Button {
-                        sendSelectedAccounts()
+                        dispatch(
+                            .sendSelectedAccounts(
+                                accountIDs: selectedAccountIDs.sorted { $0.rawValue < $1.rawValue },
+                                includeSettings: includeSettings
+                            )
+                        )
                     } label: {
                         Label(isWorking ? "Sending…" : "Send selected accounts", systemImage: "arrow.up.circle.fill")
                     }
@@ -417,7 +447,7 @@ struct PairingView: View {
             if let viewError {
                 errorBanner(viewError)
             }
-            PairingCancelButton(action: cancelPairing)
+            PairingCancelButton(action: { dispatch(.cancel) })
         }
     }
 
@@ -463,12 +493,13 @@ struct PairingView: View {
                     PairingIncomingAccountList(
                         accounts: incomingAccounts,
                         selectedIDs: $selectedAccountIDs,
-                        existingIDs: existingIDs
+                        existingIDs: existingIDs,
+                        onSelectionChange: { dispatch(.setSelectedAccounts($0)) }
                     )
                     .disabled(isWorking)
 
                     if !existingIDs.isEmpty {
-                        Toggle("Replace existing matching accounts", isOn: $replaceExisting)
+                        Toggle("Replace existing matching accounts", isOn: replaceExistingBinding)
                             .disabled(isWorking)
                             .accessibilityHint("Replace matching account settings and credential; the shared identity is adopted either way")
                         Text("Matching means the same account link identity or the same IMAP endpoint and username. Existing account settings and mailbox data remain unchanged by default, but a matching account adopts the transferred shared identity.")
@@ -478,7 +509,7 @@ struct PairingView: View {
                     }
 
                     if !bundle.settings.isEmpty {
-                        Toggle("Import workspace settings", isOn: $importSettings)
+                        Toggle("Import workspace settings", isOn: importSettingsBinding)
                             .disabled(isWorking)
                             .accessibilityHint("This one-time import is separate from ongoing iCloud sync participation")
                         Text("This choice does not alter the ongoing iCloud sync preference.")
@@ -487,7 +518,13 @@ struct PairingView: View {
                     }
 
                     Button {
-                        confirmImport(bundle, isOffline: isOffline)
+                        dispatch(
+                            .confirmImport(
+                                accountIDs: selectedAccountIDs.sorted { $0.rawValue < $1.rawValue },
+                                replaceExisting: replaceExisting,
+                                importSettings: importSettings
+                            )
+                        )
                     } label: {
                         Label(
                             isWorking ? "Importing…" : "Confirm import",
@@ -507,9 +544,9 @@ struct PairingView: View {
                 errorBanner(viewError)
             }
             if isOffline {
-                PairingCancelButton(title: "Cancel import", action: cancelOfflineImport)
+                PairingCancelButton(title: "Cancel import", action: { dispatch(.cancel) })
             } else {
-                PairingCancelButton(action: cancelPairing)
+                PairingCancelButton(action: { dispatch(.cancel) })
             }
         }
     }
@@ -530,7 +567,7 @@ struct PairingView: View {
                 )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-                Button("Pair another device", action: resetForFreshPairing)
+                Button("Pair another device", action: { dispatch(.restart) })
                     .buttonStyle(.borderedProminent)
                     .accessibilityHint("Discard this invitation and start a new secure pairing")
             }
@@ -548,8 +585,7 @@ struct PairingView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                Button("Start a new pairing", action: resetForFreshPairing)
+                Button("Start a new pairing", action: { dispatch(.restart) })
                     .buttonStyle(.borderedProminent)
                     .accessibilityHint("Use a fresh invitation rather than reusing this one")
             }
@@ -584,8 +620,277 @@ struct PairingView: View {
             .accessibilityAddTraits(.isStaticText)
     }
 
-    private func showCode() {
-        guard !isWorking else { return }
+    private var includeSettingsBinding: Binding<Bool> {
+        Binding(
+            get: { includeSettings },
+            set: { dispatch(.setIncludeSettings($0)) }
+        )
+    }
+
+    private var replaceExistingBinding: Binding<Bool> {
+        Binding(
+            get: { replaceExisting },
+            set: { dispatch(.setReplaceExisting($0)) }
+        )
+    }
+
+    private var importSettingsBinding: Binding<Bool> {
+        Binding(
+            get: { importSettings },
+            set: { dispatch(.setImportSettings($0)) }
+        )
+    }
+
+    private var offlinePassphraseBinding: Binding<String> {
+        Binding(
+            get: { offlinePassphrase },
+            set: { dispatch(.setOfflinePassphrase($0)) }
+        )
+    }
+
+    @MainActor
+    private func dispatch(_ action: PairingUIAction) {
+        onCommand(action)
+    }
+
+    /// Handles only commands from PairingAutomationBridge. All UI controls
+    /// enqueue an action through `onCommand`; the bridge is the single route
+    /// back into this live presentation.
+    @MainActor
+    private func performAutomationAction(_ action: PairingUIAction) async throws {
+        switch action {
+        case .showCode:
+            try showCode()
+        case .join(let qrString):
+            try join(qrString)
+        case .sendSelectedAccounts(let accountIDs, let includeSettings):
+            try sendSelectedAccounts(accountIDs: Set(accountIDs), includeSettings: includeSettings)
+        case .cancel, .dismiss:
+            if offlineReceivedBundle != nil || offlineImportData != nil {
+                cancelOfflineImport()
+            } else {
+                cancelPairing()
+            }
+            if action == .dismiss { dismiss() }
+        case .restart:
+            resetForFreshPairing()
+        case .setSelectedAccounts(let accountIDs):
+            try setSelectedAccounts(Set(accountIDs))
+        case .setIncludeSettings(let value):
+            try setIncludeSettings(value)
+        case .setReplaceExisting(let value):
+            try setReplaceExisting(value)
+        case .setImportSettings(let value):
+            try setImportSettings(value)
+        case .confirmImport(let accountIDs, let replaceExisting, let importSettings):
+            guard let bundle = offlineReceivedBundle ?? session.receivedBundle else {
+                throw PairingAutomationBridge.BridgeError.disabledAction(action.name)
+            }
+            try confirmImport(
+                bundle,
+                selectedAccountIDs: Set(accountIDs),
+                replaceExisting: replaceExisting,
+                importSettings: importSettings,
+                isOffline: offlineReceivedBundle != nil
+            )
+        case .exportOfflineBundle(let accountIDs, let includeSettings):
+            try exportOfflineBundle(
+                accountIDs: Set(accountIDs),
+                includeSettings: includeSettings
+            )
+        case .chooseOfflineFile:
+            guard !isWorking, session.state == .idle,
+                  !offlineImportCompleted, offlineReceivedBundle == nil,
+                  !isFileImporterPresented else {
+                throw PairingAutomationBridge.BridgeError.disabledAction(action.name)
+            }
+            isFileImporterPresented = true
+        case .importOfflineFile(let data):
+            try importOfflineFile(data)
+        case .setOfflinePassphrase(let passphrase):
+            try setOfflinePassphrase(passphrase)
+        case .decryptOfflineBundle:
+            try decryptOfflineBundle()
+        case .scanCode:
+            guard !isWorking, session.state == .idle,
+                  !offlineImportCompleted, offlineReceivedBundle == nil,
+                  !isScannerPresented else {
+                throw PairingAutomationBridge.BridgeError.disabledAction(action.name)
+            }
+            isScannerPresented = true
+        case .scanDifferentCode:
+            try scanDifferentCode()
+        case .scanImage:
+            #if os(macOS)
+            guard !isWorking, session.state == .idle,
+                  !offlineImportCompleted, offlineReceivedBundle == nil,
+                  !isImageImporterPresented else {
+                throw PairingAutomationBridge.BridgeError.disabledAction(action.name)
+            }
+            #else
+            throw PairingAutomationBridge.BridgeError.disabledAction(action.name)
+            #endif
+        case .scanDifferentImage:
+            #if os(macOS)
+            try scanDifferentImage()
+            #else
+            throw PairingAutomationBridge.BridgeError.disabledAction(action.name)
+            #endif
+        }
+    }
+
+    private var automationStateToken: String {
+        let incomingCount = session.receivedBundle?.accounts.count ?? -1
+        let offlineCount = offlineReceivedBundle?.accounts.count ?? -1
+        let invitationExpiry = session.invitation?.expiresAt.timeIntervalSince1970 ?? 0
+        let selected = selectedAccountIDs.sorted { $0.rawValue < $1.rawValue }
+            .map(\.rawValue)
+            .joined(separator: ",")
+        return [
+            String(describing: session.state),
+            String(isWorking),
+            String(offlineImportCompleted),
+            String(offlineImportData != nil),
+            String(incomingCount),
+            String(offlineCount),
+            String(invitationExpiry),
+            selected,
+            String(includeSettings),
+            String(replaceExisting),
+            String(importSettings),
+            String(didConfirmImport),
+            viewError == nil ? "0" : "1"
+        ].joined(separator: "|")
+    }
+
+    @MainActor
+    private func installAutomation() {
+        guard automationGeneration == nil else { return }
+        let generation = bridge.install(
+            snapshot: { [self] in automationDialogState },
+            perform: { [self] action in
+                try await performAutomationAction(action)
+            }
+        )
+        automationGeneration = generation
+        publishAutomationSnapshot()
+    }
+
+    @MainActor
+    private func publishAutomationSnapshot() {
+        guard let generation = automationGeneration else { return }
+        bridge.publish(
+            dialog: automationDialogState,
+            actions: automationAvailableActions,
+            generation: generation
+        )
+    }
+
+    private var automationDialogState: AutomationDialogState {
+        let phase: String
+        if offlineImportCompleted {
+            phase = "offline-completed"
+        } else if offlineReceivedBundle != nil {
+            phase = "offline-review"
+        } else {
+            switch session.state {
+            case .idle: phase = "idle"
+            case .advertising: phase = "advertising"
+            case .connecting: phase = "connecting"
+            case .connected: phase = "connected"
+            case .sending: phase = "sending"
+            case .received: phase = "received"
+            case .completed: phase = "completed"
+            case .expired: phase = "expired"
+            case .failed: phase = "failed"
+            }
+        }
+        let message = [
+            "phase=\(phase)",
+            "working=\(isWorking)",
+            "includeSettings=\(includeSettings)",
+            "replaceExisting=\(replaceExisting)",
+            "importSettings=\(importSettings)",
+            "offlineFileReady=\(offlineImportData != nil)",
+            "importConfirmed=\(didConfirmImport)",
+            "error=\(viewError != nil)"
+        ].joined(separator: ";")
+        return AutomationDialogState(
+            id: "pairing",
+            kind: "pairing",
+            isPresented: true,
+            message: message
+        )
+    }
+
+    private var automationAvailableActions: [AutomationActionState] {
+        let idle = session.state == .idle && !offlineImportCompleted && offlineReceivedBundle == nil
+        let invitation = session.state == .advertising || session.state == .connecting
+        let connected = session.state == .connected
+        let incomingBundle = session.receivedBundle ?? offlineReceivedBundle
+        let incoming = incomingBundle != nil
+        let terminal = offlineImportCompleted
+            || session.state == .completed
+            || session.state == .expired
+            || session.state == .failed
+        let selected = !selectedAccountIDs.isEmpty
+        let canChangeSelection = !isWorking && (idle || connected || incoming)
+        let canChangeIncludeSettings = !isWorking && (idle || connected)
+        let hasExisting = incomingBundle?.accounts.contains {
+            existingAccount(for: $0.config) != nil
+        } ?? false
+        let canChangeReplace = !isWorking && incoming && hasExisting
+        let canChangeImportSettings = !isWorking && incoming && !(incomingBundle?.settings.isEmpty ?? true)
+        let canConfirm = !isWorking && incoming && selected && !didConfirmImport
+        let canOfflineDecrypt = !isWorking && offlineImportData != nil && !offlinePassphrase.isEmpty
+        #if os(macOS)
+        let canScanImage = idle && !isWorking && !isImageImporterPresented
+        let canScanDifferentImage = invitation && !isWorking
+        #else
+        let canScanImage = false
+        let canScanDifferentImage = false
+        #endif
+        return [
+            actionState(.showCode, isEnabled: idle && !isWorking),
+            actionState(.join(qrString: ""), isEnabled: idle && !isWorking),
+            actionState(.sendSelectedAccounts(accountIDs: [], includeSettings: false), isEnabled: connected && selected && !isWorking, requiresSelection: true),
+            actionState(.cancel, isEnabled: true),
+            actionState(.dismiss, isEnabled: true),
+            actionState(.restart, isEnabled: terminal),
+            actionState(.setSelectedAccounts([]), isEnabled: canChangeSelection, requiresSelection: true),
+            actionState(.setIncludeSettings(false), isEnabled: canChangeIncludeSettings),
+            actionState(.setReplaceExisting(false), isEnabled: canChangeReplace),
+            actionState(.setImportSettings(false), isEnabled: canChangeImportSettings),
+            actionState(.confirmImport(accountIDs: [], replaceExisting: false, importSettings: false), isEnabled: canConfirm, requiresSelection: true),
+            actionState(.exportOfflineBundle(accountIDs: [], includeSettings: false), isEnabled: idle && selected && !isWorking, requiresSelection: true),
+            actionState(.chooseOfflineFile, isEnabled: idle && !isWorking && !isFileImporterPresented),
+            actionState(.importOfflineFile(Data()), isEnabled: idle && !isWorking),
+            actionState(.setOfflinePassphrase(""), isEnabled: !isWorking && offlineImportData != nil),
+            actionState(.decryptOfflineBundle, isEnabled: canOfflineDecrypt),
+            actionState(.scanCode, isEnabled: idle && !isWorking && !isScannerPresented),
+            actionState(.scanDifferentCode, isEnabled: invitation && !isWorking),
+            actionState(.scanImage, isEnabled: canScanImage),
+            actionState(.scanDifferentImage, isEnabled: canScanDifferentImage)
+        ]
+    }
+
+    private func actionState(
+        _ action: PairingUIAction,
+        isEnabled: Bool,
+        requiresSelection: Bool = false
+    ) -> AutomationActionState {
+        AutomationActionState(
+            id: action.name,
+            isEnabled: isEnabled,
+            requiresSelection: requiresSelection,
+            requiresGUI: true
+        )
+    }
+
+    private func showCode() throws {
+        guard !isWorking, session.state == .idle else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.show-code")
+        }
         isWorking = true
         viewError = nil
         let operationID = UUID()
@@ -606,8 +911,10 @@ struct PairingView: View {
         }
     }
 
-    private func join(_ qrString: String) {
-        guard !isWorking, !qrString.isEmpty else { return }
+    private func join(_ qrString: String) throws {
+        guard !isWorking, session.state == .idle, !qrString.isEmpty else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.join")
+        }
         isWorking = true
         viewError = nil
         let operationID = UUID()
@@ -628,8 +935,14 @@ struct PairingView: View {
         }
     }
 
-    private func sendSelectedAccounts() {
-        guard !isWorking, !selectedAccountIDs.isEmpty, session.state == .connected else { return }
+    private func sendSelectedAccounts(
+        accountIDs: Set<AccountID>,
+        includeSettings: Bool
+    ) throws {
+        guard !isWorking, !accountIDs.isEmpty, session.state == .connected,
+              accountIDs.isSubset(of: Set(accounts.map(\.id))) else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.send-accounts")
+        }
         isWorking = true
         viewError = nil
         let operationID = UUID()
@@ -643,7 +956,7 @@ struct PairingView: View {
             }
             do {
                 // Bundle creation intentionally happens only after explicit Send.
-                let bundle = try await makeBundle(selectedAccountIDs, includeSettings)
+                let bundle = try await makeBundle(accountIDs, includeSettings)
                 guard sessionOperationID == operationID else { return }
                 try await pairingSession.send(bundle)
             } catch {
@@ -653,8 +966,17 @@ struct PairingView: View {
         }
     }
 
-    private func exportOfflineBundle() {
-        guard !isWorking, !selectedAccountIDs.isEmpty else { return }
+
+    private func exportOfflineBundle(
+        accountIDs: Set<AccountID>,
+        includeSettings: Bool
+    ) throws {
+        guard !isWorking, !accountIDs.isEmpty,
+              accountIDs.isSubset(of: Set(accounts.map(\.id))),
+              session.state == .idle,
+              !offlineImportCompleted, offlineReceivedBundle == nil else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.export-offline")
+        }
         isWorking = true
         viewError = nil
         let operationID = UUID()
@@ -668,7 +990,7 @@ struct PairingView: View {
             }
             do {
                 // Bundle creation intentionally happens only after explicit export.
-                let bundle = try await makeBundle(selectedAccountIDs, includeSettings)
+                let bundle = try await makeBundle(accountIDs, includeSettings)
                 let passphrase = try PairingFileTransfer.makePassphrase()
                 let data = try PairingFileTransfer.encrypt(bundle, passphrase: passphrase)
                 try Task.checkCancellation()
@@ -686,12 +1008,15 @@ struct PairingView: View {
         offlineTask = task
     }
 
-    private func decryptOfflineBundle() {
-        guard !isWorking, let data = offlineImportData else { return }
+    private func decryptOfflineBundle() throws {
+        guard !isWorking, let data = offlineImportData, !offlinePassphrase.isEmpty else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.decrypt-offline")
+        }
         isWorking = true
         viewError = nil
         let operationID = UUID()
         offlineOperationID = operationID
+        let passphrase = offlinePassphrase
         let task = Task { @MainActor in
             defer {
                 if offlineOperationID == operationID {
@@ -700,7 +1025,7 @@ struct PairingView: View {
                 }
             }
             do {
-                let bundle = try PairingFileTransfer.decrypt(data, passphrase: offlinePassphrase)
+                let bundle = try PairingFileTransfer.decrypt(data, passphrase: passphrase)
                 try Task.checkCancellation()
                 guard offlineOperationID == operationID else { return }
                 offlineReceivedBundle = bundle
@@ -718,6 +1043,21 @@ struct PairingView: View {
             }
         }
         offlineTask = task
+    }
+
+    private func importOfflineFile(_ data: Data) throws {
+        guard !isWorking, session.state == .idle,
+              !offlineImportCompleted, offlineReceivedBundle == nil,
+              data.count <= PairingFileTransfer.maximumFileBytes else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.import-offline-file")
+        }
+        offlineImportData = data
+        offlinePassphrase = ""
+        offlineReceivedBundle = nil
+        offlineImportCompleted = false
+        offlineExportPassphrase = nil
+        offlineExportDocument = nil
+        viewError = nil
     }
 
     private func handlePairingFileImport(_ result: Result<[URL], Error>) {
@@ -745,13 +1085,7 @@ struct PairingView: View {
                 guard data.count <= PairingFileTransfer.maximumFileBytes else {
                     throw PairingFileTransferError.fileTooLarge
                 }
-                offlineImportData = data
-                offlinePassphrase = ""
-                offlineReceivedBundle = nil
-                offlineImportCompleted = false
-                offlineExportPassphrase = nil
-                offlineExportDocument = nil
-                viewError = nil
+                dispatch(.importOfflineFile(data))
             } catch {
                 viewError = error.localizedDescription
             }
@@ -791,6 +1125,60 @@ struct PairingView: View {
         offlineTask = nil
     }
 
+    private func setSelectedAccounts(_ ids: Set<AccountID>) throws {
+        let incoming = session.receivedBundle ?? offlineReceivedBundle
+        let selectionContext = session.state == .connected
+            || incoming != nil
+            || (session.state == .idle && !offlineImportCompleted)
+        guard !isWorking, selectionContext else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.select-accounts")
+        }
+        let availableIDs = Set(
+            (session.receivedBundle ?? offlineReceivedBundle)?.accounts.map(\.id)
+                ?? accounts.map(\.id)
+        )
+        guard ids.isSubset(of: availableIDs) else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.select-accounts")
+        }
+        selectedAccountIDs = ids
+    }
+
+    private func setIncludeSettings(_ value: Bool) throws {
+        guard !isWorking,
+              (session.state == .connected
+                || (session.state == .idle && !offlineImportCompleted && offlineReceivedBundle == nil))
+        else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.include-settings")
+        }
+        includeSettings = value
+    }
+
+    private func setReplaceExisting(_ value: Bool) throws {
+        let incoming = session.receivedBundle ?? offlineReceivedBundle
+        let hasExisting = incoming?.accounts.contains {
+            existingAccount(for: $0.config) != nil
+        } ?? false
+        guard !isWorking, incoming != nil, hasExisting else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.replace-existing")
+        }
+        replaceExisting = value
+    }
+
+    private func setImportSettings(_ value: Bool) throws {
+        let incoming = session.receivedBundle ?? offlineReceivedBundle
+        guard !isWorking, incoming != nil, !(incoming?.settings.isEmpty ?? true) else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.import-settings")
+        }
+        importSettings = value
+    }
+
+    private func setOfflinePassphrase(_ value: String) throws {
+        guard !isWorking, offlineImportData != nil else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.offline-passphrase")
+        }
+        offlinePassphrase = value
+    }
+
     private func cancelActiveImport() {
         importOperationID = UUID()
         importTask?.cancel()
@@ -811,13 +1199,6 @@ struct PairingView: View {
         isScannerPresented = false
     }
 
-    private func cancelAndDismiss() {
-        cancelActiveImport()
-        cancelActiveSession()
-        isScannerPresented = false
-        clearOfflineTransfer()
-        dismiss()
-    }
 
     private func resetForFreshPairing() {
         cancelActiveImport()
@@ -833,14 +1214,29 @@ struct PairingView: View {
         isWorking = false
     }
 
-    private func confirmImport(_ bundle: PairingBundle, isOffline: Bool = false) {
-        guard !isWorking, !selectedAccountIDs.isEmpty, !didConfirmImport else { return }
+    private func confirmImport(
+        _ bundle: PairingBundle,
+        selectedAccountIDs: Set<AccountID>,
+        replaceExisting: Bool,
+        importSettings: Bool,
+        isOffline: Bool
+    ) throws {
+        guard !isWorking, !selectedAccountIDs.isEmpty, !didConfirmImport else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.confirm-import")
+        }
+        let availableIDs = Set(bundle.accounts.map(\.id))
+        guard selectedAccountIDs.isSubset(of: availableIDs) else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.confirm-import")
+        }
         isWorking = true
         viewError = nil
         didConfirmImport = true
         let operationID = UUID()
         importOperationID = operationID
         let pairingSession = session
+        let selectedIDs = selectedAccountIDs
+        let replaceValue = replaceExisting
+        let importSettingsValue = importSettings
         let task = Task { @MainActor in
             defer {
                 if importOperationID == operationID {
@@ -849,7 +1245,7 @@ struct PairingView: View {
                 }
             }
             do {
-                try await importBundle(bundle, selectedAccountIDs, replaceExisting, importSettings)
+                try await importBundle(bundle, selectedIDs, replaceValue, importSettingsValue)
                 try Task.checkCancellation()
                 guard importOperationID == operationID else { return }
                 if isOffline {
@@ -872,14 +1268,18 @@ struct PairingView: View {
         importTask = task
     }
 
-    private func scanDifferentCode() {
-        guard !isWorking else { return }
+    private func scanDifferentCode() throws {
+        guard !isWorking, (session.state == .advertising || session.state == .connecting) else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.scan-different-code")
+        }
         resetForFreshPairing()
         isScannerPresented = true
     }
     #if os(macOS)
-    private func scanDifferentImage() {
-        guard !isWorking else { return }
+    private func scanDifferentImage() throws {
+        guard !isWorking, (session.state == .advertising || session.state == .connecting) else {
+            throw PairingAutomationBridge.BridgeError.disabledAction("pairing.scan-different-image")
+        }
         resetForFreshPairing()
         isImageImporterPresented = true
     }
@@ -902,7 +1302,7 @@ struct PairingView: View {
             guard let url = urls.first else { return }
             do {
                 let code = try PairingQRScanner.qrString(from: url)
-                join(code)
+                dispatch(.join(qrString: code))
             } catch {
                 viewError = error.localizedDescription
             }
@@ -1160,6 +1560,7 @@ private struct PairingAccountSelectionList: View {
     let accounts: [AccountConfig]
     @Binding var selectedIDs: Set<AccountID>
     let emptyMessage: String
+    let onSelectionChange: @MainActor ([AccountID]) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1192,7 +1593,13 @@ private struct PairingAccountSelectionList: View {
         Binding(
             get: { selectedIDs.contains(id) },
             set: { isSelected in
-                if isSelected { selectedIDs.insert(id) } else { selectedIDs.remove(id) }
+                var updated = selectedIDs
+                if isSelected {
+                    updated.insert(id)
+                } else {
+                    updated.remove(id)
+                }
+                onSelectionChange(updated.sorted { $0.rawValue < $1.rawValue })
             }
         )
     }
@@ -1202,7 +1609,7 @@ private struct PairingIncomingAccountList: View {
     let accounts: [PairingAccount]
     @Binding var selectedIDs: Set<AccountID>
     let existingIDs: Set<AccountID>
-
+    let onSelectionChange: @MainActor ([AccountID]) -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Accounts received")
@@ -1239,7 +1646,13 @@ private struct PairingIncomingAccountList: View {
         Binding(
             get: { selectedIDs.contains(id) },
             set: { isSelected in
-                if isSelected { selectedIDs.insert(id) } else { selectedIDs.remove(id) }
+                var updated = selectedIDs
+                if isSelected {
+                    updated.insert(id)
+                } else {
+                    updated.remove(id)
+                }
+                onSelectionChange(updated.sorted { $0.rawValue < $1.rawValue })
             }
         )
     }

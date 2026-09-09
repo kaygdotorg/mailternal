@@ -10,7 +10,7 @@ struct ReaderTabItem: View {
     let sender: String?
     let width: CGFloat
 
-    let onHoverChanged: (Bool) -> Void
+    let onHoverChanged: (Bool, NSView?) -> Void
     /// Optional owner hook records the user's activation boundary before the
     /// model swaps the active retained reader surface.
     var onTabCommand: (() -> Void)? = nil
@@ -20,7 +20,9 @@ struct ReaderTabItem: View {
 
 
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovered = false
+    @State private var nativeAnchor = ReaderTabNativeAnchor()
 
     private var isActive: Bool { model.tabs.activeID == tab.id }
     private var isTransient: Bool { tab.isTransient }
@@ -118,11 +120,12 @@ struct ReaderTabItem: View {
                 .simultaneousGesture(
                     TapGesture(count: 2)
                         .onEnded {
-                            if isTransient { model.tabs.keep(tab.id) }
+                            if isTransient { model.keepTab(tab.id) }
                         }
                 )
             }
         }
+        .animation(reduceMotion ? nil : MailMotion.hover, value: isHovered)
         .frame(width: width, height: 32)
         .modifier(
             ReaderTabGlassModifier(
@@ -143,13 +146,14 @@ struct ReaderTabItem: View {
         .onContinuousHover { phase in
             switch phase {
             case .active:
-                guard !isHovered else { return }
-                isHovered = true
-                onHoverChanged(true)
+                if !isHovered { isHovered = true }
+                // A real pointer move after scrolling can request the preview
+                // without requiring an exit/re-entry of this same tab.
+                onHoverChanged(true, nativeAnchor.view)
             case .ended:
                 guard isHovered else { return }
                 isHovered = false
-                onHoverChanged(false)
+                onHoverChanged(false, nativeAnchor.view)
             }
         }
         .contextMenu {
@@ -158,14 +162,14 @@ struct ReaderTabItem: View {
             }
             Button("Close Others", systemImage: "rectangle.on.rectangle") {
                 let wasActive = model.tabs.activeID == tab.id
-                model.tabs.closeOthers(tab.id)
+                model.closeOtherTabs(tab.id)
                 if !wasActive {
                     model.activateTab(tab.id)
                 }
             }
             Button("Close to the Right", systemImage: "rectangle.rightthird.inset.filled") {
                 let previousActiveID = model.tabs.activeID
-                model.tabs.closeToRight(tab.id)
+                model.closeTabsToRight(tab.id)
                 if model.tabs.activeID != previousActiveID,
                    let activeID = model.tabs.activeID {
                     model.activateTab(activeID)
@@ -173,11 +177,16 @@ struct ReaderTabItem: View {
             }
             if isTransient {
                 Button("Keep", systemImage: "pin") {
-                    model.tabs.keep(tab.id)
+                    model.keepTab(tab.id)
                 }
             }
             Divider()
-            Picker("Tab Style", selection: Bindable(model.appearance).tabStyle) {
+            Picker("Tab Style", selection: Binding(
+                get: { model.appearance.tabStyle },
+                set: { style in
+                    model.dispatchFromUI(.setSetting(AutomationPreferences.Keys.tabStyle, style.rawValue))
+                }
+            )) {
                 ForEach(ReaderTabStyle.allCases, id: \.self) { style in
                     Text(style.label).tag(style)
                 }
@@ -191,7 +200,7 @@ struct ReaderTabItem: View {
             }
         }
         .background {
-            ReaderTabMiddleClickMonitor {
+            ReaderTabMiddleClickMonitor(anchor: nativeAnchor) {
                 closeTab()
             }
         }
@@ -220,7 +229,7 @@ private struct ReaderTabFocusModifier: ViewModifier {
 }
 
 /// Active tab: the text-background colour — white in light mode, near-black
-/// in dark mode — so the selected pill is the one solid surface on the clear
+/// in dark mode — so the selected row is the one solid surface on the clear
 /// strip; hover keeps the quaternary wash.
 private struct ReaderTabGlassModifier: ViewModifier {
     let isActive: Bool
@@ -229,7 +238,11 @@ private struct ReaderTabGlassModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content.background {
-            Capsule().fill(fill)
+            RoundedRectangle(
+                cornerRadius: AppShapeScale.row,
+                style: .continuous
+            )
+            .fill(fill)
         }
     }
 
@@ -245,21 +258,32 @@ private struct ReaderTabGlassModifier: ViewModifier {
 }
 
 
+/// Reuses the middle-click view as a weak native popover anchor. Resolving its
+/// visible bounds at presentation avoids lazy-stack position estimates and
+/// per-frame SwiftUI geometry publication.
+@MainActor
+private final class ReaderTabNativeAnchor {
+    weak var view: NSView?
+}
+
 /// AppKit receives middle-button events before SwiftUI's button gesture system.
 /// A local monitor lets the tab keep normal left-click/context-menu behavior
 /// while consuming only a middle click inside this tab's bounds.
 @MainActor
 private struct ReaderTabMiddleClickMonitor: NSViewRepresentable {
+    let anchor: ReaderTabNativeAnchor
     let action: () -> Void
 
     func makeNSView(context: Context) -> ReaderTabMiddleClickView {
         let view = ReaderTabMiddleClickView()
         view.action = action
+        anchor.view = view
         return view
     }
 
     func updateNSView(_ nsView: ReaderTabMiddleClickView, context: Context) {
         nsView.action = action
+        anchor.view = nsView
     }
 }
 

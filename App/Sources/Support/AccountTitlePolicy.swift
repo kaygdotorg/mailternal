@@ -81,15 +81,9 @@ enum AccountsListPolicy {
             .error(message: message)
         }
     }
-    static func committedName(input: String, email: String) -> String {
-        AccountTitlePolicy.committedName(input: input, email: email)
-    }
 
     static func nextExpandedID(current: AccountID?, requested: AccountID) -> AccountID? {
         current == requested ? nil : requested
     }
 
-    static func removesBlankRow(rowID: AccountID, blankID: AccountID) -> Bool {
-        rowID == blankID
-    }
 }

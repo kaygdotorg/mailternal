@@ -222,3 +222,41 @@ private final class MigrationProgressCapture: @unchecked Sendable {
         #expect(migrated.isEnabled)
     }
 }
+
+@Test func outgoingAttachmentLifecycleMigrationBackfillsSchema() async throws {
+    try await withStore { store, _ in
+        let attachmentColumns = try await store.read { db in
+            try db.columns(in: "draft_attachments").map(\.name)
+        }
+        #expect(attachmentColumns.contains("unreferenced_at"))
+        #expect(attachmentColumns.contains("reclaiming_at"))
+        let tables = try await store.read { db in
+            try String.fetchAll(
+                db,
+                sql: """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name IN ('attachment_references', 'attachment_import_reservations')
+                    ORDER BY name
+                    """
+            )
+        }
+        #expect(tables == ["attachment_import_reservations", "attachment_references"])
+        let indexes = try await store.read { db in
+            try String.fetchAll(
+                db,
+                sql: """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'index'
+                      AND name IN (
+                          'attachment_references_attachment_idx',
+                          'attachment_references_account_idx',
+                          'attachment_references_source_idx',
+                          'draft_attachments_staging_idx'
+                      )
+                    """
+            )
+        }
+        #expect(Set(indexes).count == 4)
+    }
+}

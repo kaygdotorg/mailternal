@@ -17,8 +17,10 @@ package protocol IMAPClient: Sendable {
     func storeFlags(uids: IMAPUIDSet, flag: FlagKind, set: Bool) async throws
     /// Historical convenience retained for existing callers.
     func storeSeen(uids: IMAPUIDSet) async throws
-    func move(uids: IMAPUIDSet, to mailbox: String) async throws
-    func copy(uids: IMAPUIDSet, to mailbox: String) async throws
+    /// Returns exact destination UIDs from COPYUID/MOVE when the server
+    /// supplied a valid response code; nil means the identity is unavailable.
+    func move(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping?
+    func copy(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping?
     func storeDeleted(uids: IMAPUIDSet) async throws
     func renameMailbox(from source: String, to destination: String) async throws
     func expunge(uids: IMAPUIDSet) async throws
@@ -52,10 +54,10 @@ struct LiveIMAPClient: IMAPClient {
         try await session.storeFlags(uids: uids, flag: flag, set: set)
     }
     func storeSeen(uids: IMAPUIDSet) async throws { try await session.storeSeen(uids: uids) }
-    func move(uids: IMAPUIDSet, to mailbox: String) async throws {
+    func move(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping? {
         try await session.move(uids: uids, to: mailbox)
     }
-    func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
+    func copy(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping? {
         try await session.copy(uids: uids, to: mailbox)
     }
     func storeDeleted(uids: IMAPUIDSet) async throws {
@@ -200,10 +202,10 @@ actor SyncChannel {
         expectedUIDValidity: UInt32?,
         uids: IMAPUIDSet,
         destination: String
-    ) async throws {
+    ) async throws -> IMAPCopyUIDMapping? {
         try await withCommand {
             try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
-            try await self.client.move(uids: uids, to: destination)
+            return try await self.client.move(uids: uids, to: destination)
         }
     }
 
@@ -213,10 +215,10 @@ actor SyncChannel {
         expectedUIDValidity: UInt32?,
         uids: IMAPUIDSet,
         destination: String
-    ) async throws {
+    ) async throws -> IMAPCopyUIDMapping? {
         try await withCommand {
             try await self.ensureSelectedUnlocked(path, expectedUIDValidity: expectedUIDValidity)
-            try await self.client.copy(uids: uids, to: destination)
+            return try await self.client.copy(uids: uids, to: destination)
         }
     }
 

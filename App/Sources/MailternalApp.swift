@@ -2,6 +2,26 @@ import AppKit
 import SwiftUI
 import MailternalInterfaces
 
+/// Arguments consumed by the bundled app when it is launched as the local
+/// automation engine. They intentionally use a separate namespace from QA
+/// switches so a normal GUI launch cannot accidentally become headless.
+enum MailternalLaunchOptions {
+    static var arguments: [String] { ProcessInfo.processInfo.arguments }
+
+    static var isHeadlessEngine: Bool {
+        arguments.contains("--mailternal-engine")
+    }
+
+    static var containerURL: URL? {
+        guard let index = arguments.firstIndex(of: "--mailternal-container"),
+              arguments.indices.contains(arguments.index(after: index))
+        else { return nil }
+        let raw = arguments[arguments.index(after: index)]
+        guard !raw.isEmpty else { return nil }
+        return URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
+    }
+}
+
 @main
 struct MailternalApp: App {
     @NSApplicationDelegateAdaptor(MailternalAppDelegate.self) private var appDelegate
@@ -30,19 +50,37 @@ struct MailternalApp: App {
                 QALaunch.log("live facade container=\(qaConfig?.containerRoot.path ?? "")")
                 return qa
             }
+            if let containerURL = MailternalLaunchOptions.containerURL {
+                QALaunch.log("headless engine container=\(containerURL.path)")
+                return try LiveMailFacade(
+                    container: MailternalContainer(root: containerURL),
+                    enableNotifications: false
+                )
+            }
             return try LiveMailFacade()
         } catch {
             fatalError("Could not open the Mailternal store: \(error)")
         }
     }
-
     var body: some Scene {
         Settings {
             EmptyView()
         }
         .defaultLaunchBehavior(.suppressed)
         .commands {
-            CommandGroup(replacing: .newItem) {}
+            CommandGroup(replacing: .newItem) {
+                Button("New Message") {
+                    let account = model.folders.first { $0.id == model.selectedFolderID }?.accountID
+                    Task { await model.composer.newMessage(preferredAccountID: account) }
+                }
+                .keyboardShortcut("n")
+                .disabled(model.accountConfigs.isEmpty || model.composer.isOpening)
+                Button("Drafts & Outbox") {
+                    Task { await model.composer.showLibrary() }
+                }
+                .keyboardShortcut("o", modifiers: [.command, .shift])
+                .disabled(model.accountConfigs.isEmpty)
+            }
             CommandGroup(after: .textEditing) {
                 Button("Find in Message") {
                     appDelegate.showMainWindow()
@@ -151,7 +189,12 @@ struct MailternalApp: App {
                 }
                 .keyboardShortcut("d", modifiers: [.command, .option])
                 .disabled(model.selectedMessageIDs.count != 1)
-                Picker("Tab Style", selection: $appearance.tabStyle) {
+                Picker("Tab Style", selection: Binding(
+                    get: { appearance.tabStyle },
+                    set: { style in
+                        model.dispatchFromUI(.setSetting(AutomationPreferences.Keys.tabStyle, style.rawValue))
+                    }
+                )) {
                     ForEach(ReaderTabStyle.allCases) { style in
                         Text(style.label).tag(style)
                     }
@@ -214,18 +257,21 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
         pendingActions = actions
     }
 
-    func applicationWillFinishLaunching(_ notification: Notification) {
+    private var isHeadlessLaunch: Bool {
+        if MailternalLaunchOptions.isHeadlessEngine { return true }
         #if DEBUG
         if let qa = QALaunch.parse(), qa.openWindowLink == nil,
            !ProcessInfo.processInfo.arguments.contains("-qa-gui") {
-            // SSH/headless: no WindowServer. Don't activate a UI session.
-            NSApp.setActivationPolicy(.prohibited)
-        } else {
-            NSApp.setActivationPolicy(.regular)
+            return true
         }
-        #else
-        NSApp.setActivationPolicy(.regular)
         #endif
+        return false
+    }
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // An engine is a real app runtime without a UI session. In particular,
+        // never call activateIgnoringOtherApps or construct a window here.
+        NSApp.setActivationPolicy(isHeadlessLaunch ? .prohibited : .regular)
         if let model = Self.pendingModel,
            let appearance = Self.pendingAppearance,
            let actions = Self.pendingActions {
@@ -237,27 +283,32 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         QALaunch.launchPhase("did-finish-launching")
-        #if DEBUG
-        if let qa = QALaunch.parse(), qa.openWindowLink == nil,
-           !ProcessInfo.processInfo.arguments.contains("-qa-gui") {
-            // SwiftUI `.task` on MainSplitRoot may never fire without a rendered
-            // window. Drive restore/engine from the delegate instead.
+        QAInteractionProfile.installIfRequested()
+        if isHeadlessLaunch {
             QALaunch.log(
                 "headless launch pid=\(ProcessInfo.processInfo.processIdentifier) footprint=\(QALaunch.footprintBytes())"
             )
             model?.start()
+            // Start the authenticated listener before clients issue their first
+            // request, while leaving all window construction on the GUI path.
+            model?.startAutomation()
+            #if DEBUG
             if let count = QALaunch.parse()?.benchSelectCount {
                 model?.runQABenchSelect(count: count)
             }
-            openQAMessageWindowIfRequested()
+            if !MailternalLaunchOptions.isHeadlessEngine {
+                openQAMessageWindowIfRequested()
+            }
+            #endif
             return
         }
-        #endif
         showMainWindow()
+        model?.startAutomation()
         #if DEBUG
         openQAMessageWindowIfRequested()
         #endif
     }
+
     func applicationDidBecomeActive(_ notification: Notification) {
         model?.workspaceSync.didBecomeActive()
     }
@@ -268,6 +319,7 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
 
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !isHeadlessLaunch else { return false }
         showMainWindow()
         return true
     }
@@ -296,14 +348,16 @@ final class MailternalAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showMainWindow() {
-        guard let model, let appearance, let actions else { return }
+        guard !isHeadlessLaunch,
+              let model, let appearance, let actions
+        else { return }
         QALaunch.launchPhase("shell-show-begin")
         MainWindowController.shared.show(model: model, appearance: appearance, actions: actions)
         QALaunch.launchPhase("shell-show-end")
     }
 
     func toggleSidebar() {
-        guard let model else { return }
+        guard !isHeadlessLaunch, let model else { return }
         showMainWindow()
         model.toggleSidebar()
     }

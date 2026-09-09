@@ -98,6 +98,26 @@ struct FolderSidebar: View {
                 .allowsHitTesting(false)
         }
         .mailWindowDissolve(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                Button {
+                    Task { await model.composer.showLibrary() }
+                } label: {
+                    Label("Drafts & Outbox", systemImage: "tray.and.arrow.up")
+                        .lineLimit(1)
+                }
+                .disabled(model.accountConfigs.isEmpty)
+                Spacer(minLength: 8)
+                MailComposeButton(
+                    controller: model.composer,
+                    preferredAccountID: model.folders.first { $0.id == model.selectedFolderID }?.accountID
+                )
+                .labelStyle(.iconOnly)
+                .help("New Message")
+            }
+            .buttonStyle(.borderless)
+            .padding(12)
+        }
         .popover(item: $inspectorFolder, arrowEdge: .trailing) { folder in
             FolderInspector(folder: folder)
         }
@@ -147,7 +167,7 @@ struct FolderSidebar: View {
             onKeepLocally: { folder, keep in
                 Task { @MainActor in
                     do {
-                        try await model.facade.setKeepLocally(keep, for: folder.id)
+                        try await model.setKeepLocally(folder.id, keep)
                     } catch {
                         model.toasts.post(
                             title: "Couldn’t update cache setting",

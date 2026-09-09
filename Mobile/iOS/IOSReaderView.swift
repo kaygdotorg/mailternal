@@ -4,6 +4,9 @@ import WebKit
 import MailternalInterfaces
 import MailternalSanitizer
 
+/// Presents the selected message as a reading-first surface while keeping
+/// diagnostic views available through the native More menu. The subject belongs
+/// to the reading content, not a second large navigation heading.
 struct IOSReaderView: View {
     @Bindable var state: IOSAppState
     @State private var section: ReaderSection = .body
@@ -19,6 +22,8 @@ struct IOSReaderView: View {
     @State private var nextAttachmentGeneration: UInt64 = 0
     @State private var rawSourceTask: Task<Void, Never>?
     @State private var htmlIsolationError: String?
+
+    /// The reader's primary message view and its explicitly requested diagnostics.
     enum ReaderSection: String, CaseIterable, Identifiable {
         case body
         case headers
@@ -26,6 +31,13 @@ struct IOSReaderView: View {
         var id: String { rawValue }
         var title: String {
             switch self { case .body: "Message"; case .headers: "Headers"; case .source: "Raw Source" }
+        }
+        var systemImage: String {
+            switch self {
+            case .body: "envelope.open"
+            case .headers: "list.bullet.rectangle"
+            case .source: "doc.plaintext"
+            }
         }
     }
 
@@ -43,7 +55,8 @@ struct IOSReaderView: View {
                 }
             }
         }
-        .navigationTitle(state.detail?.envelope.subject.isEmpty == false ? state.detail?.envelope.subject ?? "Reader" : "Reader")
+        .navigationTitle("Reader")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button { Task { await state.openAdjacent(delta: -1) } } label: { Label("Previous", systemImage: "chevron.up") }
@@ -51,6 +64,18 @@ struct IOSReaderView: View {
                 Button { Task { await state.openAdjacent(delta: 1) } } label: { Label("Next", systemImage: "chevron.down") }
                     .disabled(!state.canNavigateNext)
                 Menu {
+                    if let id = state.selectedMessageID {
+                        Button { Task { await state.composer.reply(to: id, all: false) } } label: {
+                            Label("Reply", systemImage: "arrowshape.turn.up.left")
+                        }
+                        Button { Task { await state.composer.reply(to: id, all: true) } } label: {
+                            Label("Reply All", systemImage: "arrowshape.turn.up.left.2")
+                        }
+                        Button { Task { await state.composer.forward(id) } } label: {
+                            Label("Forward", systemImage: "arrowshape.turn.up.right")
+                        }
+                        Divider()
+                    }
                     Button {
                         let flagged = state.selectedMessageIsFlagged
                         let ids = state.selectedMessageID.map { Set([$0]) } ?? []
@@ -65,6 +90,20 @@ struct IOSReaderView: View {
                     Button(role: .destructive) { Task { await state.trashSelected(state.selectedMessageID.map { Set([$0]) }) } } label: { Label("Trash", systemImage: "trash") }
                     Divider()
                     Button("Refresh") { Task { await state.refresh() } }
+                    Divider()
+                    Section("Reader view") {
+                        Picker("Reader view", selection: $section) {
+                            ForEach(ReaderSection.allCases) { view in
+                                Label(view.title, systemImage: view.systemImage).tag(view)
+                            }
+                        }
+                        .accessibilityLabel("Reader view")
+                    }
+                    if section != .body {
+                        Button { section = .body } label: {
+                            Label("Return to Message", systemImage: "arrow.uturn.backward")
+                        }
+                    }
                 } label: {
                     Label("More", systemImage: "ellipsis")
                 }
@@ -107,12 +146,23 @@ struct IOSReaderView: View {
                         }
                     }
                 }
-                IOSEnvelopeView(envelope: detail.envelope, expanded: $showHeaders)
-                Picker("Reader section", selection: $section) {
-                    ForEach(ReaderSection.allCases) { Text($0.title).tag($0) }
+                IOSEnvelopeView(
+                    envelope: detail.envelope,
+                    showSenderIcons: state.showSenderIcons,
+                    expanded: $showHeaders
+                )
+                if section != .body {
+                    HStack(alignment: .center, spacing: 12) {
+                        Label(section.title, systemImage: section.systemImage)
+                            .font(.headline)
+                            .accessibilityAddTraits(.isHeader)
+                        Spacer(minLength: 0)
+                        Button("Return to Message") { section = .body }
+                            .buttonStyle(.borderless)
+                            .frame(minHeight: 44)
+                    }
+                    .accessibilityElement(children: .contain)
                 }
-                .pickerStyle(.segmented)
-                .accessibilityLabel("Reader section")
                 switch section {
                 case .body:
                     bodyView(detail)
@@ -167,6 +217,8 @@ struct IOSReaderView: View {
         }
     }
 
+    /// Keeps ordinary reading in the body path; HTML remains unconstrained while
+    /// plain text receives the design language's 490-point readable measure.
     @ViewBuilder
     private func bodyView(_ detail: MessageDetail) -> some View {
         if detail.hasRemoteImageReferences && !state.remoteImagesAllowed.contains(detail.id) {
@@ -177,15 +229,13 @@ struct IOSReaderView: View {
                     Text("Remote images are blocked")
                         .font(.subheadline.weight(.semibold))
                     Text("Loading them can reveal when and where this message is opened.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                     Button("Load Remote Images") { state.setRemoteImagesAllowed(true) }
                         .buttonStyle(.bordered)
-                        .controlSize(.small)
+                        .controlSize(.regular)
                 }
             }
             .padding(14)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         if detail.isQuarantined {
             VStack(alignment: .leading, spacing: 8) {
@@ -196,7 +246,7 @@ struct IOSReaderView: View {
                     .foregroundStyle(.secondary)
                 Button("Inspect Capped Raw Source") { section = .source }
                     .buttonStyle(.bordered)
-                    .controlSize(.small)
+                    .controlSize(.regular)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(14)
@@ -235,6 +285,7 @@ struct IOSReaderView: View {
                 .lineSpacing(4)
                 .textSelection(.enabled)
                 .textCase(nil)
+                .frame(maxWidth: 490, alignment: .leading)
         } else {
             Text("This message has no locally stored body.")
                 .font(.body)
@@ -297,48 +348,112 @@ struct IOSReaderView: View {
 
 }
 
+/// Shows the envelope as compact, individually copyable native targets.
 private struct IOSEnvelopeView: View {
     let envelope: Envelope
+    let showSenderIcons: Bool
     @Binding var expanded: Bool
+    @Environment(\.layoutDirection) private var layoutDirection
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 10) {
-                Text("From").font(.caption).foregroundStyle(.secondary).frame(width: 48, alignment: .leading)
-                Text(addresses(envelope.from)).font(.subheadline).textSelection(.enabled)
-                Spacer()
-            }
-            HStack(alignment: .top, spacing: 10) {
-                Text("To").font(.caption).foregroundStyle(.secondary).frame(width: 48, alignment: .leading)
-                Text(addresses(envelope.to)).font(.subheadline).textSelection(.enabled)
-                Spacer()
-            }
+        VStack(alignment: .leading, spacing: 10) {
+            addressRow("From", values: envelope.from, role: "sender", row: .sender)
+            addressRow("To", values: envelope.to, role: "recipient", row: .recipient)
             if expanded {
                 if !envelope.cc.isEmpty {
-                    HStack(alignment: .top, spacing: 10) {
-                        Text("Cc").font(.caption).foregroundStyle(.secondary).frame(width: 48, alignment: .leading)
-                        Text(addresses(envelope.cc)).font(.subheadline).textSelection(.enabled)
-                    }
+                    detailRow("Cc", addresses(envelope.cc))
                 }
                 if !envelope.replyTo.isEmpty {
-                    HStack(alignment: .top, spacing: 10) {
-                        Text("Reply-To").font(.caption).foregroundStyle(.secondary).frame(width: 48, alignment: .leading)
-                        Text(addresses(envelope.replyTo)).font(.subheadline).textSelection(.enabled)
-                    }
+                    detailRow("Reply-To", addresses(envelope.replyTo))
                 }
                 if let headerDate = envelope.headerDate {
-                    HStack(spacing: 10) {
-                        Text("Date").font(.caption).foregroundStyle(.secondary).frame(width: 48, alignment: .leading)
-                        Text(headerDate.formatted(date: .complete, time: .shortened)).font(.subheadline)
-                    }
+                    detailRow("Date", headerDate.formatted(date: .complete, time: .shortened))
                 }
             }
             Button(expanded ? "Hide details" : "Show details") { expanded.toggle() }
                 .font(.caption)
-                .buttonStyle(.plain)
+                .buttonStyle(.borderless)
                 .foregroundStyle(.tint)
+                .frame(minHeight: 44, alignment: .leading)
+                .accessibilityLabel(expanded ? "Hide message details" : "Show message details")
         }
-        .padding(14)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 14)
+        .padding(.leading, 30)
         .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .coordinateSpace(name: "envelope")
+        .overlayPreferenceValue(IOSEnvelopeRowCenterPreferenceKey.self) { centers in
+            GeometryReader { proxy in
+                if let senderY = centers[.sender], let recipientY = centers[.recipient] {
+                    IOSEnvelopeConnectorShape(senderY: senderY, recipientY: recipientY)
+                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                        .frame(width: 24, height: proxy.size.height)
+                        .scaleEffect(x: layoutDirection == .rightToLeft ? -1 : 1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func addressRow(
+        _ label: String,
+        values: [MailAddress],
+        role: String,
+        row: IOSEnvelopeRow
+    ) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize()
+                .padding(.top, 12)
+            IOSAddressTargetLayout(
+                horizontalSpacing: 8,
+                verticalSpacing: 8,
+                layoutDirection: layoutDirection
+            ) {
+                if values.isEmpty {
+                    Text(role == "sender" ? "Unknown sender" : "No recipients")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ForEach(Array(values.enumerated()), id: \.offset) { _, address in
+                        IOSAddressCopyTarget(
+                            address: address,
+                            role: role,
+                            showsMonogram: showSenderIcons
+                        )
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: IOSEnvelopeRowCenterPreferenceKey.self,
+                    value: [row: proxy.frame(in: .named("envelope")).midY]
+                )
+            }
+        }
+    }
+
+    private func detailRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize()
+            Text(value)
+                .font(.subheadline)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     private func addresses(_ values: [MailAddress]) -> String {
@@ -346,6 +461,214 @@ private struct IOSEnvelopeView: View {
             if let name = address.displayName, !name.isEmpty { return "\(name) <\(address.address)>" }
             return address.address
         }.joined(separator: ", ")
+    }
+}
+
+private enum IOSEnvelopeRow: Hashable {
+    case sender
+    case recipient
+}
+
+private struct IOSEnvelopeRowCenterPreferenceKey: PreferenceKey {
+    static let defaultValue: [IOSEnvelopeRow: CGFloat] = [:]
+
+    static func reduce(
+        value: inout [IOSEnvelopeRow: CGFloat],
+        nextValue: () -> [IOSEnvelopeRow: CGFloat]
+    ) {
+        for (row, center) in nextValue() {
+            value[row] = center
+        }
+    }
+}
+
+/// Draws the static rounded sender-to-recipient direction connector.
+private struct IOSEnvelopeConnectorShape: Shape {
+    let senderY: CGFloat
+    let recipientY: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let leftX = min(7, rect.width / 3)
+        let tipX = max(leftX + 2, rect.width - 2)
+        let radius = min(6, max(2, abs(recipientY - senderY) / 2))
+        var path = Path()
+        path.move(to: CGPoint(x: tipX, y: senderY))
+        path.addLine(to: CGPoint(x: leftX + radius, y: senderY))
+        if recipientY >= senderY {
+            path.addQuadCurve(
+                to: CGPoint(x: leftX, y: senderY + radius),
+                control: CGPoint(x: leftX, y: senderY)
+            )
+            path.addLine(to: CGPoint(x: leftX, y: recipientY - radius))
+            path.addQuadCurve(
+                to: CGPoint(x: leftX + radius, y: recipientY),
+                control: CGPoint(x: leftX, y: recipientY)
+            )
+        } else {
+            path.addQuadCurve(
+                to: CGPoint(x: leftX, y: senderY - radius),
+                control: CGPoint(x: leftX, y: senderY)
+            )
+            path.addLine(to: CGPoint(x: leftX, y: recipientY + radius))
+            path.addQuadCurve(
+                to: CGPoint(x: leftX + radius, y: recipientY),
+                control: CGPoint(x: leftX, y: recipientY)
+            )
+        }
+        path.addLine(to: CGPoint(x: tipX, y: recipientY))
+        path.move(to: CGPoint(x: tipX - 8, y: recipientY - 5))
+        path.addLine(to: CGPoint(x: tipX, y: recipientY))
+        path.addLine(to: CGPoint(x: tipX - 8, y: recipientY + 5))
+        return path
+    }
+}
+
+/// A content-sized native copy button that copies only the exact address value.
+private struct IOSAddressCopyTarget: View {
+    let address: MailAddress
+    let role: String
+    let showsMonogram: Bool
+
+    var body: some View {
+        Button {
+            UIPasteboard.general.string = address.address
+        } label: {
+            HStack(alignment: .center, spacing: 8) {
+                if showsMonogram {
+                    Text(monogram)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tint)
+                        .frame(width: 28, height: 28)
+                        .background(Color.accentColor.opacity(0.12), in: Circle())
+                        .accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    if let displayName = address.displayName, !displayName.isEmpty {
+                        Text(displayName)
+                            .font(.subheadline.weight(.semibold))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(address.address)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .multilineTextAlignment(.leading)
+            }
+        }
+        .buttonStyle(.bordered)
+        .frame(minHeight: 44)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Copy \(role) address")
+        .accessibilityValue(address.address)
+        .accessibilityHint("Copies the exact email address")
+    }
+
+    private var monogram: String {
+        let source = address.displayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? address.displayName!
+            : address.address.split(separator: "@", maxSplits: 1).first.map(String.init) ?? address.address
+        let words = source.split(whereSeparator: { $0.isWhitespace })
+        let initials = words.prefix(2).compactMap { $0.first.map(String.init) }.joined()
+        return (initials.isEmpty ? String(source.prefix(2)) : initials).uppercased()
+    }
+}
+
+/// Wraps address targets without stretching short targets into unused reader width.
+private struct IOSAddressTargetLayout: Layout {
+    let horizontalSpacing: CGFloat
+    let verticalSpacing: CGFloat
+    let layoutDirection: LayoutDirection
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        let availableWidth = proposal.width ?? .infinity
+        let sizes = targetSizes(subviews, availableWidth: availableWidth)
+        var lineWidth: CGFloat = 0
+        var lineHeight: CGFloat = 0
+        var totalHeight: CGFloat = 0
+        var maxLineWidth: CGFloat = 0
+        for size in sizes {
+            if lineWidth > 0, lineWidth + horizontalSpacing + size.width > availableWidth {
+                maxLineWidth = max(maxLineWidth, lineWidth)
+                totalHeight += lineHeight + verticalSpacing
+                lineWidth = 0
+                lineHeight = 0
+            }
+            lineWidth = lineWidth == 0 ? size.width : lineWidth + horizontalSpacing + size.width
+            lineHeight = max(lineHeight, size.height)
+        }
+        maxLineWidth = max(maxLineWidth, lineWidth)
+        totalHeight += lineHeight
+        return CGSize(
+            width: proposal.width.map { min($0, maxLineWidth) } ?? maxLineWidth,
+            height: totalHeight
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        let sizes = targetSizes(subviews, availableWidth: bounds.width)
+        var y = bounds.minY
+        var lineHeight: CGFloat = 0
+        if layoutDirection == .rightToLeft {
+            var x = bounds.maxX
+            for (index, subview) in subviews.enumerated() {
+                let size = sizes[index]
+                if x < bounds.maxX, x - horizontalSpacing - size.width < bounds.minX {
+                    x = bounds.maxX
+                    y += lineHeight + verticalSpacing
+                    lineHeight = 0
+                }
+                if x < bounds.maxX {
+                    x -= horizontalSpacing
+                }
+                x -= size.width
+                subview.place(
+                    at: CGPoint(x: x + size.width / 2, y: y + size.height / 2),
+                    anchor: .center,
+                    proposal: ProposedViewSize(size)
+                )
+                lineHeight = max(lineHeight, size.height)
+            }
+        } else {
+            var x = bounds.minX
+            for (index, subview) in subviews.enumerated() {
+                let size = sizes[index]
+                if x > bounds.minX, x + horizontalSpacing + size.width > bounds.maxX {
+                    x = bounds.minX
+                    y += lineHeight + verticalSpacing
+                    lineHeight = 0
+                }
+                if x > bounds.minX {
+                    x += horizontalSpacing
+                }
+                subview.place(
+                    at: CGPoint(x: x + size.width / 2, y: y + size.height / 2),
+                    anchor: .center,
+                    proposal: ProposedViewSize(size)
+                )
+                x += size.width
+                lineHeight = max(lineHeight, size.height)
+            }
+        }
+    }
+
+    private func targetSizes(_ subviews: Subviews, availableWidth: CGFloat) -> [CGSize] {
+        subviews.map { subview in
+            let ideal = subview.sizeThatFits(.unspecified)
+            guard availableWidth.isFinite, ideal.width > availableWidth else { return ideal }
+            return subview.sizeThatFits(
+                ProposedViewSize(width: availableWidth, height: nil)
+            )
+        }
     }
 }
 
@@ -398,12 +721,14 @@ private struct IOSAttachmentsView: View {
                     if let url = urls[attachment.id] {
                         ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
                             .labelStyle(.iconOnly)
+                            .frame(minWidth: 44, minHeight: 44)
                             .accessibilityLabel("Share attachment")
                     } else {
                         Button { fetch(attachment) } label: {
                             if loadingID == attachment.id { ProgressView().controlSize(.small) }
                             else { Image(systemName: "arrow.down.circle") }
                         }
+                        .frame(minWidth: 44, minHeight: 44)
                         .accessibilityLabel("Download attachment")
                     }
                 }

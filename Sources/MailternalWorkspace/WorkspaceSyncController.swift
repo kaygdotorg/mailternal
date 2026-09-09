@@ -14,7 +14,7 @@ public enum WorkspaceSyncCategory: String, Codable, CaseIterable, Sendable {
 }
 
 /// The side to retain when a category has divergent local and iCloud values.
-public enum WorkspaceSyncChoice: Sendable {
+public enum WorkspaceSyncChoice: String, Codable, CaseIterable, Sendable {
     case local
     case cloud
 }

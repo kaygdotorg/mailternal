@@ -2,10 +2,12 @@ import Foundation
 import Security
 import MailternalInterfaces
 
-/// Generic-password Keychain for IMAP credentials.
+/// Generic-password Keychain for IMAP and account-scoped SMTP credentials.
 ///
-/// Items are `kSecClassGenericPassword` with service `org.kayg.mailternal`
-/// and `kSecAttrAccount` = `AccountID.rawValue`.
+/// IMAP items use `kSecClassGenericPassword` with service
+/// `org.kayg.mailternal` and `kSecAttrAccount` = `AccountID.rawValue`.
+/// SMTP items use the same store with an injective account-and-reference key,
+/// so a client-provided reference cannot resolve another account's secret.
 ///
 /// Production items are synchronizable iCloud Keychain records in the shared
 /// access group configured by the app's generated Info.plist. The access group
@@ -82,6 +84,27 @@ struct KeychainStore: Sendable {
         case .keychain:
             try deleteFromKeychain(account: account)
         }
+    }
+
+    /// Stores a separate SMTP password under an account-and-reference scoped
+    /// Keychain account key. The caller must never use a raw reference as the
+    /// Keychain account, preventing one account from resolving another's item.
+    func saveSMTPPassword(_ password: String, for account: AccountID, reference: String) throws {
+        try savePassword(password, for: smtpCredentialAccount(account: account, reference: reference))
+    }
+
+    func loadSMTPPassword(for account: AccountID, reference: String) throws -> String {
+        try loadPassword(for: smtpCredentialAccount(account: account, reference: reference))
+    }
+
+    func deleteSMTPPassword(for account: AccountID, reference: String) throws {
+        try deletePassword(for: smtpCredentialAccount(account: account, reference: reference))
+    }
+
+    private func smtpCredentialAccount(account: AccountID, reference: String) -> AccountID {
+        let raw = "\(account.rawValue)\u{0}\(reference)"
+        let encoded = Data(raw.utf8).base64EncodedString()
+        return AccountID(rawValue: "smtp.\(encoded)")
     }
 
     private func saveToKeychain(_ password: String, account: AccountID) throws {

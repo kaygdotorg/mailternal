@@ -22,7 +22,7 @@ func liveMoveResolvesDestinationFromStoreWithoutObservedFolders() async throws {
     #expect(outcome.skippedCrossAccountCount == 0)
     #expect(outcome.acceptedIDs == [fixture.messageID])
     #expect(try await fixture.store.accountID(for: fixture.destination) == fixture.account.id)
-    #expect(try await fixture.store.messageRef(fixture.messageID) == nil)
+    #expect(try await fixture.store.messageIDs(in: fixture.source, sort: .newest).isEmpty)
     let queued = try await fixture.store.snapshotMoveQueue()
     #expect(queued.count == 1)
     #expect(queued[0].destinationFolderID == fixture.destination)

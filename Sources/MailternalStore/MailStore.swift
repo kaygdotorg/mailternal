@@ -17,10 +17,11 @@ private func mailStoreOpenSignpost(_ phase: String) {
 
 
 /// GRDB 7 storage layer for Mailternal (spec: sync.md Storage).
-///
-/// One WAL `DatabasePool` is the single writer queue. All mutations go through
-/// `DatabasePool.write`; ValueObservation delivers after commit. List reads are
-/// keyset-paginated; FTS is an external-content table kept consistent by triggers.
+/// One WAL `DatabasePool` is the single writer queue. Ordinary mutations go
+/// through `DatabasePool.write`; outgoing mutations use the same writer queue
+/// with a scoped FULL-synchronous transaction. ValueObservation delivers after
+/// commit. List reads are keyset-paginated; FTS is an external-content table
+/// kept consistent by triggers.
 public final class MailStore: Sendable {
     /// Default attachment-cache cap: 2 GiB (spec: sync.md Attachment cache).
     public static let defaultAttachmentCacheCapBytes: Int64 = 2 * 1024 * 1024 * 1024
@@ -33,15 +34,20 @@ public final class MailStore: Sendable {
 
     let dbPool: DatabasePool
     let cachesDirectory: URL
+    /// Private durable spool beside this database (never part of the evictable cache).
+    let outgoingDirectory: URL
     let attachmentCacheCapBytes: Int64
     let observationDebounceNanoseconds: UInt64
     let observationSleep: @Sendable (Duration) async throws -> Void
     let pins: PinTracker
+    let outgoingImportRegistry: OutgoingImportRegistry
     private let observationQueue = DispatchQueue(label: "mailternal.store.observation")
 
-    /// Opens (or creates) the store at `databaseURL` with attachment files under
-    /// `cachesDirectory`. `migrationProgress` is called before each migration
-    /// body with its one-based position, total count, and identifier.
+    /// Opens (or creates) the store at `databaseURL` with evictable attachment
+    /// files under `cachesDirectory` and durable outgoing files under
+    /// `databaseURL.appendingPathExtension("outgoing")`.
+    /// `migrationProgress` is called before each migration body with its
+    /// one-based position, total count, and identifier.
     /// `openProgress` reports the synchronous open stages to an optional
     /// launch profiler; it is otherwise unused by the store.
     public convenience init(
@@ -106,13 +112,16 @@ public final class MailStore: Sendable {
         // explicit makes a future checkpoint regression visible in QA traces.
         mailStoreOpenSignpost("checkpoint-skipped")
         openProgress("checkpoint-skipped")
-
         self.dbPool = pool
         self.cachesDirectory = cachesDirectory
+        let outgoingDirectory = databaseURL.appendingPathExtension("outgoing")
+        try MailStore.prepareOutgoingDirectories(at: outgoingDirectory)
+        self.outgoingDirectory = outgoingDirectory
         self.attachmentCacheCapBytes = max(0, attachmentCacheCapBytes)
         self.observationDebounceNanoseconds = MailStore.nanoseconds(from: observationDebounce)
         self.observationSleep = observationSleep
         self.pins = PinTracker()
+        self.outgoingImportRegistry = OutgoingImportRegistry()
 
         try FileManager.default.createDirectory(at: cachesDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(
@@ -123,6 +132,36 @@ public final class MailStore: Sendable {
 
     func write<T: Sendable>(_ updates: @Sendable @escaping (Database) throws -> T) async throws -> T {
         try await dbPool.write(updates)
+    }
+
+    /// Runs one outgoing mutation in an explicit transaction while the writer
+    /// connection is temporarily in SQLite FULL synchronous mode. The pragma
+    /// is connection-local and restored after commit, leaving launch/sync
+    /// performance unchanged.
+    func durableWrite<T: Sendable>(
+        _ updates: @Sendable @escaping (Database) throws -> T
+    ) async throws -> T {
+        try await dbPool.writeWithoutTransaction { db in
+            let original = try Int.fetchOne(db, sql: "PRAGMA synchronous") ?? 1
+            try db.execute(sql: "PRAGMA synchronous = FULL")
+            var result: Result<T, Error>?
+            do {
+                try db.inTransaction {
+                    do {
+                        result = .success(try updates(db))
+                        return .commit
+                    } catch {
+                        result = .failure(error)
+                        return .rollback
+                    }
+                }
+            } catch {
+                try? db.execute(sql: "PRAGMA synchronous = \(original)")
+                throw error
+            }
+            try db.execute(sql: "PRAGMA synchronous = \(original)")
+            return try result!.get()
+        }
     }
 
     func read<T: Sendable>(_ values: @Sendable @escaping (Database) throws -> T) async throws -> T {
@@ -259,8 +298,10 @@ extension MailStore {
                 sql: """
                     INSERT INTO accounts (
                         id, account_link_id, display_name, email_address, username,
-                        imap_host, imap_port, imap_security, is_enabled
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        imap_host, imap_port, imap_security, is_enabled,
+                        smtp_host, smtp_port, smtp_security, smtp_username,
+                        smtp_credential_reference
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         display_name = excluded.display_name,
                         email_address = excluded.email_address,
@@ -268,7 +309,12 @@ extension MailStore {
                         imap_host = excluded.imap_host,
                         imap_port = excluded.imap_port,
                         imap_security = excluded.imap_security,
-                        is_enabled = excluded.is_enabled
+                        is_enabled = excluded.is_enabled,
+                        smtp_host = excluded.smtp_host,
+                        smtp_port = excluded.smtp_port,
+                        smtp_security = excluded.smtp_security,
+                        smtp_username = excluded.smtp_username,
+                        smtp_credential_reference = excluded.smtp_credential_reference
                     """,
                 arguments: [
                     config.id.rawValue,
@@ -280,6 +326,11 @@ extension MailStore {
                     config.imap.port,
                     config.imap.security.rawValue,
                     config.isEnabled,
+                    config.smtp?.host,
+                    config.smtp?.port,
+                    config.smtp?.security.rawValue,
+                    config.smtp?.username,
+                    config.smtp?.credentialReference,
                 ]
             )
         }
@@ -374,8 +425,42 @@ extension MailStore {
     }
 
     public func deleteAccount(_ id: AccountID) async throws {
-        try await write { db in
+        let root = outgoingDirectory
+        let removed = try await write { db -> (outbox: [String], attachments: [String]) in
+            let outboxIDs = try String.fetchAll(
+                db,
+                sql: "SELECT id FROM outbox WHERE account_id = ?",
+                arguments: [id.rawValue]
+            )
+            let attachmentIDs = try String.fetchAll(
+                db,
+                sql: "SELECT id FROM draft_attachments WHERE account_id = ?",
+                arguments: [id.rawValue]
+            )
+            // v18 tables predate explicit foreign keys; remove account-owned
+            // outgoing rows explicitly so deletion cannot leave accessible
+            // drafts or submissions behind.
+            try db.execute(sql: "DELETE FROM outbox WHERE account_id = ?", arguments: [id.rawValue])
+            try db.execute(sql: "DELETE FROM drafts WHERE account_id = ?", arguments: [id.rawValue])
+            try db.execute(
+                sql: "DELETE FROM draft_attachments WHERE account_id = ?",
+                arguments: [id.rawValue]
+            )
             try db.execute(sql: "DELETE FROM accounts WHERE id = ?", arguments: [id.rawValue])
+            return (outboxIDs, attachmentIDs)
+        }
+        for rawID in removed.outbox {
+            try? FileManager.default.removeItem(
+                at: root.appendingPathComponent("submissions", isDirectory: true)
+                    .appendingPathComponent(rawID, isDirectory: false)
+                    .appendingPathExtension("eml")
+            )
+        }
+        for rawID in removed.attachments {
+            try? FileManager.default.removeItem(
+                at: root.appendingPathComponent("attachments", isDirectory: true)
+                    .appendingPathComponent(rawID, isDirectory: false)
+            )
         }
     }
 
@@ -392,6 +477,24 @@ extension MailStore {
               let accountLinkID = AccountLinkID(uuidString: accountLinkRaw) else {
             throw MailStoreError.accountNotFound
         }
+        let smtp: SMTPConfiguration?
+        let smtpHost: String? = row["smtp_host"]
+        let smtpPort: Int? = row["smtp_port"]
+        let smtpSecurityRaw: String? = row["smtp_security"]
+        let smtpUsername: String? = row["smtp_username"]
+        if let smtpHost, let smtpPort, let smtpSecurityRaw,
+           let smtpSecurity = IMAPEndpoint.Security(rawValue: smtpSecurityRaw),
+           let smtpUsername {
+            smtp = SMTPConfiguration(
+                host: smtpHost,
+                port: smtpPort,
+                security: smtpSecurity,
+                username: smtpUsername,
+                credentialReference: row["smtp_credential_reference"]
+            )
+        } else {
+            smtp = nil
+        }
         return AccountConfig(
             id: AccountID(rawValue: row["id"]),
             accountLinkID: accountLinkID,
@@ -403,6 +506,7 @@ extension MailStore {
                 port: row["imap_port"],
                 security: security
             ),
+            smtp: smtp,
             isEnabled: row["is_enabled"]
         )
     }
@@ -633,9 +737,23 @@ extension MailStore {
         let sql = """
             SELECT f.id, f.account_id, f.name, f.path, f.separator, f.role, f.keep_locally,
                    CASE WHEN f.keep_locally = 0 THEN f.server_message_count
-                        ELSE (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id)
+                        ELSE (SELECT COUNT(*) FROM messages m
+                              WHERE m.generation_id = f.live_generation_id
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM archive_queue q
+                                    WHERE q.folder_id = f.id
+                                      AND q.uid_validity = (SELECT uid_validity FROM generations WHERE id = m.generation_id)
+                                      AND q.uid = m.uid
+                                ))
                    END AS total,
-                   (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id AND m.is_read = 0) AS unread,
+                   (SELECT COUNT(*) FROM messages m
+                    WHERE m.generation_id = f.live_generation_id AND m.is_read = 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM archive_queue q
+                          WHERE q.folder_id = f.id
+                            AND q.uid_validity = (SELECT uid_validity FROM generations WHERE id = m.generation_id)
+                            AND q.uid = m.uid
+                      )) AS unread,
                    s.backfill_phase, s.progress, s.halted_through
             FROM folders f
             LEFT JOIN sync_state s ON s.generation_id = f.live_generation_id
@@ -650,9 +768,23 @@ extension MailStore {
         let sql = """
             SELECT f.id, f.account_id, f.name, f.path, f.separator, f.role, f.keep_locally,
                    CASE WHEN f.keep_locally = 0 THEN f.server_message_count
-                        ELSE (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id)
+                        ELSE (SELECT COUNT(*) FROM messages m
+                              WHERE m.generation_id = f.live_generation_id
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM archive_queue q
+                                    WHERE q.folder_id = f.id
+                                      AND q.uid_validity = (SELECT uid_validity FROM generations WHERE id = m.generation_id)
+                                      AND q.uid = m.uid
+                                ))
                    END AS total,
-                   (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id AND m.is_read = 0) AS unread,
+                   (SELECT COUNT(*) FROM messages m
+                    WHERE m.generation_id = f.live_generation_id AND m.is_read = 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM archive_queue q
+                          WHERE q.folder_id = f.id
+                            AND q.uid_validity = (SELECT uid_validity FROM generations WHERE id = m.generation_id)
+                            AND q.uid = m.uid
+                      )) AS unread,
                    s.backfill_phase, s.progress, s.halted_through
             FROM folders f
             LEFT JOIN sync_state s ON s.generation_id = f.live_generation_id
@@ -663,14 +795,27 @@ extension MailStore {
         }
         return folderSummary(from: row)
     }
-
     static func fetchCounts(_ db: Database, folder: FolderID) throws -> FolderCounts {
         let sql = """
             SELECT
               CASE WHEN keep_locally = 0 THEN server_message_count
-                   ELSE (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id)
+                   ELSE (SELECT COUNT(*) FROM messages m
+                         WHERE m.generation_id = f.live_generation_id
+                           AND NOT EXISTS (
+                               SELECT 1 FROM archive_queue q
+                               WHERE q.folder_id = f.id
+                                 AND q.uid_validity = (SELECT uid_validity FROM generations WHERE id = m.generation_id)
+                                 AND q.uid = m.uid
+                           ))
               END AS total,
-              (SELECT COUNT(*) FROM messages m WHERE m.generation_id = f.live_generation_id AND m.is_read = 0) AS unread
+              (SELECT COUNT(*) FROM messages m
+               WHERE m.generation_id = f.live_generation_id AND m.is_read = 0
+                 AND NOT EXISTS (
+                     SELECT 1 FROM archive_queue q
+                     WHERE q.folder_id = f.id
+                       AND q.uid_validity = (SELECT uid_validity FROM generations WHERE id = m.generation_id)
+                       AND q.uid = m.uid
+                 )) AS unread
             FROM folders f
             WHERE f.id = ?
             """

@@ -23,6 +23,7 @@ targets:
     sources:
       - path: iOS
       - path: ../App/Sources/Pairing
+      - path: ../App/Sources/Composer
       - path: Companion/PhoneCompanionSession.swift
       - path: ../App/Sources/Live/LiveMailFacade.swift
       - path: ../App/Sources/Live/MailternalContainer.swift
@@ -44,6 +45,8 @@ targets:
         product: MailternalWorkspace
       - package: MailternalCore
         product: MailternalPairing
+      - package: MailternalCore
+        product: MailternalAutomation
       - sdk: AVFoundation.framework
       - sdk: CoreImage.framework
       - sdk: Network.framework

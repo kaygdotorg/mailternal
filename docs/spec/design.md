@@ -98,6 +98,8 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   24 pt native table header below the title band, outside its dissolve, and
   uses compact status icons with full accessibility labels. Windowed-mode
   coverage is disclosed in the ⌘K panel.
+  In columns presentation, horizontal gestures scroll between columns; row
+  swipe actions are disabled. Cards retain their configured swipe actions.
   When multiple messages are selected, the title moves up by the subtitle's
   measured height plus its 1 pt separation, and a secondary, tabular-number
   “X messages selected” subtitle fades in. Selection takes precedence over
@@ -113,6 +115,9 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   whole-word/state changes use the content transition's fallback rather than
   replacing the view. The same animation lifts the title for subtitle
   presence; Reduce Motion updates immediately.
+  The H1 also retains one stable `Text` with `.numericText()` when its folder
+  or account title changes, using the disclosure animation; Reduce Motion
+  updates it immediately without moving the header's resting position.
 - **Reader, side-by-side**: the top ramp starts exactly where the tab strip ends
   (46 pt: the 40 pt strip centred in the 52 pt titlebar) and reaches 24 pt into
   the pane. The subject glyph rests one 12 pt guard below the ramp. No bottom ramp.
@@ -146,13 +151,24 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
 
 ## Settings panes
 
-- **Accounts** uses a native `List` so account rows retain platform swipe actions:
-  Enable/Disable and Remove. Context-menu and hover actions remain available as
-  secondary affordances.
-- Expanding an account inserts its inline editor as a separate `List` row inside
-  `withAnimation(MailMotion.expand)`; collapsing removes that row. The native Add
-  Account toolbar item remains the entry point and expansion scrolls the account
-  row into view.
+- The macOS right-pane section H1 occupies the first comfortable position
+  below the window frame, with 16 pt of top padding rather than a full
+  titlebar inset or forced alignment to the traffic lights. Its top dissolve
+  begins at the measured lower edge of the text, not the titlebar's bottom;
+  moving the heading moves the fade and the scroll-content inset together.
+- **Accounts** uses a native `List` with system `GroupBox` row chrome. Clicking
+  anywhere on an account row expands or collapses its inline editor; no disclosure
+  caret is shown. Enable/Disable and Remove remain native swipe and context-menu
+  actions, not hover-only buttons. The editor exposes a native account-name
+  field, a standard enable checkbox, and a labeled destructive Remove button.
+  Name and connection edits take effect on Save Changes; Cancel discards those
+  drafts. Enable changes immediately through the same persisted command as the
+  context-menu action, independently of Save Changes.
+- A standard **Add account…** button sits below the account list, aligned right,
+  as in the [native reference](https://img.kayg.org/u/XvRwG3.png); there is no
+  toolbar plus button. Adding expands the new account editor and scrolls it into
+  view. Expansion uses the existing motion tokens, with no animation under
+  Reduce Motion.
 - A disabled account remains in the Accounts list as a dimmed row with a red
   status dot. The “No accounts” empty state is shown only when there are no
   account configurations.
@@ -318,17 +334,27 @@ choices are mutually exclusive:
 
 ### Hover preview card
 
-- Hovering an inactive tab MUST immediately show a floating card beneath that
-  tab with no dwell delay or entrance animation; the active tab never shows a
-  card (its content is already on screen). Leaving the tab MUST dismiss it
-  after a 150 ms grace period unless the pointer is over the card; moving
-  directly to another tab transfers the card immediately.
-- The card MUST be a system `NSPopover` (`.applicationDefined` behaviour,
-  no animation) anchored below the hovered tab, exactly 220 pt wide by
+- Hovering an inactive tab MUST wait for a 500 ms dwell on that tab before
+  showing a floating card beneath it; the active tab never shows a card.
+  Leaving, changing tabs, activating the candidate, or scrolling cancels the
+  pending presentation. Each different tab requires its own dwell. A shown
+  card retains a 150 ms exit grace period so the pointer can reach its content;
+  returning to that same visible card's tab does not restart its entrance.
+  Scrolling dismisses the card and suppresses previews for tabs moving beneath
+  a stationary pointer, including momentum and phase-less mouse-wheel input.
+  After scrolling, fresh pointer movement can begin a new 500 ms dwell.
+- The card MUST be a system `NSPopover` (`.applicationDefined` behaviour)
+  anchored below the hovered tab, exactly 220 pt wide by
   160 pt high, whose whole content scrolls as one piece without a scroll
   indicator. The popover supplies the chrome (the same as the QR-code
   popover); the card paints no background of its own. 14 pt horizontal and
   12 pt vertical padding.
+  Content MUST be laid out at its final opacity before presentation. Disable
+  AppKit's default popover spring; the whole native window (chrome and content)
+  enters together with the shared 120 ms ease-out hover opacity transition.
+  Do not independently fade or blur text after the chrome appears. The popover
+  does not reflow the tab strip. Dismissal is immediate after the exit grace
+  period; Reduce Motion skips the entrance animation, not the dwell.
 - If sender and received time are already available locally, the card MUST
   include them in a compact metadata line; otherwise it MUST omit them and MUST
   NOT fetch them. It MUST NEVER fetch remote content, mark the message read,

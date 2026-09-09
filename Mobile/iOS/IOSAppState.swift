@@ -3,6 +3,7 @@ import Observation
 import SwiftUI
 import MailternalInterfaces
 import MailternalWorkspace
+import MailternalAutomation
 
 /// Serializable navigation and reading preferences owned by the iOS shell.
 /// Mail content and credentials are deliberately absent from this document.
@@ -99,9 +100,18 @@ final class IOSAppState {
 
     @ObservationIgnored let facade: any MailFacade
     @ObservationIgnored let dispatcher: IOSCommandDispatcher
+    @ObservationIgnored lazy var composer = MailComposerController(facade: facade) { [weak self] command, secret in
+        guard let self else { throw AutomationCommandError.appUnavailable }
+        return try await self.dispatcher.submit(command, secret: secret)
+    }
     let actions: ActionSettings
     let workspace: WorkspaceSyncController
     let listLayout: MailListLayoutStore
+    /// Native collapsed-column navigation is separate from wide-layout visibility.
+    /// Opening a message exposes its loading surface immediately; mail loading,
+    /// read acknowledgement and workspace publication must not hold navigation.
+    var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
+    @ObservationIgnored let pairingAutomation = PairingAutomationBridge()
     @ObservationIgnored private let stateURL: URL
     @ObservationIgnored private var streamTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var pageTask: Task<Void, Never>?
@@ -164,6 +174,17 @@ final class IOSAppState {
         self.listLayout = MailListLayoutStore(controller: workspace)
         self.actions = ActionSettings()
         restoreUIState()
+    }
+
+    func performPairingAction(_ action: PairingUIAction) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await dispatcher.submitPairing(action, bridge: pairingAutomation)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 
     deinit {
@@ -332,6 +353,12 @@ final class IOSAppState {
     }
 
     private func observeFacadeStreams() {
+        streamTasks.append(Task { @MainActor [weak self, stream = facade.observeOutgoing(accounts: nil, limit: 50)] in
+            for await outgoing in stream {
+                guard let self, !Task.isCancelled else { return }
+                await self.companion?.update(outgoing: outgoing)
+            }
+        })
         streamTasks.append(Task { @MainActor [weak self, stream = facade.accountsStream] in
             for await accounts in stream {
                 guard let self else { return }
@@ -686,6 +713,7 @@ final class IOSAppState {
         selectedMessageID = messageID
         isLoadingDetail = true
         detail = nil
+        preferredCompactColumn = .detail
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
@@ -714,7 +742,7 @@ final class IOSAppState {
 
                 if shouldMarkRead {
                     do {
-                        try await self.dispatcher.submit(.markRead([messageID]))
+                        try await self.dispatcher.submit(.markRead(.explicit([messageID])))
                         await self.refreshSearchResultsIfNeeded()
                     } catch {
                         guard self.detailGeneration == generation,
@@ -803,7 +831,7 @@ final class IOSAppState {
         let ids = Array(selectedMessageIDs)
         guard !ids.isEmpty else { return }
         do {
-            try await dispatcher.submit(read ? .markRead(ids) : .markUnread(ids))
+            try await dispatcher.submit(read ? .markRead(.explicit(ids)) : .markUnread(.explicit(ids)))
             await selectFolderIfNeeded()
         } catch {
             commandRevision &+= 1
@@ -815,7 +843,7 @@ final class IOSAppState {
         let ids = ids.isEmpty ? selectedMessageIDs : ids
         guard !ids.isEmpty else { return }
         do {
-            try await dispatcher.submit(.setFlagged(Array(ids), flagged))
+            try await dispatcher.submit(.setFlagged(.explicit(Array(ids)), flagged))
             await selectFolderIfNeeded()
         } catch {
             commandRevision &+= 1
@@ -825,26 +853,32 @@ final class IOSAppState {
 
     func archiveSelected(_ ids: Set<MessageID>? = nil) async {
         let ids = ids ?? selectedMessageIDs
-        await submitTriage(.archive(Array(ids)), ids: ids)
+        await submitTriage(.archive(.explicit(Array(ids))), ids: ids)
     }
 
     func trashSelected(_ ids: Set<MessageID>? = nil) async {
         let ids = ids ?? selectedMessageIDs
-        await submitTriage(.trash(Array(ids)), ids: ids)
+        await submitTriage(.trash(.explicit(Array(ids))), ids: ids)
     }
 
     func moveSelected(to folder: FolderID) async {
         let ids = selectedMessageIDs
-        await submitTriage(.move(Array(ids), folder), ids: ids)
+        await submitTriage(.move(.explicit(Array(ids)), folder), ids: ids)
     }
 
     private func submitTriage(
-        _ command: IOSCommandDispatcher.Command,
+        _ command: MailternalAutomation.Command,
         ids: Set<MessageID>
     ) async {
         guard !ids.isEmpty else { return }
         do {
-            let outcome = try await dispatcher.submit(command)
+            let result = try await dispatcher.submit(command)
+            let outcome: MoveOutcome?
+            if case .move = command {
+                outcome = try decodeComposerResult(result)
+            } else {
+                outcome = nil
+            }
             if case .move = command,
                let outcome,
                outcome.skippedCrossAccountCount > 0 {
@@ -913,7 +947,7 @@ final class IOSAppState {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let results = try await self.facade.search(text, limit: 80)
+                let results = try await self.facade.search(text, limit: 80, accountLinks: nil)
                 guard !Task.isCancelled,
                       self.searchGeneration == generation,
                       self.query == text else { return }
@@ -999,7 +1033,7 @@ final class IOSAppState {
     }
     func mark(_ row: MessageRow, read: Bool) async {
         do {
-            try await dispatcher.submit(read ? .markRead([row.id]) : .markUnread([row.id]))
+            try await dispatcher.submit(read ? .markRead(.explicit([row.id])) : .markUnread(.explicit([row.id])))
             await selectFolderIfNeeded()
         } catch {
             commandRevision &+= 1
@@ -1009,7 +1043,7 @@ final class IOSAppState {
 
     func toggleFlag(_ row: MessageRow) async {
         do {
-            try await dispatcher.submit(.setFlagged([row.id], !row.isFlagged))
+            try await dispatcher.submit(.setFlagged(.explicit([row.id]), !row.isFlagged))
             await selectFolderIfNeeded()
         } catch {
             commandRevision &+= 1
@@ -1019,7 +1053,7 @@ final class IOSAppState {
 
     func archive(_ row: MessageRow) async {
         do {
-            try await dispatcher.submit(.archive([row.id]))
+            try await dispatcher.submit(.archive(.explicit([row.id])))
             await selectFolderIfNeeded()
         } catch {
             commandRevision &+= 1
@@ -1029,7 +1063,7 @@ final class IOSAppState {
 
     func trash(_ row: MessageRow) async {
         do {
-            try await dispatcher.submit(.trash([row.id]))
+            try await dispatcher.submit(.trash(.explicit([row.id])))
             await selectFolderIfNeeded()
         } catch {
             commandRevision &+= 1
@@ -1045,7 +1079,7 @@ final class IOSAppState {
         do {
             _ = try await dispatcher.retry(record.id, secret: password)
             commandRevision &+= 1
-            noticeMessage = "\(record.command.title) queued."
+            noticeMessage = "\(record.title) queued."
         } catch {
             commandRevision &+= 1
             errorMessage = error.localizedDescription
@@ -1065,7 +1099,7 @@ final class IOSAppState {
     func updateAccount(_ config: AccountConfig, password: String?, isNew: Bool) async -> Bool {
         do {
             try await dispatcher.submit(
-                .saveAccount(config, requiresPassword: isNew || password != nil),
+                .saveAccount(config, hasPassword: isNew || password != nil),
                 secret: password
             )
             noticeMessage = isNew ? "Account added." : "Account updated."

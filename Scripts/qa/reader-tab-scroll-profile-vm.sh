@@ -22,7 +22,8 @@ fi
 
 driver=/Applications/CuaDriver.app/Contents/MacOS/cua-driver
 run="$HOME/mailternal-qa-$name"
-app="$HOME/mailternal/Mailternal.app/Contents/MacOS/Mailternal"
+bundle="$HOME/mailternal/Mailternal.app"
+app="$bundle/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist")"
 artifact_dir="$run/tab-scroll-profile"
 mkdir -p "$artifact_dir"
 

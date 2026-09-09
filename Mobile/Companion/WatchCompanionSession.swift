@@ -66,7 +66,7 @@ public final class WatchCompanionSession: NSObject, ObservableObject, WCSessionD
         }
     }
 
-    /// Queues a user mutation in the local durable log before transferring it.
+    /// Queues a triage mutation in the local durable log before transferring it.
     public func queue(_ message: CompanionMessageSnapshot, mutation: CompanionMutation) {
         let command = CompanionCommand(
             accountLinkID: message.accountLinkID,
@@ -79,12 +79,46 @@ public final class WatchCompanionSession: NSObject, ObservableObject, WCSessionD
             guard let self else { return }
             guard let queuedState = await self.store.enqueue(command),
                   let queued = queuedState.commands.first(where: { $0.id == command.id }) else {
+                await self.recordNotice("This action could not be saved on Watch.")
                 await self.refreshState()
                 return
             }
             self.state = queuedState
             self.send(queued.command)
         }
+    }
+
+    /// Durable admission for all Watch compose and outbox actions. A false
+    /// result means the editor must stay open because no transferable command
+    /// was persisted.
+    @discardableResult
+    public func queueOutgoing(
+        accountLinkID: String,
+        messageLink: String? = nil,
+        mutation: CompanionMutation
+    ) async -> Bool {
+        guard mutation.isOutgoing else {
+            await recordNotice("This is not an outgoing Watch action.")
+            return false
+        }
+        let command = CompanionCommand(
+            accountLinkID: accountLinkID,
+            messageLink: messageLink,
+            mutation: mutation
+        )
+        guard command.isSyntacticallyValid else {
+            await recordNotice("This message could not be queued. Check the recipients and message.")
+            return false
+        }
+        guard let queuedState = await store.enqueue(command),
+              let queued = queuedState.commands.first(where: { $0.id == command.id }) else {
+            await recordNotice("This message could not be saved on Watch. Keep editing and try again.")
+            await refreshState()
+            return false
+        }
+        state = queuedState
+        send(queued.command)
+        return true
     }
 
     /// Persists an identified handoff before transfer. A reachable request gets

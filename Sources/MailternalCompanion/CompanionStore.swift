@@ -100,23 +100,27 @@ public actor CompanionStore {
             return state
         }
         let previousState = state
-        let oldAccountLinks = Set(state.folders.map(\.accountLinkID))
         if epochChanged {
             rebaseForPhoneInstallation(snapshot.phoneStoreEpoch)
         }
         let folderLinks = Set(snapshot.folders.map(\.canonicalLink))
-        let accountLinks = Set(snapshot.folders.map(\.accountLinkID))
+        let accountLinks = Set(snapshot.accounts.map(\.id)).union(snapshot.folders.map(\.accountLinkID))
 
-        if !epochChanged {
+        if !epochChanged && snapshot.accountsComplete {
             for index in state.commands.indices where
-                oldAccountLinks.contains(state.commands[index].command.accountLinkID)
-                    && !accountLinks.contains(state.commands[index].command.accountLinkID)
+                !accountLinks.contains(state.commands[index].command.accountLinkID)
                     && state.commands[index].status != .failed
                     && state.commands[index].status != .needsReview
             {
                 let command = state.commands[index].command
-                state.commands[index].status = .failed
-                state.commands[index].failureReason = "The account was removed from iPhone."
+                if command.mutation.isOutgoing && state.commands[index].status != .pendingOnWatch {
+                    state.commands[index].status = .needsReview
+                    state.commands[index].failureReason =
+                        "The account was removed before delivery was confirmed. Review on iPhone before sending another copy."
+                } else {
+                    state.commands[index].status = .failed
+                    state.commands[index].failureReason = "The account was removed from iPhone."
+                }
                 state.commands[index].updatedAt = Date()
                 revertOptimism(command)
             }
@@ -155,6 +159,25 @@ public actor CompanionStore {
 
         state.folders = snapshot.folders
         state.messages = mergedMessages
+        if snapshot.accountsComplete && snapshot.accountDisplayEntriesComplete {
+            state.accounts = snapshot.accounts
+        } else {
+            // Account identities can be complete through folder ownership even
+            // when transfer bounds omit display entries. Keep cached entries
+            // first-class for compose, while an authoritative identity set
+            // still removes entries for accounts that truly disappeared.
+            let incomingAccountIDs = Set(snapshot.accounts.map(\.id))
+            var mergedAccounts = snapshot.accounts
+            mergedAccounts.reserveCapacity(snapshot.accounts.count + state.accounts.count)
+            for account in state.accounts where
+                !incomingAccountIDs.contains(account.id)
+                    && (!snapshot.accountsComplete || accountLinks.contains(account.id))
+            {
+                mergedAccounts.append(account)
+            }
+            state.accounts = mergedAccounts
+        }
+        state.outgoing = snapshot.outgoing
         if !snapshot.phoneStoreEpoch.isEmpty {
             state.phoneStoreEpoch = snapshot.phoneStoreEpoch
             state.phoneEpochConfirmed = true
@@ -175,7 +198,6 @@ public actor CompanionStore {
     }
 
     /// Inserts a Watch command and applies its local optimistic value. The
-    /// command is written before the caller sends its durable user-info packet.
     @discardableResult
     public func enqueue(_ command: CompanionCommand) -> CompanionState? {
         guard journalFailure == nil else { return nil }
@@ -185,10 +207,13 @@ public actor CompanionStore {
         guard command.isSyntacticallyValid,
               !state.commands.contains(where: { $0.id == command.id }),
               activeCount < CompanionProtocol.maximumCommandCount else { return nil }
+        let nextSequence = max(state.commandSequence, command.sequence)
+        guard nextSequence < Int64.max else { return nil }
+        let sequenced = command.withSequence(nextSequence + 1)
+        guard let envelope = try? CompanionCodec.encode(.command(sequenced)),
+              envelope.count <= CompanionProtocol.maximumTransferBytes else { return nil }
         let previousState = state
-        state.commandSequence = max(state.commandSequence, command.sequence)
-        state.commandSequence &+= 1
-        let sequenced = command.withSequence(state.commandSequence)
+        state.commandSequence = sequenced.sequence
         state.commands.append(CompanionCommandRecord(command: sequenced))
         applyOptimism(sequenced)
         state.lastError = nil
@@ -239,11 +264,12 @@ public actor CompanionStore {
                 || state.commands[index].command.mutation == .archive
                 || state.commands[index].command.mutation == .trash
             {
-                if let messageIndex = state.messages.firstIndex(where: {
-                    $0.canonicalLink == state.commands[index].command.messageLink
-                }) {
+                if let messageLink = state.commands[index].command.messageLink,
+                   let messageIndex = state.messages.firstIndex(where: {
+                       $0.canonicalLink == messageLink
+                   }) {
                     state.messages[messageIndex].isPendingRemoval = false
-                    reapplyOutstandingOptimism(for: state.commands[index].command.messageLink)
+                    reapplyOutstandingOptimism(for: messageLink)
                 }
             }
         case .needsReview:
@@ -258,7 +284,9 @@ public actor CompanionStore {
             state.commands[index].phoneStoreEpoch = ack.phoneStoreEpoch ?? state.commands[index].phoneStoreEpoch
             state.commands[index].failureReason =
                 ack.reason ?? "Delivery status unknown; review before retrying."
-            reapplyOutstandingOptimism(for: state.commands[index].command.messageLink)
+            if let messageLink = state.commands[index].command.messageLink {
+                reapplyOutstandingOptimism(for: messageLink)
+            }
             state.lastError = state.commands[index].failureReason
         case .failed:
             guard state.commands[index].status == .pendingOnWatch
@@ -269,7 +297,9 @@ public actor CompanionStore {
             state.commands[index].status = .failed
             state.commands[index].failureReason = ack.reason ?? "The phone rejected this action."
             revertOptimism(state.commands[index].command)
-            reapplyOutstandingOptimism(for: state.commands[index].command.messageLink)
+            if let messageLink = state.commands[index].command.messageLink {
+                reapplyOutstandingOptimism(for: messageLink)
+            }
             state.lastError = state.commands[index].failureReason
         }
         state.revision &+= 1
@@ -293,6 +323,8 @@ public actor CompanionStore {
             let execute = record.status == .acceptedByPhone && record.execution == .notStarted
             return PhoneCommandAcceptance(record: record, shouldExecute: execute)
         }
+        guard let envelope = try? CompanionCodec.encode(.command(command)),
+              envelope.count <= CompanionProtocol.maximumTransferBytes else { return nil }
         let activeCount = state.commands.filter {
             $0.status == .acceptedByPhone || $0.status == .pendingOnWatch
         }.count
@@ -378,6 +410,35 @@ public actor CompanionStore {
         }
         return CompanionCommandAck(commandID: record.command.id, accountLinkID: record.command.accountLinkID,
                                    status: .failed, reason: failureReason,
+                                   phoneStoreEpoch: state.phoneStoreEpoch)
+    }
+
+    /// Records that MailFacade accepted an effect but the phone could not
+    /// durably record completion. The effect may already be committed, so this
+    /// path never reverts optimistic state or makes the command retryable.
+    @discardableResult
+    public func markExecutionNeedsReview(commandID: String, reason: String) -> CompanionCommandAck? {
+        guard journalFailure == nil else { return nil }
+        guard let index = state.commands.firstIndex(where: { $0.id == commandID }) else { return nil }
+        let previousState = state
+        let record = state.commands[index]
+        guard record.status == .acceptedByPhone,
+              record.execution == .inFlight else { return nil }
+        let reviewReason = String(reason.prefix(512))
+        state.commands[index].status = .needsReview
+        state.commands[index].failureReason = reviewReason
+        state.commands[index].updatedAt = Date()
+        state.lastError = reviewReason
+        state.revision &+= 1
+        state = Self.bounded(state, maxMessages: maxMessages, maxCharacters: maxCharacters)
+        guard persist() else {
+            restoreAfterPersistenceFailure(previousState)
+            return nil
+        }
+        return CompanionCommandAck(commandID: record.command.id,
+                                   accountLinkID: record.command.accountLinkID,
+                                   status: .needsReview,
+                                   reason: reviewReason,
                                    phoneStoreEpoch: state.phoneStoreEpoch)
     }
 
@@ -632,6 +693,8 @@ public actor CompanionStore {
         state.lastSyncAt = nil
         state.folders = []
         state.messages = []
+        state.accounts = []
+        state.outgoing = []
         if unknown > 0 {
             state.lastError =
                 "Delivery status unknown for \(unknown) action(s): the previous iPhone installation was reset."
@@ -639,17 +702,20 @@ public actor CompanionStore {
     }
 
     private func applyOptimism(_ command: CompanionCommand) {
-        guard let index = state.messages.firstIndex(where: { $0.canonicalLink == command.messageLink }) else { return }
+        guard let messageLink = command.messageLink,
+              let index = state.messages.firstIndex(where: { $0.canonicalLink == messageLink }) else { return }
         switch command.mutation {
         case .markRead: state.messages[index].isRead = true
         case .markUnread: state.messages[index].isRead = false
         case .setFlagged(let value): state.messages[index].isFlagged = value
         case .archive, .trash, .move: state.messages[index].isPendingRemoval = true
+        case .send, .retrySubmission, .cancelSubmission: break
         }
     }
 
     private func revertOptimism(_ command: CompanionCommand) {
-        guard let index = state.messages.firstIndex(where: { $0.canonicalLink == command.messageLink }) else { return }
+        guard let messageLink = command.messageLink,
+              let index = state.messages.firstIndex(where: { $0.canonicalLink == messageLink }) else { return }
         switch command.mutation {
         case .markRead:
             if let previous = command.previousIsRead { state.messages[index].isRead = previous }
@@ -658,11 +724,14 @@ public actor CompanionStore {
         case .setFlagged:
             if let previous = command.previousIsFlagged { state.messages[index].isFlagged = previous }
         case .archive, .trash, .move: state.messages[index].isPendingRemoval = false
+        case .send, .retrySubmission, .cancelSubmission: break
         }
     }
     private static func bounded(_ value: CompanionState, maxMessages: Int, maxCharacters: Int) -> CompanionState {
         var state = value
         state.folders = Array(state.folders.prefix(256))
+        state.accounts = Array(state.accounts.prefix(32))
+        state.outgoing = Array(state.outgoing.prefix(50))
         var retainedMessages: [CompanionMessageSnapshot] = []
         retainedMessages.reserveCapacity(min(maxMessages, state.messages.count))
         var bodyCharacters = 0
@@ -698,11 +767,13 @@ public actor CompanionStore {
         state.commands = (active + Array(terminal)).sorted { $0.enqueuedAt < $1.enqueuedAt }
         return state
     }
-    private func reapplyOutstandingOptimism(for messageLink: String) {
-        guard let index = state.messages.firstIndex(where: { $0.canonicalLink == messageLink }) else { return }
+    private func reapplyOutstandingOptimism(for messageLink: String?) {
+        guard let messageLink,
+              let index = state.messages.firstIndex(where: { $0.canonicalLink == messageLink }) else { return }
         let records = state.commands
             .filter {
-                $0.command.messageLink == messageLink
+                $0.command.messageLink == Optional(messageLink)
+                    && !$0.command.mutation.isOutgoing
                     && ($0.status == .pendingOnWatch || $0.status == .acceptedByPhone)
             }
             .sorted {
@@ -717,6 +788,7 @@ public actor CompanionStore {
             case .markUnread: state.messages[index].isRead = false
             case .setFlagged(let value): state.messages[index].isFlagged = value
             case .archive, .trash, .move: state.messages[index].isPendingRemoval = true
+            case .send, .retrySubmission, .cancelSubmission: break
             }
         }
     }
@@ -726,7 +798,8 @@ public actor CompanionStore {
                                                   commands: [CompanionCommandRecord]) -> CompanionMessageSnapshot {
         var result = incoming
         let records = commands.filter {
-            $0.command.messageLink == incoming.canonicalLink
+            $0.command.messageLink == Optional(incoming.canonicalLink)
+                && !$0.command.mutation.isOutgoing
                 && ($0.status == .pendingOnWatch || $0.status == .acceptedByPhone)
         }.sorted {
             if $0.command.sequence != $1.command.sequence {
@@ -740,6 +813,7 @@ public actor CompanionStore {
             case .markUnread: result.isRead = false
             case .setFlagged(let value): result.isFlagged = value
             case .archive, .trash, .move: result.isPendingRemoval = true
+            case .send, .retrySubmission, .cancelSubmission: break
             }
         }
         if result.bodyText == nil { result.bodyText = old.bodyText }

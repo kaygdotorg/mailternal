@@ -103,13 +103,15 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
             (try await store.fetchFolders(account: sampleConfig().id))
                 .first(where: { $0.role == .archive })?.id
         )
+        // Queue while the explicit destination is live; the drainer must
+        // discard the persisted move after discovery retires that folder.
         await engine.stop()
+        try await store.enqueueMove(message: message, to: archive)
         world.replaceFolders([inboxMailbox()])
         await engine.start()
         try await waitUntil(timeout: .seconds(3)) {
             try await store.fetchFolderSummary(archive) == nil
         }
-        try await store.enqueueMove(message: message, to: archive)
 
         try await waitUntil(timeout: .seconds(3)) {
             guard try await store.snapshotMoveQueue().isEmpty else { return false }
@@ -177,14 +179,14 @@ private func waitForArchiveInbox(_ store: MailStore) async throws -> (FolderID, 
                 .first(where: { $0.role == .archive })?.id
         )
         await engine.stop()
+        try await store.enqueueMove(message: message, to: archive)
         world.replaceFolders([inboxMailbox()])
         await engine.start()
-        // Wait for LIST reconciliation to retire the destination before
-        // creating the move. This prevents drain and discovery racing.
+        // Let LIST reconciliation retire the destination before the
+        // persisted move is drained.
         try await waitUntil(timeout: .seconds(3)) {
             try await store.fetchFolderSummary(archive) == nil
         }
-        try await store.enqueueMove(message: message, to: archive)
 
         try await waitUntil(timeout: .seconds(3)) {
             guard try await store.snapshotMoveQueue().isEmpty else { return false }

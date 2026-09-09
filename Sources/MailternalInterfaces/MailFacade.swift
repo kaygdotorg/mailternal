@@ -3,6 +3,51 @@
 // it over the real sync engine.
 import Foundation
 
+/// The lightweight state needed to authorize and reverse a user mutation.
+/// This deliberately excludes message bodies and raw MIME.
+public struct MessageMutationState: Sendable, Hashable {
+    public let id: MessageID
+    /// The currently retained cache row. This differs from `id` only when an
+    /// exact move collided with a row already fetched in the destination.
+    public let canonicalID: MessageID
+    public let folderID: FolderID
+    public let accountLinkID: AccountLinkID
+    public let isRead: Bool
+    public let isFlagged: Bool
+    public let link: MailternalDeepLink?
+
+    public init(
+        id: MessageID,
+        canonicalID: MessageID? = nil,
+        folderID: FolderID,
+        accountLinkID: AccountLinkID,
+        isRead: Bool,
+        isFlagged: Bool,
+        link: MailternalDeepLink?
+    ) {
+        self.id = id; self.canonicalID = canonicalID ?? id; self.folderID = folderID
+        self.accountLinkID = accountLinkID; self.isRead = isRead; self.isFlagged = isFlagged; self.link = link
+    }
+}
+
+/// Errors surfaced by the persisted mail undo journal.
+public enum MailUndoError: Error, LocalizedError, Sendable, Equatable {
+    case unavailable
+    case permissionDenied
+    case irreversible(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            return "No reversible mail action is available."
+        case .permissionDenied:
+            return "Undo is not permitted for this mail action."
+        case .irreversible(let reason):
+            return "This mail action cannot be undone: \(reason)"
+        }
+    }
+}
+
 @MainActor
 public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     // Account lifecycle. Every account has independent credentials, state, and
@@ -75,6 +120,13 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     /// Enqueues a move to an arbitrary folder.
     func move(_ ids: [MessageID], to folder: FolderID) async throws -> MoveOutcome
     func rawSource(_ id: MessageID) async throws -> String
+    /// Returns lightweight state for each unique locally stored message ID in
+    /// input order; missing/expunged rows are omitted.
+    func messageMutationStates(_ ids: [MessageID]) async throws -> [MessageMutationState]
+    /// Whether the newest reversible mail operation is available to this scope.
+    func canUndo(allowedAccountLinks: Set<AccountLinkID>?) async throws -> Bool
+    /// Atomically requests undo of the newest reversible mail operation.
+    func undo(allowedAccountLinks: Set<AccountLinkID>?) async throws
     /// On-demand attachment/inline-part fetch → file URL in the attachment cache.
     func fetchAttachment(_ message: MessageID, part: String) async throws -> URL
 
@@ -85,15 +137,58 @@ public protocol MailFacade: AnyObject, MailFacadeDeepLinking {
     func setFlagged(_ id: MessageID, _ flagged: Bool) async throws
     func archive(_ id: MessageID) async throws
     func move(_ id: MessageID, to folder: FolderID) async throws -> MoveOutcome
+    func search(
+        _ query: String,
+        limit: Int,
+        accountLinks: Set<AccountLinkID>?
+    ) async throws -> [MessageRow]
 
-    // Search (FTS5 over synced history)
-    func search(_ query: String, limit: Int) async throws -> [MessageRow]
+    // Outgoing mail. Drafts, submissions, and attachments are account-scoped
+    // durable records; clients never receive store or worker internals.
+    func configureSMTP(
+        _ accountID: AccountID,
+        configuration: SMTPConfiguration?,
+        password: String?
+    ) async throws
+    func createDraft(id: UUID, accountID: AccountID, content: DraftContent) async throws -> MailDraft
+    func createReplyDraft(id: UUID, messageID: MessageID, replyAll: Bool) async throws -> MailDraft
+    func createForwardDraft(id: UUID, messageID: MessageID) async throws -> MailDraft
+    func saveDraft(
+        id: UUID,
+        expectedRevision: Int64,
+        content: DraftContent
+    ) async throws -> DraftSaveResult
+    func deleteDraft(id: UUID, expectedRevision: Int64) async throws
+    func draft(id: UUID) async throws -> MailDraft?
+    func drafts(accounts: Set<AccountID>?, limit: Int) async throws -> [DraftSummary]
+    /// Stages a caller-identified immutable file until a saved draft adopts it.
+    /// Retrying the same account and identifier returns the original import.
+    func importDraftAttachment(
+        id: UUID,
+        accountID: AccountID,
+        sourceURL: URL,
+        filename: String,
+        mimeType: String
+    ) async throws -> DraftAttachment
+    func draftAttachmentURL(id: UUID, accountID: AccountID) async throws -> URL
+    func enqueueSubmission(
+        id: UUID,
+        draftID: UUID,
+        expectedRevision: Int64
+    ) async throws -> OutboxRecord
+    func retrySubmission(
+        id: UUID,
+        acknowledgeDuplicateRisk: Bool
+    ) async throws -> OutboxRecord
+    func cancelSubmission(id: UUID) async throws -> OutboxRecord
+    func outbox(id: UUID) async throws -> OutboxRecord?
+    func outbox(accounts: Set<AccountID>?, limit: Int) async throws -> [OutboxSummary]
+    func observeOutgoing(accounts: Set<AccountID>?, limit: Int) -> AsyncStream<OutgoingState>
 
     // Sync surface
     var syncStatusStream: AsyncStream<SyncStatus> { get }
     func refresh() async // user-initiated ⌘R: run delta pass now
 }
-
 public extension MailFacade {
     /// Older settings/test callers may remove the first account explicitly.
     func removeAccount() async throws {

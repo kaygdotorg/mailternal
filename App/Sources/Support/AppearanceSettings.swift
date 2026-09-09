@@ -155,7 +155,14 @@ final class AccentSource {
             accentOverride = nil
         }
     }
+
+    func resetOverride() {
+        defaults.removeObject(forKey: Self.defaultsKey)
+        accentOverride = nil
+    }
 }
+
+
 
 /// Owns persisted appearance choices; `accent` is the sole accent source.
 /// Its custom override is the only persisted accent input, and all true accent
@@ -278,6 +285,42 @@ final class AppearanceSettings {
     func persistOpacity() {
         defaults.set(backgroundOpacity, forKey: Keys.opacity)
     }
+
+    func resetMode() {
+        defaults.removeObject(forKey: Keys.mode)
+        mode = .system
+    }
+
+    func resetEmailReadingMode() {
+        defaults.removeObject(forKey: Keys.emailReadingMode)
+        emailReadingMode = .original
+    }
+
+    func resetTabStyle() {
+        defaults.removeObject(forKey: Keys.tabStyle)
+        tabStyle = Self.defaultTabStyle
+    }
+
+    func resetShowsSenderIcons() {
+        defaults.removeObject(forKey: Keys.showsSenderIcons)
+        showsSenderIcons = false
+    }
+
+    func resetBackgroundOpacity() {
+        defaults.removeObject(forKey: Keys.opacity)
+        backgroundOpacity = Self.defaultBackgroundOpacity
+    }
+
+    func resetBackdropStyle() {
+        defaults.removeObject(forKey: Keys.backdropStyle)
+        backdropStyle = .frostedBlur
+    }
+
+    func resetMessageListLines() {
+        defaults.removeObject(forKey: Keys.messageListLines)
+        messageListLines = Self.defaultMessageListLines
+    }
+
 
     func applyAppKitAppearance() {
         // NSApp is nil until NSApplication is created; .shared creates it on demand,

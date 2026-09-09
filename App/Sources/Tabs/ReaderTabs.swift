@@ -29,7 +29,12 @@ final class ReaderTabs {
         var unique: [ReaderTab] = []
         var foundTransient = false
         for tab in tabs {
-            if let duplicateIndex = unique.firstIndex(where: { $0.message == tab.message }) {
+            if let duplicateIndex = unique.firstIndex(where: {
+                $0.message == tab.message
+                    || $0.canonicalID == tab.message
+                    || tab.canonicalID == $0.message
+                    || ($0.canonicalID != nil && $0.canonicalID == tab.canonicalID)
+            }) {
                 // A permanent record wins over a transient duplicate while
                 // retaining the first record's strip position.
                 if unique[duplicateIndex].isTransient && !tab.isTransient {
@@ -94,19 +99,14 @@ final class ReaderTabs {
         notify()
     }
 
-    private struct OpenState {
-        var tabs: [ReaderTab]
-        var activeID: UUID?
-        var mruIDs: [UUID]
-        var scrollOffsets: [UUID: CGFloat]
-    }
-
     private static func openWithoutNotify(
         _ message: MessageID,
         permanent: Bool,
         state: inout OpenState
     ) -> Bool {
-        if let existingIndex = state.tabs.firstIndex(where: { $0.message == message }) {
+        if let existingIndex = state.tabs.firstIndex(where: {
+            $0.message == message || $0.canonicalID == message
+        }) {
             let id = state.tabs[existingIndex].id
             let promoted = permanent && state.tabs[existingIndex].isTransient
             if promoted {
@@ -119,6 +119,9 @@ final class ReaderTabs {
         if !permanent, let transientIndex = state.tabs.firstIndex(where: \.isTransient) {
             let tab = state.tabs[transientIndex]
             state.tabs[transientIndex].message = message
+            state.tabs[transientIndex].canonicalID = nil
+            state.tabs[transientIndex].folderID = nil
+            state.tabs[transientIndex].link = nil
             state.scrollOffsets.removeValue(forKey: tab.id)
             _ = activateWithoutNotify(tab.id, state: &state)
             return true
@@ -136,6 +139,7 @@ final class ReaderTabs {
         state.mruIDs.insert(tab.id, at: 0)
         return true
     }
+
 
     private static func activateWithoutNotify(
         _ id: UUID,
@@ -235,8 +239,32 @@ final class ReaderTabs {
 
     @discardableResult
     func messageRemoved(_ message: MessageID) -> Bool {
-        guard let id = tabs.first(where: { $0.message == message })?.id else { return false }
+        guard let id = tabs.first(where: {
+            $0.message == message || $0.canonicalID == message
+        })?.id else { return false }
         close(id)
+        return true
+    }
+
+    /// Updates durable identity metadata without changing the local message
+    /// key. Alias adoption therefore preserves cached detail, native surfaces,
+    /// selection, and scroll position.
+    @discardableResult
+    func updateIdentity(
+        _ id: UUID,
+        folderID: FolderID?,
+        canonicalID: MessageID?,
+        link: MailternalDeepLink?
+    ) -> Bool {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return false }
+        let changed = tabs[index].folderID != folderID
+            || tabs[index].canonicalID != canonicalID
+            || tabs[index].link != link
+        guard changed else { return false }
+        tabs[index].folderID = folderID
+        tabs[index].canonicalID = canonicalID
+        tabs[index].link = link
+        notify()
         return true
     }
 
@@ -309,14 +337,38 @@ final class ReaderTabs {
     }
 }
 
+private struct OpenState {
+    var tabs: [ReaderTab]
+    var activeID: UUID?
+    var mruIDs: [UUID]
+    var scrollOffsets: [UUID: CGFloat]
+}
+
 struct ReaderTab: Identifiable, Hashable, Codable {
     let id: UUID
+    /// Local identity used by the reader/detail cache. It remains stable when
+    /// the store reports an alias for a different current row.
     var message: MessageID
     var isTransient: Bool
+    /// Current store row identity, when known. Alias adoption never changes
+    /// `message`, because that would remount an unchanged reader surface.
+    var canonicalID: MessageID?
+    var folderID: FolderID?
+    var link: MailternalDeepLink?
 
-    init(id: UUID = UUID(), message: MessageID, isTransient: Bool) {
+    init(
+        id: UUID = UUID(),
+        message: MessageID,
+        isTransient: Bool,
+        canonicalID: MessageID? = nil,
+        folderID: FolderID? = nil,
+        link: MailternalDeepLink? = nil
+    ) {
         self.id = id
         self.message = message
         self.isTransient = isTransient
+        self.canonicalID = canonicalID
+        self.folderID = folderID
+        self.link = link
     }
 }

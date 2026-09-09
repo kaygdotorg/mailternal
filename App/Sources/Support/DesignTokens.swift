@@ -56,7 +56,9 @@ enum MailMotion {
     /// The source island should acknowledge the toggle immediately while its
     /// height still eases cleanly into the detailed header layout.
     static let sourceMorph = Animation.easeOut(duration: 0.17)
-    static let hover = Animation.easeOut(duration: 0.12)
+    /// Shared by SwiftUI hover feedback and the native whole-popover entrance.
+    static let hoverDuration: TimeInterval = 0.12
+    static let hover = Animation.easeOut(duration: hoverDuration)
     static let searchPanel = Animation.spring(response: 0.36, dampingFraction: 1)
     static let searchPanelReduced = Animation.easeOut(duration: 0.18)
     static let composer = Animation.smooth(duration: 0.18)
@@ -79,7 +81,7 @@ enum MailMotion {
 /// sizing lives in `ReaderTabLayoutPolicy`; these values describe the visual
 /// surfaces that policy intentionally does not decide.
 enum ReaderTabTokens {
-    static let hoverDelay: Duration = .zero
+    static let hoverDelay: Duration = .milliseconds(500)
     static let previewWidth: CGFloat = ReaderTabLayoutPolicy.maximumTabWidth
     static let previewHeight: CGFloat = 160
     static let previewHorizontalPadding: CGFloat = 14

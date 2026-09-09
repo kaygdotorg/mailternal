@@ -161,12 +161,11 @@ struct CacheSettingsView: View {
         let ids = Array(folderIDs).sorted { $0.rawValue < $1.rawValue }
         guard !ids.isEmpty else { return }
         for id in ids { pendingKeep[id] = keep }
-        let facade = model.facade
         for id in ids {
             Task { @MainActor in
                 var failure: (any Error)?
                 do {
-                    try await facade.setKeepLocally(keep, for: id)
+                    try await model.setKeepLocally(id, keep)
                 } catch {
                     failure = error
                 }

@@ -291,6 +291,107 @@ public struct CompanionMessageSnapshot: Codable, Hashable, Sendable, Identifiabl
 
     private static func clip(_ value: String, to count: Int) -> String { String(value.prefix(count)) }
 }
+public struct CompanionSendContent: Codable, Hashable, Sendable {
+    public enum Kind: String, Codable, Hashable, Sendable {
+        case newMessage
+        case reply
+        case replyAll
+        case forward
+    }
+
+    public let kind: Kind
+    public let to: String
+    public let cc: String
+    public let bcc: String
+    public let subject: String
+    public let body: String
+
+    public init(kind: Kind, to: String = "", cc: String = "", bcc: String = "",
+                subject: String = "", body: String = "") {
+        self.kind = kind
+        self.to = to
+        self.cc = cc
+        self.bcc = bcc
+        self.subject = subject
+        self.body = body
+    }
+
+    public var isSyntacticallyValid: Bool {
+        guard body.utf8.count <= 16_384,
+              to.utf8.count <= 2_048,
+              cc.utf8.count <= 2_048,
+              bcc.utf8.count <= 2_048,
+              subject.utf8.count <= 1_024 else { return false }
+        switch kind {
+        case .newMessage, .forward:
+            return !to.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !cc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !bcc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .reply, .replyAll:
+            return true
+        }
+    }
+}
+
+public struct CompanionAccountSnapshot: Codable, Hashable, Sendable, Identifiable {
+    public let id: String
+    public let name: String
+    public let email: String
+    public let canSend: Bool
+
+    public init(id: String, name: String, email: String, canSend: Bool) {
+        self.id = id
+        self.name = String(name.prefix(64))
+        self.email = String(email.prefix(128))
+        self.canSend = canSend
+    }
+
+    public var isSyntacticallyValid: Bool {
+        id.count == 36
+            && UUID(uuidString: id)?.uuidString.lowercased() == id
+            && name.count <= 64
+            && email.count <= 128
+    }
+}
+
+public enum CompanionOutboxState: String, Codable, Hashable, Sendable {
+    case queued
+    case preparing
+    case sending
+    case awaitingAcceptance
+    case deliveryUnknown
+    case failed
+    case cancelled
+    case sentCopyPending
+    case sent
+}
+
+public struct CompanionOutgoingSnapshot: Codable, Hashable, Sendable, Identifiable {
+    public let id: String
+    public let accountLinkID: String
+    public let subject: String
+    public let state: CompanionOutboxState
+    public let failureReason: String?
+
+    public init(id: String, accountLinkID: String, subject: String,
+                state: CompanionOutboxState, failureReason: String? = nil) {
+        self.id = id
+        self.accountLinkID = accountLinkID
+        self.subject = String(subject.prefix(120))
+        self.state = state
+        self.failureReason = failureReason.map { String($0.prefix(160)) }
+    }
+
+    public var isSyntacticallyValid: Bool {
+        id.count == 36
+            && UUID(uuidString: id)?.uuidString.lowercased() == id
+            && accountLinkID.count == 36
+            && UUID(uuidString: accountLinkID)?.uuidString.lowercased() == accountLinkID
+            && subject.count <= 120
+            && (failureReason?.count ?? 0) <= 160
+    }
+}
+
 
 public struct CompanionSnapshot: Codable, Hashable, Sendable {
     public let schema: String
@@ -303,10 +404,25 @@ public struct CompanionSnapshot: Codable, Hashable, Sendable {
     public let lastSyncAt: Date?
     public let folders: [CompanionFolderSnapshot]
     public let messages: [CompanionMessageSnapshot]
+    public let accounts: [CompanionAccountSnapshot]
+    public let outgoing: [CompanionOutgoingSnapshot]
+    /// True when every current phone account identity is represented by either
+    /// an account display entry or a selected folder. Only a true value makes
+    /// absence authoritative for account-scoped command invalidation.
+    public let accountsComplete: Bool
+    /// True when `accounts` contains every current phone account display entry.
+    /// A bounded snapshot can have complete account identities through folders
+    /// while omitting display entries; consumers must merge those entries with
+    /// their cached values in that case.
+    public let accountDisplayEntriesComplete: Bool
 
     public init(revision: Int = 0, phoneStoreEpoch: String = "", generatedAt: Date = Date(),
                 lastSyncAt: Date? = Date(), folders: [CompanionFolderSnapshot],
-                messages: [CompanionMessageSnapshot]) {
+                messages: [CompanionMessageSnapshot],
+                accounts: [CompanionAccountSnapshot] = [],
+                outgoing: [CompanionOutgoingSnapshot] = [],
+                accountsComplete: Bool = true,
+                accountDisplayEntriesComplete: Bool = true) {
         self.schema = CompanionProtocol.schema
         self.version = CompanionProtocol.version
         self.revision = max(0, revision)
@@ -315,10 +431,16 @@ public struct CompanionSnapshot: Codable, Hashable, Sendable {
         self.lastSyncAt = lastSyncAt
         self.folders = Array(folders.prefix(256))
         self.messages = Array(messages.prefix(CompanionProtocol.maximumMessageCount))
+        self.accounts = Array(accounts.prefix(32))
+        self.outgoing = Array(outgoing.prefix(50))
+        self.accountsComplete = accountsComplete
+        self.accountDisplayEntriesComplete = accountDisplayEntriesComplete
     }
 
     private enum CodingKeys: String, CodingKey {
-        case schema, version, revision, phoneStoreEpoch, generatedAt, lastSyncAt, folders, messages
+        case schema, version, revision, phoneStoreEpoch, generatedAt, lastSyncAt
+        case folders, messages, accounts, outgoing, accountsComplete
+        case accountDisplayEntriesComplete
     }
 
     public init(from decoder: Decoder) throws {
@@ -331,6 +453,14 @@ public struct CompanionSnapshot: Codable, Hashable, Sendable {
         lastSyncAt = try container.decodeIfPresent(Date.self, forKey: .lastSyncAt)
         folders = try container.decode([CompanionFolderSnapshot].self, forKey: .folders)
         messages = try container.decode([CompanionMessageSnapshot].self, forKey: .messages)
+        accounts = try container.decodeIfPresent([CompanionAccountSnapshot].self, forKey: .accounts) ?? []
+        outgoing = try container.decodeIfPresent([CompanionOutgoingSnapshot].self, forKey: .outgoing) ?? []
+        accountsComplete = try container.decodeIfPresent(Bool.self, forKey: .accountsComplete) ?? true
+        // Older snapshots cannot distinguish a complete account display list
+        // from one reduced by transfer bounds. Preserve cached entries unless
+        // the producer explicitly supplies the new completeness bit.
+        accountDisplayEntriesComplete =
+            try container.decodeIfPresent(Bool.self, forKey: .accountDisplayEntriesComplete) ?? false
     }
 
     /// Rejects untrusted wire values before they reach the persistent cache.
@@ -338,7 +468,12 @@ public struct CompanionSnapshot: Codable, Hashable, Sendable {
         guard schema == CompanionProtocol.schema, version == CompanionProtocol.version,
               revision >= 0, phoneStoreEpoch.utf8.count <= 128, folders.count <= 256,
               messages.count <= CompanionProtocol.maximumMessageCount,
-              messages.allSatisfy({ ($0.bodyText?.count ?? 0) <= CompanionProtocol.maximumMessageCharacters }) else { return nil }
+              accounts.count <= 32, outgoing.count <= 50,
+              messages.allSatisfy({ ($0.bodyText?.count ?? 0) <= CompanionProtocol.maximumMessageCharacters }),
+              accounts.allSatisfy(\.isSyntacticallyValid),
+              outgoing.allSatisfy(\.isSyntacticallyValid),
+              Set(accounts.map(\.id)).count == accounts.count,
+              Set(outgoing.map(\.id)).count == outgoing.count else { return nil }
         let validFolders = folders.filter { folder in
             guard let link = CompanionDeepLink(rawValue: folder.canonicalLink), link.kind == .folder,
                   link.accountLinkID == folder.accountLinkID else { return false }
@@ -356,7 +491,10 @@ public struct CompanionSnapshot: Codable, Hashable, Sendable {
         guard validMessages.count == messages.count else { return nil }
         return CompanionSnapshot(revision: revision, phoneStoreEpoch: phoneStoreEpoch,
                                  generatedAt: generatedAt, lastSyncAt: lastSyncAt,
-                                 folders: validFolders, messages: validMessages)
+                                 folders: validFolders, messages: validMessages,
+                                 accounts: accounts, outgoing: outgoing,
+                                 accountsComplete: accountsComplete,
+                                 accountDisplayEntriesComplete: accountDisplayEntriesComplete)
     }
 }
 public enum CompanionMutation: Codable, Hashable, Sendable {
@@ -366,9 +504,17 @@ public enum CompanionMutation: Codable, Hashable, Sendable {
     case archive
     case trash
     case move(destinationFolderLink: String)
+    case send(CompanionSendContent)
+    case retrySubmission(id: String, acknowledgeDuplicateRisk: Bool)
+    case cancelSubmission(id: String)
 
-    private enum CodingKeys: String, CodingKey { case kind, flagged, destinationFolderLink }
-    private enum Kind: String, Codable { case markRead, markUnread, setFlagged, archive, trash, move }
+    private enum CodingKeys: String, CodingKey {
+        case kind, flagged, destinationFolderLink, send, submissionID, acknowledgeDuplicateRisk
+    }
+    private enum Kind: String, Codable {
+        case markRead, markUnread, setFlagged, archive, trash, move
+        case send, retrySubmission, cancelSubmission
+    }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
@@ -383,6 +529,16 @@ public enum CompanionMutation: Codable, Hashable, Sendable {
         case .move(let link):
             try container.encode(Kind.move, forKey: .kind)
             try container.encode(link, forKey: .destinationFolderLink)
+        case .send(let content):
+            try container.encode(Kind.send, forKey: .kind)
+            try container.encode(content, forKey: .send)
+        case .retrySubmission(let id, let acknowledge):
+            try container.encode(Kind.retrySubmission, forKey: .kind)
+            try container.encode(id, forKey: .submissionID)
+            try container.encode(acknowledge, forKey: .acknowledgeDuplicateRisk)
+        case .cancelSubmission(let id):
+            try container.encode(Kind.cancelSubmission, forKey: .kind)
+            try container.encode(id, forKey: .submissionID)
         }
     }
 
@@ -395,12 +551,27 @@ public enum CompanionMutation: Codable, Hashable, Sendable {
         case .archive: self = .archive
         case .trash: self = .trash
         case .move: self = .move(destinationFolderLink: try container.decode(String.self, forKey: .destinationFolderLink))
+        case .send: self = .send(try container.decode(CompanionSendContent.self, forKey: .send))
+        case .retrySubmission:
+            self = .retrySubmission(
+                id: try container.decode(String.self, forKey: .submissionID),
+                acknowledgeDuplicateRisk: try container.decode(Bool.self, forKey: .acknowledgeDuplicateRisk)
+            )
+        case .cancelSubmission:
+            self = .cancelSubmission(id: try container.decode(String.self, forKey: .submissionID))
         }
     }
 
     public var isMove: Bool {
         if case .move = self { return true }
         return false
+    }
+
+    public var isOutgoing: Bool {
+        switch self {
+        case .send, .retrySubmission, .cancelSubmission: return true
+        case .markRead, .markUnread, .setFlagged, .archive, .trash, .move: return false
+        }
     }
 }
 
@@ -409,13 +580,13 @@ public struct CompanionCommand: Codable, Hashable, Sendable, Identifiable {
     public let sequence: Int64
     public let createdAt: Date
     public let accountLinkID: String
-    public let messageLink: String
+    public let messageLink: String?
     public let mutation: CompanionMutation
     public let previousIsRead: Bool?
     public let previousIsFlagged: Bool?
 
     public init(id: String = UUID().uuidString.lowercased(), sequence: Int64 = 0,
-                createdAt: Date = Date(), accountLinkID: String, messageLink: String,
+                createdAt: Date = Date(), accountLinkID: String, messageLink: String? = nil,
                 mutation: CompanionMutation, previousIsRead: Bool? = nil,
                 previousIsFlagged: Bool? = nil) {
         self.id = id
@@ -441,7 +612,7 @@ public struct CompanionCommand: Codable, Hashable, Sendable, Identifiable {
             sequence: try container.decodeIfPresent(Int64.self, forKey: .sequence) ?? 0,
             createdAt: try container.decode(Date.self, forKey: .createdAt),
             accountLinkID: try container.decode(String.self, forKey: .accountLinkID),
-            messageLink: try container.decode(String.self, forKey: .messageLink),
+            messageLink: try container.decodeIfPresent(String.self, forKey: .messageLink),
             mutation: try container.decode(CompanionMutation.self, forKey: .mutation),
             previousIsRead: try container.decodeIfPresent(Bool.self, forKey: .previousIsRead),
             previousIsFlagged: try container.decodeIfPresent(Bool.self, forKey: .previousIsFlagged)
@@ -455,15 +626,42 @@ public struct CompanionCommand: Codable, Hashable, Sendable, Identifiable {
                          previousIsFlagged: previousIsFlagged)
     }
 
+    private static func isCanonicalUUID(_ value: String) -> Bool {
+        value.count == 36 && UUID(uuidString: value)?.uuidString.lowercased() == value
+    }
+
     public var isSyntacticallyValid: Bool {
         guard id.count <= 128, UUID(uuidString: id) != nil, sequence >= 0,
-              let link = CompanionDeepLink(rawValue: messageLink), link.kind == .message,
-              link.accountLinkID == accountLinkID else { return false }
-        if case .move(let destination) = mutation {
-            guard let destinationLink = CompanionDeepLink(rawValue: destination), destinationLink.kind == .folder,
-                  destinationLink.accountLinkID == accountLinkID else { return false }
+              Self.isCanonicalUUID(accountLinkID) else { return false }
+
+        switch mutation {
+        case .markRead, .markUnread, .setFlagged, .archive, .trash, .move:
+            guard let messageLink,
+                  let link = CompanionDeepLink(rawValue: messageLink),
+                  link.kind == .message, link.accountLinkID == accountLinkID else { return false }
+            if case .move(let destination) = mutation {
+                guard let destinationLink = CompanionDeepLink(rawValue: destination),
+                      destinationLink.kind == .folder,
+                      destinationLink.accountLinkID == accountLinkID else { return false }
+            }
+            return true
+        case .send(let content):
+            guard content.isSyntacticallyValid else { return false }
+            switch content.kind {
+            case .newMessage:
+                return messageLink == nil
+            case .reply, .replyAll, .forward:
+                guard let messageLink,
+                      let link = CompanionDeepLink(rawValue: messageLink),
+                      link.kind == .message,
+                      link.accountLinkID == accountLinkID else { return false }
+                return true
+            }
+        case .retrySubmission(let id, _):
+            return messageLink == nil && UUID(uuidString: id) != nil
+        case .cancelSubmission(let id):
+            return messageLink == nil && UUID(uuidString: id) != nil
         }
-        return true
     }
 }
 
@@ -523,6 +721,8 @@ public struct CompanionState: Codable, Hashable, Sendable {
     public var lastSyncAt: Date?
     public var folders: [CompanionFolderSnapshot]
     public var messages: [CompanionMessageSnapshot]
+    public var accounts: [CompanionAccountSnapshot]
+    public var outgoing: [CompanionOutgoingSnapshot]
     public var commands: [CompanionCommandRecord]
     public var handoffs: [CompanionHandoffRecord]
     public var lastError: String?
@@ -531,6 +731,7 @@ public struct CompanionState: Codable, Hashable, Sendable {
                 phoneEpochConfirmed: Bool = false, commandSequence: Int64 = 0,
                 generatedAt: Date? = nil, lastSyncAt: Date? = nil,
                 folders: [CompanionFolderSnapshot] = [], messages: [CompanionMessageSnapshot] = [],
+                accounts: [CompanionAccountSnapshot] = [], outgoing: [CompanionOutgoingSnapshot] = [],
                 commands: [CompanionCommandRecord] = [], handoffs: [CompanionHandoffRecord] = [],
                 lastError: String? = nil) {
         self.schema = CompanionProtocol.schema
@@ -544,6 +745,8 @@ public struct CompanionState: Codable, Hashable, Sendable {
         self.lastSyncAt = lastSyncAt
         self.folders = folders
         self.messages = messages
+        self.accounts = accounts
+        self.outgoing = outgoing
         self.commands = commands
         self.handoffs = handoffs
         self.lastError = lastError
@@ -551,7 +754,8 @@ public struct CompanionState: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case schema, version, revision, lastSnapshotRevision, phoneStoreEpoch, phoneEpochConfirmed
-        case commandSequence, generatedAt, lastSyncAt, folders, messages, commands, handoffs, lastError
+        case commandSequence, generatedAt, lastSyncAt, folders, messages, accounts, outgoing
+        case commands, handoffs, lastError
     }
 
     public init(from decoder: Decoder) throws {
@@ -567,6 +771,8 @@ public struct CompanionState: Codable, Hashable, Sendable {
         lastSyncAt = try container.decodeIfPresent(Date.self, forKey: .lastSyncAt)
         folders = try container.decodeIfPresent([CompanionFolderSnapshot].self, forKey: .folders) ?? []
         messages = try container.decodeIfPresent([CompanionMessageSnapshot].self, forKey: .messages) ?? []
+        accounts = try container.decodeIfPresent([CompanionAccountSnapshot].self, forKey: .accounts) ?? []
+        outgoing = try container.decodeIfPresent([CompanionOutgoingSnapshot].self, forKey: .outgoing) ?? []
         commands = try container.decodeIfPresent([CompanionCommandRecord].self, forKey: .commands) ?? []
         handoffs = try container.decodeIfPresent([CompanionHandoffRecord].self, forKey: .handoffs) ?? []
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)

@@ -1,6 +1,21 @@
 import Foundation
 import MailternalInterfaces
 
+public extension MIMEParser {
+    /// Parses a composer field without silently dropping unfinished recipients.
+    /// Any defective input is retained verbatim as one incomplete address, so a
+    /// draft can save it and send-time validation rejects it until corrected.
+    static func parseEditableAddresses(_ value: String) -> [MailAddress] {
+        guard !trimWS(value).isEmpty else { return [] }
+        let state = ParseState()
+        let addresses = parseAddressList(value, state: state, specifier: nil)
+        guard state.defects.isEmpty, !addresses.isEmpty else {
+            return [MailAddress(displayName: nil, address: value)]
+        }
+        return addresses
+    }
+}
+
 func parseAddressList(_ value: String, state: ParseState, specifier: String?) -> [MailAddress] {
     let decoded = decodeEncodedWords(value, state: state, specifier: specifier)
     if trimWS(decoded).isEmpty { return [] }

@@ -124,7 +124,7 @@ public struct MailAddress: Hashable, Sendable, Codable {
     }
 }
 
-public struct Envelope: Hashable, Sendable {
+public struct Envelope: Hashable, Sendable, Codable {
     public var subject: String
     public var from: [MailAddress]
     public var to: [MailAddress]
@@ -147,7 +147,7 @@ public struct Envelope: Hashable, Sendable {
 
 // MARK: - Message list & detail
 
-public struct MessageRow: Identifiable, Hashable, Sendable {
+public struct MessageRow: Identifiable, Hashable, Sendable, Codable {
     public var id: MessageID
     public var from: String       // rendered sender
     /// Original sender address retained for sender-domain favicon lookup.
@@ -180,7 +180,7 @@ public struct MessageRow: Identifiable, Hashable, Sendable {
 /// `movedCount` is the number of message IDs accepted and durably queued by
 /// the facade. IDs from another account are not accepted because IMAP cannot
 /// move them in the destination account; those are counted separately.
-public struct MoveOutcome: Hashable, Sendable {
+public struct MoveOutcome: Codable, Hashable, Sendable {
     public let movedCount: Int
     public let skippedCrossAccountCount: Int
     /// The accepted IDs let optimistic callers restore only IDs rejected by
@@ -257,7 +257,7 @@ public struct MessagePageCursor: Hashable, Sendable, Codable {
     }
 }
 
-public struct MessagePage: Sendable {
+public struct MessagePage: Sendable, Codable {
     public var rows: [MessageRow]
     public var next: MessagePageCursor? // nil = end
     public init(rows: [MessageRow], next: MessagePageCursor?) {
@@ -266,7 +266,7 @@ public struct MessagePage: Sendable {
     }
 }
 
-public struct AttachmentInfo: Identifiable, Hashable, Sendable {
+public struct AttachmentInfo: Identifiable, Hashable, Sendable, Codable {
     public var id: String          // IMAP part specifier
     public var filename: String?
     public var mimeType: String
@@ -289,7 +289,7 @@ public struct AttachmentInfo: Identifiable, Hashable, Sendable {
     }
 }
 
-public struct MessageDetail: Sendable {
+public struct MessageDetail: Sendable, Codable {
     public var id: MessageID
     public var envelope: Envelope
     public var bodyText: String?
@@ -340,10 +340,12 @@ public struct AccountConfig: Hashable, Sendable, Codable {
     public var emailAddress: String
     public var username: String
     public var imap: IMAPEndpoint
+    /// Optional until outgoing setup is completed; contains no password.
+    public var smtp: SMTPConfiguration?
     public var isEnabled: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case id, accountLinkID, displayName, emailAddress, username, imap, isEnabled
+        case id, accountLinkID, displayName, emailAddress, username, imap, smtp, isEnabled
     }
 
     public init(
@@ -353,6 +355,7 @@ public struct AccountConfig: Hashable, Sendable, Codable {
         emailAddress: String,
         username: String,
         imap: IMAPEndpoint,
+        smtp: SMTPConfiguration? = nil,
         isEnabled: Bool = true
     ) {
         self.id = id
@@ -361,6 +364,7 @@ public struct AccountConfig: Hashable, Sendable, Codable {
         self.emailAddress = emailAddress
         self.username = username
         self.imap = imap
+        self.smtp = smtp
         self.isEnabled = isEnabled
     }
 
@@ -372,6 +376,7 @@ public struct AccountConfig: Hashable, Sendable, Codable {
         emailAddress = try container.decode(String.self, forKey: .emailAddress)
         username = try container.decode(String.self, forKey: .username)
         imap = try container.decode(IMAPEndpoint.self, forKey: .imap)
+        smtp = try container.decodeIfPresent(SMTPConfiguration.self, forKey: .smtp)
         isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
     }
 }

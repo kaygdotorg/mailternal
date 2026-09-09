@@ -252,6 +252,42 @@ public enum MailternalDeepLink: Hashable, Sendable {
     }
 }
 
+extension MailternalDeepLink: Codable {
+    private enum CodingKeys: String, CodingKey { case kind, accountLinkID, folderLocator, uidValidity, uid }
+    private enum Kind: String, Codable { case folder, message }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(accountLinkID, forKey: .accountLinkID)
+        try container.encode(folderLocator, forKey: .folderLocator)
+        switch self {
+        case .folder:
+            try container.encode(Kind.folder, forKey: .kind)
+        case .message(_, _, let uidValidity, let uid):
+            try container.encode(Kind.message, forKey: .kind)
+            try container.encode(uidValidity, forKey: .uidValidity)
+            try container.encode(uid, forKey: .uid)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let accountLinkID = try container.decode(AccountLinkID.self, forKey: .accountLinkID)
+        let folderLocator = try container.decode(FolderLocator.self, forKey: .folderLocator)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .folder:
+            self = .folder(accountLinkID: accountLinkID, folderLocator: folderLocator)
+        case .message:
+            self = .message(
+                accountLinkID: accountLinkID,
+                folderLocator: folderLocator,
+                uidValidity: try container.decode(UInt32.self, forKey: .uidValidity),
+                uid: try container.decode(IMAPUID.self, forKey: .uid)
+            )
+        }
+    }
+}
+
 public enum MailternalDeepLinkResolution: Hashable, Sendable {
     case folder(FolderID)
     case message(folderID: FolderID, messageID: MessageID, row: MessageRow)

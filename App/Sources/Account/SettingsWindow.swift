@@ -1,10 +1,10 @@
 import AppKit
-import Observation
 import SwiftUI
 import MailternalInterfaces
+import MailternalAutomation
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case accounts, cache, appearance, actions, sync
+    case accounts, cache, appearance, actions, sync, commandLine
 
     var id: Self { self }
 
@@ -15,6 +15,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .appearance: "Appearance"
         case .actions: "Actions"
         case .sync: "Sync"
+        case .commandLine: "Command Line"
         }
     }
 
@@ -25,131 +26,11 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .appearance: "paintbrush"
         case .actions: "hand.draw"
         case .sync: "icloud"
+        case .commandLine: "terminal"
         }
     }
 }
 
-/// Presentation state shared by the AppKit settings toolbar and the Accounts
-/// detail view. The request generation is an event channel; the other
-/// properties are the detail view's current toolbar validation state.
-@MainActor
-@Observable
-final class SettingsToolbarCoordinator: NSObject {
-    static let toolbarIdentifier = NSToolbar.Identifier("Mailternal.SettingsToolbar")
-    static let addAccountIdentifier = NSToolbarItem.Identifier("Mailternal.SettingsToolbar.addAccount")
-
-    private(set) var section: SettingsSection = .accounts
-    private(set) var canAddAccounts = true
-    private(set) var isValidatingAccounts = false
-    private(set) var addAccountRequestGeneration: UInt64 = 0
-
-    @ObservationIgnored private weak var toolbar: NSToolbar?
-    @ObservationIgnored private lazy var addAccountItem = makeAddAccountItem()
-
-    func makeToolbar() -> NSToolbar {
-        let toolbar = NSToolbar(identifier: Self.toolbarIdentifier)
-        toolbar.delegate = self
-        toolbar.displayMode = .iconOnly
-        toolbar.autosavesConfiguration = false
-        self.toolbar = toolbar
-        updateAddAccountItem()
-        return toolbar
-    }
-
-    func update(section: SettingsSection) {
-        guard self.section != section else {
-            updateAddAccountItem()
-            return
-        }
-        self.section = section
-        updateAddAccountItem()
-        toolbar?.validateVisibleItems()
-    }
-    func reportAccountsState(canAdd: Bool, isValidating: Bool) {
-        guard canAddAccounts != canAdd || isValidatingAccounts != isValidating else {
-            return
-        }
-        canAddAccounts = canAdd
-        isValidatingAccounts = isValidating
-        updateAddAccountItem()
-        toolbar?.validateVisibleItems()
-    }
-
-    private func requestAddAccount() {
-        guard section == .accounts, canAddAccounts, !isValidatingAccounts else {
-            return
-        }
-        addAccountRequestGeneration &+= 1
-    }
-
-    private func makeAddAccountItem() -> NSToolbarItem {
-        let item = NSToolbarItem(itemIdentifier: Self.addAccountIdentifier)
-        let image = NSImage(
-            systemSymbolName: "plus",
-            accessibilityDescription: "Add Account"
-        )
-        item.image = image
-        item.label = "Add Account"
-        item.paletteLabel = "Add Account"
-        item.toolTip = "Add Account"
-        item.isBordered = true
-        item.target = self
-        item.action = #selector(addAccount(_:))
-        item.autovalidates = false
-        let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(addAccountButton(_:)))
-        button.isBordered = true
-        button.setAccessibilityIdentifier(UIIdentifier.accountsAdd)
-        item.view = button
-        return item
-    }
-
-    @objc
-    private func addAccountButton(_ sender: NSButton) {
-        requestAddAccount()
-    }
-
-    private func updateAddAccountItem() {
-        addAccountItem.isHidden = section != .accounts
-        addAccountItem.isEnabled = section == .accounts
-            && canAddAccounts
-            && !isValidatingAccounts
-    }
-
-    @objc
-    private func addAccount(_ sender: NSToolbarItem) {
-        requestAddAccount()
-    }
-}
-
-extension SettingsToolbarCoordinator: NSToolbarDelegate, NSToolbarItemValidation {
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.flexibleSpace, Self.addAccountIdentifier]
-    }
-
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.flexibleSpace, .space, Self.addAccountIdentifier]
-    }
-
-    func toolbarSelectableItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        []
-    }
-
-    func toolbar(
-        _ toolbar: NSToolbar,
-        itemForItemIdentifier identifier: NSToolbarItem.Identifier,
-        willBeInsertedIntoToolbar flag: Bool
-    ) -> NSToolbarItem? {
-        identifier == Self.addAccountIdentifier ? addAccountItem : nil
-    }
-
-    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
-        guard item.itemIdentifier == Self.addAccountIdentifier else {
-            return item.isEnabled
-        }
-        updateAddAccountItem()
-        return item.isEnabled
-    }
-}
 
 
 
@@ -166,7 +47,6 @@ struct SettingsSourceList: View {
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
         .focusEffectDisabled(true)
-        .environment(actions)
         .tint(appearance.accent.color)
         .environment(appearance.accent)
         .padding(.top, 46)
@@ -178,15 +58,19 @@ struct SettingsDetailView: View {
     @Bindable var model: AppModel
     let appearance: AppearanceSettings
     let actions: ActionSettings
-    let toolbarCoordinator: SettingsToolbarCoordinator
     @State private var titleBottom: CGFloat = 0
-    @State private var isPairingPresented = false
 
     private var settingsDissolvePolicy: MailWindowDissolvePolicy {
-        // The H1 is fixed chrome over the form. Keep the fallback at the
-        // titlebar depth until the first global geometry measurement arrives.
+        // Follow the text's lower edge, even above the titlebar's bottom.
+        // The native toolbar band is only a first-layout fallback.
         .settings.withTopOrigin(
-            max(titleBottom, MailWindowTopDissolvePolicy.titlebarDepth)
+            titleBottom > 0 ? titleBottom : PaneHeaderInsetPolicy.windowTitlebarHeight
+        )
+    }
+    private var pairingPresentedBinding: Binding<Bool> {
+        Binding(
+            get: { model.isPairingPresented },
+            set: { model.setPairingPresented($0) }
         )
     }
 
@@ -195,18 +79,20 @@ struct SettingsDetailView: View {
             Group {
                 switch section {
                 case .accounts:
-                    AccountsSettingsView(model: model, toolbarCoordinator: toolbarCoordinator)
+                    AccountsSettingsView(model: model)
                 case .cache:
                     CacheSettingsView(model: model)
                 case .appearance:
-                    AppearanceSettingsForm(appearance: appearance)
+                    AppearanceSettingsForm(model: model, appearance: appearance)
                 case .actions:
-                    ActionSettingsForm(actions: actions)
+                    ActionSettingsForm(model: model, actions: actions)
                 case .sync:
                     WorkspaceSyncSettingsView(
-                        coordinator: model.workspaceSync,
-                        onPairDevice: { isPairingPresented = true }
+                        model: model,
+                        onPairDevice: { model.setPairingPresented(true) }
                     )
+                case .commandLine:
+                    CommandLineSettingsForm()
             }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -222,8 +108,12 @@ struct SettingsDetailView: View {
 
             Text(section.title)
                 .font(.system(size: 26, weight: .bold))
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.frame(in: .global).maxY
+                } action: { titleBottom = $0 }
                 .padding(.horizontal, 20)
-                .padding(.top, PaneHeaderInsetPolicy.settingsHeaderTopPadding)
+                // First comfortable position below the frame, not below the toolbar.
+                .padding(.top, 16)
                 .padding(.bottom, PaneHeaderInsetPolicy.settingsTitleBottomPadding)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityIdentifier(
@@ -233,14 +123,8 @@ struct SettingsDetailView: View {
                             ? UIIdentifier.cacheSectionTitle
                             : UIIdentifier.settingsSectionTitle
                 )
-                .onGeometryChange(for: CGFloat.self) { proxy in
-                    // Geometry includes the optical bottom padding; remove it
-                    // so the ramp starts at the H1's actual lower edge.
-                    proxy.frame(in: .global).maxY
-                        - PaneHeaderInsetPolicy.settingsTitleBottomPadding
-                } action: { titleBottom = $0 }
         }
-        .sheet(isPresented: $isPairingPresented) {
+        .sheet(isPresented: pairingPresentedBinding) {
             PairingView(
                 accounts: model.accountConfigs,
                 makeBundle: { accountIDs, includeSettings in
@@ -253,7 +137,9 @@ struct SettingsDetailView: View {
                         replaceExisting: replaceExisting,
                         importSettings: importSettings
                     )
-                }
+                },
+                bridge: model.pairingAutomation,
+                onCommand: { action in model.performPairingAction(action) }
             )
             // Fit the complete invitation and its quiet zone above the footer.
             .frame(minWidth: 560, minHeight: 600)
@@ -265,9 +151,63 @@ struct SettingsDetailView: View {
     }
 }
 
-struct ActionSettingsForm: View {
-    @Bindable var actions: ActionSettings
+/// The sandbox never installs a shell command. Show the exact bundled helper
+/// and refresh its symlink status while this settings section is visible.
+private struct CommandLineSettingsForm: View {
+    @State private var installationStatus = "Checking installation…"
+    private let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/mailternal")
 
+    private var installCommand: String {
+        AutomationCLI.installationCommand(executable: executable)
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                LabeledContent("Status", value: installationStatus)
+                Text(installCommand)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Copy Install Command") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(installCommand, forType: .string)
+                }
+            } header: {
+                Text("Terminal access")
+            } footer: {
+                Text("Run this command in Terminal. The link uses this app’s bundled version of mailternal. If /usr/local/bin is not writable, choose a writable directory on your PATH.")
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+        .task {
+            while !Task.isCancelled {
+                installationStatus = Self.checkInstallation(executable: executable)
+                do { try await Task.sleep(for: .seconds(2)) }
+                catch { return }
+            }
+        }
+    }
+
+    private static func checkInstallation(executable: URL) -> String {
+        let target = URL(fileURLWithPath: "/usr/local/bin/mailternal")
+        do {
+            _ = try FileManager.default.destinationOfSymbolicLink(atPath: target.path)
+            return target.resolvingSymlinksInPath().standardizedFileURL == executable.resolvingSymlinksInPath().standardizedFileURL
+                ? "Installed" : "Linked to another version"
+        } catch let error as NSError {
+            if error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+                return "Not installed"
+            }
+            return "Unable to check /usr/local/bin/mailternal"
+        }
+    }
+}
+
+struct ActionSettingsForm: View {
+    @Bindable var model: AppModel
+    @Bindable var actions: ActionSettings
     var body: some View {
         Form {
             Section {
@@ -311,8 +251,34 @@ struct ActionSettingsForm: View {
                     ? actions.swipeActions(for: edge)[index]
                     : nil
             },
-            set: { actions.setSwipeAction($0, at: index, edge: edge) }
+            set: { action in
+                do {
+                    let encoded = try AutomationPreferences.encodedSwipeActionEdit(
+                        index: index,
+                        action: action
+                    )
+                    model.dispatchFromUI(
+                        .setSetting(
+                            settingKey(for: edge),
+                            encoded
+                        )
+                    )
+                } catch {
+                    model.toasts.post(
+                        title: "Couldn’t update swipe action",
+                        detail: error.localizedDescription,
+                        severity: .error
+                    )
+                }
+            }
         )
+    }
+
+    private func settingKey(for edge: SwipeEdge) -> String {
+        switch edge {
+        case .leading: AutomationPreferences.Keys.leadingSwipe
+        case .trailing: AutomationPreferences.Keys.trailingSwipe
+        }
     }
 
     private func pickerIdentifier(for edge: SwipeEdge, at index: Int) -> String {
@@ -325,12 +291,17 @@ struct ActionSettingsForm: View {
 
 
 struct AppearanceSettingsForm: View {
+    @Bindable var model: AppModel
     @Bindable var appearance: AppearanceSettings
-
     var body: some View {
         Form {
             Section {
-                Picker(selection: $appearance.mode) {
+                Picker(selection: Binding(
+                    get: { appearance.mode },
+                    set: { mode in
+                        model.dispatchFromUI(.setSetting(AutomationPreferences.Keys.mode, mode.rawValue))
+                    }
+                )) {
                     ForEach(AppearanceMode.allCases) { mode in
                         Text(mode.label).tag(mode)
                     }
@@ -338,7 +309,12 @@ struct AppearanceSettingsForm: View {
                     Text("Theme")
                     Text("System follows the macOS light or dark setting.")
                 }
-                Picker(selection: $appearance.emailReadingMode) {
+                Picker(selection: Binding(
+                    get: { appearance.emailReadingMode },
+                    set: { mode in
+                        model.dispatchFromUI(.setSetting(AutomationPreferences.Keys.emailReadingMode, mode.rawValue))
+                    }
+                )) {
                     ForEach(EmailReadingMode.allCases) { mode in
                         Text(mode.label).tag(mode)
                     }
@@ -349,13 +325,30 @@ struct AppearanceSettingsForm: View {
                 .accessibilityIdentifier(UIIdentifier.emailReadingMode)
             }
             Section("Messages") {
-                Toggle(isOn: $appearance.showsSenderIcons) {
+                Toggle(isOn: Binding(
+                    get: { appearance.showsSenderIcons },
+                    set: { enabled in
+                        model.dispatchFromUI(
+                            .setSetting(
+                                AutomationPreferences.Keys.showsSenderIcons,
+                                enabled ? "true" : "false"
+                            )
+                        )
+                    }
+                )) {
                     Text("Sender icons")
                     Text("Show a sender icon beside each message in the list.")
                 }
                 .accessibilityIdentifier("appearance-sender-icons")
 
-                Picker(selection: $appearance.messageListLines) {
+                Picker(selection: Binding(
+                    get: { appearance.messageListLines },
+                    set: { lines in
+                        model.dispatchFromUI(
+                            .setSetting(AutomationPreferences.Keys.messageListLines, String(lines))
+                        )
+                    }
+                )) {
                     ForEach(Array(MessageListLayout.lineRange), id: \.self) { lines in
                         Text("\(lines) \(lines == 1 ? "line" : "lines")").tag(lines)
                     }
@@ -369,14 +362,19 @@ struct AppearanceSettingsForm: View {
                 LabeledContent {
                     HStack {
                         Slider(
-                            value: $appearance.backgroundOpacity,
+                            value: Binding(
+                                get: { appearance.backgroundOpacity },
+                                set: { opacity in
+                                    model.dispatchFromUI(
+                                        .setSetting(
+                                            AutomationPreferences.Keys.backgroundOpacity,
+                                            String(opacity)
+                                        )
+                                    )
+                                }
+                            ),
                             in: AppearanceSettings.backgroundOpacityRange,
                             step: 0.01,
-                            onEditingChanged: { isEditing in
-                                if !isEditing {
-                                    appearance.persistOpacity()
-                                }
-                            }
                         )
                         // Proportional text, in a fixed trailing slot: the
                         // readout keeps its place without monospaced digits.
@@ -388,7 +386,14 @@ struct AppearanceSettingsForm: View {
                     Text("Opacity")
                     Text("How solid the window is. Lower lets more of the desktop show through; 100% is fully solid.")
                 }
-                Picker(selection: $appearance.backdropStyle) {
+                Picker(selection: Binding(
+                    get: { appearance.backdropStyle },
+                    set: { style in
+                        model.dispatchFromUI(
+                            .setSetting(AutomationPreferences.Keys.backdropStyle, style.rawValue)
+                        )
+                    }
+                )) {
                     ForEach(WindowBackdropStyle.allCases) { style in
                         Text(style.label).tag(style)
                     }
@@ -406,9 +411,12 @@ struct AppearanceSettingsForm: View {
                     get: { appearance.accent.accentOverride != nil },
                     set: { enabled in
                         if enabled {
-                            appearance.accent.accentOverride = AccentColorValue(nsColor: appearance.accent.nsColor)
+                            let accent = AccentColorValue(nsColor: appearance.accent.nsColor)
+                            model.dispatchFromUI(
+                                .setSetting(AutomationPreferences.Keys.accent, encodedAccent(accent))
+                            )
                         } else {
-                            appearance.accent.accentOverride = nil
+                            model.dispatchFromUI(.setSetting(AutomationPreferences.Keys.accent, nil))
                         }
                     }
                 )) {
@@ -425,7 +433,10 @@ struct AppearanceSettingsForm: View {
                         selection: Binding(
                             get: { appearance.accent.color },
                             set: { color in
-                                appearance.accent.accentOverride = AccentColorValue(nsColor: NSColor(color))
+                                let accent = AccentColorValue(nsColor: NSColor(color))
+                                model.dispatchFromUI(
+                                    .setSetting(AutomationPreferences.Keys.accent, encodedAccent(accent))
+                                )
                             }
                         ),
                         supportsOpacity: false
@@ -436,6 +447,12 @@ struct AppearanceSettingsForm: View {
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
     }
+
+    private func encodedAccent(_ accent: AccentColorValue) -> String {
+        let values = [accent.red, accent.green, accent.blue, accent.alpha]
+        guard let data = try? JSONEncoder().encode(values) else { return "system" }
+        return String(decoding: data, as: UTF8.self)
+    }
 }
 
 @MainActor
@@ -443,7 +460,6 @@ final class SettingsSplitController: NSSplitViewController {
     private let sidebarHosting: NSHostingController<SettingsSourceList>
     private let detailHosting: NSHostingController<SettingsDetailView>
     private let sidebarItem: NSSplitViewItem
-    private let toolbarCoordinator: SettingsToolbarCoordinator
     private var backgroundEffect: NSVisualEffectView?
     private var didSetDivider = false
 
@@ -451,10 +467,8 @@ final class SettingsSplitController: NSSplitViewController {
         model: AppModel,
         appearance: AppearanceSettings,
         actions: ActionSettings,
-        selection: Binding<SettingsSection?>,
-        toolbarCoordinator: SettingsToolbarCoordinator
+        selection: Binding<SettingsSection?>
     ) {
-        self.toolbarCoordinator = toolbarCoordinator
         sidebarHosting = NSHostingController(
             rootView: SettingsSourceList(selection: selection, appearance: appearance, actions: actions)
         )
@@ -463,8 +477,7 @@ final class SettingsSplitController: NSSplitViewController {
                 section: selection.wrappedValue ?? .accounts,
                 model: model,
                 appearance: appearance,
-                actions: actions,
-                toolbarCoordinator: toolbarCoordinator
+                actions: actions
             )
         )
         sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarHosting)
@@ -481,7 +494,6 @@ final class SettingsSplitController: NSSplitViewController {
         let detailItem = NSSplitViewItem(viewController: detailHosting)
         detailItem.minimumThickness = 480
         addSplitViewItem(detailItem)
-        toolbarCoordinator.update(section: selection.wrappedValue ?? .accounts)
         splitView.isVertical = true
     }
 
@@ -494,14 +506,12 @@ final class SettingsSplitController: NSSplitViewController {
         selection: Binding<SettingsSection?>
     ) {
         let section = selection.wrappedValue ?? .accounts
-        toolbarCoordinator.update(section: section)
         sidebarHosting.rootView = SettingsSourceList(selection: selection, appearance: appearance, actions: actions)
         detailHosting.rootView = SettingsDetailView(
             section: section,
             model: model,
             appearance: appearance,
-            actions: actions,
-            toolbarCoordinator: toolbarCoordinator
+            actions: actions
         )
         configureWindow()
     }
@@ -546,13 +556,11 @@ final class SettingsWindowController: NSWindowController {
     }
     private var actions: ActionSettings?
     private var split: SettingsSplitController?
-    private let toolbarCoordinator: SettingsToolbarCoordinator
     private var model: AppModel?
     private var appearance: AppearanceSettings?
     private var hasShown = false
 
     private init() {
-        toolbarCoordinator = SettingsToolbarCoordinator()
         super.init(window: nil)
     }
 
@@ -578,8 +586,7 @@ final class SettingsWindowController: NSWindowController {
                 model: model,
                 appearance: appearance,
                 actions: actions,
-                selection: selectionBinding,
-                toolbarCoordinator: toolbarCoordinator
+                selection: selectionBinding
             )
             self.split = split
             split.preferredContentSize = NSSize(width: 720, height: 460)
@@ -595,7 +602,8 @@ final class SettingsWindowController: NSWindowController {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.toolbarStyle = .unified
-            window.toolbar = toolbarCoordinator.makeToolbar()
+            // Keep native unified window chrome; account actions live in the list.
+            window.toolbar = NSToolbar(identifier: "Mailternal.SettingsToolbar")
             window.isReleasedWhenClosed = false
             window.isRestorable = false
             window.setAccessibilitySubrole(.floatingWindow)

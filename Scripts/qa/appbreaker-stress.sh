@@ -4,7 +4,10 @@
 set -euo pipefail
 
 ROOT="${APPBREAKER_ROOT:-$HOME/Developer/Worktrees/mailternal-build/AppBreaker}"
-APP="${APP:-$ROOT/App/build/Build/Products/Debug/Mailternal.app/Contents/MacOS/Mailternal}"
+if [[ -z "${APP:-}" ]]; then
+  bundle="$ROOT/App/build/Build/Products/Debug/Mailternal.app"
+  APP="$bundle/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist")"
+fi
 DATA="${APPBREAKER_DATA:-$HOME/Developer/Worktrees/mailternal-build/AppBreaker-qa}"
 LOGDIR="${APPBREAKER_LOGS:-$HOME/Developer/Worktrees/mailternal-build/AppBreaker-logs}"
 HOST="${QA_HOST:-127.0.0.1}"

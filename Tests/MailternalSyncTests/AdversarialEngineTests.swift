@@ -325,13 +325,13 @@ private struct HalfNoIMAPClient: IMAPClient {
         try await base.storeFlags(uids: uids, flag: flag, set: set)
     }
     func storeSeen(uids: IMAPUIDSet) async throws { try await base.storeSeen(uids: uids) }
-    func move(uids: IMAPUIDSet, to mailbox: String) async throws {
+    func move(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping? {
         try await base.move(uids: uids, to: mailbox)
     }
     func renameMailbox(from source: String, to destination: String) async throws {
         try await base.renameMailbox(from: source, to: destination)
     }
-    func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
+    func copy(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping? {
         try await base.copy(uids: uids, to: mailbox)
     }
     func storeDeleted(uids: IMAPUIDSet) async throws { try await base.storeDeleted(uids: uids) }

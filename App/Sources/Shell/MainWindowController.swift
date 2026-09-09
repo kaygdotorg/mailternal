@@ -2,6 +2,7 @@ import AppKit
 import os
 import Observation
 import SwiftUI
+import QuartzCore
 
 import MailternalInterfaces
 
@@ -98,6 +99,7 @@ struct MainSplitRoot: View {
                     .zIndex(1)
             }
         }
+        .modifier(MailComposerPresentation(controller: model.composer))
     }
 private struct StoreMigrationOverlay: View {
     var body: some View {
@@ -126,10 +128,9 @@ private struct StoreMigrationOverlay: View {
 
     private func handleEscape() {
         if model.isSearchPresented {
-            model.isSearchPresented = false
-            model.toasts.isSuppressed = false
+            model.dispatchFromUI(.cancelSearch)
         } else if model.isFindPresented {
-            model.isFindPresented = false
+            model.dispatchFromUI(.setFindPresented(false))
         } else {
             model.toasts.dismissFront()
         }
@@ -166,18 +167,23 @@ private struct ReaderPaneActions: NSViewRepresentable {
         MainToolbarController(model: model, includesSidebarToggle: false, isPaneLocal: true)
     }
 
-    func makeNSView(context: Context) -> NSStackView {
+    func makeNSView(context: Context) -> NSGlassEffectView {
         context.coordinator.makePaneActions()
     }
 
-    func updateNSView(_ nsView: NSStackView, context: Context) {
+    func updateNSView(
+        _ nsView: NSGlassEffectView,
+        context: Context
+    ) {
         context.coordinator.update(model: model)
     }
 
     func sizeThatFits(
-        _ proposal: ProposedViewSize, nsView: NSStackView, context: Context
+        _ proposal: ProposedViewSize,
+        nsView: NSGlassEffectView,
+        context: Context
     ) -> CGSize? {
-        nsView.fittingSize
+        nsView.contentView?.fittingSize ?? nsView.fittingSize
     }
 }
 
@@ -498,7 +504,9 @@ private final class ReaderTabsHostingView: NSHostingView<ReaderTabBar> {
 /// Tab hover preview: a system `NSPopover` (same chrome as the QR-code
 /// popover) anchored to the hovered tab. `.applicationDefined` behaviour keeps
 /// it open while the pointer is over the tab or the card; the owner dismisses
-/// it. The content tracks pointer entry/exit so scrolling the preview works.
+/// it. Chrome and content enter together in the shared 120 ms hover motion;
+/// AppKit's half-second popover spring is disabled. Dismissal is immediate.
+/// The content tracks pointer entry/exit so scrolling the preview works.
 @MainActor
 final class ReaderTabHoverPopover: NSPopover {
     private let trackingView = ReaderTabHoverTrackingView()
@@ -507,6 +515,8 @@ final class ReaderTabHoverPopover: NSPopover {
     init(card: ReaderTabHoverCard, cardHovered: Binding<Bool>) {
         hostingView = NSHostingView(rootView: card)
         super.init()
+        delegate = trackingView
+        animates = false
         trackingView.onHoverChanged = { inside in
             cardHovered.wrappedValue = inside
         }
@@ -526,29 +536,24 @@ final class ReaderTabHoverPopover: NSPopover {
             height: ReaderTabTokens.previewHeight
         )
         behavior = .applicationDefined
-        animates = false
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(card: ReaderTabHoverCard) {
-        hostingView.rootView = card
-    }
 
-    /// `tabFrame` is in `view`'s SwiftUI (top-left) coordinates.
+    /// `tabFrame` uses the native positioning view's bounds coordinates.
     func present(tabFrame: CGRect, in view: NSView) {
         var rect = tabFrame.intersection(view.bounds)
         if rect.isNull || rect.isEmpty { rect = view.bounds }
-        if !view.isFlipped {
-            rect.origin.y = view.bounds.height - rect.maxY
-        }
         if isShown {
             positioningRect = rect
             return
         }
+        trackingView.shouldAnimateEntrance = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         show(relativeTo: rect, of: view, preferredEdge: .maxY)
     }
+
 
     func dismiss() {
         if isShown { performClose(nil) }
@@ -556,9 +561,24 @@ final class ReaderTabHoverPopover: NSPopover {
 }
 
 @MainActor
-private final class ReaderTabHoverTrackingView: NSView {
+private final class ReaderTabHoverTrackingView: NSView, NSPopoverDelegate {
     var onHoverChanged: ((Bool) -> Void)?
+    var shouldAnimateEntrance = false
     private var trackingArea: NSTrackingArea?
+
+    func popoverWillShow(_ notification: Notification) {
+        // Fade the native window, including its chrome, rather than the text.
+        window?.alphaValue = shouldAnimateEntrance ? 0 : 1
+    }
+
+    func popoverDidShow(_ notification: Notification) {
+        guard shouldAnimateEntrance, let window else { return }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = MailMotion.hoverDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().alphaValue = 1
+        }
+    }
 
     override func updateTrackingAreas() {
         if let trackingArea {
@@ -650,32 +670,75 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
 
     /// The same command/menu owner backs native pane buttons and titlebar
     /// items. Only presentation changes; mutations still go through AppModel.
-    func makePaneActions() -> NSStackView {
-        let archive = NSButton(
-            image: NSImage(), target: self, action: #selector(archiveSelected(_:))
+    func makePaneActions() -> NSGlassEffectView {
+        let archive = makePaneButton(
+            from: archiveItem,
+            identifier: MessageToolbarPolicy.Identifier.archive
         )
-        let trash = NSButton(
-            image: NSImage(), target: self, action: #selector(trashSelected(_:))
+        let trash = makePaneButton(
+            from: trashItem,
+            identifier: MessageToolbarPolicy.Identifier.trash
         )
-        let more = NSPopUpButton(frame: .zero, pullsDown: true)
-        menuNeedsUpdate(overflowMenu)
-        more.menu = overflowMenu
-        (more.cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
+        let more = makePaneMenuButton(
+            from: overflowItem,
+            identifier: MessageToolbarPolicy.Identifier.overflow
+        )
         paneButtons = [.archive: archive, .trash: trash, .overflow: more]
-        for (identifier, button) in paneButtons {
-            button.bezelStyle = .glass
-            button.imagePosition = .imageOnly
-            button.setAccessibilityIdentifier(identifier.rawValue)
-        }
         configureMessageItems()
         let stack = NSStackView(views: [archive, trash, more])
         stack.orientation = .horizontal
         stack.alignment = .centerY
-        stack.spacing = ReaderTabLayoutPolicy.toolbarSpacing
+        stack.spacing = 0
         stack.setHuggingPriority(.required, for: .horizontal)
-        return stack
+
+        // One native glass capsule matches the titlebar's grouped actions.
+        // Borderless native controls inside retain AppKit's hit testing,
+        // keyboard focus, accessibility, menus, and pressed/disabled states.
+        for button in [archive, trash, more] {
+            button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .regular)
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalToConstant: 34),
+                button.heightAnchor.constraint(equalToConstant: 34)
+            ])
+        }
+        let glass = NSGlassEffectView(frame: .zero)
+        glass.cornerRadius = 17
+        glass.contentView = stack
+        return glass
     }
 
+    private func makePaneButton(
+        from item: NSToolbarItem,
+        identifier: MessageToolbarPolicy.Identifier
+    ) -> NSButton {
+        guard let action = item.action else {
+            preconditionFailure("Native message toolbar item has no action")
+        }
+        let button = NSButton(image: item.image ?? NSImage(), target: item.target ?? self, action: action)
+        button.bezelStyle = .toolbar
+        button.controlSize = .large
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.setAccessibilityIdentifier(identifier.rawValue)
+        return button
+    }
+
+    private func makePaneMenuButton(
+        from item: NSMenuToolbarItem,
+        identifier: MessageToolbarPolicy.Identifier
+    ) -> NSPopUpButton {
+        menuNeedsUpdate(item.menu)
+        let button = NSPopUpButton(frame: .zero, pullsDown: true)
+        button.menu = item.menu
+        button.image = item.image
+        button.bezelStyle = .toolbar
+        button.controlSize = .large
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        (button.cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
+        button.setAccessibilityIdentifier(identifier.rawValue)
+        return button
+    }
     /// AppKit's toolbar validation is not driven by SwiftUI's observation
     /// updates. Keep native message actions in step with only the state they
     /// consume, without rebuilding the reader-tabs item for list/menu changes.
@@ -1361,7 +1424,13 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         case .moveToJunk:
             guard let junk = model.folders.first(where: { $0.role == .junk }) else { return }
             model.move(ids: selection, to: junk.id)
-        case .delete, .archive, .reply, .replyAll, .forward:
+        case .reply, .replyAll:
+            guard selection.count == 1, let id = selection.first else { return }
+            Task { await model.composer.reply(to: id, all: action == .replyAll) }
+        case .forward:
+            guard selection.count == 1, let id = selection.first else { return }
+            Task { await model.composer.forward(id) }
+        case .delete, .archive:
             break
         }
     }
@@ -1373,6 +1442,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var toolbarController: MainToolbarController?
     private var readerInteractionModel: AppModel?
     private var readerInteractionMonitor: Any?
+    private var mailUndoMonitor: Any?
     private var didScheduleFirstFrame = false
     private var didScheduleSettledFrame = false
     private var launchDataPhases: Set<String> = []
@@ -1429,6 +1499,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let window else { return }
         readerInteractionModel = model
         installReaderInteractionMonitor(for: window)
+        installMailUndoMonitor(for: window)
         if !didScheduleFirstFrame {
             didScheduleFirstFrame = true
             CATransaction.begin()
@@ -1473,6 +1544,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
               ),
               window.makeFirstResponder(table) else { return }
         readerInteractionModel?.noteListInteraction()
+    }
+
+    /// Focuses the live search text field, rather than only changing the
+    /// observable focus state. Automation and native commands therefore land
+    /// in the same AppKit responder used by the panel.
+    func focusSearchField() {
+        guard let window, window === NSApp.keyWindow,
+              let contentView = window.contentView,
+              let field = Self.findView(
+                  withAccessibilityIdentifier: UIIdentifier.searchField,
+                  in: contentView
+              )
+        else { return }
+        _ = window.makeFirstResponder(field)
     }
 
     /// Native text/WebKit responders and toolbar hosts are tested against
@@ -1521,6 +1606,72 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return event
         }
     }
+    private func installMailUndoMonitor(for window: NSWindow) {
+        guard mailUndoMonitor == nil else { return }
+        mailUndoMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+            [weak self, weak window] event in
+            guard let self,
+                  let window,
+                  event.window === window,
+                  window === self.window,
+                  window.isKeyWindow,
+                  NSApp.keyWindow === window,
+                  NSApp.isActive,
+                  event.modifierFlags.contains(.command),
+                  !event.modifierFlags.contains(.shift),
+                  !event.modifierFlags.contains(.option),
+                  !event.modifierFlags.contains(.control),
+                  event.charactersIgnoringModifiers?.lowercased() == "z",
+                  let model = self.readerInteractionModel,
+                  self.isMailSurfaceResponder(in: window, model: model)
+            else {
+                return event
+            }
+            model.dispatchFromUI(.undo)
+            return nil
+        }
+    }
+
+    private func isMailSurfaceResponder(in window: NSWindow, model: AppModel) -> Bool {
+        guard let contentView = window.contentView,
+              let responder = window.firstResponder as? NSView,
+              responder !== contentView,
+              responder.window === window,
+              !isTextEditorResponder(responder)
+        else { return false }
+        let responderFrame = responder.convert(responder.bounds, to: contentView)
+        guard !responderFrame.isEmpty else { return false }
+        if isReaderFocused(in: window) {
+            return true
+        }
+        if Self.frame(of: UIIdentifier.messageTable, in: contentView)?
+            .intersects(responderFrame) == true {
+            return true
+        }
+        if Self.frame(of: UIIdentifier.sidebar, in: contentView)?
+            .intersects(responderFrame) == true {
+            return true
+        }
+        return model.isSearchPresented
+            && Self.frame(of: UIIdentifier.searchPanel, in: contentView)?
+                .intersects(responderFrame) == true
+    }
+
+    private func isTextEditorResponder(_ responder: NSResponder?) -> Bool {
+        var current = responder
+        while let currentResponder = current {
+            if currentResponder is NSTextView
+                || currentResponder is NSTextField
+                || (currentResponder as? NSControl)?.cell?.isEditable == true
+                || (currentResponder.responds(to: Selector(("isEditable")))
+                    && (currentResponder.value(forKey: "editable") as? Bool) == true) {
+                return true
+            }
+            current = currentResponder.nextResponder
+        }
+        return false
+    }
+
 
     private static func frame(of identifier: String, in view: NSView) -> CGRect? {
         guard let target = findView(
@@ -1568,6 +1719,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         shellLaunchPhase("shell-toolbar-controller-ready")
         window.toolbar = toolbarController.makeToolbar()
         shellLaunchPhase("shell-toolbar-install-end")
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if let monitor = mailUndoMonitor {
+            NSEvent.removeMonitor(monitor)
+            mailUndoMonitor = nil
+        }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {

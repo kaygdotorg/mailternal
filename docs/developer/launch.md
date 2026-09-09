@@ -61,28 +61,45 @@ zsh ~/vm-qa.sh phases lv-debug
 ```
 
 `Scripts/deploy-vm.sh` copies `vm-qa.sh` and the dedicated tab-switch helper to
-`~/vm-qa.sh` and `~/tab-switch-latency-vm.sh`. For the tab-switch gate, leave
-two or more tabs loaded after launch, then run:
+`~/vm-qa.sh` and `~/tab-switch-latency-vm.sh`. For a diagnostic tab-switch run,
+leave two or more genuinely loaded tabs after launch, then run:
 
 ```text
 zsh ~/tab-switch-latency-vm.sh NightlyQA 10 100
 ```
 
-The final `NightlyQA` run on 2026-09-05 reported
-`samples=10 max=95.9ms navigations=0 malformed=0 budget=100.0ms`.
+Any prior tab-switch sample is diagnostic only, not final scrolling evidence.
+The existing 103-tab/66.4 ms sample predates the current API and fixture, so it
+is not current acceptance evidence. The current API fixture has created 103
+pinned existing-read tabs, but final tab restoration and performance
+measurements remain pending. No reliable continuous scroll/hitch measurement
+exists: Cua or endpoint round-trip duration is transport time, not
+presented-frame smoothness, and wheel displacement/handler timing alone is not
+an end-to-end scrolling measurement.
 
-`vm-qa.sh launch` removes and copies `~/mailternal-qa-base` before every run.
+`vm-qa.sh launch` removes and re-copies the store before every run, including
+`launch-release`, so it cannot substantiate warm-reopen performance. For a true
+warm run, manually restart the same Release executable against the unchanged
+store, and record the fixture identity and executable hash. Keep five runs per
+controlled cell, report medians, and retain the raw phase logs with the artifact.
+
 For Release, rsync the Release `.app` to `~/mailternal/Mailternal-release.app`
 and run `zsh ~/vm-qa.sh launch-release lv-release`; `APP=/path/to/app` can
 override that path. The helper stages the fixture in a run-named directory
 inside the `org.kayg.mailternal` sandbox container, passes that exact
 Application Support path to `-qa-container`, and installs the QA certificate
 inside the same container. A cold run includes `sudo purge` before the copy and
-launch; a warm run relaunches immediately against the same container. Keep five
-runs per cell, report medians, and retain the raw phase logs with the artifact.
+launch. Do not call a helper's recopy a warm relaunch.
 
-The fixture must already contain the current GRDB migration identifiers when
-the goal is launch latency. If `v10_unread_index` or `v14_list_sort_indexes` is
+The only measured overnight performance improvement proven on the final migration
+artifact is a legacy-schema upgrade: store-open 88,597.3 ms → 47,245.2 ms
+settled (46.7% lower; one controlled legacy clone/observation). This is a
+one-time migration result, not steady-state or cache-cold launch. Prior warm
+medians overlap concurrent build activity and older artifacts and are not a final
+API/native baseline.
+
+The fixture must already contain the current GRDB migration identifiers when the
+goal is launch latency. If `v10_unread_index` or `v14_list_sort_indexes` is
 absent, GRDB correctly builds the corresponding required indexes over the
 populated `messages` table at open. These are one-time schema migrations, not
 steady-state launch work; report each migration separately rather than

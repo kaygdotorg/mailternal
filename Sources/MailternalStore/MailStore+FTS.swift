@@ -13,12 +13,15 @@ extension MailStore {
     ///
     /// Known 0.0.1 limitation: `unicode61` does not segment CJK, so CJK search is
     /// substring-poor until a later ICU-backed tokenizer.
-    public func search(_ query: String, limit: Int) async throws -> [MessageRow] {
+    public func search(
+        _ query: String,
+        limit: Int,
+        accountLinks: Set<AccountLinkID>? = nil
+    ) async throws -> [MessageRow] {
         let cap = max(0, limit)
-        if cap == 0 { return [] }
         return try await read { db in
             guard let pattern = FTS5Pattern(matchingAllTokensIn: query) else { return [] }
-            let sql = """
+            var sql = """
                 SELECT m.id, m.from_display, m.from_text, m.subject, m.internal_date, m.uid,
                        m.is_read, m.has_attachments, m.is_flagged, m.preview,
                        COALESCE(NULLIF(f.name, ''), CASE f.role
@@ -39,10 +42,27 @@ extension MailStore {
                 JOIN accounts a ON a.id = f.account_id
                 WHERE messages_fts MATCH ?1
                   AND a.is_enabled = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM archive_queue q
+                      WHERE q.folder_id = g.folder_id
+                        AND q.uid_validity = g.uid_validity
+                        AND q.uid = m.uid
+                  )
+                """
+            var arguments: StatementArguments = [pattern]
+            if let accountLinks {
+                let placeholders = Array(repeating: "?", count: accountLinks.count).joined(separator: ", ")
+                sql += " AND a.account_link_id IN (\(placeholders))"
+                arguments += StatementArguments(
+                    accountLinks.sorted { $0.uuidString < $1.uuidString }.map(\.uuidString)
+                )
+            }
+            sql += """
                 ORDER BY messages_fts.rowid DESC
-                LIMIT ?2
-            """
-            let rows = try Row.fetchAll(db, sql: sql, arguments: [pattern, cap])
+                LIMIT ?
+                """
+            arguments += [cap]
+            let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
             return rows.map { row in
                 let bodySnippet: String? = row["body_snippet"]
                 let subjectSnippet: String? = row["subject_snippet"]

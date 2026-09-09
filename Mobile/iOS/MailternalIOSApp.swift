@@ -1,5 +1,6 @@
 import SwiftUI
 import MailternalInterfaces
+import MailternalAutomation
 
 @main
 @MainActor
@@ -31,6 +32,12 @@ struct MailternalIOSApp: App {
                 onOpenMessage: { [weak appState] link in
                     guard let appState else { return false }
                     return await appState.openDeepLink(link)
+                },
+                onCommand: { [weak appState] command in
+                    guard let appState else {
+                        throw AutomationCommandError.appUnavailable
+                    }
+                    return try await appState.dispatcher.submit(command, origin: .watch)
                 }
             )
             appState.attachCompanion(companion)

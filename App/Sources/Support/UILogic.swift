@@ -37,8 +37,6 @@ enum UIIdentifier {
     static let setupPort = "setup-port"
     static let accountsList = "accounts-list"
     static let accountsAdd = "accounts-add"
-    // Retained for UI-test source compatibility; removal now lives inline.
-    static let accountsRemove = "accounts-remove"
     static let accountsEmptyAdd = "accounts-empty-add"
     static let accountEditorSheet = "account-editor-sheet"
     static let accountEditorPreset = "account-editor-preset"
@@ -52,12 +50,7 @@ enum UIIdentifier {
     static let accountEditorSave = "account-editor-save"
     static let accountEditorCancel = "account-editor-cancel"
     static let accountEditorRemove = "account-editor-remove"
-    // The display-name field moved into each row; keep the historical
-    // identifier so existing automation and the row-specific name stay one
-    // address.
-    static let accountsRowName = accountEditorDisplayName
     static let accountsRowEmail = "accounts-row-email"
-    static let accountsRowDisclosure = "accounts-row-disclosure"
     static let cacheTree = "cache-tree"
     static let cacheAll = "cache-all"
     static func cacheAccount(_ id: String) -> String { "cache-account-\(id)" }
@@ -279,22 +272,16 @@ enum PaneHeaderInsetPolicy {
     enum Pane: Sendable {
         case sidebar
         case messageList
-        case settings
     }
 
     /// Standard toolbar/titlebar depth, with the documented 52pt fallback.
     static let windowTitlebarHeight: CGFloat = 52
     static let sidebarTopInset: CGFloat = windowTitlebarHeight
     static let messageListTopInset: CGFloat = windowTitlebarHeight
-    /// The settings window has a titlebar but no toolbar: its H1 sits close
-    /// under the traffic-light band, and its fade follows the H1.
-    static let settingsTopInset: CGFloat = 46
     /// Main-window pane headers share one baseline: the titlebar band plus
     /// this air. The list H1 uses it as its top padding so it clears the
     /// sidebar toggle when the sidebar is collapsed.
     static let headerTopPadding: CGFloat = windowTitlebarHeight + MessageViewerLayoutPolicy.fadeGuard
-    /// The settings H1's top padding.
-    static let settingsHeaderTopPadding: CGFloat = settingsTopInset
     /// Below the list H1: the ramp begins at the H1's bottom edge.
     static let listTitleBottomPadding: CGFloat = 12
     /// Shared air below settings H1s before their scroll content begins.
@@ -320,8 +307,6 @@ enum PaneHeaderInsetPolicy {
             sidebarTopInset
         case .messageList:
             messageListTopInset
-        case .settings:
-            settingsTopInset
         }
     }
 }
@@ -482,6 +467,10 @@ struct MailWindowDissolvePolicy: Equatable, Sendable {
     /// FolderSidebar's account inset is outside its masked List, so this stays
     /// zero while the message list reaches the window bottom.
     let bottomReservedHeight: CGFloat
+    /// Clear tail after the bottom ramp. The message list keeps the native
+    /// 15 pt resting clear band in the side-by-side pane; stacked layout
+    /// overrides this to zero so the fade reaches the reader tab row exactly.
+    var bottomClearTail: CGFloat = 15
 
     /// The reader's ramp starts exactly where the tab strip ends (the 40 pt
     /// strip is centred in the 52 pt titlebar) and dissolves content over a
@@ -517,6 +506,22 @@ struct MailWindowDissolvePolicy: Equatable, Sendable {
     /// Row text owns its separate 10 pt top inset; subtitle presence is
     /// measured inside the fixed header and must not increase this reach.
     static let messageListTopReach: CGFloat = 16
+    /// The stacked list meets pane-local reader chrome at its bottom edge.
+    /// Keep the ramp short enough that the final row remains readable until
+    /// it reaches that boundary; side-by-side keeps the full 48 pt ramp.
+    static let stackedMessageListBottomReach: CGFloat = 16
+
+    /// Returns a copy with a pane-specific bottom ramp.
+    func withBottomReach(_ reach: CGFloat?) -> Self {
+        Self(
+            topOrigin: topOrigin,
+            topReach: topReach,
+            bottomReach: reach,
+            bottomReservedHeight: bottomReservedHeight,
+            bottomClearTail: bottomClearTail
+        )
+    }
+
     static let messageList = Self(
         topOrigin: .windowTop,
         topReach: messageListTopReach,
@@ -540,7 +545,19 @@ struct MailWindowDissolvePolicy: Equatable, Sendable {
             topOrigin: .measured(depth),
             topReach: topReach,
             bottomReach: bottomReach,
-            bottomReservedHeight: bottomReservedHeight
+            bottomReservedHeight: bottomReservedHeight,
+            bottomClearTail: bottomClearTail
+        )
+    }
+
+    /// Returns a copy with a pane-specific clear tail at the bottom boundary.
+    func withBottomClearTail(_ tail: CGFloat) -> Self {
+        Self(
+            topOrigin: topOrigin,
+            topReach: topReach,
+            bottomReach: bottomReach,
+            bottomReservedHeight: bottomReservedHeight,
+            bottomClearTail: max(tail, 0)
         )
     }
 
@@ -599,9 +616,29 @@ struct MailWindowDissolvePolicy: Equatable, Sendable {
             (bottomEnd - distanceFromEnd) / height
         }
         stops.append(MailWindowTopDissolveStop(location: location(reach), alpha: 1))
-        stops.append(MailWindowTopDissolveStop(location: location(min(reach, 36)), alpha: 0.55))
-        stops.append(MailWindowTopDissolveStop(location: location(min(reach, 24)), alpha: 0.12))
-        stops.append(MailWindowTopDissolveStop(location: location(min(reach, 15)), alpha: 0))
+        // Preserve the established 36/24 pt stops for the side-by-side
+        // 48 pt ramp. A stacked ramp is shorter, so scale those interior
+        // points instead of collapsing multiple stops onto its start.
+        let interiorStops: [(distance: CGFloat, alpha: CGFloat)] = reach > 36
+            ? [(36, 0.55), (24, 0.12)]
+            : [(reach * 0.75, 0.55), (reach * 0.5, 0.12)]
+        for stop in interiorStops {
+            stops.append(
+                MailWindowTopDissolveStop(
+                    location: location(stop.distance),
+                    alpha: stop.alpha
+                )
+            )
+        }
+        let clearTail = min(reach, max(bottomClearTail, 0))
+        if clearTail > 0 {
+            stops.append(
+                MailWindowTopDissolveStop(
+                    location: location(clearTail),
+                    alpha: 0
+                )
+            )
+        }
         stops.append(MailWindowTopDissolveStop(location: bottomEnd / height, alpha: 0))
         if bottomEnd < height {
             stops.append(MailWindowTopDissolveStop(location: 1, alpha: 1))

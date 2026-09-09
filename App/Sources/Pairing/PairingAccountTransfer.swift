@@ -2,6 +2,7 @@ import Foundation
 import MailternalInterfaces
 import MailternalPairing
 import MailternalStore
+import MailternalAutomation
 import MailternalWorkspace
 
 /// Errors raised before the transport acknowledges a pairing import.
@@ -147,7 +148,17 @@ private func pairingAccounts(
         guard !credential.isEmpty else {
             throw PairingAccountTransferError.missingCredential(id)
         }
-        return PairingAccount(config: account, credential: credential)
+        let smtpCredential: String?
+        do {
+            smtpCredential = try live.accountTransferSMTPCredential(for: id)
+        } catch {
+            throw PairingAccountTransferError.missingCredential(id)
+        }
+        return PairingAccount(
+            config: account,
+            credential: credential,
+            smtpCredential: smtpCredential
+        )
     }
 }
 
@@ -212,9 +223,19 @@ extension AppModel {
                 guard replaceExisting else { continue }
                 var replacement = incoming.config
                 replacement.id = adopted.id
+                // Account edits keep SMTP state behind configureSMTP, which
+                // also imports the encrypted account-scoped secret.
+                replacement.smtp = adopted.smtp
                 try await facade.updateAccount(replacement, password: incoming.credential)
+                try await facade.configureSMTP(
+                    adopted.id,
+                    configuration: incoming.config.smtp,
+                    password: incoming.smtpCredential
+                )
                 if let index = localAccounts.firstIndex(where: { $0.id == adopted.id }) {
-                    localAccounts[index] = replacement
+                    var updated = replacement
+                    updated.smtp = incoming.config.smtp
+                    localAccounts[index] = updated
                 }
                 continue
             }
@@ -222,9 +243,16 @@ extension AppModel {
                 throw PairingAccountTransferError.accountIdentityConflict(incoming.id)
             }
             try Task.checkCancellation()
-            // Keep the credential in the facade's normal account lifecycle; it
-            // writes Keychain and the durable account record before returning.
-            try await facade.addAccount(incoming.config, password: incoming.credential)
+            var importedConfig = incoming.config
+            importedConfig.smtp = nil
+            try await facade.addAccount(importedConfig, password: incoming.credential)
+            if let smtp = incoming.config.smtp {
+                try await facade.configureSMTP(
+                    incoming.id,
+                    configuration: smtp,
+                    password: incoming.smtpCredential
+                )
+            }
             localAccounts.append(incoming.config)
         }
 
@@ -325,12 +353,19 @@ extension IOSAppState {
                 guard replaceExisting else { continue }
                 var replacement = incoming.config
                 replacement.id = adopted.id
+                replacement.smtp = adopted.smtp
                 try await dispatcher.submit(
-                    .saveAccount(replacement, requiresPassword: true),
+                    .saveAccount(replacement, hasPassword: true),
                     secret: incoming.credential
                 )
+                _ = try await dispatcher.submit(
+                    .configureSMTP(adopted.id, incoming.config.smtp, hasPassword: incoming.smtpCredential != nil),
+                    secret: incoming.smtpCredential
+                )
                 if let index = localAccounts.firstIndex(where: { $0.id == adopted.id }) {
-                    localAccounts[index] = replacement
+                    var updated = replacement
+                    updated.smtp = incoming.config.smtp
+                    localAccounts[index] = updated
                 }
                 continue
             }
@@ -338,10 +373,18 @@ extension IOSAppState {
                 throw PairingAccountTransferError.accountIdentityConflict(incoming.id)
             }
             try Task.checkCancellation()
+            var importedConfig = incoming.config
+            importedConfig.smtp = nil
             try await dispatcher.submit(
-                .saveAccount(incoming.config, requiresPassword: true),
+                .saveAccount(importedConfig, hasPassword: true),
                 secret: incoming.credential
             )
+            if let smtp = incoming.config.smtp {
+                _ = try await dispatcher.submit(
+                    .configureSMTP(incoming.id, smtp, hasPassword: incoming.smtpCredential != nil),
+                    secret: incoming.smtpCredential
+                )
+            }
             localAccounts.append(incoming.config)
         }
         guard importSettings, !importedSettings.isEmpty else {

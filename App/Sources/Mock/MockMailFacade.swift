@@ -15,6 +15,20 @@ private struct StoredMessage: Sendable {
     var raw: String
     var parts: [String: (data: Data, mimeType: String)]
 }
+private struct MockMutationState {
+    let id: MessageID
+    let folder: FolderID
+    let accountLinkID: AccountLinkID
+    let uid: IMAPUID
+    let uidValidity: UInt32
+    let isRead: Bool
+    let isFlagged: Bool
+}
+
+private enum MockMutation {
+    case flags([MockMutationState], FlagKind)
+    case move([MockMutationState])
+}
 
 @MainActor
 final class MockMailFacade: MailFacade {
@@ -41,6 +55,7 @@ final class MockMailFacade: MailFacade {
     private let syncContinuation: AsyncStream<SyncStatus>.Continuation
 
     private var folders: [FolderSummary] = []
+    private var mutationJournal: [MockMutation] = []
     private var messages: [FolderID: [StoredMessage]] = [:]
     private var byID: [MessageID: StoredMessage] = [:]
     private var syncStatus = SyncStatus(mode: .fullHistory, isOnline: true)
@@ -48,6 +63,18 @@ final class MockMailFacade: MailFacade {
     private var nextMessageID: Int64 = 1
     private var nextFolderID: Int64 = 1
     private var passwords: [AccountID: String] = [:]
+    private var smtpPasswords: [AccountID: [String: String]] = [:]
+    private var outgoingDrafts: [UUID: MailDraft] = [:]
+    private var outgoing: [UUID: OutboxRecord] = [:]
+    private var attachmentData: [UUID: Data] = [:]
+    private var attachmentOwners: [UUID: AccountID] = [:]
+    private var attachmentMetadata: [UUID: DraftAttachment] = [:]
+    private struct OutgoingObserver {
+        let accounts: Set<AccountID>?
+        let limit: Int
+        let continuation: AsyncStream<OutgoingState>.Continuation
+    }
+    private var outgoingObservers: [UUID: OutgoingObserver] = [:]
     var accountConfig: AccountConfig? { accounts.first }
     var accountDisplayName: String? {
         guard let config = accounts.first else { return nil }
@@ -115,6 +142,7 @@ final class MockMailFacade: MailFacade {
             emailAddress: config.emailAddress,
             username: config.username,
             imap: config.imap,
+            smtp: config.smtp,
             isEnabled: config.isEnabled
         )
         if let index = accounts.firstIndex(where: { $0.id == mockConfig.id }) {
@@ -185,6 +213,7 @@ final class MockMailFacade: MailFacade {
             throw MailAccountError(message)
         }
     }
+
     func removeAccount(_ id: AccountID) async throws {
         activityCycleTask?.cancel()
         let removedFolders = folders.filter { $0.accountID == id }.map(\.id)
@@ -194,10 +223,423 @@ final class MockMailFacade: MailFacade {
         }
         byID = byID.filter { !removedFolders.contains($0.value.folder) }
         passwords[id] = nil
+        smtpPasswords[id] = nil
+        let removedAttachments = attachmentOwners.compactMap { key, owner in
+            owner == id ? key : nil
+        }
+        for attachmentID in removedAttachments {
+            attachmentOwners[attachmentID] = nil
+            attachmentData[attachmentID] = nil
+            attachmentMetadata[attachmentID] = nil
+        }
+        outgoingDrafts = outgoingDrafts.filter { $0.value.accountID != id }
+        outgoing = outgoing.filter { $0.value.accountID != id }
         accounts.removeAll { $0.id == id }
         accountStates[id] = nil
         publishFolders()
+        publishOutgoing()
         publishAggregateState()
+    }
+
+    func configureSMTP(
+        _ accountID: AccountID,
+        configuration: SMTPConfiguration?,
+        password: String?
+    ) async throws {
+        guard let index = accounts.firstIndex(where: { $0.id == accountID }) else {
+            throw MailAccountError("That account is no longer available.")
+        }
+        guard password == nil || configuration != nil else {
+            throw MailAccountError("An SMTP password requires SMTP configuration.")
+        }
+        let oldReference = accounts[index].smtp?.credentialReference
+        var next = configuration
+        if var config = next {
+            if let password {
+                guard !password.isEmpty else { throw MailAccountError("An SMTP password is required.") }
+                let reference = UUID().uuidString.lowercased()
+                config.credentialReference = reference
+                smtpPasswords[accountID, default: [:]][reference] = password
+            } else if let reference = config.credentialReference {
+                guard accounts[index].smtp?.credentialReference == reference,
+                      smtpPasswords[accountID]?[reference] != nil else {
+                    throw MailAccountError("A new SMTP credential requires its password.")
+                }
+            }
+            next = config
+        } else {
+            smtpPasswords[accountID] = nil
+        }
+        accounts[index].smtp = next
+        if let oldReference, oldReference != next?.credentialReference {
+            smtpPasswords[accountID]?[oldReference] = nil
+        }
+        publishOutgoing()
+    }
+
+    func createDraft(
+        id: UUID,
+        accountID: AccountID,
+        content: DraftContent
+    ) async throws -> MailDraft {
+        guard accounts.contains(where: { $0.id == accountID }) else {
+            throw OutgoingMailError.draftNotFound
+        }
+        try validateMockAttachments(content.attachments, accountID: accountID)
+        guard outgoingDrafts[id] == nil else {
+            throw OutgoingMailError.invalidContent("A draft with this identifier already exists.")
+        }
+        let draft = MailDraft(
+            id: id,
+            accountID: accountID,
+            revision: 1,
+            content: content,
+            updatedAt: Date()
+        )
+        outgoingDrafts[id] = draft
+        publishOutgoing()
+        return draft
+    }
+
+    func createReplyDraft(
+        id: UUID,
+        messageID: MessageID,
+        replyAll: Bool
+    ) async throws -> MailDraft {
+        guard let stored = byID[messageID],
+              let source = folders.first(where: { $0.id == stored.folder }),
+              let account = accounts.first(where: { $0.id == source.accountID }) else {
+            throw OutgoingMailError.draftNotFound
+        }
+        let recipients = mockReplyRecipients(
+            stored.detail.envelope,
+            accountIdentity: account.emailAddress,
+            replyAll: replyAll
+        )
+        let parentID = stored.detail.envelope.rfcMessageID
+        var references = stored.detail.envelope.references
+        if let parentID, !references.contains(where: {
+            $0.caseInsensitiveCompare(parentID) == .orderedSame
+        }) {
+            references.append(parentID)
+        }
+        return try await createDraft(
+            id: id,
+            accountID: account.id,
+            content: DraftContent(
+                from: MailAddress(displayName: account.displayName, address: account.emailAddress),
+                to: recipients.to,
+                cc: recipients.cc,
+                subject: mockReplySubject(stored.detail.envelope.subject),
+                plainText: stored.detail.bodyText ?? "",
+                html: stored.detail.sanitizedHTML,
+                inReplyTo: parentID,
+                references: references
+            )
+        )
+    }
+
+    func createForwardDraft(id: UUID, messageID: MessageID) async throws -> MailDraft {
+        guard let stored = byID[messageID],
+              let source = folders.first(where: { $0.id == stored.folder }),
+              let account = accounts.first(where: { $0.id == source.accountID }) else {
+            throw OutgoingMailError.draftNotFound
+        }
+        var attachments: [DraftAttachment] = []
+        for info in stored.detail.attachments {
+            guard let data = stored.parts[info.id]?.data else {
+                throw OutgoingMailError.attachmentNotFound
+            }
+            let attachment = DraftAttachment(
+                id: UUID(),
+                filename: info.filename ?? "attachment-\(attachments.count + 1)",
+                mimeType: info.mimeType,
+                byteCount: Int64(data.count)
+            )
+            attachmentData[attachment.id] = data
+            attachmentOwners[attachment.id] = account.id
+            attachmentMetadata[attachment.id] = attachment
+            attachments.append(attachment)
+        }
+        return try await createDraft(
+            id: id,
+            accountID: account.id,
+            content: DraftContent(
+                from: MailAddress(displayName: account.displayName, address: account.emailAddress),
+                subject: mockForwardSubject(stored.detail.envelope.subject),
+                plainText: stored.detail.bodyText ?? "",
+                html: stored.detail.sanitizedHTML,
+                attachments: attachments
+            )
+        )
+    }
+
+    func saveDraft(
+        id: UUID,
+        expectedRevision: Int64,
+        content: DraftContent
+    ) async throws -> DraftSaveResult {
+        guard let current = outgoingDrafts[id] else {
+            throw OutgoingMailError.draftNotFound
+        }
+        try validateMockAttachments(content.attachments, accountID: current.accountID)
+        guard current.revision == expectedRevision else {
+            let conflict = MailDraft(
+                id: UUID(),
+                accountID: current.accountID,
+                revision: 1,
+                content: content,
+                updatedAt: Date(),
+                conflictOf: id
+            )
+            outgoingDrafts[conflict.id] = conflict
+            publishOutgoing()
+            return DraftSaveResult(saved: conflict, conflictWith: current)
+        }
+        let saved = MailDraft(
+            id: current.id,
+            accountID: current.accountID,
+            revision: current.revision + 1,
+            content: content,
+            updatedAt: Date(),
+            conflictOf: current.conflictOf
+        )
+        outgoingDrafts[id] = saved
+        publishOutgoing()
+        return DraftSaveResult(saved: saved)
+    }
+
+    func deleteDraft(id: UUID, expectedRevision: Int64) async throws {
+        guard let draft = outgoingDrafts[id] else {
+            throw OutgoingMailError.draftNotFound
+        }
+        guard draft.revision == expectedRevision else {
+            throw OutgoingMailError.revisionConflict
+        }
+        outgoingDrafts[id] = nil
+        publishOutgoing()
+    }
+
+    func draft(id: UUID) async throws -> MailDraft? {
+        outgoingDrafts[id]
+    }
+
+    func drafts(accounts: Set<AccountID>?, limit: Int) async throws -> [DraftSummary] {
+        makeDraftSummaries(accounts: accounts, limit: limit)
+    }
+
+    private func makeDraftSummaries(
+        accounts: Set<AccountID>?,
+        limit: Int
+    ) -> [DraftSummary] {
+        guard limit > 0, accounts?.isEmpty != true else { return [] }
+        return outgoingDrafts.values
+            .filter { draft in
+                guard let accounts else { return true }
+                return accounts.contains(draft.accountID)
+            }
+            .filter { draft in
+                !outgoing.values.contains {
+                    $0.draftID == draft.id
+                        && $0.draftRevision == draft.revision
+                        && ($0.state == .sentCopyPending || $0.state == .sent)
+                }
+            }
+            .sorted {
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            .prefix(min(limit, 1_000))
+            .map {
+                DraftSummary(
+                    id: $0.id,
+                    accountID: $0.accountID,
+                    revision: $0.revision,
+                    subject: $0.content.subject,
+                    updatedAt: $0.updatedAt,
+                    conflictOf: $0.conflictOf,
+                    attachmentCount: $0.content.attachments.count
+                )
+            }
+    }
+
+    func importDraftAttachment(
+        id: UUID,
+        accountID: AccountID,
+        sourceURL: URL,
+        filename: String,
+        mimeType: String
+    ) async throws -> DraftAttachment {
+        if let existing = attachmentMetadata[id] {
+            guard attachmentOwners[id] == accountID else {
+                throw OutgoingMailError.attachmentNotFound
+            }
+            return existing
+        }
+        guard accounts.contains(where: { $0.id == accountID }),
+              sourceURL.isFileURL else {
+            throw OutgoingMailError.invalidContent("Attachment source is invalid.")
+        }
+        let data = try Data(contentsOf: sourceURL)
+        let attachment = DraftAttachment(
+            id: id,
+            filename: filename,
+            mimeType: mimeType,
+            byteCount: Int64(data.count)
+        )
+        attachmentData[attachment.id] = data
+        attachmentOwners[attachment.id] = accountID
+        attachmentMetadata[id] = attachment
+        return attachment
+    }
+
+    func draftAttachmentURL(id: UUID, accountID: AccountID) async throws -> URL {
+        guard attachmentOwners[id] == accountID, let data = attachmentData[id] else {
+            throw OutgoingMailError.attachmentNotFound
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailternal-mock-\(id.uuidString)")
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
+    func enqueueSubmission(
+        id: UUID,
+        draftID: UUID,
+        expectedRevision: Int64
+    ) async throws -> OutboxRecord {
+        guard let draft = outgoingDrafts[draftID] else {
+            throw OutgoingMailError.draftNotFound
+        }
+        guard draft.revision == expectedRevision else {
+            throw OutgoingMailError.revisionConflict
+        }
+        guard let account = accounts.first(where: { $0.id == draft.accountID }),
+              account.isEnabled,
+              account.smtp != nil,
+              mockSMTPPassword(for: account) != nil else {
+            throw OutgoingMailError.invalidContent("Configure SMTP before sending.")
+        }
+        if let existing = outgoing[id] {
+            guard existing.draftID == draftID, existing.draftRevision == expectedRevision else {
+                throw OutgoingMailError.invalidContent("A submission identifier cannot target another draft revision.")
+            }
+            return existing
+        }
+        if let existing = outgoing.values.first(where: {
+            $0.draftID == draftID && $0.draftRevision == expectedRevision
+        }) {
+            return existing
+        }
+        let record = OutboxRecord(
+            id: id,
+            accountID: account.id,
+            draftID: draftID,
+            draftRevision: expectedRevision,
+            content: draft.content,
+            messageID: "<\(id.uuidString.lowercased())@mailternal.mock>",
+            messageDate: Date()
+        )
+        outgoing[id] = record
+        publishOutgoing()
+        return record
+    }
+
+    func retrySubmission(
+        id: UUID,
+        acknowledgeDuplicateRisk: Bool
+    ) async throws -> OutboxRecord {
+        guard var record = outgoing[id] else {
+            throw OutgoingMailError.submissionNotFound
+        }
+        if record.state == .deliveryUnknown && !acknowledgeDuplicateRisk {
+            throw OutgoingMailError.duplicateRiskRequiresAcknowledgement
+        }
+        guard record.state == .failed || record.state == .deliveryUnknown else {
+            throw OutgoingMailError.invalidTransition
+        }
+        record.state = .queued
+        record.failure = nil
+        record.nextAttemptAt = Date()
+        outgoing[id] = record
+        publishOutgoing()
+        return record
+    }
+
+    func cancelSubmission(id: UUID) async throws -> OutboxRecord {
+        guard var record = outgoing[id] else {
+            throw OutgoingMailError.submissionNotFound
+        }
+        guard [.queued, .preparing, .sending, .failed].contains(record.state) else {
+            throw OutgoingMailError.invalidTransition
+        }
+        record.state = .cancelled
+        record.attemptID = nil
+        outgoing[id] = record
+        publishOutgoing()
+        return record
+    }
+
+    func outbox(id: UUID) async throws -> OutboxRecord? {
+        outgoing[id]
+    }
+
+    func outbox(accounts: Set<AccountID>?, limit: Int) async throws -> [OutboxSummary] {
+        makeOutboxSummaries(accounts: accounts, limit: limit)
+    }
+
+    private func makeOutboxSummaries(
+        accounts: Set<AccountID>?,
+        limit: Int
+    ) -> [OutboxSummary] {
+        guard limit > 0, accounts?.isEmpty != true else { return [] }
+        return outgoing.values
+            .filter { record in
+                guard let accounts else { return true }
+                return accounts.contains(record.accountID)
+            }
+            .sorted {
+                $0.messageDate == $1.messageDate
+                    ? $0.id.uuidString > $1.id.uuidString
+                    : $0.messageDate > $1.messageDate
+            }
+            .prefix(min(limit, 1_000))
+            .map {
+                OutboxSummary(
+                    id: $0.id,
+                    accountID: $0.accountID,
+                    draftID: $0.draftID,
+                    draftRevision: $0.draftRevision,
+                    subject: $0.content.subject,
+                    state: $0.state,
+                    attemptCount: $0.attemptCount,
+                    nextAttemptAt: $0.nextAttemptAt,
+                    acceptedAt: $0.acceptedAt,
+                    failure: $0.failure
+                )
+            }
+    }
+    func observeOutgoing(
+        accounts: Set<AccountID>?,
+        limit: Int
+    ) -> AsyncStream<OutgoingState> {
+        AsyncStream { continuation in
+            let id = UUID()
+            outgoingObservers[id] = OutgoingObserver(
+                accounts: accounts,
+                limit: limit,
+                continuation: continuation
+            )
+            continuation.yield(
+                OutgoingState(
+                    drafts: makeDraftSummaries(accounts: accounts, limit: limit),
+                    outbox: makeOutboxSummaries(accounts: accounts, limit: limit)
+                )
+            )
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.outgoingObservers[id] = nil }
+            }
+        }
     }
 
 
@@ -343,6 +785,44 @@ final class MockMailFacade: MailFacade {
         let enabledAccounts = Set(accounts.lazy.filter { $0.isEnabled }.map(\.id))
         foldersContinuation.yield(folders.filter { enabledAccounts.contains($0.accountID) })
     }
+    private func publishOutgoing() {
+        for observer in outgoingObservers.values {
+            observer.continuation.yield(
+                OutgoingState(
+                    drafts: makeDraftSummaries(
+                        accounts: observer.accounts,
+                        limit: observer.limit
+                    ),
+                    outbox: makeOutboxSummaries(
+                        accounts: observer.accounts,
+                        limit: observer.limit
+                    )
+                )
+            )
+        }
+    }
+
+    private func validateMockAttachments(
+        _ attachments: [DraftAttachment],
+        accountID: AccountID
+    ) throws {
+        var seen = Set<UUID>()
+        for attachment in attachments {
+            guard seen.insert(attachment.id).inserted,
+                  attachmentOwners[attachment.id] == accountID,
+                  let data = attachmentData[attachment.id],
+                  Int64(data.count) == attachment.byteCount else {
+                throw OutgoingMailError.attachmentNotFound
+            }
+        }
+    }
+
+    private func mockSMTPPassword(for account: AccountConfig) -> String? {
+        if let reference = account.smtp?.credentialReference {
+            return smtpPasswords[account.id]?[reference]
+        }
+        return passwords[account.id]
+    }
 
 
 
@@ -364,10 +844,10 @@ final class MockMailFacade: MailFacade {
         return details
     }
 
-    func markRead(_ ids: [MessageID]) async {
-        for id in Set(ids) {
-            markReadOne(id)
-        }
+    func markRead(_ ids: [MessageID]) async throws {
+        let changed = try captureFlagMutation(ids, flag: .seen, set: true)
+        for state in changed { markReadOne(state.id) }
+        if !changed.isEmpty { appendMutation(.flags(changed, .seen)) }
     }
 
     private func markReadOne(_ id: MessageID) {
@@ -386,10 +866,10 @@ final class MockMailFacade: MailFacade {
         publishObservers(in: stored.folder)
     }
 
-    func markUnread(_ ids: [MessageID]) async {
-        for id in Set(ids) {
-            markUnreadOne(id)
-        }
+    func markUnread(_ ids: [MessageID]) async throws {
+        let changed = try captureFlagMutation(ids, flag: .seen, set: false)
+        for state in changed { markUnreadOne(state.id) }
+        if !changed.isEmpty { appendMutation(.flags(changed, .seen)) }
     }
 
     private func markUnreadOne(_ id: MessageID) {
@@ -408,43 +888,94 @@ final class MockMailFacade: MailFacade {
         publishObservers(in: stored.folder)
     }
 
-    func setFlagged(_ ids: [MessageID], _ flagged: Bool) async {
-        for id in Set(ids) {
-            guard var stored = byID[id], stored.row.isFlagged != flagged else { continue }
+    func setFlagged(_ ids: [MessageID], _ flagged: Bool) async throws {
+        let changed = try captureFlagMutation(ids, flag: .flagged, set: flagged)
+        for state in changed {
+            guard var stored = byID[state.id] else { continue }
             stored.row.isFlagged = flagged
-            byID[id] = stored
+            byID[state.id] = stored
             if var list = messages[stored.folder],
-               let index = list.firstIndex(where: { $0.row.id == id }) {
+               let index = list.firstIndex(where: { $0.row.id == state.id }) {
                 list[index] = stored
                 messages[stored.folder] = list
             }
             publishObservers(in: stored.folder)
         }
+        if !changed.isEmpty { appendMutation(.flags(changed, .flagged)) }
     }
 
-    func trash(_ ids: [MessageID]) async {
-        await moveToRole(.trash, ids: ids)
+    private func appendMutation(_ mutation: MockMutation) {
+        mutationJournal.append(mutation)
+        if mutationJournal.count > 50 {
+            mutationJournal.removeFirst(mutationJournal.count - 50)
+        }
     }
-
-    func archive(_ ids: [MessageID]) async {
-        await moveToRole(.archive, ids: ids)
-    }
-
-    private func moveToRole(_ role: FolderRole, ids: [MessageID]) async {
-        for account in accounts {
-            guard let destination = folders.first(where: {
-                $0.accountID == account.id && $0.role == role
-            })?.id else { continue }
-            let accountIDs = ids.filter { id in
-                guard let stored = byID[id],
-                      let folder = folders.first(where: { $0.id == stored.folder })
-                else { return false }
-                return folder.accountID == account.id
+    private func captureFlagMutation(
+        _ ids: [MessageID],
+        flag: FlagKind,
+        set: Bool
+    ) throws -> [MockMutationState] {
+        var result: [MockMutationState] = []
+        var seen = Set<MessageID>()
+        for id in ids where seen.insert(id).inserted {
+            guard let stored = byID[id],
+                  let summary = folders.first(where: { $0.id == stored.folder }),
+                  let account = accounts.first(where: { $0.id == summary.accountID }) else {
+                throw MailAccountError("That message is no longer available.")
             }
-            for id in accountIDs {
-                moveOne(id, to: destination)
+            let changed = flag == .seen ? stored.row.isRead != set : stored.row.isFlagged != set
+            if changed {
+                result.append(MockMutationState(
+                    id: id,
+                    folder: stored.folder,
+                    accountLinkID: account.accountLinkID,
+                    uid: stored.uid,
+                    uidValidity: stored.uidValidity,
+                    isRead: stored.row.isRead,
+                    isFlagged: stored.row.isFlagged
+                ))
             }
         }
+        return result
+    }
+
+    func trash(_ ids: [MessageID]) async throws {
+        try await moveToRole(.trash, ids: ids)
+    }
+
+    func archive(_ ids: [MessageID]) async throws {
+        try await moveToRole(.archive, ids: ids)
+    }
+
+    private func moveToRole(_ role: FolderRole, ids: [MessageID]) async throws {
+        var changed: [MockMutationState] = []
+        var destinations: [MessageID: FolderID] = [:]
+        var seen = Set<MessageID>()
+        for id in ids where seen.insert(id).inserted {
+            guard let stored = byID[id],
+                  let source = folders.first(where: { $0.id == stored.folder }),
+                  let account = accounts.first(where: { $0.id == source.accountID }),
+                  let destination = folders.first(where: {
+                      $0.accountID == account.id && $0.role == role
+                  }) else {
+                throw MailAccountError("That message or destination is no longer available.")
+            }
+            guard destination.id != source.id else { continue }
+            destinations[id] = destination.id
+            changed.append(MockMutationState(
+                id: id,
+                folder: source.id,
+                accountLinkID: account.accountLinkID,
+                uid: stored.uid,
+                uidValidity: stored.uidValidity,
+                isRead: stored.row.isRead,
+                isFlagged: stored.row.isFlagged
+            ))
+        }
+        for state in changed {
+            _ = moveOne(state.id, to: destinations[state.id]!)
+        }
+        if !changed.isEmpty { appendMutation(.move(changed)) }
     }
 
     func move(_ ids: [MessageID], to destination: FolderID) async throws -> MoveOutcome {
@@ -453,20 +984,32 @@ final class MockMailFacade: MailFacade {
         }
         var acceptedIDs = Set<MessageID>()
         var skippedCrossAccount = 0
-        for id in ids {
+        var changed: [MockMutationState] = []
+        var seen = Set<MessageID>()
+        for id in ids where seen.insert(id).inserted {
             guard let stored = byID[id],
-                  let sourceSummary = folders.first(where: { $0.id == stored.folder })
-            else {
+                  let sourceSummary = folders.first(where: { $0.id == stored.folder }),
+                  let account = accounts.first(where: { $0.id == sourceSummary.accountID }) else {
                 throw MailAccountError("That message is no longer available.")
             }
             guard sourceSummary.accountID == destinationSummary.accountID else {
                 skippedCrossAccount += 1
                 continue
             }
-            if moveOne(id, to: destination) {
-                acceptedIDs.insert(id)
-            }
+            guard sourceSummary.id != destinationSummary.id else { continue }
+            changed.append(MockMutationState(
+                id: id,
+                folder: sourceSummary.id,
+                accountLinkID: account.accountLinkID,
+                uid: stored.uid,
+                uidValidity: stored.uidValidity,
+                isRead: stored.row.isRead,
+                isFlagged: stored.row.isFlagged
+            ))
+            acceptedIDs.insert(id)
         }
+        for state in changed { _ = moveOne(state.id, to: destination) }
+        if !changed.isEmpty { appendMutation(.move(changed)) }
         return MoveOutcome(
             movedCount: acceptedIDs.count,
             skippedCrossAccountCount: skippedCrossAccount,
@@ -543,20 +1086,119 @@ final class MockMailFacade: MailFacade {
         return url
     }
 
-    func search(_ query: String, limit: Int) async throws -> [MessageRow] {
+    func messageMutationStates(_ ids: [MessageID]) async throws -> [MessageMutationState] {
+        var unique: [MessageID] = []
+        var seen = Set<MessageID>()
+        for id in ids where seen.insert(id).inserted { unique.append(id) }
+        return unique.compactMap { id in
+            guard let stored = byID[id],
+                  let folder = folders.first(where: { $0.id == stored.folder }),
+                  let account = accounts.first(where: { $0.id == folder.accountID }) else {
+                return nil
+            }
+            let locator = FolderLocator(kind: .path, value: folder.path)
+            let link = MailternalDeepLink.message(
+                accountLinkID: account.accountLinkID,
+                folderLocator: locator,
+                uidValidity: stored.uidValidity,
+                uid: stored.uid
+            )
+            return MessageMutationState(
+                id: id,
+                canonicalID: id,
+                folderID: stored.folder,
+                accountLinkID: account.accountLinkID,
+                isRead: stored.row.isRead,
+                isFlagged: stored.row.isFlagged,
+                link: link
+            )
+        }
+    }
+
+    func canUndo(allowedAccountLinks: Set<AccountLinkID>?) async throws -> Bool {
+        guard let latest = mutationJournal.last else { return false }
+        guard allowedAccountLinks?.isEmpty != true else { return false }
+        switch latest {
+        case .flags(let states, _), .move(let states):
+            return allowedAccountLinks == nil
+                || states.allSatisfy { allowedAccountLinks!.contains($0.accountLinkID) }
+        }
+    }
+
+    func undo(allowedAccountLinks: Set<AccountLinkID>?) async throws {
+        guard let latest = mutationJournal.last else { throw MailUndoError.unavailable }
+        guard allowedAccountLinks?.isEmpty != true else { throw MailUndoError.permissionDenied }
+        let states: [MockMutationState]
+        switch latest {
+        case .flags(let entries, _), .move(let entries):
+            states = entries
+        }
+        guard states.allSatisfy({ byID[$0.id] != nil }) else {
+            throw MailUndoError.irreversible("a message identity is no longer current")
+        }
+        switch latest {
+        case .flags(let entries, let flag):
+            guard entries.allSatisfy({
+                guard let stored = byID[$0.id] else { return false }
+                return stored.uid == $0.uid
+                    && stored.uidValidity == $0.uidValidity
+                    && stored.folder == $0.folder
+            }) else {
+                throw MailUndoError.irreversible("a message identity is no longer current")
+            }
+            for entry in entries {
+                guard var stored = byID[entry.id] else {
+                    throw MailUndoError.irreversible("a message identity is no longer current")
+                }
+                if flag == .seen {
+                    if stored.row.isRead != entry.isRead {
+                        if entry.isRead { markReadOne(entry.id) } else { markUnreadOne(entry.id) }
+                    }
+                } else {
+                    stored.row.isFlagged = entry.isFlagged
+                    byID[entry.id] = stored
+                    if var list = messages[stored.folder],
+                       let index = list.firstIndex(where: { $0.row.id == entry.id }) {
+                        list[index] = stored
+                        messages[stored.folder] = list
+                    }
+                    publishObservers(in: stored.folder)
+                }
+            }
+        case .move(let entries):
+            for entry in entries {
+                guard let stored = byID[entry.id] else {
+                    throw MailUndoError.irreversible("a message identity is no longer current")
+                }
+                if stored.folder != entry.folder {
+                    guard moveOne(entry.id, to: entry.folder) else {
+                        throw MailUndoError.irreversible("the original folder is no longer available")
+                    }
+                }
+            }
+        }
+        mutationJournal.removeLast()
+    }
+
+    func search(
+        _ query: String,
+        limit: Int,
+        accountLinks: Set<AccountLinkID>?
+    ) async throws -> [MessageRow] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !needle.isEmpty else { return [] }
+        let cap = max(0, limit)
         var hits: [MessageRow] = []
-        hits.reserveCapacity(min(limit, 64))
+        hits.reserveCapacity(min(cap, 64))
         let all = messages.values.flatMap { $0 }.sorted { lhs, rhs in
             if lhs.row.date != rhs.row.date { return lhs.row.date > rhs.row.date }
             return lhs.uid > rhs.uid
         }
         for stored in all {
-            if hits.count >= limit { break }
+            if hits.count >= cap { break }
             guard let summary = folders.first(where: { $0.id == stored.folder }),
                   let account = accounts.first(where: { $0.id == summary.accountID }),
-                  account.isEnabled else {
+                  account.isEnabled,
+                  accountLinks == nil || accountLinks!.contains(account.accountLinkID) else {
                 continue
             }
             let hay = [
@@ -598,6 +1240,7 @@ final class MockMailFacade: MailFacade {
             switch sort.field {
             case .date:
                 comparison = lhs.row.date.compare(rhs.row.date)
+
             case .sender:
                 comparison = lhs.row.from.compare(rhs.row.from)
             case .subject:
@@ -997,6 +1640,41 @@ final class MockMailFacade: MailFacade {
         uuidString: "00000000-0000-4000-8000-000000000001"
     )!
     fileprivate static let pixelPNG = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
+}
+
+private func mockReplyRecipients(
+    _ envelope: Envelope,
+    accountIdentity: String,
+    replyAll: Bool
+) -> (to: [MailAddress], cc: [MailAddress]) {
+    let identity = accountIdentity.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    var seen = Set<String>()
+    var to: [MailAddress] = []
+    var cc: [MailAddress] = []
+    func append(_ address: MailAddress, toCC: Bool) {
+        let value = address.address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = value.lowercased()
+        guard !value.isEmpty, key != identity, seen.insert(key).inserted else { return }
+        if toCC { cc.append(address) } else { to.append(address) }
+    }
+    for address in (envelope.replyTo.isEmpty ? envelope.from : envelope.replyTo) {
+        append(address, toCC: false)
+    }
+    if replyAll {
+        for address in envelope.to { append(address, toCC: false) }
+        for address in envelope.cc { append(address, toCC: true) }
+    }
+    return (to, cc)
+}
+
+private func mockReplySubject(_ subject: String) -> String {
+    let value = subject.trimmingCharacters(in: .whitespacesAndNewlines)
+    return value.lowercased().hasPrefix("re:") ? value : "Re: \(value)"
+}
+
+private func mockForwardSubject(_ subject: String) -> String {
+    let value = subject.trimmingCharacters(in: .whitespacesAndNewlines)
+    return value.lowercased().hasPrefix("fwd:") ? value : "Fwd: \(value)"
 }
 
 private struct SplitMix64 {

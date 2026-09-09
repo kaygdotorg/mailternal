@@ -2969,7 +2969,7 @@ public actor SyncEngine {
 
             // Coalesce adjacent operations with the same source generation and
             // destination identity. One UID MOVE/COPY carries the whole set.
-            let batch = ops.filter { candidate in
+            var batch = ops.filter { candidate in
                 guard !handled.contains(candidate.id),
                       candidate.folder == op.folder,
                       candidate.uidValidity == op.uidValidity,
@@ -2999,6 +2999,15 @@ public actor SyncEngine {
                 try? await restoreMoveMessages(batch, source: source, channel: channel)
                 continue
             }
+            var claimedBatch: [MoveOp] = []
+            claimedBatch.reserveCapacity(batch.count)
+            for candidate in batch {
+                guard try await store.claimMoveOp(candidate) else { continue }
+                claimedBatch.append(candidate)
+            }
+            batch = claimedBatch
+            guard !batch.isEmpty else { continue }
+
 
 
             // Keep the gate over the whole server sequence (and its local
@@ -3024,6 +3033,20 @@ public actor SyncEngine {
             let useMove = !op.copied && capabilities.move
             var phase = useMove ? "MOVE" : (op.copied ? "STORE" : "COPY")
             let uids = SyncPolicy.uidSet(uids: batch.map { $0.uid.rawValue })
+            func destinationIdentity(
+                _ mapping: IMAPCopyUIDMapping?,
+                for candidate: MoveOp
+            ) -> [MoveDestinationIdentity] {
+                guard let mapping,
+                      let destinationUID = mapping.destinationUID(for: candidate.uid) else {
+                    return []
+                }
+                return [MoveDestinationIdentity(
+                    sourceUID: candidate.uid,
+                    uidValidity: mapping.destinationUIDValidity,
+                    uid: destinationUID
+                )]
+            }
             do {
                 let liveNow = try await store.liveGeneration(for: op.folder)
                 if liveNow?.uidValidity != op.uidValidity {
@@ -3031,23 +3054,32 @@ public actor SyncEngine {
                     try await store.dropStaleMove(folder: op.folder)
                     continue
                 }
+                for candidate in batch {
+                    try await store.recordMoveDestinationFolder(candidate, destination: target.id)
+                }
+                let mapping: IMAPCopyUIDMapping?
                 if useMove {
-                    try await channel.archiveMove(
+                    mapping = try await channel.archiveMove(
                         in: source.path,
                         expectedUIDValidity: op.uidValidity,
                         uids: uids,
                         destination: target.path
                     )
                 } else {
+                    mapping = nil
                     if !op.copied {
                         phase = "COPY"
-                        try await channel.archiveCopy(
+                        let copyMapping = try await channel.archiveCopy(
                             in: source.path,
                             expectedUIDValidity: op.uidValidity,
                             uids: uids,
                             destination: target.path
                         )
                         for candidate in batch {
+                            try await store.recordMoveDestinations(
+                                candidate,
+                                destinations: destinationIdentity(copyMapping, for: candidate)
+                            )
                             try await store.markMoveCopied(candidate)
                         }
                     }
@@ -3068,7 +3100,12 @@ public actor SyncEngine {
                 affectedFolders.insert(op.folder)
                 affectedFolders.insert(target.id)
                 for candidate in batch {
-                    try await store.deleteMoveOp(candidate)
+                    try await store.completeMoveOp(
+                        candidate,
+                        destinations: useMove
+                            ? destinationIdentity(mapping, for: candidate)
+                            : nil
+                    )
                 }
             } catch SyncChannelError.staleMailbox {
                 // The source generation can change after the queue snapshot but
@@ -3127,15 +3164,7 @@ public actor SyncEngine {
     }
 
     private func discardMove(_ op: MoveOp, reason: String) async throws {
-        try await store.deleteMoveOp(op)
-        try await store.recordError(StoreLogEntry(
-            kind: .archive,
-            account: op.account,
-            folder: op.folder,
-            generation: MailboxGeneration(folder: op.folder, uidValidity: op.uidValidity),
-            uid: op.uid,
-            message: reason
-        ))
+        try await store.rejectMoveOp(op, reason: reason)
     }
 
     private func retainMove(

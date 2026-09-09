@@ -212,6 +212,63 @@ stall a folder.
   substring-poor in 0.0.1. A segmentation strategy (ICU-backed auxiliary tokens) is
   planned post-0.0.1.
 
+## Outgoing delivery core
+
+`MailternalSMTP`, `MailternalMIME`, `MailStore`, and `OutgoingDelivery` implement
+the shared submission path. `LiveMailFacade` owns the durable draft/outbox
+surface, account-scoped credentials, worker lifecycle, recovery, and Sent-copy
+integration; command dispatchers consume that same facade on every client.
+- SMTP settings persist only non-secret host, port, TLS mode, username, and an
+  account-scoped credential reference. A nil reference reuses the account's
+  IMAP password; a separate SMTP password is stored in Keychain under an
+  account-and-reference key and is included only in encrypted pairing bundles.
+  Password replacement validates the transient secret first, writes it under a
+  fresh reference, then commits configuration. The previous Keychain item remains
+  untouched until commit; post-commit cleanup cannot roll back the new credential.
+
+- Drafts persist complete, revision-checked editor values. A stale complete edit
+  becomes a conflict draft; it never overwrites the current head. Sending freezes
+  one revision, Message-ID, date, routing envelope, and MIME file. Re-enqueueing
+  the same revision returns the existing submission.
+- Outgoing files live beside the database, outside the evictable attachment
+  cache. Directories are private (`0700`), files are private (`0600`), and imported
+  files must be regular files. Outgoing transactions use the existing writer
+  queue with scoped `synchronous=FULL`; files and containing directories are
+  synced before the database publishes their durable references.
+  Attachment imports use caller-provided UUIDs for idempotency. Files not yet
+  referenced by a saved draft or frozen outbox record are staging, not an unlimited
+  archive: one file is at most 256 MiB; uncommitted staging is limited to 1 GiB/64
+  files per account and 4 GiB/256 files globally. Unreferenced staging expires
+  after 24 hours; removing its last durable reference starts a new 24-hour grace
+  period. Saved heads, conflict forks and frozen outbox records protect their
+  bytes from collection. Crash-orphan files are reclaimed only after the same
+  grace period, without touching active imports.
+- One runtime owner drains each account. Disabled/missing accounts cannot claim
+  an attempt or cross the final DATA commit marker. The owner recovers the outbox
+  once under its exclusive runtime lease before starting any workers.
+  Background suspension gates worker creation as well as stopping existing
+  workers, so an overlapping account restore cannot restart SMTP while suspended.
+- The transport streams CRLF MIME with dot-stuffing, requires every recipient to
+  be accepted, and persists `awaitingAcceptance` before the DATA terminator.
+  Interrupted preparation/sending can recover as unsent; interrupted acceptance
+  becomes `deliveryUnknown`. That state requires explicit duplicate-risk
+  acknowledgement before retry. Only definitely unsent transient failures retry
+  automatically.
+- A positive SMTP DATA reply becomes `sentCopyPending`, not another SMTP attempt.
+  Sent persistence discovers the Sent mailbox, searches the frozen Message-ID,
+  and streams APPEND only if the copy is absent. A lost APPEND acknowledgement
+  therefore triggers reconciliation, never another SMTP submission. Untrusted
+  IMAP response text is not persisted in outgoing error metadata.
+- Accepted/sent revisions disappear from Drafts without deleting their heads.
+  A later concurrent editor revision remains a visible draft. Bounded outgoing
+  observations publish summaries, not message bodies; unresolved outgoing work
+  is available to account-removal admission checks.
+- IMAP and SMTP share one TLS trust/context implementation. Production retains
+  full hostname/system-trust verification and TLS 1.2+. Explicit QA anchors use
+  the established Apple BoringSSL path; macOS includes exported system roots,
+  iOS QA uses its explicit set, and Linux supplements system roots. No test path
+  disables certificate or hostname verification.
+
 ## MIME (a real subsystem, treated as one)
 - Own parser in `MailternalCore` (Swift, cross-platform), developed against a
   **conformance corpus**: malformed boundaries, `message/rfc822` nesting, RFC

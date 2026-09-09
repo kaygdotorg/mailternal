@@ -1,5 +1,6 @@
 import Foundation
 import MailternalInterfaces
+import MailternalTLS
 import NIO
 import NIOIMAP
 import NIOSSL
@@ -115,45 +116,11 @@ struct TLSUpgrader: Sendable {
     static let passthrough = TLSUpgrader { _, _ in }
 }
 
-private struct IMAPTLSTrustKey: Hashable, Sendable {
-    let additionalPEM: [Data]
-}
-
-private final class IMAPTLSContextCache: @unchecked Sendable {
-    private let lock = NSLock()
-    private var contexts: [IMAPTLSTrustKey: NIOSSLContext] = [:]
-
-    func context(
-        for key: IMAPTLSTrustKey,
-        make: () throws -> NIOSSLContext
-    ) throws -> NIOSSLContext {
-        // NIOSSLContext construction can read the system trust store. Serialize
-        // cache misses so concurrent sessions never duplicate that blocking work.
-        // Callers construct contexts before entering a NIO event loop.
-        lock.lock()
-        defer { lock.unlock() }
-        if let context = contexts[key] {
-            return context
-        }
-        let context = try make()
-        contexts[key] = context
-        return context
-    }
-
-    func invalidate() {
-        lock.lock()
-        contexts.removeAll(keepingCapacity: true)
-        lock.unlock()
-    }
-}
-
 enum IMAPTLS {
-    private static let contextCache = IMAPTLSContextCache()
-
     /// Drops contexts whose trust roots no longer match the effective
     /// configuration. Called whenever QA roots are installed or reset.
     static func invalidateContextCache() {
-        contextCache.invalidate()
+        MailTLS.invalidateContextCache()
     }
 
     /// Creates (or reuses) a context for the complete trust configuration.
@@ -170,36 +137,10 @@ enum IMAPTLS {
         // context.
         let additionalPEM = IMAPTrust.additionalPEM()
         try IMAPTrust.requireHostnameVerification(for: host, additionalPEM: additionalPEM)
-        let key = IMAPTLSTrustKey(additionalPEM: additionalPEM)
-        return try contextCache.context(for: key) {
-            var configuration = TLSConfiguration.makeClientConfiguration()
-            configuration.certificateVerification = .fullVerification
-            if !additionalPEM.isEmpty {
-                // The QA certificate is a self-signed leaf rather than a CA
-                // certificate. BoringSSL accepts an explicitly configured
-                // trust anchor while preserving hostname verification; the
-                // Apple SecTrust path rejects this fixture before the anchor
-                // can be applied. This branch is reachable only after the
-                // explicit QA/test trust-root installation above.
-                var extras: [NIOSSLCertificate] = []
-                extras.reserveCapacity(additionalPEM.count)
-                for pem in additionalPEM {
-                    do {
-                        extras.append(contentsOf: try NIOSSLCertificate.fromPEMBytes(Array(pem)))
-                    } catch {
-                        throw IMAPError.tls("Configured additional TLS trust roots are invalid")
-                    }
-                }
-                guard !extras.isEmpty else {
-                    throw IMAPError.tls("Configured additional TLS trust roots are invalid")
-                }
-                #if os(macOS)
-                configuration.trustRoots = .certificates(IMAPTrust.extendedTrustRoots(extras))
-                #else
-                configuration.trustRoots = .certificates(extras)
-                #endif
-            }
-            return try NIOSSLContext(configuration: configuration)
+        do {
+            return try MailTLS.clientContext(additionalPEM: additionalPEM)
+        } catch {
+            throw IMAPError.tls(error.localizedDescription)
         }
     }
 

@@ -8,6 +8,20 @@ import Testing
     }
 }
 
+@Test func editableRecipientsRetainMalformedTail() {
+    let input = "Alice <alice@example.test>, unfinished"
+    let recipients = MIMEParser.parseEditableAddresses(input)
+    #expect(recipients.map(\.address) == [input])
+}
+
+@Test func editableRecipientsKeepQuotedCommas() {
+    let recipients = MIMEParser.parseEditableAddresses(
+        "\"Doe, Jane\" <jane@example.test>, \"quoted,local\"@example.test"
+    )
+    #expect(recipients.map(\.address) == ["jane@example.test", "\"quoted,local\"@example.test"])
+    #expect(recipients.first?.displayName == "Doe, Jane")
+}
+
 @Test func simplePlainMessage() throws {
     let data = MIMETestSupport.message(
         headers: [

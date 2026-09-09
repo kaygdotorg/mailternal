@@ -178,6 +178,70 @@ public struct IMAPUIDSet: Sendable, Hashable {
     public var isEmpty: Bool { ranges.isEmpty }
 }
 
+/// Exact server-assigned identity from COPYUID for COPY or MOVE. Ranges retain
+/// response order and stay compressed, even when a server names billions of UIDs.
+public struct IMAPCopyUIDMapping: Sendable, Hashable {
+    public let destinationUIDValidity: UInt32
+    private let sourceUIDs: [ClosedRange<UInt32>]
+    private let destinationUIDs: [ClosedRange<UInt32>]
+
+    /// Rejects unusable mappings without turning a successful server mutation
+    /// into a retry. A missing mapping makes that move unavailable for undo.
+    public init?(
+        destinationUIDValidity: UInt32,
+        sourceUIDs: [ClosedRange<UInt32>],
+        destinationUIDs: [ClosedRange<UInt32>]
+    ) {
+        guard destinationUIDValidity != 0,
+              !sourceUIDs.isEmpty,
+              !destinationUIDs.isEmpty,
+              sourceUIDs.allSatisfy({ $0.lowerBound != 0 }),
+              destinationUIDs.allSatisfy({ $0.lowerBound != 0 }),
+              Self.count(sourceUIDs) == Self.count(destinationUIDs)
+        else { return nil }
+        self.destinationUIDValidity = destinationUIDValidity
+        self.sourceUIDs = sourceUIDs
+        self.destinationUIDs = destinationUIDs
+    }
+
+    /// Resolves only the requested UID, without expanding either sequence set.
+    /// Duplicate source/destination identities are ambiguous and fail closed.
+    public func destinationUID(for sourceUID: IMAPUID) -> IMAPUID? {
+        var preceding: UInt64 = 0
+        var position: UInt64?
+        for range in sourceUIDs {
+            if range.contains(sourceUID.rawValue) {
+                guard position == nil else { return nil }
+                position = preceding + UInt64(sourceUID.rawValue - range.lowerBound)
+            }
+            preceding += Self.count(range)
+        }
+        guard var offset = position else { return nil }
+        for range in destinationUIDs {
+            let length = Self.count(range)
+            if offset < length {
+                let uid = range.lowerBound + UInt32(offset)
+                var matches = 0
+                for candidate in destinationUIDs where candidate.contains(uid) {
+                    matches += 1
+                    if matches > 1 { return nil }
+                }
+                return IMAPUID(rawValue: uid)
+            }
+            offset -= length
+        }
+        return nil
+    }
+
+    private static func count(_ range: ClosedRange<UInt32>) -> UInt64 {
+        UInt64(range.upperBound) - UInt64(range.lowerBound) + 1
+    }
+
+    private static func count(_ ranges: [ClosedRange<UInt32>]) -> UInt64 {
+        ranges.reduce(0) { $0 + count($1) }
+    }
+}
+
 // MARK: - Discovery
 
 /// One selectable mailbox from `LIST` (spec: sync.md Mailbox discovery).

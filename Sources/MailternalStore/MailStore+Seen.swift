@@ -26,25 +26,6 @@ extension MailStore {
     }
 
     /// Looks up all message rows and enqueues the batch in one transaction.
-    /// Any missing message aborts the transaction, preserving atomicity.
-    public func enqueueFlag(messages ids: [MessageID], flag: FlagKind, set: Bool) async throws {
-        try await write { db in
-            for id in ids {
-                guard let row = try MailStore.flagMessageRow(db, id: id) else {
-                    throw MailStoreError.messageNotFound
-                }
-                try MailStore.enqueueFlag(
-                    db,
-                    account: AccountID(rawValue: row.account),
-                    folder: FolderID(rawValue: row.folder),
-                    uidValidity: row.uidValidity,
-                    uid: row.uid,
-                    flag: flag,
-                    set: set
-                )
-            }
-        }
-    }
 
     /// Single-id convenience variant.
     public func enqueueFlag(message id: MessageID, flag: FlagKind, set: Bool) async throws {
@@ -84,6 +65,18 @@ extension MailStore {
                     op.set,
                 ]
             )
+            guard db.changesCount == 1, let journalID = op.journalID else { return }
+            let remaining = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM seen_queue WHERE journal_id = ?",
+                arguments: [journalID]
+            ) ?? 0
+            if remaining == 0 {
+                try db.execute(
+                    sql: "UPDATE op_journal SET state = ?, completed_at = ? WHERE id = ? AND state = ?",
+                    arguments: ["completed", Date().timeIntervalSince1970, journalID, "active"]
+                )
+            }
         }
     }
 
@@ -111,6 +104,37 @@ extension MailStore {
                 ]
             )
             guard db.changesCount == 1 else { return }
+            if let journalID = op.journalID {
+                try db.execute(
+                    sql: """
+                        UPDATE op_journal_entries SET state = 'rejected'
+                        WHERE journal_id = ? AND state = 'active'
+                          AND source_folder_id = ? AND source_uid_validity = ?
+                          AND source_uid = ? AND flag = ?
+                        """,
+                    arguments: [
+                        journalID, op.folder.rawValue, Int64(op.uidValidity),
+                        Int64(op.uid.rawValue), op.flag.rawValue,
+                    ]
+                )
+                try db.execute(
+                    sql: """
+                        UPDATE op_journal
+                        SET state = CASE
+                            WHEN NOT EXISTS (
+                                SELECT 1 FROM op_journal_entries e
+                                WHERE e.journal_id = op_journal.id AND e.state = 'active'
+                            ) THEN 'rejected'
+                            ELSE 'completed'
+                        END, completed_at = ?
+                        WHERE id = ? AND state = 'active'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM seen_queue q WHERE q.journal_id = op_journal.id
+                          )
+                        """,
+                    arguments: [Date().timeIntervalSince1970, journalID]
+                )
+            }
             let column = op.flag == .seen ? "is_read" : "is_flagged"
             try db.execute(
                 sql: """
@@ -177,7 +201,8 @@ extension MailStore {
     }
 
     private static func flagMessageRow(_ db: Database, id: MessageID) throws -> FlagMessageRow? {
-        guard let row = try Row.fetchOne(
+        guard let canonicalID = try MailStore.resolveMessageID(db, id: id),
+              let row = try Row.fetchOne(
             db,
             sql: """
                 SELECT m.uid, g.folder_id, g.uid_validity, f.account_id
@@ -186,7 +211,7 @@ extension MailStore {
                 JOIN folders f ON f.id = g.folder_id
                 WHERE m.id = ?
                 """,
-            arguments: [id.rawValue]
+            arguments: [canonicalID.rawValue]
         ) else {
             return nil
         }
@@ -205,19 +230,20 @@ extension MailStore {
         folder: FolderID,
         uidValidity: UInt32,
         uid: IMAPUID,
-
         flag: FlagKind,
-        set: Bool
+        set: Bool,
+        journalID: Int64? = nil
     ) throws {
         try db.execute(
             sql: """
                 INSERT INTO seen_queue (
-                    account_id, folder_id, uid_validity, uid, enqueued_at, flag, "set"
+                    account_id, folder_id, uid_validity, uid, enqueued_at, flag, "set", journal_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, folder_id, uid_validity, uid, flag) DO UPDATE SET
                     enqueued_at = excluded.enqueued_at,
-                    "set" = excluded."set"
+                    "set" = excluded."set",
+                    journal_id = excluded.journal_id
                 """,
             arguments: [
                 account.rawValue,
@@ -227,6 +253,7 @@ extension MailStore {
                 Date().timeIntervalSince1970,
                 flag.rawValue,
                 set,
+                journalID,
             ]
         )
         let column = flag == .seen ? "is_read" : "is_flagged"
@@ -246,6 +273,24 @@ extension MailStore {
     static func dropStaleFlag(_ db: Database, folder: FolderID) throws {
         try db.execute(
             sql: """
+                UPDATE op_journal SET state = ?, completed_at = ?
+                WHERE id IN (
+                    SELECT journal_id FROM seen_queue
+                    WHERE folder_id = ?
+                      AND uid_validity != COALESCE(
+                        (SELECT g.uid_validity
+                         FROM folders f
+                         JOIN generations g ON g.id = f.live_generation_id
+                         WHERE f.id = ?),
+                        -1
+                      )
+                      AND journal_id IS NOT NULL
+                )
+                """,
+            arguments: ["irreversible", Date().timeIntervalSince1970, folder.rawValue, folder.rawValue]
+        )
+        try db.execute(
+            sql: """
                 DELETE FROM seen_queue
                 WHERE folder_id = ?
                   AND uid_validity != COALESCE(
@@ -263,6 +308,7 @@ extension MailStore {
         let uidValidity: Int64 = row["uid_validity"]
         let uid: Int64 = row["uid"]
         let rawFlag: String = row["flag"]
+        let journalID: Int64? = row["journal_id"]
         return FlagOp(
             id: row["id"],
             account: AccountID(rawValue: row["account_id"]),
@@ -270,7 +316,8 @@ extension MailStore {
             uidValidity: UInt32(uidValidity),
             uid: IMAPUID(rawValue: UInt32(uid)),
             flag: FlagKind(rawValue: rawFlag) ?? .seen,
-            set: row["set"]
+            set: row["set"],
+            journalID: journalID
         )
     }
 

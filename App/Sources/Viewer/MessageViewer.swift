@@ -99,12 +99,15 @@ struct MessageViewer: View {
             content
             if model.isFindPresented {
                 FindBar(
-                    query: $model.findQuery,
+                    query: Binding(
+                        get: { model.findQuery },
+                        set: { model.setFindQuery($0) }
+                    ),
                     matchCount: findSnapshot.count,
                     selectedMatchNumber: findSnapshot.selectedMatchNumber,
                     next: { stepFind(.next) },
                     previous: { stepFind(.previous) },
-                    close: { model.isFindPresented = false }
+                    close: { model.dispatchFromUI(.setFindPresented(false)) }
                 )
                 .padding(.top, 12)
                 .padding(.trailing, 16)
@@ -123,7 +126,7 @@ struct MessageViewer: View {
         )
         .onExitCommand {
             if model.isFindPresented {
-                model.isFindPresented = false
+                model.dispatchFromUI(.setFindPresented(false))
             }
         }
         .onChange(of: model.findQuery) { _, _ in
@@ -221,6 +224,9 @@ struct MessageViewer: View {
         }
     }
 
+    /// Capture the tab beside its detail before entering deferred builders.
+    /// Reading live activeID inside a child can pair the outgoing detail with
+    /// the incoming tab and overwrite that tab's retained native surface.
     private func reader(_ detail: MessageDetail) -> some View {
         let activeTabID = model.tabs.activeID
         let savedScrollOffset = activeTabID.map {
@@ -254,7 +260,7 @@ struct MessageViewer: View {
                             rawSource: model.rawSource,
                             accent: model.appearance.accent.color
                         )
-                        bodyRegion(detail)
+                        bodyRegion(detail, tabID: activeTabID)
                     }
                     .padding(.horizontal, MessageViewerLayoutPolicy.horizontalPadding)
                     // The inset is local to the reader's chrome: stacked
@@ -323,7 +329,7 @@ struct MessageViewer: View {
         }
     }
 
-    private func bodyRegion(_ detail: MessageDetail) -> some View {
+    private func bodyRegion(_ detail: MessageDetail, tabID: UUID?) -> some View {
         VStack(alignment: .leading, spacing: MessageViewerLayoutPolicy.bodyContentSpacing) {
             if detail.isQuarantined {
                 QuarantineBanner(
@@ -333,7 +339,7 @@ struct MessageViewer: View {
                 .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
                 .padding(.top, MessageViewerLayoutPolicy.islandVerticalPadding)
             }
-            bodyContent(detail)
+            bodyContent(detail, tabID: tabID)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .readerIslandSurface(
@@ -344,9 +350,9 @@ struct MessageViewer: View {
     }
 
     @ViewBuilder
-    private func bodyContent(_ detail: MessageDetail) -> some View {
+    private func bodyContent(_ detail: MessageDetail, tabID: UUID?) -> some View {
         let surfaceAnchor = ReaderScrollAnchor(
-            tabID: model.tabs.activeID,
+            tabID: tabID,
             messageID: detail.id,
             surface: surfaceKind(for: detail)
         )
@@ -393,7 +399,7 @@ struct MessageViewer: View {
                 }
             }
         } else if let html = detail.sanitizedHTML, !html.isEmpty {
-            htmlBody(detail, html: html)
+            htmlBody(detail, html: html, tabID: tabID)
         } else if let text = detail.bodyText, !text.isEmpty {
             PlainTextBody(
                 text: text,
@@ -401,7 +407,7 @@ struct MessageViewer: View {
                 selectedMatchIndex: findSnapshot.index,
                 findTick: findTick,
                 pool: model.readerSurfacePool,
-                tabID: model.tabs.activeID,
+                tabID: tabID,
                 messageID: detail.id,
                 onSurfaceReady: { [weak model, surfaceReadiness] tabID, messageID in
                     DispatchQueue.main.async {
@@ -440,14 +446,14 @@ struct MessageViewer: View {
     }
 
 
-    private func htmlBody(_ detail: MessageDetail, html: String) -> some View {
+    private func htmlBody(_ detail: MessageDetail, html: String, tabID: UUID?) -> some View {
         let surfaceReadiness = $surfaceReadyAnchor
         let surfaceAnchor = ReaderScrollAnchor(
-            tabID: model.tabs.activeID,
+            tabID: tabID,
             messageID: detail.id,
             surface: surfaceKind(for: detail)
         )
-        let activeTabID = model.tabs.activeID
+        let activeTabID = tabID
         let showRemoteImageNotice = model.hasRemoteImageReferences && !model.allowRemoteImages
         let _ = htmlContentHeightRevision
         let cachedContentHeight: CGFloat
@@ -468,7 +474,7 @@ struct MessageViewer: View {
             // the consent update to the pooled surface.
             ZStack(alignment: .topLeading) {
                 if showRemoteImageNotice {
-                    RemoteImageNotice { model.allowRemoteImages = true }
+                    RemoteImageNotice { model.setRemoteImagesAllowed(true) }
                         .padding(.horizontal, MessageViewerLayoutPolicy.islandContentPadding)
                         .padding(.top, MessageViewerLayoutPolicy.islandVerticalPadding)
                 }
@@ -616,6 +622,7 @@ private final class ReaderScrollTrackingView: NSView {
     private var onScrollEnd: ((UUID, CGFloat) -> Void)?
     private var onLayoutChange: (@MainActor @Sendable () -> Void)?
     private weak var scrollView: NSScrollView?
+    private var hasPendingLayoutChange = false
     private var didApplyRestore = false
     private var didReportScrollRestored = false
     private var restoreTask: Task<Void, Never>?
@@ -824,9 +831,18 @@ private final class ReaderScrollTrackingView: NSView {
     private func requestTopAnchorIfNeeded() {
         guard restoreOffset <= 0.5,
               !hasUserScrollIntent,
-              let onLayoutChange
+              !hasPendingLayoutChange,
+              onLayoutChange != nil
         else { return }
-        DispatchQueue.main.async(execute: onLayoutChange)
+        hasPendingLayoutChange = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.hasPendingLayoutChange = false
+            guard self.restoreOffset <= 0.5,
+                  !self.hasUserScrollIntent
+            else { return }
+            self.onLayoutChange?()
+        }
     }
 
     @objc private func boundsChanged() {
@@ -1988,6 +2004,8 @@ struct HighlightedMessageText: NSViewRepresentable {
     }
 }
 
+/// SwiftUI can overlap outgoing and incoming hosts for one retained surface.
+/// Only the host currently parenting that surface may lay it out or remove it.
 @MainActor
 final class HighlightedMessageTextHost: NSView {
     private lazy var fallbackView = ReaderPlainTextView()
@@ -2008,7 +2026,7 @@ final class HighlightedMessageTextHost: NSView {
 
     override func layout() {
         super.layout()
-        guard let view = installedView else { return }
+        guard let view = installedView, view.superview === self else { return }
         if bounds.width > 0,
            let container = view.textContainer,
            abs(container.containerSize.width - bounds.width) > 0.5 {
@@ -2023,7 +2041,9 @@ final class HighlightedMessageTextHost: NSView {
     }
 
     func detach() {
-        installedView?.removeFromSuperview()
+        if installedView?.superview === self {
+            installedView?.removeFromSuperview()
+        }
         installedView = nil
         installedTabID = nil
         pool = nil
@@ -2050,8 +2070,10 @@ final class HighlightedMessageTextHost: NSView {
             nextView = fallbackView
             nextTabID = nil
         }
-        if installedView !== nextView {
-            installedView?.removeFromSuperview()
+        if installedView !== nextView || nextView.superview !== self {
+            if installedView?.superview === self {
+                installedView?.removeFromSuperview()
+            }
             installedView = nextView
             addSubview(nextView)
             nextView.translatesAutoresizingMaskIntoConstraints = true
@@ -2082,7 +2104,7 @@ final class HighlightedMessageTextHost: NSView {
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize) -> CGSize? {
-        guard let view = installedView else { return nil }
+        guard let view = installedView, view.superview === self else { return nil }
         let width = proposal.width ?? view.bounds.width
         guard width.isFinite, width > 0 else { return nil }
         guard let identity = view.renderedIdentity else {
@@ -2131,7 +2153,7 @@ final class HighlightedMessageTextHost: NSView {
         query: String,
         selectedMatchIndex: Int?
     ) {
-        guard let view = installedView,
+        guard let view = installedView, view.superview === self,
               let selectedMatchIndex
         else {
             return

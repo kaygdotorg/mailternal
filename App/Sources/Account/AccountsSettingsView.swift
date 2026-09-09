@@ -1,13 +1,11 @@
 import MailternalInterfaces
-import AppKit
 import SwiftUI
 
 struct AccountsSettingsView: View {
     @Bindable var model: AppModel
-    let toolbarCoordinator: SettingsToolbarCoordinator
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expandedRowID: AccountID?
     @State private var pendingRemovalID: AccountID?
-    @State private var draftDisplayNames: [AccountID: String] = [:]
     @State private var isRemoveConfirmationPresented = false
 
     private static let blankAccountID = AccountID(rawValue: "new-account")
@@ -39,18 +37,6 @@ struct AccountsSettingsView: View {
             }
         }
         .accessibilityIdentifier(UIIdentifier.accountsList)
-        .onAppear {
-            reportToolbarState()
-        }
-        .onChange(of: isAdding) { _, _ in
-            reportToolbarState()
-        }
-        .onChange(of: isValidating) { _, _ in
-            reportToolbarState()
-        }
-        .onChange(of: toolbarCoordinator.addAccountRequestGeneration) { _, _ in
-            addBlankAccount()
-        }
         .alert("Remove Account?", isPresented: $isRemoveConfirmationPresented) {
             Button("Remove", role: .destructive) {
                 Task { await removePendingAccount() }
@@ -78,13 +64,24 @@ struct AccountsSettingsView: View {
                 if isAdding {
                     accountSection(nil)
                 }
+                HStack {
+                    Spacer()
+                    Button("Add account…", action: addBlankAccount)
+                        .buttonStyle(.bordered)
+                        .tint(.primary)
+                        .disabled(!canAdd || isValidating)
+                        .accessibilityIdentifier(UIIdentifier.accountsAdd)
+                }
+                .padding(.top, 12)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
             .onChange(of: expandedRowID) { _, rowID in
                 guard let rowID else { return }
                 DispatchQueue.main.async {
-                    withAnimation(MailMotion.expand) {
+                    withAnimation(reduceMotion ? nil : MailMotion.expand) {
                         proxy.scrollTo(rowID, anchor: .top)
                     }
                 }
@@ -92,37 +89,28 @@ struct AccountsSettingsView: View {
         }
     }
 
-    @ViewBuilder
     private func accountSection(_ account: AccountConfig?) -> some View {
-        let rowID = account?.id ?? Self.blankAccountID
-
-        accountRow(account)
-        if expandedRowID == rowID {
-            accountEditorRow(account)
-        }
-    }
-
-    private func accountRow(_ account: AccountConfig?) -> some View {
         let rowID = account?.id ?? Self.blankAccountID
         let state = account.map { model.accountStates[$0.id] ?? .none } ?? .none
 
-        return AccountRow(
-            account: account,
-            state: state,
-            displayName: displayNameBinding(for: account),
-            isExpanded: expandedRowID == rowID,
-            onToggle: { toggleExpansion(for: rowID) },
-            onCommitName: { commitDisplayName($0, for: rowID) },
-            onToggleEnabled: account == nil ? nil : {
-                Task { await model.setAccountEnabled(rowID, !account!.isEnabled) }
-            },
-            onRemove: account == nil ? nil : { requestRemoval(rowID) }
-        )
-        .background(Color(nsColor: NSColor.controlBackgroundColor).opacity(0.18))
-        .clipShape(RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous))
-        .opacity(account.map { $0.isEnabled ? 1 : 0.55 } ?? 1)
-        .listRowBackground(Color.clear)
-        .id(rowID)
+        return Group {
+            Button {
+                toggleExpansion(for: rowID)
+            } label: {
+                GroupBox {
+                    AccountRow(account: account, state: state)
+                        .opacity(account.map { $0.isEnabled ? 1 : 0.55 } ?? 1)
+                }
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(account.map { AccountsListPolicy.rowSummary(for: $0).text } ?? "New account")
+            .accessibilityValue(expandedRowID == rowID ? "Expanded" : "Collapsed")
+            .accessibilityIdentifier(UIIdentifier.accountsRow(rowID.rawValue))
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            .id(rowID)
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             if let account {
                 Button {
@@ -134,12 +122,32 @@ struct AccountsSettingsView: View {
                     )
                 }
                 .tint(account.isEnabled ? .orange : .green)
-
                 Button(role: .destructive) {
                     requestRemoval(rowID)
                 } label: {
                     Label("Remove Account", systemImage: "trash")
                 }
+            }
+        }
+        .contextMenu {
+            if let account {
+                Button {
+                    Task { await model.setAccountEnabled(rowID, !account.isEnabled) }
+                } label: {
+                    Label(
+                        account.isEnabled ? "Disable Account" : "Enable Account",
+                        systemImage: account.isEnabled ? "pause.circle" : "play.circle"
+                    )
+                }
+                Button(role: .destructive) {
+                    requestRemoval(rowID)
+                } label: {
+                    Label("Remove Account", systemImage: "trash")
+                }
+            }
+        }
+            if expandedRowID == rowID {
+                accountEditorRow(account)
             }
         }
     }
@@ -150,13 +158,10 @@ struct AccountsSettingsView: View {
         return AccountEditorSheet(
             model: model,
             configuration: account,
-            displayName: displayNameBinding(for: account),
-            onCancel: { cancelEditing(rowID) },
-            onSaved: { finishEditing(rowID) },
+            onCancel: { closeEditor(rowID) },
+            onSaved: { closeEditor(rowID) },
             onRemove: account == nil ? nil : { requestRemoval(rowID) }
         )
-        .padding(.leading, 28)
-        .padding(.trailing, 8)
         .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
         .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)
@@ -173,38 +178,21 @@ struct AccountsSettingsView: View {
                 .font(.headline)
             Text("Add an account to start receiving mail.")
                 .foregroundStyle(.secondary)
-            Button("Add an account") {
+            Button("Add account…") {
                 addBlankAccount()
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!canAdd || isValidating)
             .accessibilityIdentifier(UIIdentifier.accountsEmptyAdd)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func displayNameBinding(for account: AccountConfig?) -> Binding<String> {
-        let id = account?.id ?? Self.blankAccountID
-        return Binding(
-            get: {
-                if let draft = draftDisplayNames[id] { return draft }
-                guard let account else { return "" }
-                return AccountTitlePolicy.title(for: account) ?? account.emailAddress
-            },
-            set: { draftDisplayNames[id] = $0 }
-        )
-    }
 
-    private func reportToolbarState() {
-        toolbarCoordinator.reportAccountsState(
-            canAdd: canAdd,
-            isValidating: isValidating
-        )
-    }
 
     private func addBlankAccount() {
-        guard canAdd else { return }
-        draftDisplayNames[Self.blankAccountID] = ""
-        withAnimation(MailMotion.expand) {
+        guard canAdd, !isValidating else { return }
+        withAnimation(reduceMotion ? nil : MailMotion.expand) {
             expandedRowID = Self.blankAccountID
         }
     }
@@ -214,44 +202,20 @@ struct AccountsSettingsView: View {
             current: expandedRowID,
             requested: id
         )
-        withAnimation(next == nil ? MailMotion.accountEditorCollapse : MailMotion.expand) {
+        withAnimation(reduceMotion ? nil : (next == nil ? MailMotion.accountEditorCollapse : MailMotion.expand)) {
             expandedRowID = next
         }
     }
 
-    private func cancelEditing(_ id: AccountID) {
-        withAnimation(MailMotion.accountEditorCollapse) {
-            if AccountsListPolicy.removesBlankRow(rowID: id, blankID: Self.blankAccountID) {
-                draftDisplayNames[id] = nil
-            }
+    private func closeEditor(_ id: AccountID) {
+        withAnimation(reduceMotion ? nil : MailMotion.accountEditorCollapse) {
             if expandedRowID == id {
                 expandedRowID = nil
             }
         }
     }
 
-    private func finishEditing(_ id: AccountID) {
-        withAnimation(MailMotion.accountEditorCollapse) {
-            if id == Self.blankAccountID {
-                draftDisplayNames[id] = nil
-            }
-            if expandedRowID == id {
-                expandedRowID = nil
-            }
-        }
-    }
 
-    private func commitDisplayName(_ input: String, for id: AccountID) {
-        guard let account = accounts.first(where: { $0.id == id }) else { return }
-        let committed = AccountsListPolicy.committedName(input: input, email: account.emailAddress)
-        draftDisplayNames[id] = committed
-        Task { @MainActor in
-            await model.renameAccount(id, to: committed)
-            // The stored name now flows through accountsStream; drop the
-            // draft so the row shows exactly what was persisted.
-            draftDisplayNames[id] = nil
-        }
-    }
 
     private func requestRemoval(_ id: AccountID) {
         pendingRemovalID = id
@@ -261,7 +225,7 @@ struct AccountsSettingsView: View {
     private func removePendingAccount() async {
         guard let id = pendingRemovalID else { return }
         do {
-            try await model.facade.removeAccount(id)
+            try await model.removeAccount(id)
             pendingRemovalID = nil
             expandedRowID = nil
         } catch {
@@ -277,18 +241,7 @@ struct AccountsSettingsView: View {
 private struct AccountRow: View {
     let account: AccountConfig?
     let state: AccountState
-    @Binding var displayName: String
-    let isExpanded: Bool
-    let onToggle: () -> Void
-    let onCommitName: (String) -> Void
-    let onToggleEnabled: (() -> Void)?
-    let onRemove: (() -> Void)?
-    @State private var isHovered = false
-    @FocusState private var isNameFocused: Bool
 
-    private var rowID: String {
-        account?.id.rawValue ?? "new-account"
-    }
 
     private var email: String {
         account?.emailAddress ?? "Configure your account"
@@ -306,19 +259,9 @@ private struct AccountRow: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 3) {
-                TextField("Account name", text: $displayName)
+                Text(account.map { AccountTitlePolicy.title(for: $0) ?? $0.emailAddress } ?? "New account")
                     .font(.headline)
-                    .textFieldStyle(.plain)
                     .lineLimit(1)
-                    .focused($isNameFocused)
-                    .onSubmit {
-                        commitName()
-                        if !isExpanded { onToggle() }
-                    }
-                    .onChange(of: isNameFocused) { _, focused in
-                        if !focused { commitName() }
-                    }
-                    .accessibilityIdentifier(UIIdentifier.accountsRowName)
 
                 Text(email)
                     .foregroundStyle(.secondary)
@@ -338,66 +281,12 @@ private struct AccountRow: View {
 
             Spacer(minLength: 0)
 
-            if let account {
-                HStack(spacing: 4) {
-                    Button {
-                        onToggleEnabled?()
-                    } label: {
-                        Image(systemName: account.isEnabled ? "pause.circle" : "play.circle")
-                    }
-                    .buttonStyle(.borderless)
-                    .accessibilityLabel(account.isEnabled ? "Disable Account" : "Enable Account")
-                    .help(account.isEnabled ? "Disable account" : "Enable account")
-
-                    Button(role: .destructive) {
-                        onRemove?()
-                    } label: {
-                        Image(systemName: "trash")
-                    }
-                    .buttonStyle(.borderless)
-                    .accessibilityIdentifier(UIIdentifier.accountsRemove)
-                    .accessibilityLabel("Remove Account")
-                    .help("Remove account")
-                }
-                .opacity(isHovered ? 1 : 0)
-                .allowsHitTesting(isHovered)
-                .animation(MailMotion.hover, value: isHovered)
-            }
-
-            Image(systemName: "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                .accessibilityIdentifier(UIIdentifier.accountsRowDisclosure)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .contentShape(Rectangle())
         .accessibilityElement(children: .contain)
-        .accessibilityIdentifier(UIIdentifier.accountsRow(rowID))
         .accessibilityLabel(summary?.text ?? "New account")
-        .onTapGesture {
-            guard !isNameFocused else { return }
-            onToggle()
-        }
-        .onHover { isHovered = $0 }
-        .contextMenu {
-            if let account {
-                Button {
-                    onToggleEnabled?()
-                } label: {
-                    Label(
-                        account.isEnabled ? "Disable Account" : "Enable Account",
-                        systemImage: account.isEnabled ? "pause.circle" : "play.circle"
-                    )
-                }
-                Button(role: .destructive) {
-                    onRemove?()
-                } label: {
-                    Label("Remove Account", systemImage: "trash")
-                }
-            }
-        }
     }
 
     private var statusColor: Color {
@@ -411,7 +300,4 @@ private struct AccountRow: View {
     }
 
 
-    private func commitName() {
-        onCommitName(displayName)
-    }
 }

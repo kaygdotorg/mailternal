@@ -9,12 +9,6 @@ struct SearchPanel: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorSchemeContrast) private var contrast
     @State private var hasAppeared = false
-    @State private var query = ""
-    @State private var results: [MessageRow] = []
-    @State private var selectedIndex: Int?
-    @State private var isSearching = false
-    @State private var errorMessage: String?
-    @State private var searchTask: Task<Void, Never>?
 
     var body: some View {
         GeometryReader { geometry in
@@ -42,26 +36,29 @@ struct SearchPanel: View {
                     .accessibilityHidden(true)
 
                 SearchPanelSurface(
-                    query: $query,
+                    query: Binding(
+                        get: { model.searchPresentation.query },
+                        set: { model.setSearchQuery($0) }
+                    ),
                     fieldFocused: $fieldFocused,
-                    results: results,
-                    selectedIndex: selectedIndex,
-                    isSearching: isSearching,
-                    errorMessage: errorMessage,
+                    results: model.searchPresentation.results,
+                    selectedResultID: model.searchPresentation.selectedResultID,
+                    isSearching: model.searchPresentation.isSearching,
+                    errorMessage: model.searchPresentation.errorMessage,
                     maximumHeight: maximumHeight,
                     contrast: contrast,
                     coverage: coverageDisclosure,
                     onMove: moveSelection,
                     onActivate: activateSelection,
-                    onOpen: { row in
-                        model.openSearchResult(row)
+                    onOpen: { messageID in
+                        model.openSearchResult(messageID)
                     },
                     onCopyDeepLink: { messageID in
                         Task { await model.copyDeepLink(for: messageID) }
                     },
-                    onClear: { query = "" },
+                    onClear: { model.setSearchQuery("") },
                     onDismiss: dismiss,
-                    onRetry: { runSearch(query) }
+                    onRetry: { model.setSearchQuery(model.searchPresentation.query) }
                 )
                 .frame(width: panelWidth)
                 .padding(.top, geometry.size.height / 3)
@@ -75,18 +72,28 @@ struct SearchPanel: View {
                     value: hasAppeared
                 )
             }
-            .onAppear { hasAppeared = true }
-            .onDisappear { fieldFocused = false }
+            .onAppear {
+                hasAppeared = true
+            }
+            .onDisappear {
+                fieldFocused = false
+                model.setSearchFieldFocused(false)
+            }
             .task {
                 await Task.yield()
                 guard !Task.isCancelled else { return }
                 fieldFocused = true
+                model.setSearchFieldFocused(true)
             }
             .onExitCommand(perform: dismiss)
             .focusScope(searchFocusScope)
             .defaultFocus($fieldFocused, true)
-            .onChange(of: query) { _, newValue in
-                runSearch(newValue)
+            .onChange(of: fieldFocused) { _, focused in
+                model.setSearchFieldFocused(focused)
+            }
+            .onChange(of: model.searchFieldFocused) { _, focused in
+                guard fieldFocused != focused else { return }
+                fieldFocused = focused
             }
         }
     }
@@ -102,9 +109,11 @@ struct SearchPanel: View {
 
     private func dismiss() {
         fieldFocused = false
-        model.toasts.isSuppressed = false
+        model.setSearchFieldFocused(false)
+        model.cancelSearch()
         guard hasAppeared else {
-            model.isSearchPresented = false
+            guard model.isSearchPresented else { return }
+            model.toggleSearch()
             return
         }
         // Card first, then backdrop, then remove the overlay once both
@@ -113,50 +122,26 @@ struct SearchPanel: View {
         hasAppeared = false
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(MailMotion.searchDismissDuration))
-            guard !hasAppeared else { return }
-            model.isSearchPresented = false
+            guard !hasAppeared, model.isSearchPresented else { return }
+            model.toggleSearch()
         }
     }
 
     private func moveSelection(_ delta: Int) {
-        guard !results.isEmpty else { return }
-        let current = selectedIndex ?? (delta > 0 ? -1 : results.count)
-        let next = min(max(current + delta, 0), results.count - 1)
-        selectedIndex = next
+        let presentation = model.searchPresentation
+        guard !presentation.results.isEmpty else { return }
+        let current = presentation.selectedResultID
+            .flatMap { id in presentation.results.firstIndex { $0.id == id } }
+            ?? (delta > 0 ? -1 : presentation.results.count)
+        let next = min(max(current + delta, 0), presentation.results.count - 1)
+        model.selectSearchResult(presentation.results[next].id)
     }
 
     private func activateSelection() {
-        let index = selectedIndex ?? 0
-        guard results.indices.contains(index) else { return }
-        model.openSearchResult(results[index])
-    }
-
-    private func runSearch(_ text: String) {
-        searchTask?.cancel()
-        guard let trimmed = SearchQueryPolicy.normalizedQuery(text) else {
-            results = []
-            selectedIndex = nil
-            isSearching = false
-            errorMessage = nil
-            return
-        }
-        isSearching = true
-        errorMessage = nil
-        searchTask = Task {
-            try? await Task.sleep(for: SearchQueryPolicy.debounce)
-            guard !Task.isCancelled else { return }
-            do {
-                let hits = try await model.facade.search(trimmed, limit: 40)
-                guard !Task.isCancelled else { return }
-                results = hits
-                selectedIndex = hits.isEmpty ? nil : 0
-                isSearching = false
-            } catch {
-                guard !Task.isCancelled else { return }
-                errorMessage = error.localizedDescription
-                isSearching = false
-            }
-        }
+        let presentation = model.searchPresentation
+        let messageID = presentation.selectedResultID ?? presentation.results.first?.id
+        guard let messageID else { return }
+        model.openSearchResult(messageID)
     }
 }
 
@@ -179,7 +164,7 @@ private struct SearchPanelSurface: View {
     @Binding var query: String
     var fieldFocused: FocusState<Bool>.Binding
     let results: [MessageRow]
-    let selectedIndex: Int?
+    let selectedResultID: MessageID?
     let isSearching: Bool
     let errorMessage: String?
     let maximumHeight: CGFloat
@@ -187,7 +172,7 @@ private struct SearchPanelSurface: View {
     let coverage: String?
     let onMove: (Int) -> Void
     let onActivate: () -> Void
-    let onOpen: (MessageRow) -> Void
+    let onOpen: (MessageID) -> Void
     let onCopyDeepLink: (MessageID) -> Void
     let onClear: () -> Void
     let onDismiss: () -> Void
@@ -309,11 +294,11 @@ private struct SearchPanelSurface: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(results.enumerated()), id: \.element.id) { index, row in
-                            Button { onOpen(row) } label: {
+                        ForEach(results) { row in
+                            Button { onOpen(row.id) } label: {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(row.subject)
-                                        .font(.body.weight(selectedIndex == index ? .semibold : .regular))
+                                        .font(.body.weight(selectedResultID == row.id ? .semibold : .regular))
                                         .lineLimit(2)
                                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                                         Text(row.from)
@@ -337,7 +322,7 @@ private struct SearchPanelSurface: View {
                                 .padding(.vertical, 10)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .background(
-                                    selectedIndex == index
+                                    selectedResultID == row.id
                                         ? accent.color.opacity(contrast == .increased ? 0.24 : 0.12)
                                         : Color.clear,
                                     in: RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
@@ -355,9 +340,10 @@ private struct SearchPanelSurface: View {
                     .padding(.horizontal, 12)
                     .padding(.bottom, 8)
                 }
-                .onChange(of: selectedIndex) { _, newIndex in
-                    guard let newIndex, results.indices.contains(newIndex) else { return }
-                    let messageID = results[newIndex].id
+                .onChange(of: selectedResultID) { _, messageID in
+                    guard let messageID,
+                          results.contains(where: { $0.id == messageID })
+                    else { return }
                     if reduceMotion {
                         proxy.scrollTo(messageID, anchor: .center)
                     } else {

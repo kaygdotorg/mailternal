@@ -13,6 +13,7 @@ final class MessageWindowController: NSObject, NSWindowDelegate {
 
     private var windows: [MessageID: NSWindow] = [:]
     private var toolbarControllers: [MessageID: MainToolbarController] = [:]
+    private var windowModels: [ObjectIdentifier: AppModel] = [:]
     private override init() {
         super.init()
     }
@@ -20,9 +21,11 @@ final class MessageWindowController: NSObject, NSWindowDelegate {
     func show(
         messageID: MessageID,
         model: AppModel,
-        title: String? = nil
+        title: String? = nil,
+        accountLinkID: AccountLinkID? = nil
     ) {
         if let window = windows[messageID] {
+            model.registerAutomationWindow(window, accountLinkID: accountLinkID)
             if let title, !title.isEmpty {
                 window.title = title
             }
@@ -71,16 +74,19 @@ final class MessageWindowController: NSObject, NSWindowDelegate {
         window.center()
 
         windows[messageID] = window
+        windowModels[ObjectIdentifier(window)] = model
+        model.registerAutomationWindow(window, accountLinkID: accountLinkID)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
     }
-
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
         if let messageID = windows.first(where: { $0.value === window })?.key {
             windows.removeValue(forKey: messageID)
             toolbarControllers.removeValue(forKey: messageID)
         }
+        let objectID = ObjectIdentifier(window)
+        windowModels.removeValue(forKey: objectID)?.unregisterAutomationWindow(window)
     }
 
     private func updateTitle(_ subject: String, for messageID: MessageID) {

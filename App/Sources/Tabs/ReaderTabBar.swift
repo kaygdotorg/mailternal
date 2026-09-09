@@ -33,11 +33,15 @@ struct ReaderTabBar: View {
     }
 
     @State private var hoveredTabID: UUID?
+    @State private var hoverPresentationTask: Task<Void, Never>?
+    @State private var previewTabID: UUID?
     @State private var hoverDismissTask: Task<Void, Never>?
     @State private var hoverPopover: ReaderTabHoverPopover?
     @State private var isCardHovered = false
-    @State private var tabBarView: NSView?
     @State private var showsLeadingFade = false
+    @State private var metadataCache = ReaderTabMetadataCache()
+    @State private var widthCache = ReaderTabWidthCache()
+    @State private var scrollState = ReaderTabScrollState()
     @FocusState private var focusedTabID: UUID?
 
     var body: some View {
@@ -48,11 +52,13 @@ struct ReaderTabBar: View {
         )
         if model.tabs.tabs.count > 1 && !model.isSearchPresented {
             let metadata = tabMetadataByMessage()
+            let widths = widthCache.widths(
+                for: model.tabs.tabs,
+                metadata: metadata,
+                style: model.appearance.tabStyle
+            )
+            let contentWidth = ReaderTabLayoutPolicy.contentWidth(tabWidths: widths)
             GeometryReader { geometry in
-                let widths = model.tabs.tabs.map {
-                    tabWidth(for: $0, metadata: metadata)
-                }
-                let contentWidth = ReaderTabLayoutPolicy.contentWidth(tabWidths: widths)
                 let viewportWidth = max(0, geometry.size.width + trailingGap)
                 // Extend only through the measured native inter-item gap.
                 // The clear end of the mask stops at the action capsule.
@@ -66,42 +72,19 @@ struct ReaderTabBar: View {
                 .coordinateSpace(name: "reader-tab-bar")
             }
             .frame(height: ReaderTabLayoutPolicy.rowHeight)
-            .background(
-                ReaderTabWindowProbe { view in
-                    // The toolbar owns card/capsule alignment. This probe
-                    // only tracks the strip's laid-out hover coordinates.
-                    DispatchQueue.main.async {
-                        if tabBarView !== view {
-                            tabBarView = view
-                        }
-                        guard let anchor = view as? ReaderTabWindowProbeView,
-                              anchor.window != nil else { return }
-                        let frameInWindow = anchor.convert(anchor.bounds, to: nil)
-                        let geometryChanged = anchor.lastFrameInWindow != frameInWindow
-                        anchor.lastFrameInWindow = frameInWindow
-                        if geometryChanged,
-                           let hoverPopover,
-                           let contentFrame = anchor.hoverContentFrame {
-                            let frame = contentFrame.offsetBy(
-                                dx: -anchor.horizontalOffset,
-                                dy: 0
-                            )
-                            if frame.intersects(anchor.bounds) {
-                                hoverPopover.present(tabFrame: frame, in: anchor)
-                            } else {
-                                dismissHoverCard()
-                            }
-                        }
-                    }
-                }
-            )
+            .background(ReaderTabWindowProbe())
             .zIndex(hoveredTabID == nil ? 0 : 1)
             .accessibilityIdentifier(UIIdentifier.readerTabBar)
             .background {
                 Color.clear
                     .contentShape(Rectangle())
                     .contextMenu {
-                        Picker("Tab Style", selection: Bindable(model.appearance).tabStyle) {
+                        Picker("Tab Style", selection: Binding(
+                            get: { model.appearance.tabStyle },
+                            set: { style in
+                                model.dispatchFromUI(.setSetting(AutomationPreferences.Keys.tabStyle, style.rawValue))
+                            }
+                        )) {
                             ForEach(ReaderTabStyle.allCases, id: \.self) { style in
                                 Text(style.label).tag(style)
                             }
@@ -109,10 +92,7 @@ struct ReaderTabBar: View {
                     }
             }
             .onChange(of: model.tabs.activeID) { _, _ in
-                if let hoveredTabID,
-                   !canPresentHoverPreview(for: hoveredTabID) {
-                    dismissHoverCard()
-                }
+                dismissHoverCard()
             }
             .onChange(of: isCardHovered) { _, cardHovered in
                 if cardHovered {
@@ -123,6 +103,9 @@ struct ReaderTabBar: View {
                 }
             }
             .onDisappear {
+                scrollState.isUserDriven = false
+                scrollState.hoverSuspendedAt = nil
+                scrollState.pendingReveal = false
                 dismissHoverCard()
             }
         }
@@ -148,18 +131,8 @@ struct ReaderTabBar: View {
                             subject: tabMetadata.subject,
                             sender: tabMetadata.sender,
                             width: width,
-                            onHoverChanged: { hovering in
-                                updateHover(
-                                    for: tab.id,
-                                    hovering: hovering,
-                                    contentFrame: CGRect(
-                                        x: widths.prefix(index).reduce(0, +)
-                                            + CGFloat(index) * ReaderTabLayoutPolicy.tabSpacing,
-                                        y: 0,
-                                        width: width,
-                                        height: ReaderTabLayoutPolicy.rowHeight
-                                    )
-                                )
+                            onHoverChanged: { hovering, tabView in
+                                updateHover(for: tab.id, hovering: hovering, tabView: tabView)
                             },
                             onTabCommand: {
                                 model.noteQATabCommand(
@@ -183,7 +156,7 @@ struct ReaderTabBar: View {
                                 afterTarget: location.x > width / 2,
                                 count: model.tabs.tabs.count
                             )
-                            model.tabs.move(sourceID, to: destination)
+                            model.moveTab(sourceID, to: destination)
                             return true
                         }
                     }
@@ -200,7 +173,9 @@ struct ReaderTabBar: View {
             } action: { _, offset in
                 // Keep continuous geometry outside SwiftUI state; scrolling
                 // must not rebuild every tab or republish layout preferences.
-                (tabBarView as? ReaderTabWindowProbeView)?.horizontalOffset = offset
+                // Moving content beneath a stationary pointer is scrolling,
+                // not a request to construct another native preview window.
+                scrollState.hoverSuspendedAt = NSEvent.mouseLocation
                 if hoverPopover != nil || hoveredTabID != nil {
                     dismissHoverCard()
                 }
@@ -219,16 +194,45 @@ struct ReaderTabBar: View {
                     viewportWidth: width
                 )
             }
+            .onScrollPhaseChange { _, phase in
+                switch phase {
+                case .tracking, .interacting, .decelerating:
+                    scrollState.isUserDriven = true
+                    scrollState.hoverSuspendedAt = NSEvent.mouseLocation
+                    if hoverPopover != nil || hoveredTabID != nil {
+                        dismissHoverCard()
+                    }
+                default:
+                    scrollState.isUserDriven = false
+                    if scrollState.pendingReveal {
+                        scrollState.pendingReveal = false
+                        if let activeID = model.tabs.activeID {
+                            proxy.scrollTo(activeID, anchor: .center)
+                        }
+                    }
+                }
+            }
             .onChange(of: model.tabs.activeID, initial: true) { _, activeID in
                 guard let activeID else { return }
+                scrollState.pendingReveal = false
+                // Activation is authoritative: reveal the selected tab even
+                // when a wheel gesture is still settling.
                 proxy.scrollTo(activeID, anchor: .center)
             }
             .onChange(of: width) { _, _ in
                 guard let activeID = model.tabs.activeID else { return }
+                guard !scrollState.isUserDriven else {
+                    scrollState.pendingReveal = true
+                    return
+                }
                 proxy.scrollTo(activeID, anchor: .center)
             }
             .onChange(of: widths) { _, _ in
                 guard let activeID = model.tabs.activeID else { return }
+                guard !scrollState.isUserDriven else {
+                    scrollState.pendingReveal = true
+                    return
+                }
                 proxy.scrollTo(activeID, anchor: .center)
             }
         }
@@ -275,8 +279,16 @@ struct ReaderTabBar: View {
     }
 
     private func tabMetadataByMessage(includeHTMLPreview: Bool = false) -> [MessageID: ReaderTabMetadata] {
+        if !includeHTMLPreview {
+            return metadataCache.metadata(
+                tabs: model.tabs.tabs,
+                rows: model.listRows,
+                detail: model.detail,
+                listRevision: model.listContentRevision
+            )
+        }
         let tabMessages = Set(model.tabs.tabs.map(\.message))
-        var metadata: [MessageID: ReaderTabMetadata] = [:]
+        var metadata = tabMetadataByMessage()
         metadata.reserveCapacity(tabMessages.count + 1)
         for row in model.listRows where tabMessages.contains(row.id) {
             metadata[row.id] = ReaderTabMetadata(
@@ -294,7 +306,7 @@ struct ReaderTabBar: View {
                 subject: detail.envelope.subject,
                 sender: sender,
                 preview: detail.bodyText
-                    ?? (includeHTMLPreview ? detail.sanitizedHTML.map(Self.plainText(fromHTML:)) : nil)
+                    ?? detail.sanitizedHTML.map(Self.plainText(fromHTML:))
                     ?? "",
                 receivedDate: detail.envelope.headerDate ?? detail.envelope.internalDate
             )
@@ -302,32 +314,6 @@ struct ReaderTabBar: View {
         return metadata
     }
 
-    private func tabWidth(
-        for tab: ReaderTab,
-        metadata: [MessageID: ReaderTabMetadata]
-    ) -> CGFloat {
-        let title = metadata[tab.message]?.subject ?? ""
-        let displayTitle = title.isEmpty ? "No Subject" : title
-        let titleWidth: CGFloat
-        if ReaderTabStylePolicy.showsSubject(for: model.appearance.tabStyle) {
-            let font = NSFont.preferredFont(forTextStyle: .subheadline)
-            titleWidth = ceil(
-                (displayTitle as NSString).size(withAttributes: [.font: font]).width
-            )
-        } else {
-            titleWidth = 0
-        }
-        let leadingWidth = ReaderTabStylePolicy.showsLeadingSlot(
-            for: model.appearance.tabStyle,
-            isHovered: false
-        ) ? ReaderTabLayoutPolicy.leadingSlotWidth : 0
-        let intrinsic = leadingWidth
-            + titleWidth
-            + (titleWidth > 0 ? ReaderTabLayoutPolicy.subjectItemSpacing : 0)
-            + (titleWidth > 0 ? ReaderTabLayoutPolicy.subjectLeadingPadding : 0)
-            + (titleWidth > 0 ? ReaderTabLayoutPolicy.subjectTrailingPadding : 0)
-        return ReaderTabLayoutPolicy.tabWidth(intrinsic: intrinsic)
-    }
 
     private var hoveredPreview: ReaderTabPreview? {
         guard let hoveredTabID,
@@ -351,62 +337,83 @@ struct ReaderTabBar: View {
         )
     }
 
-    private func updateHover(for id: UUID, hovering: Bool, contentFrame: CGRect) {
+    private func updateHover(for id: UUID, hovering: Bool, tabView: NSView?) {
         if hovering {
-            guard canPresentHoverPreview(for: id) else {
-                dismissHoverCard()
+            guard let tabView, canPresentHoverPreview(for: id) else {
+                if hoverPopover != nil || hoveredTabID != nil {
+                    dismissHoverCard()
+                }
                 return
             }
+            scrollState.hoverSuspendedAt = nil
+            guard hoveredTabID != id
+                || (hoverPresentationTask == nil && hoverPopover?.isShown != true) else { return }
+            hoverPresentationTask?.cancel()
+            hoverPresentationTask = nil
             hoverDismissTask?.cancel()
             hoverDismissTask = nil
-            if hoveredTabID != id {
-                hoveredTabID = id
+            hoveredTabID = id
+            if previewTabID == id, hoverPopover?.isShown == true {
+                return
             }
-            showHoverPanel(for: id, contentFrame: contentFrame)
+            hoverPopover?.dismiss()
+            hoverPopover = nil
+            previewTabID = nil
+            isCardHovered = false
+            hoverPresentationTask = Task { @MainActor [weak tabView] in
+                do {
+                    try await Task.sleep(for: ReaderTabTokens.hoverDelay)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                hoverPresentationTask = nil
+                guard let tabView, hoveredTabID == id, canPresentHoverPreview(for: id) else { return }
+                showHoverPanel(for: id, tabView: tabView)
+            }
             return
         }
 
         guard hoveredTabID == id else { return }
+        hoverPresentationTask?.cancel()
+        hoverPresentationTask = nil
         hoveredTabID = nil
         scheduleHoverDismissal()
     }
 
-    /// Shared gate for hover events, delayed anchor updates, and active-tab
-    /// changes: the selected tab never owns a preview.
+    /// Pointer movement can begin a dwell; scroll-driven hover/layout events
+    /// cannot, including phase-less mouse wheels. Recheck after the delay.
     private func canPresentHoverPreview(for id: UUID) -> Bool {
-        model.tabs.activeID != id
+        guard model.tabs.activeID != id,
+              !scrollState.isUserDriven,
+              NSApp.currentEvent?.type != .scrollWheel else { return false }
+        if let location = scrollState.hoverSuspendedAt {
+            return NSEvent.mouseLocation != location
+        }
+        return true
     }
 
-    private func showHoverPanel(for id: UUID, contentFrame: CGRect) {
+    private func showHoverPanel(for id: UUID, tabView: NSView) {
         guard canPresentHoverPreview(for: id),
               let preview = hoveredPreview,
-              let anchor = tabBarView as? ReaderTabWindowProbeView else {
+              tabView.window != nil else {
             if hoveredTabID == id {
                 dismissHoverCard()
             }
             return
         }
-        let frame = contentFrame.offsetBy(
-            dx: -anchor.horizontalOffset,
-            dy: 0
-        )
-        guard !frame.isEmpty, frame.intersects(anchor.bounds) else { return }
+        let frame = tabView.visibleRect
+        guard !frame.isEmpty else { return }
         let card = ReaderTabHoverCard(
             subject: preview.subject,
             preview: preview.preview,
             sender: preview.sender,
             receivedDate: preview.receivedDate
         )
-        let popover: ReaderTabHoverPopover
-        if let hoverPopover {
-            popover = hoverPopover
-            popover.update(card: card)
-        } else {
-            popover = ReaderTabHoverPopover(card: card, cardHovered: $isCardHovered)
-            hoverPopover = popover
-        }
-        anchor.hoverContentFrame = contentFrame
-        popover.present(tabFrame: frame, in: anchor)
+        let popover = ReaderTabHoverPopover(card: card, cardHovered: $isCardHovered)
+        hoverPopover = popover
+        popover.present(tabFrame: frame, in: tabView)
+        previewTabID = id
     }
 
     private func scheduleHoverDismissal() {
@@ -417,11 +424,15 @@ struct ReaderTabBar: View {
             guard !Task.isCancelled, !isCardHovered, hoveredTabID == nil else { return }
             hoverPopover?.dismiss()
             hoverPopover = nil
+            previewTabID = nil
             hoverDismissTask = nil
         }
     }
 
     private func dismissHoverCard() {
+        hoverPresentationTask?.cancel()
+        hoverPresentationTask = nil
+        previewTabID = nil
         hoverDismissTask?.cancel()
         hoverDismissTask = nil
         hoverPopover?.dismiss()
@@ -429,6 +440,7 @@ struct ReaderTabBar: View {
         hoveredTabID = nil
         isCardHovered = false
     }
+
 
 
 
@@ -456,52 +468,185 @@ private struct ReaderTabMetadata {
     )
 }
 
+/// Caches the small display projection needed by the strip. Known labels stay
+/// with open messages even when their rows leave the current page; activation
+/// must not shrink the previous tab to "No Subject" and relayout the strip.
+/// Hover previews intentionally use the uncached, full projection below.
+private final class ReaderTabMetadataCache {
+    private var cachedListRevision: UInt64?
+    private var cachedMessages: [MessageID] = []
+    private var cachedDetailID: MessageID?
+    private var cachedDetailSubject = ""
+    private var cachedDetailSender: String?
+    private var cachedDetailDate: Date?
+    private var baseValues: [MessageID: ReaderTabMetadata] = [:]
+    private var values: [MessageID: ReaderTabMetadata] = [:]
 
+    func metadata(
+        tabs: [ReaderTab],
+        rows: [MessageRow],
+        detail: MessageDetail?,
+        listRevision: UInt64
+    ) -> [MessageID: ReaderTabMetadata] {
+        let messages = tabs.map(\.message)
+        let listChanged = cachedListRevision != listRevision || cachedMessages != messages
+        let detailID = detail?.id
+        let detailSubject = detail?.envelope.subject ?? ""
+        let detailSender = detail?.envelope.from.first.map {
+            ($0.displayName?.isEmpty == false ? $0.displayName : nil) ?? $0.address
+        }
+        let detailDate = detail?.envelope.headerDate ?? detail?.envelope.internalDate
+        let detailChanged = cachedDetailID != detailID
+            || cachedDetailSubject != detailSubject
+            || cachedDetailSender != detailSender
+            || cachedDetailDate != detailDate
+        guard listChanged || detailChanged else {
+            return values
+        }
+
+        if listChanged {
+            let tabMessages = Set(messages)
+            var base = baseValues.filter { tabMessages.contains($0.key) }
+            base.reserveCapacity(tabMessages.count + 1)
+            for row in rows where tabMessages.contains(row.id) {
+                base[row.id] = ReaderTabMetadata(
+                    subject: row.subject,
+                    sender: row.from,
+                    preview: row.preview,
+                    receivedDate: row.date
+                )
+            }
+            baseValues = base
+            cachedListRevision = listRevision
+            cachedMessages = messages
+        }
+
+        // Retain detail-only labels after activation moves elsewhere. Keep
+        // body text out of this display cache; preview construction owns it.
+        if let detail, cachedMessages.contains(detail.id), baseValues[detail.id] == nil {
+            baseValues[detail.id] = ReaderTabMetadata(
+                subject: detailSubject,
+                sender: detailSender,
+                preview: "",
+                receivedDate: detailDate
+            )
+        }
+        cachedDetailID = detailID
+        cachedDetailSubject = detailSubject
+        cachedDetailSender = detailSender
+        cachedDetailDate = detailDate
+        values = baseValues
+        return values
+    }
+}
+
+/// Intrinsic width measurement is stable for a tab identity until its subject,
+/// display style, or preferred font changes. Keeping that result out of the
+/// SwiftUI value tree avoids measuring every open title on parent invalidation.
+private final class ReaderTabWidthCache {
+    private struct Entry {
+        let subject: String
+        let width: CGFloat
+    }
+
+    private var cachedStyle: ReaderTabStyle?
+    private var cachedFontName: String?
+    private var cachedFontSize: CGFloat?
+    private var cachedTabIDs: [UUID] = []
+    private var widthsByTabID: [UUID: Entry] = [:]
+
+    func widths(
+        for tabs: [ReaderTab],
+        metadata: [MessageID: ReaderTabMetadata],
+        style: ReaderTabStyle
+    ) -> [CGFloat] {
+        let font = ReaderTabStylePolicy.showsSubject(for: style)
+            ? NSFont.preferredFont(forTextStyle: .subheadline)
+            : nil
+        let fontName = font?.fontName
+        let fontSize = font?.pointSize
+        if cachedStyle != style
+            || cachedFontName != fontName
+            || cachedFontSize != fontSize {
+            widthsByTabID.removeAll(keepingCapacity: true)
+            cachedStyle = style
+            cachedFontName = fontName
+            cachedFontSize = fontSize
+        }
+
+        let tabIDs = tabs.map(\.id)
+        if cachedTabIDs != tabIDs {
+            let liveIDs = Set(tabIDs)
+            widthsByTabID = widthsByTabID.filter { liveIDs.contains($0.key) }
+            cachedTabIDs = tabIDs
+        }
+
+        var widths: [CGFloat] = []
+        widths.reserveCapacity(tabs.count)
+        for tab in tabs {
+            let subject = metadata[tab.message]?.subject ?? ""
+            if let entry = widthsByTabID[tab.id], entry.subject == subject {
+                widths.append(entry.width)
+                continue
+            }
+            let width = Self.width(for: subject, style: style, font: font)
+            widthsByTabID[tab.id] = Entry(subject: subject, width: width)
+            widths.append(width)
+        }
+        return widths
+    }
+
+    private static func width(
+        for subject: String,
+        style: ReaderTabStyle,
+        font: NSFont?
+    ) -> CGFloat {
+        let displayTitle = subject.isEmpty ? "No Subject" : subject
+        let titleWidth: CGFloat
+        if ReaderTabStylePolicy.showsSubject(for: style), let font {
+            titleWidth = ceil(
+                (displayTitle as NSString).size(withAttributes: [.font: font]).width
+            )
+        } else {
+            titleWidth = 0
+        }
+        let leadingWidth = ReaderTabStylePolicy.showsLeadingSlot(
+            for: style,
+            isHovered: false
+        ) ? ReaderTabLayoutPolicy.leadingSlotWidth : 0
+        let intrinsic = leadingWidth
+            + titleWidth
+            + (titleWidth > 0 ? ReaderTabLayoutPolicy.subjectItemSpacing : 0)
+            + (titleWidth > 0 ? ReaderTabLayoutPolicy.subjectLeadingPadding : 0)
+            + (titleWidth > 0 ? ReaderTabLayoutPolicy.subjectTrailingPadding : 0)
+        return ReaderTabLayoutPolicy.tabWidth(intrinsic: intrinsic)
+    }
+}
+
+/// Scroll phase is kept outside SwiftUI state so wheel motion does not rebuild
+/// the strip. Width changes still reveal the active tab once user scrolling has
+/// settled, while activation remains authoritative in the view modifier.
+private final class ReaderTabScrollState {
+    var isUserDriven = false
+    var pendingReveal = false
+    var hoverSuspendedAt: NSPoint?
+}
+
+
+/// Marker for native input routing in stacked layouts. Hover positioning uses
+/// each tab's actual native view, not this viewport or estimated content offsets.
 @MainActor
-/// Reports the AppKit view that backs the strip's coordinate space so the
-/// hover popover can be anchored to a tab frame.
 private struct ReaderTabWindowProbe: NSViewRepresentable {
-    let onViewReady: (NSView?) -> Void
-
     func makeNSView(context: Context) -> ReaderTabWindowProbeView {
-        ReaderTabWindowProbeView(onViewReady: onViewReady)
+        ReaderTabWindowProbeView()
     }
 
-    func updateNSView(_ nsView: ReaderTabWindowProbeView, context: Context) {
-        nsView.onViewReady = onViewReady
-        nsView.resolveWindow()
-    }
+    func updateNSView(_ nsView: ReaderTabWindowProbeView, context: Context) {}
 }
 
 @MainActor
-private final class ReaderTabWindowProbeView: NSView {
-    var onViewReady: (NSView?) -> Void
-    var horizontalOffset: CGFloat = 0
-    var lastFrameInWindow: CGRect?
-    var hoverContentFrame: CGRect?
+private final class ReaderTabWindowProbeView: NSView {}
 
-    init(onViewReady: @escaping (NSView?) -> Void) {
-        self.onViewReady = onViewReady
-        super.init(frame: .zero)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        resolveWindow()
-    }
-    override func layout() {
-        super.layout()
-        resolveWindow()
-    }
-
-
-    func resolveWindow() {
-        onViewReady(window == nil ? nil : self)
-    }
-}
 private struct ReaderTabPreview: Identifiable {
     let id: UUID
     let subject: String

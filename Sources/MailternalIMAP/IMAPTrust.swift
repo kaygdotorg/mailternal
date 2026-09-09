@@ -1,8 +1,4 @@
 import Foundation
-import NIOSSL
-#if canImport(Security)
-import Security
-#endif
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -42,7 +38,6 @@ enum IMAPTrust {
     private final class Storage: @unchecked Sendable {
         let lock = NSLock()
         var pemBlobs: [Data] = []
-        var systemAnchors: [NIOSSLCertificate]?
     }
 
     private static let storage = Storage()
@@ -74,21 +69,6 @@ enum IMAPTrust {
         return !storage.pemBlobs.isEmpty
     }
 
-    /// System anchors plus the extra PEMs. Used only when extras are installed.
-    static func extendedTrustRoots(_ extras: [NIOSSLCertificate]) -> [NIOSSLCertificate] {
-        extras + cachedSystemAnchors()
-    }
-
-    static func cachedSystemAnchors() -> [NIOSSLCertificate] {
-        storage.lock.lock()
-        defer { storage.lock.unlock() }
-        if let cached = storage.systemAnchors {
-            return cached
-        }
-        let loaded = systemAnchorCertificates()
-        storage.systemAnchors = loaded
-        return loaded
-    }
     /// DNS names are used directly for SNI and hostname verification.
     static func sniHostname(for host: String) -> String? {
         isIPAddress(host) ? nil : host
@@ -150,19 +130,3 @@ extension IMAPSession {
         IMAPTrust.setAdditionalPEM([])
     }
 }
-
-#if os(macOS)
-private func systemAnchorCertificates() -> [NIOSSLCertificate] {
-    var anchors: CFArray?
-    let status = SecTrustCopyAnchorCertificates(&anchors)
-    guard status == errSecSuccess, let certs = anchors as? [SecCertificate] else {
-        return []
-    }
-    return certs.compactMap { cert in
-        let data = SecCertificateCopyData(cert) as Data
-        return try? NIOSSLCertificate(bytes: Array(data), format: .der)
-    }
-}
-#else
-private func systemAnchorCertificates() -> [NIOSSLCertificate] { [] }
-#endif

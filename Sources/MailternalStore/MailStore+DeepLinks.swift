@@ -26,7 +26,8 @@ extension MailStore {
     /// UIDVALIDITY generation. Retired generations cannot produce links.
     public func makeDeepLink(account: AccountID, message: MessageID) async throws -> MailternalDeepLink? {
         try await read { db in
-            guard let row = try Row.fetchOne(
+            guard let canonicalID = try Self.resolveMessageID(db, id: message),
+                  let row = try Row.fetchOne(
                 db,
                 sql: """
                     SELECT m.uid, g.uid_validity, f.path, f.object_id, a.account_link_id
@@ -36,7 +37,7 @@ extension MailStore {
                     JOIN accounts a ON a.id = f.account_id
                     WHERE m.id = ? AND f.account_id = ? AND f.retired = 0
                     """,
-                arguments: [GenerationState.live.rawValue, message.rawValue, account.rawValue]
+                arguments: [GenerationState.live.rawValue, canonicalID.rawValue, account.rawValue]
             ),
             let accountLinkID = Self.accountLinkID(from: row),
             let folderLocator = Self.folderLocator(from: row) else { return nil }
@@ -57,7 +58,7 @@ extension MailStore {
     /// Resolves a cross-device link by account link ID and server mailbox
     /// locator. Message links additionally require the exact current generation.
     public func resolve(_ link: MailternalDeepLink) async throws -> MailternalDeepLinkResolution? {
-        try await read { db in
+        try await read { db -> MailternalDeepLinkResolution? in
             guard let folder = try Self.folderRow(db, accountLinkID: link.accountLinkID, locator: link.folderLocator) else {
                 return nil
             }

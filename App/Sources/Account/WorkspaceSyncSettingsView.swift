@@ -6,16 +6,18 @@ import MailternalWorkspace
 /// Workspace synchronization excludes mail content and credentials; Pair Device opens
 /// the separate explicit account-transfer flow.
 struct WorkspaceSyncSettingsView: View {
+    @Bindable var model: AppModel
     let coordinator: MacWorkspaceCoordinator
     let onPairDevice: () -> Void
     @Bindable var controller: WorkspaceSyncController
     @State private var conflictCategory: WorkspaceSyncCategory?
     @State private var actionError: String?
 
-    init(coordinator: MacWorkspaceCoordinator, onPairDevice: @escaping () -> Void) {
-        self.coordinator = coordinator
+    init(model: AppModel, onPairDevice: @escaping () -> Void) {
+        self.model = model
+        self.coordinator = model.workspaceSync
         self.onPairDevice = onPairDevice
-        self._controller = Bindable(wrappedValue: coordinator.controller)
+        self._controller = Bindable(wrappedValue: model.workspaceSync.controller)
     }
 
     var body: some View {
@@ -102,7 +104,7 @@ struct WorkspaceSyncSettingsView: View {
 
     private func setMaster(_ enabled: Bool) async {
         do {
-            try await coordinator.setEnabled(enabled)
+            try await model.dispatch(.setWorkspaceSync(enabled))
             actionError = nil
         } catch {
             actionError = error.localizedDescription
@@ -111,7 +113,7 @@ struct WorkspaceSyncSettingsView: View {
 
     private func setCategory(_ category: WorkspaceSyncCategory, enabled: Bool) async {
         do {
-            try await coordinator.setCategory(category, enabled: enabled)
+            try await model.dispatch(.setWorkspaceSyncCategory(category, enabled))
             actionError = nil
         } catch {
             actionError = error.localizedDescription
@@ -120,7 +122,7 @@ struct WorkspaceSyncSettingsView: View {
 
     private func resolve(_ category: WorkspaceSyncCategory, using choice: WorkspaceSyncChoice) async {
         do {
-            try await coordinator.resolve(category, using: choice)
+            try await model.dispatch(.resolveWorkspaceSyncConflict(category, choice))
             conflictCategory = nil
             actionError = nil
         } catch {

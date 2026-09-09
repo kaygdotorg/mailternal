@@ -208,6 +208,8 @@ public struct FlagOp: Hashable, Sendable, Identifiable {
     public var uid: IMAPUID
     public var flag: FlagKind
     public var set: Bool
+    /// The reversible operation that created this queue row, when available.
+    public var journalID: Int64?
 
     public init(
         id: Int64,
@@ -216,7 +218,8 @@ public struct FlagOp: Hashable, Sendable, Identifiable {
         uidValidity: UInt32,
         uid: IMAPUID,
         flag: FlagKind,
-        set: Bool
+        set: Bool,
+        journalID: Int64? = nil
     ) {
         self.id = id
         self.account = account
@@ -225,6 +228,22 @@ public struct FlagOp: Hashable, Sendable, Identifiable {
         self.uid = uid
         self.flag = flag
         self.set = set
+        self.journalID = journalID
+    }
+}
+
+/// Exact server identity returned by an IMAP COPYUID/MOVE response.
+/// A missing mapping is intentionally represented by the absence of a value,
+/// never by reusing the source UID.
+public struct MoveDestinationIdentity: Hashable, Sendable {
+    public let sourceUID: IMAPUID
+    public let uidValidity: UInt32
+    public let uid: IMAPUID
+
+    public init(sourceUID: IMAPUID, uidValidity: UInt32, uid: IMAPUID) {
+        self.sourceUID = sourceUID
+        self.uidValidity = uidValidity
+        self.uid = uid
     }
 }
 
@@ -244,6 +263,13 @@ public struct MoveOp: Hashable, Sendable, Identifiable {
     /// folder. The role remains populated for historical queue rows.
     public var destinationFolderID: FolderID?
     public var copied: Bool
+    /// True while the sync drainer owns this queue row for a server command.
+    public var claimed: Bool
+    /// The reversible operation that created this queue row, when available.
+    public var journalID: Int64?
+    /// Exact destination identity from COPYUID/MOVE, once server-completed.
+    public var destinationUIDValidity: UInt32?
+    public var destinationUID: IMAPUID?
 
     public init(
         id: Int64,
@@ -253,7 +279,11 @@ public struct MoveOp: Hashable, Sendable, Identifiable {
         uid: IMAPUID,
         destination: FolderRole = .archive,
         destinationFolderID: FolderID? = nil,
-        copied: Bool = false
+        copied: Bool = false,
+        claimed: Bool = false,
+        journalID: Int64? = nil,
+        destinationUIDValidity: UInt32? = nil,
+        destinationUID: IMAPUID? = nil
     ) {
         self.id = id
         self.account = account
@@ -263,8 +293,14 @@ public struct MoveOp: Hashable, Sendable, Identifiable {
         self.destination = destination
         self.destinationFolderID = destinationFolderID
         self.copied = copied
+        self.claimed = claimed
+        self.journalID = journalID
+        self.destinationUIDValidity = destinationUIDValidity
+        self.destinationUID = destinationUID
     }
 }
+
+
 
 // MARK: - Folder rename queue
 

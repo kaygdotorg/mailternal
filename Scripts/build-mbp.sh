@@ -22,7 +22,8 @@ case "$MODE" in
     if [[ -n "$FILTER" ]]; then printf -v FILTER_ARG ' --filter %q' "$FILTER"; fi
     ssh "$REMOTE" "cd $DEST && swift test${FILTER_ARG} 2>&1" ;;
   app)
-    ssh "$REMOTE" "cd $DEST/App && /opt/homebrew/bin/xcodegen generate && \
+    # The local shell's pipefail does not propagate through SSH.
+    ssh "$REMOTE" "set -o pipefail && cd $DEST/App && /opt/homebrew/bin/xcodegen generate && \
       xcodebuild -project Mailternal.xcodeproj -scheme Mailternal -configuration Debug \
       -derivedDataPath build build 2>&1 | tail -30" ;;
   *) echo "unknown mode $MODE" >&2; exit 2 ;;

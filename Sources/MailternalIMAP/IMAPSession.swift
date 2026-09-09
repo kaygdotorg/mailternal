@@ -2,6 +2,13 @@ import Foundation
 import MailternalInterfaces
 import NIO
 import NIOIMAP
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 
 /// IMAP session actor: TLS/auth/capabilities, LIST discovery, PEEK fetch,
 /// UID STORE `\Seen`, archive MOVE/COPY/STORE/EXPUNGE, IDLE, and
@@ -47,6 +54,7 @@ public actor IMAPSession {
     private var fetchAssembler = IMAPFetchAssembler()
     private var fetchInFlight = false
     private var taggedWaiter: (tag: String, continuation: CheckedContinuation<TaggedResponse, Error>)?
+    private var appendDeadline: (tag: String, timer: Scheduled<Void>)?
     private var greetingWaiter: CheckedContinuation<ResponsePayload, Error>?
     private var greetingPayload: ResponsePayload?
     private var idleStartWaiter: CheckedContinuation<Void, Error>?
@@ -379,30 +387,55 @@ extension IMAPSession {
             self.selected = selected
         }
     }
-    /// `UID MOVE <uids> <mailbox>`. Only tagged `OK` is success.
-    public func move(uids: IMAPUIDSet, to mailbox: String) async throws {
+    /// `UID MOVE <uids> <mailbox>`. Returns exact COPYUID identity when supplied;
+    /// nil still means tagged success, not permission to retry the mutation.
+    @discardableResult
+    public func move(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping? {
         try ensureAuthenticated()
         guard let set = IMAPCommandFactory.uidSet(uids),
               let command = Command.uidMove(
                 messages: set,
                 mailbox: MailboxName(ByteBuffer(string: mailbox))
               )
-        else { return }
-        let tagged = try await send(command)
-        try throwIfFailed(tagged)
+        else { return nil }
+        return try await sendCopyOrMove(command)
     }
 
-    /// `UID COPY <uids> <mailbox>`. Only tagged `OK` is success.
-    public func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
+    /// `UID COPY <uids> <mailbox>`. Returns exact COPYUID identity when supplied;
+    /// missing identity must never be guessed from message headers.
+    @discardableResult
+    public func copy(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping? {
         try ensureAuthenticated()
         guard let set = IMAPCommandFactory.uidSet(uids),
               let command = Command.uidCopy(
                 messages: set,
                 mailbox: MailboxName(ByteBuffer(string: mailbox))
               )
-        else { return }
-        let tagged = try await send(command)
+        else { return nil }
+        return try await sendCopyOrMove(command)
+    }
+
+    private func sendCopyOrMove(_ command: Command) async throws -> IMAPCopyUIDMapping? {
+        var copyCode: ResponseCodeCopy?
+        var conflictingCodes = false
+        let tagged = try await send(command) { payload in
+            guard case .conditionalState(.ok(let text)) = payload,
+                  case .uidCopy(let code)? = text.code
+            else { return }
+            if let previous = copyCode, previous != code { conflictingCodes = true }
+            copyCode = code
+        }
         try throwIfFailed(tagged)
+        if case .ok(let text) = tagged.state, case .uidCopy(let code)? = text.code {
+            if let previous = copyCode, previous != code { conflictingCodes = true }
+            copyCode = code
+        }
+        guard !conflictingCodes, let copyCode else { return nil }
+        return IMAPCopyUIDMapping(
+            destinationUIDValidity: UInt32(copyCode.destinationUIDValidity),
+            sourceUIDs: copyCode.sourceUIDs.map { $0.lowerBound.rawValue...$0.upperBound.rawValue },
+            destinationUIDs: copyCode.destinationUIDs.map { $0.lowerBound.rawValue...$0.upperBound.rawValue }
+        )
     }
 
     /// `UID STORE <uids> +FLAGS.SILENT (\Deleted)`. Only tagged `OK` is success.
@@ -937,5 +970,157 @@ extension IMAPSession {
         guard authenticated else {
             throw IMAPError.auth("Not authenticated")
         }
+    }
+}
+
+extension IMAPSession {
+    /// Creates a mailbox as part of a persisted folder/outbox operation.
+    public func createMailbox(_ mailbox: String) async throws {
+        try ensureAuthenticated()
+        guard !idleActive, taggedWaiter == nil,
+              !mailbox.isEmpty, !mailbox.contains("\r"),
+              !mailbox.contains("\n"), !mailbox.contains("\0") else {
+            throw OutgoingMailError.invalidContent("The destination mailbox is invalid or busy.")
+        }
+        let reply = try await send(.create(MailboxName(ByteBuffer(string: mailbox)), []))
+        try throwIfFailed(reply)
+    }
+
+    /// Reconciles a previously accepted Sent copy before attempting APPEND.
+    /// The caller selects the destination mailbox first. Missing or malformed
+    /// search responses are errors, never permission to append another copy.
+    public func containsMessageID(_ messageID: String) async throws -> Bool {
+        try ensureAuthenticated()
+        guard selected != nil, !idleActive, taggedWaiter == nil else {
+            throw IMAPError.transport("Sent-copy search requires an idle selected command channel.")
+        }
+        guard messageID.hasPrefix("<"), messageID.hasSuffix(">"),
+              messageID.utf8.count <= 998,
+              !messageID.unicodeScalars.contains(where: { $0.value <= 0x20 || $0.value == 0x7F }) else {
+            throw OutgoingMailError.invalidContent("The outgoing Message-ID is invalid.")
+        }
+        var receivedSearch = false
+        var found = false
+        let reply = try await send(.uidSearch(key: .header("Message-ID", ByteBuffer(string: messageID)))) { payload in
+            if case .mailboxData(.search(let matches, _)) = payload {
+                receivedSearch = true
+                found = found || !matches.isEmpty
+            }
+        }
+        try throwIfFailed(reply)
+        guard receivedSearch else { throw IMAPError.parse("The Sent-copy search response was incomplete.") }
+        return found
+    }
+
+    /// Streams an immutable MIME file into a mailbox and returns only after
+    /// tagged OK. Failure may mean the server saved the copy: callers must
+    /// reconcile by Message-ID before retrying, and must never repeat SMTP.
+    /// Each wire-progress wait is bounded; a progressing large file has no
+    /// fixed total-duration limit.
+    public func append(fileURL: URL, byteCount: Int64, to mailbox: String, date: Date) async throws {
+        try Task.checkCancellation()
+        try ensureAuthenticated()
+        guard !idleActive, taggedWaiter == nil else {
+            throw IMAPError.transport("Sent-copy APPEND requires an idle command channel.")
+        }
+        guard fileURL.isFileURL, byteCount >= 0, Int(exactly: byteCount) != nil,
+              !mailbox.isEmpty, !mailbox.contains("\r"), !mailbox.contains("\n"), !mailbox.contains("\0") else {
+            throw OutgoingMailError.invalidContent("The Sent-copy file or mailbox is invalid.")
+        }
+        let descriptor = fileURL.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else { throw OutgoingMailError.invalidContent("The Sent-copy file is unavailable.") }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var attributes = stat()
+        guard fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              Int64(attributes.st_size) == byteCount else {
+            throw OutgoingMailError.invalidContent("The Sent-copy file changed or is not a regular file.")
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let components = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        guard let parts = ServerMessageDate.Components(
+            year: components.year ?? 0, month: components.month ?? 0, day: components.day ?? 0,
+            hour: components.hour ?? 0, minute: components.minute ?? 0, second: components.second ?? 0,
+            timeZoneMinutes: 0
+        ) else {
+            throw OutgoingMailError.invalidContent("The Sent-copy date is invalid.")
+        }
+        let tag = nextTag()
+        defer { cancelAppendDeadline(tag: tag) }
+        let reply = try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<TaggedResponse, Error>) in
+                taggedWaiter = (tag, continuation)
+                armAppendDeadline(tag: tag)
+                Task { [handle] in
+                    // A tagged rejection can resume the caller before this
+                    // writer unwinds. Keep the descriptor alive until it stops.
+                    defer { try? handle.close() }
+                    do {
+                        try await self.sendRaw(.append(.start(tag: tag, appendingTo: MailboxName(ByteBuffer(string: mailbox)))))
+                        guard self.taggedWaiter?.tag == tag else { return }
+                        self.armAppendDeadline(tag: tag)
+                        try await self.sendRaw(.append(.beginMessage(message: AppendMessage(
+                            options: AppendOptions(flagList: [.seen], internalDate: ServerMessageDate(parts)),
+                            data: AppendData(byteCount: Int(byteCount))
+                        ))))
+                        var remaining = byteCount
+                        var buffer = ByteBufferAllocator().buffer(capacity: 64 * 1024)
+                        while remaining > 0 {
+                            try Task.checkCancellation()
+                            guard self.taggedWaiter?.tag == tag else { return }
+                            buffer.clear()
+                            let requested = Int(min(remaining, 64 * 1024))
+                            let count = try buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: requested) { bytes in
+                                var count: Int
+                                repeat {
+                                    count = read(descriptor, bytes.baseAddress!, requested)
+                                } while count < 0 && errno == EINTR
+                                guard count > 0 else {
+                                    throw OutgoingMailError.invalidContent("The Sent-copy file changed during APPEND.")
+                                }
+                                return count
+                            }
+                            remaining -= Int64(count)
+                            self.armAppendDeadline(tag: tag)
+                            try await self.sendRaw(.append(.messageBytes(buffer)))
+                        }
+                        guard self.taggedWaiter?.tag == tag else { return }
+                        self.armAppendDeadline(tag: tag)
+                        try await self.sendRaw(.append(.endMessage))
+                        guard self.taggedWaiter?.tag == tag else { return }
+                        try await self.sendRaw(.append(.finish))
+                    } catch {
+                        self.poisonConnection(error)
+                    }
+                }
+            }
+        }, onCancel: {
+            Task { await self.close() }
+        })
+        try throwIfFailed(reply)
+    }
+
+    private func armAppendDeadline(tag: String) {
+        cancelAppendDeadline(tag: tag)
+        guard let connection else { return }
+        let timer: Scheduled<Void> = connection.channel.eventLoop.scheduleTask(in: .seconds(30)) { [weak self] in
+            Task { await self?.expireAppend(tag: tag) }
+        }
+        appendDeadline = (tag, timer)
+    }
+
+    private func cancelAppendDeadline(tag: String) {
+        guard appendDeadline?.tag == tag else { return }
+        appendDeadline?.timer.cancel()
+        appendDeadline = nil
+    }
+
+    private func expireAppend(tag: String) {
+        guard taggedWaiter?.tag == tag else { return }
+        poisonConnection(IMAPError.transport("The Sent-copy APPEND made no progress before its deadline."))
     }
 }

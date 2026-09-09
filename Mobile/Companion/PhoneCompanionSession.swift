@@ -3,12 +3,15 @@ import Foundation
 import MailternalCompanion
 import MailternalInterfaces
 import MailternalWorkspace
+import MailternalAutomation
+import MailternalMIME
 @preconcurrency import WatchConnectivity
 
 /// The iPhone endpoint of the paired companion protocol. It owns no mail
 /// streams: callers feed it the latest folders snapshot they already observe.
 /// Incoming commands are validated against canonical deep links, recorded in a
-/// durable phone-side log, and then passed to the existing MailFacade.
+/// durable phone-side log, and outgoing work is routed through the shared
+/// iPhone command dispatcher.
 @MainActor
 final class PhoneCompanionSession: NSObject, WCSessionDelegate {
     private nonisolated static let payloadKey = "mailternal.companion.payload"
@@ -20,12 +23,22 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
     private var listLayout: MailListLayoutStore?
     private let store: CompanionStore
     private let onOpenMessage: @MainActor (String) async -> Bool
+    private let onCommand: @MainActor (MailternalAutomation.Command) async throws -> CommandResult
     private var session: WCSession?
     private var updateGeneration = 0
+    /// The latest completed folder generation. Outgoing-only publications may
+    /// reuse wire folders only while this equals the current requested
+    /// generation; otherwise a folder refresh is still in flight.
+    private var committedFolderGeneration = 0
+    private var outgoingGeneration = 0
     /// The latest facade folder value is retained while WatchConnectivity is
     /// activating. A demand flag ensures a pre-activation update is published
     /// once the session becomes usable.
     private var latestFolders: [FolderSummary]?
+    private var latestWireFolders: [CompanionFolderSnapshot] = []
+    private var latestWireMessages: [CompanionMessageSnapshot] = []
+    private var hasWireSnapshot = false
+    private var latestOutgoing = OutgoingState()
     private var snapshotDemanded = false
     private var knownAccountLinks: Set<String> = []
     private var removedAccountLinks: Set<String> = []
@@ -34,11 +47,16 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
     private var executionDrainRequested = false
     private var deferredAccountDrainRequests: Set<String> = []
     private var accountDrainTasks: [String: Task<Void, Never>] = [:]
-    init(facade: any MailFacade, storageURL: URL,
-         onOpenMessage: @escaping @MainActor (String) async -> Bool) {
+    init(
+        facade: any MailFacade,
+        storageURL: URL,
+        onOpenMessage: @escaping @MainActor (String) async -> Bool,
+        onCommand: @escaping @MainActor (MailternalAutomation.Command) async throws -> CommandResult
+    ) {
         self.facade = facade
         self.store = CompanionStore(fileURL: storageURL)
         self.onOpenMessage = onOpenMessage
+        self.onCommand = onCommand
         super.init()
     }
 
@@ -139,47 +157,30 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
         }
 
         guard generation == updateGeneration else { return }
-        let incomingAccountLinks = Set(wireFolders.map(\.accountLinkID))
+        let allAccountLinks = Set(wireFolders.map(\.accountLinkID))
+            .union(facade.accounts.map { $0.accountLinkID.uuidString.lowercased() })
         if hasAuthoritativeAccountSnapshot {
-            removedAccountLinks.formUnion(knownAccountLinks.subtracting(incomingAccountLinks))
+            removedAccountLinks.formUnion(knownAccountLinks.subtracting(allAccountLinks))
         }
-        removedAccountLinks.subtract(incomingAccountLinks)
-        knownAccountLinks = incomingAccountLinks
+        removedAccountLinks.subtract(allAccountLinks)
+        knownAccountLinks = allAccountLinks
         hasAuthoritativeAccountSnapshot = true
-        let phoneState = await store.currentState()
-        let revision = phoneState.lastSnapshotRevision &+ 1
-        guard generation == updateGeneration else { return }
-        guard let snapshot = await Self.boundedSnapshot(
-            revision: revision,
-            phoneStoreEpoch: phoneState.phoneStoreEpoch,
-            folders: wireFolders,
-            messages: wireMessages
-        ) else {
-            let notice = CompanionTransportNotice(
-                message: "The phone could not fit the mail snapshot within the Watch transfer limit."
-            )
-            guard generation == updateGeneration else { return }
-            snapshotDemanded = false
-            _ = await store.apply(notice)
-            send(.notice(notice))
-            return
-        }
-        guard generation == updateGeneration else { return }
-        guard snapshot.validated() != nil else {
-            let notice = CompanionTransportNotice(message: "The phone produced an invalid mail snapshot.")
-            guard generation == updateGeneration else { return }
-            snapshotDemanded = false
-            _ = await store.apply(notice)
-            send(.notice(notice))
-            return
-        }
-        guard generation == updateGeneration,
-              session?.activationState == .activated else { return }
-        _ = await store.merge(snapshot)
-        guard generation == updateGeneration else { return }
-        snapshotDemanded = false
-        send(.snapshot(snapshot))
+        latestWireFolders = wireFolders
+        latestWireMessages = wireMessages
+        hasWireSnapshot = true
+        committedFolderGeneration = generation
+        await publishSnapshot(expectedGeneration: generation)
 
+    }
+
+    /// Outgoing state is already a bounded projection from the shared mail
+    /// runtime. Publishing it reuses the last completed mail snapshot so SMTP
+    func update(outgoing: OutgoingState) async {
+        latestOutgoing = outgoing
+        outgoingGeneration &+= 1
+        let generation = outgoingGeneration
+        guard hasWireSnapshot else { return }
+        await publishSnapshot(expectedOutgoingGeneration: generation)
     }
     nonisolated func session(_ session: WCSession,
                             activationDidCompleteWith activationState: WCSessionActivationState,
@@ -369,7 +370,14 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
     private func execute(_ command: CompanionCommand) async -> Bool {
         var executionStarted = false
         do {
-            switch await waitForFacadeReadiness(accountLinkID: command.accountLinkID) {
+            let allowsDisabled: Bool
+            switch command.mutation {
+            case .retrySubmission, .cancelSubmission: allowsDisabled = true
+            default: allowsDisabled = false
+            }
+            switch await waitForFacadeReadiness(
+                accountLinkID: command.accountLinkID, allowsDisabled: allowsDisabled
+            ) {
             case .ready:
                 break
             case .deferred, .cancelled:
@@ -379,55 +387,337 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
             }
             guard await store.markExecutionStarted(commandID: command.id) else { return true }
             executionStarted = true
-            guard let link = MailternalDeepLink(string: command.messageLink),
-                  link.accountLinkID.uuidString.lowercased() == command.accountLinkID,
-                  let account = facade.accounts.first(where: {
-                      $0.accountLinkID == link.accountLinkID && $0.isEnabled
-                  }),
-                  facadeAccountCanAcceptCommands(facade.accountState(for: account.id)),
-                  let resolution = try await facade.resolve(link),
-                  case .message(_, let messageID, _) = resolution else {
-                throw PhoneCompanionError.targetUnavailable
-            }
 
-            switch command.mutation {
-            case .markRead:
-                try await facade.markRead(messageID)
-            case .markUnread:
-                try await facade.markUnread(messageID)
-            case .setFlagged(let value):
-                try await facade.setFlagged(messageID, value)
-            case .archive:
-                try await facade.archive(messageID)
-            case .trash:
-                try await facade.trash(messageID)
-            case .move(let destinationLink):
-                guard let destination = MailternalDeepLink(string: destinationLink),
-                      destination.accountLinkID == link.accountLinkID,
-                      case .folder = destination,
-                      let destinationResolution = try await facade.resolve(destination),
-                      case .folder(let folderID) = destinationResolution else {
-                    throw PhoneCompanionError.destinationUnavailable
+            if command.mutation.isOutgoing {
+                try await executeOutgoing(command)
+            } else {
+                guard let messageLink = command.messageLink,
+                      let link = MailternalDeepLink(string: messageLink),
+                      link.accountLinkID.uuidString.lowercased() == command.accountLinkID,
+                      let account = facade.accounts.first(where: {
+                          $0.accountLinkID == link.accountLinkID && $0.isEnabled
+                      }),
+                      facadeAccountCanAcceptCommands(facade.accountState(for: account.id)),
+                      let resolution = try await facade.resolve(link),
+                      case .message(_, let messageID, _) = resolution else {
+                    throw PhoneCompanionError.targetUnavailable
                 }
-                let outcome = try await facade.move(messageID, to: folderID)
-                guard outcome.movedCount == 1 else { throw PhoneCompanionError.moveRejected }
+
+                switch command.mutation {
+                case .markRead:
+                    _ = try await onCommand(.markRead(.explicit([messageID])))
+                case .markUnread:
+                    _ = try await onCommand(.markUnread(.explicit([messageID])))
+                case .setFlagged(let value):
+                    _ = try await onCommand(.setFlagged(.explicit([messageID]), value))
+                case .archive:
+                    _ = try await onCommand(.archive(.explicit([messageID])))
+                case .trash:
+                    _ = try await onCommand(.trash(.explicit([messageID])))
+                case .move(let destinationLink):
+                    guard let destination = MailternalDeepLink(string: destinationLink),
+                          destination.accountLinkID == link.accountLinkID,
+                          case .folder = destination,
+                          let destinationResolution = try await facade.resolve(destination),
+                          case .folder(let folderID) = destinationResolution else {
+                        throw PhoneCompanionError.destinationUnavailable
+                    }
+                    let outcome: MoveOutcome = try decodeCommandResult(
+                        await onCommand(.move(.explicit([messageID]), folderID))
+                    )
+                    guard outcome.movedCount == 1 else { throw PhoneCompanionError.moveRejected }
+                case .send, .retrySubmission, .cancelSubmission:
+                    throw PhoneCompanionError.targetUnavailable
+                }
             }
             if let ack = await store.markExecutionSubmitted(commandID: command.id) {
                 send(.acknowledgment(ack))
             }
-            await publishSnapshotAfterMutation()
-        } catch {
+            if command.mutation.isOutgoing {
+                await publishSnapshot()
+            } else {
+                await publishSnapshotAfterMutation()
+            }
+        } catch let error as MailternalAutomation.CommandEffectAppliedError {
             guard !Task.isCancelled else { return false }
-            if let ack = await store.markExecutionFailed(commandID: command.id,
-                                                         reason: error.localizedDescription) {
+            let reason = "The iPhone accepted this action but could not confirm completion: \(error.message). Review before sending another copy."
+            if let ack = await store.markExecutionNeedsReview(
+                commandID: command.id,
+                reason: reason
+            ) {
                 send(.acknowledgment(ack))
             }
             if executionStarted {
-                await publishSnapshotAfterMutation()
+                if command.mutation.isOutgoing {
+                    await publishSnapshot()
+                } else {
+                    await publishSnapshotAfterMutation()
+                }
+            }
+        } catch {
+            guard !Task.isCancelled else { return false }
+            if let ack = await store.markExecutionFailed(
+                commandID: command.id,
+                reason: error.localizedDescription
+            ) {
+                send(.acknowledgment(ack))
+            }
+            if executionStarted {
+                if command.mutation.isOutgoing {
+                    await publishSnapshot()
+                } else {
+                    await publishSnapshotAfterMutation()
+                }
             }
         }
         return true
     }
+
+
+    private func executeOutgoing(_ command: CompanionCommand) async throws {
+        guard let account = facade.accounts.first(where: {
+            $0.accountLinkID.uuidString.lowercased() == command.accountLinkID
+        }) else {
+            throw PhoneCompanionError.targetUnavailable
+        }
+
+        switch command.mutation {
+        case .send(let content):
+            guard account.isEnabled else {
+                throw PhoneCompanionError.targetUnavailable
+            }
+            guard content.isSyntacticallyValid else {
+                throw OutgoingMailError.invalidContent("The Watch message is no longer valid.")
+            }
+
+            guard let commandID = UUID(uuidString: command.id) else {
+                throw OutgoingMailError.invalidContent("The Watch submission identifier is invalid.")
+            }
+            let draft: MailDraft
+            switch content.kind {
+            case .newMessage:
+                guard command.messageLink == nil else {
+                    throw OutgoingMailError.invalidContent("A new Watch message has an invalid link.")
+                }
+                let initial = DraftContent(
+                    from: MailAddress(
+                        displayName: account.displayName.isEmpty ? nil : account.displayName,
+                        address: account.emailAddress
+                    ),
+                    to: MIMEParser.parseEditableAddresses(content.to),
+                    cc: MIMEParser.parseEditableAddresses(content.cc),
+                    bcc: MIMEParser.parseEditableAddresses(content.bcc),
+                    subject: content.subject,
+                    plainText: content.body,
+                    html: nil
+                )
+                draft = try decodeCommandResult(await onCommand(
+                    .createDraft(id: commandID, accountID: account.id, content: initial)
+                ))
+            case .reply, .replyAll, .forward:
+                guard let messageLink = command.messageLink,
+                      let link = MailternalDeepLink(string: messageLink),
+                      link.accountLinkID == account.accountLinkID,
+                      let resolution = try await facade.resolve(link),
+                      case .message(_, let messageID, _) = resolution else {
+                    throw PhoneCompanionError.targetUnavailable
+                }
+                let create: MailternalAutomation.Command
+                switch content.kind {
+                case .reply:
+                    create = .createReplyDraft(id: commandID, .local(messageID), replyAll: false)
+                case .replyAll:
+                    create = .createReplyDraft(id: commandID, .local(messageID), replyAll: true)
+                case .forward:
+                    create = .createForwardDraft(id: commandID, .local(messageID))
+                case .newMessage:
+                    throw PhoneCompanionError.targetUnavailable
+                }
+                let initial: MailDraft = try decodeCommandResult(await onCommand(create))
+                var edited = initial.content
+                switch content.kind {
+                case .reply, .replyAll:
+                    if !content.body.isEmpty {
+                        edited.plainText = Self.prepend(content.body, to: edited.plainText)
+                    }
+                    edited.html = nil
+                    let saved: DraftSaveResult = try decodeCommandResult(await onCommand(.saveDraft(
+                        id: initial.id,
+                        expectedRevision: initial.revision,
+                        content: edited
+                    )))
+                    draft = saved.saved
+                case .forward:
+                    edited.to = MIMEParser.parseEditableAddresses(content.to)
+                    edited.cc = MIMEParser.parseEditableAddresses(content.cc)
+                    edited.bcc = MIMEParser.parseEditableAddresses(content.bcc)
+                    if !content.body.isEmpty {
+                        edited.plainText = Self.prepend(content.body, to: edited.plainText)
+                        edited.html = nil
+                    }
+                    let saved: DraftSaveResult = try decodeCommandResult(await onCommand(.saveDraft(
+                        id: initial.id,
+                        expectedRevision: initial.revision,
+                        content: edited
+                    )))
+                    draft = saved.saved
+                case .newMessage:
+                    throw PhoneCompanionError.targetUnavailable
+                }
+            }
+            _ = try await onCommand(.sendDraft(
+                id: commandID,
+                draftID: draft.id,
+                expectedRevision: draft.revision
+            ))
+
+        case .retrySubmission(let submissionID, let acknowledgeDuplicateRisk):
+            guard command.messageLink == nil,
+                  let id = UUID(uuidString: submissionID),
+                  let submission = try await facade.outbox(id: id),
+                  submission.accountID == account.id else {
+                throw PhoneCompanionError.targetUnavailable
+            }
+            _ = try await onCommand(.retrySubmission(
+                id,
+                acknowledgeDuplicateRisk: acknowledgeDuplicateRisk
+            ))
+
+        case .cancelSubmission(let submissionID):
+            guard command.messageLink == nil,
+                  let id = UUID(uuidString: submissionID),
+                  let submission = try await facade.outbox(id: id),
+                  submission.accountID == account.id else {
+                throw PhoneCompanionError.targetUnavailable
+            }
+            _ = try await onCommand(.cancelSubmission(id))
+
+        default:
+            throw PhoneCompanionError.targetUnavailable
+        }
+    }
+
+    private static func prepend(_ prefix: String, to quoted: String) -> String {
+        guard !quoted.isEmpty else { return prefix }
+        return "\(prefix)\n\n\(quoted)"
+    }
+
+    private func decodeCommandResult<Value: Decodable>(_ result: CommandResult) throws -> Value {
+        guard let data = result.data else {
+            throw OutgoingMailError.invalidContent("iPhone did not return the prepared draft.")
+        }
+        return try AutomationLineCodec.decode(Value.self, from: data)
+    }
+    private func publishSnapshot(
+        expectedGeneration: Int? = nil,
+        expectedOutgoingGeneration: Int? = nil
+    ) async {
+        guard hasWireSnapshot,
+              committedFolderGeneration == updateGeneration else { return }
+        snapshotDemanded = true
+        let capturedFolderGeneration = committedFolderGeneration
+        let capturedOutgoingGeneration = outgoingGeneration
+        let folders = latestWireFolders
+        let messages = latestWireMessages
+        let accounts = accountSnapshots()
+        let allFacadeAccountLinks = Set(facade.accounts.map {
+            $0.accountLinkID.uuidString.lowercased()
+        })
+        let outgoing = outgoingSnapshots()
+        let phoneState = await store.currentState()
+        let revision = phoneState.lastSnapshotRevision &+ 1
+        guard capturedFolderGeneration == committedFolderGeneration,
+              capturedFolderGeneration == updateGeneration,
+              capturedOutgoingGeneration == outgoingGeneration,
+              expectedGeneration == nil || expectedGeneration == committedFolderGeneration,
+              expectedOutgoingGeneration == nil || expectedOutgoingGeneration == outgoingGeneration
+        else { return }
+        guard let snapshot = await Self.boundedSnapshot(
+            revision: revision,
+            phoneStoreEpoch: phoneState.phoneStoreEpoch,
+            folders: folders,
+            messages: messages,
+            accounts: accounts,
+            allFacadeAccountLinks: allFacadeAccountLinks,
+            outgoing: outgoing
+        ) else {
+            let notice = CompanionTransportNotice(
+                message: "The phone could not fit the mail snapshot within the Watch transfer limit."
+            )
+            guard capturedFolderGeneration == committedFolderGeneration,
+                  capturedFolderGeneration == updateGeneration,
+                  capturedOutgoingGeneration == outgoingGeneration else { return }
+            snapshotDemanded = false
+            _ = await store.apply(notice)
+            send(.notice(notice))
+            return
+        }
+        guard capturedFolderGeneration == committedFolderGeneration,
+              capturedFolderGeneration == updateGeneration,
+              capturedOutgoingGeneration == outgoingGeneration else { return }
+        guard snapshot.validated() != nil else {
+            let notice = CompanionTransportNotice(message: "The phone produced an invalid mail snapshot.")
+            guard capturedFolderGeneration == committedFolderGeneration,
+                  capturedFolderGeneration == updateGeneration,
+                  capturedOutgoingGeneration == outgoingGeneration else { return }
+            snapshotDemanded = false
+            _ = await store.apply(notice)
+            send(.notice(notice))
+            return
+        }
+        guard session?.activationState == .activated else { return }
+        _ = await store.merge(snapshot)
+        guard capturedFolderGeneration == committedFolderGeneration,
+              capturedFolderGeneration == updateGeneration,
+              capturedOutgoingGeneration == outgoingGeneration else {
+            await publishSnapshot()
+            return
+        }
+        snapshotDemanded = false
+        send(.snapshot(snapshot))
+
+    }
+    private func accountSnapshots() -> [CompanionAccountSnapshot] {
+        facade.accounts.prefix(32).map {
+                CompanionAccountSnapshot(
+                    id: $0.accountLinkID.uuidString.lowercased(),
+                    name: $0.displayName,
+                    email: $0.emailAddress,
+                    canSend: $0.isEnabled && $0.smtp != nil
+                )
+            }
+    }
+
+    private func outgoingSnapshots() -> [CompanionOutgoingSnapshot] {
+        let accountLinks = Dictionary(uniqueKeysWithValues: facade.accounts.map {
+            ($0.id, $0.accountLinkID.uuidString.lowercased())
+        })
+        return latestOutgoing.outbox.prefix(50).compactMap { item in
+            guard let accountLinkID = accountLinks[item.accountID] else {
+                return nil
+            }
+            let state: CompanionOutboxState
+            switch item.state {
+            case .queued: state = .queued
+            case .preparing: state = .preparing
+            case .sending: state = .sending
+            case .awaitingAcceptance: state = .awaitingAcceptance
+            case .deliveryUnknown: state = .deliveryUnknown
+            case .failed: state = .failed
+            case .cancelled: state = .cancelled
+            case .sentCopyPending: state = .sentCopyPending
+            case .sent: state = .sent
+            }
+            return CompanionOutgoingSnapshot(
+                id: item.id.uuidString.lowercased(),
+                accountLinkID: accountLinkID,
+                subject: item.subject,
+                state: state,
+                failureReason: item.failure?.message
+            )
+        }
+    }
+
 
     /// A Watch mutation can change message flags without changing folder
     /// aggregates. Reuse the latest folder demand so the refreshed page is
@@ -450,7 +740,9 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
     /// Performs one readiness check. Deferred commands remain durably accepted
     /// and are retried by existing account/folder update and activation
     /// callbacks rather than by a polling loop that can starve another lane.
-    private func waitForFacadeReadiness(accountLinkID: String) async -> FacadeReadiness {
+    private func waitForFacadeReadiness(
+        accountLinkID: String, allowsDisabled: Bool
+    ) async -> FacadeReadiness {
         guard !Task.isCancelled else { return .cancelled }
         if removedAccountLinks.contains(accountLinkID) {
             return .unavailable
@@ -458,6 +750,7 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
         if let account = facade.accounts.first(where: {
             $0.accountLinkID.uuidString.lowercased() == accountLinkID
         }) {
+            if allowsDisabled { return .ready }
             guard account.isEnabled else { return .deferred }
             return facadeAccountCanAcceptCommands(facade.accountState(for: account.id))
                 ? .ready
@@ -533,13 +826,14 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
             for: .folder(account: account.accountLinkID, path: folder.path)
         ).sort
     }
-
-
     private nonisolated static func boundedSnapshot(
         revision: Int,
         phoneStoreEpoch: String,
         folders: [CompanionFolderSnapshot],
-        messages: [CompanionMessageSnapshot]
+        messages: [CompanionMessageSnapshot],
+        accounts: [CompanionAccountSnapshot],
+        allFacadeAccountLinks: Set<String>,
+        outgoing: [CompanionOutgoingSnapshot]
     ) async -> CompanionSnapshot? {
         guard !Task.isCancelled else { return nil }
         let worker = Task.detached(priority: .userInitiated) { () -> CompanionSnapshot? in
@@ -548,7 +842,10 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
                 revision: revision,
                 phoneStoreEpoch: phoneStoreEpoch,
                 folders: folders,
-                messages: messages
+                messages: messages,
+                accounts: accounts,
+                allFacadeAccountLinks: allFacadeAccountLinks,
+                outgoing: outgoing
             )
         }
         return await withTaskCancellationHandler(operation: {
@@ -562,9 +859,14 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
         revision: Int,
         phoneStoreEpoch: String,
         folders: [CompanionFolderSnapshot],
-        messages: [CompanionMessageSnapshot]
+        messages: [CompanionMessageSnapshot],
+        accounts: [CompanionAccountSnapshot],
+        allFacadeAccountLinks: Set<String>,
+        outgoing: [CompanionOutgoingSnapshot]
     ) -> CompanionSnapshot? {
         let boundedFolders = Array(folders.prefix(256))
+        let boundedAccounts = Array(accounts.prefix(32))
+        let boundedOutgoing = Array(outgoing.prefix(20))
         let allowedFolderLinks = Set(boundedFolders.map(\.canonicalLink))
         let candidates = messages.filter { allowedFolderLinks.contains($0.folderLink) }
         let generatedAt = Date()
@@ -582,21 +884,35 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
             return selected
         }
 
-        func makeSnapshot(folderCount: Int, messageCount: Int,
-                          retainingBodies: Int) -> CompanionSnapshot {
+        func makeSnapshot(
+            folderCount: Int,
+            messageCount: Int,
+            retainingBodies: Int,
+            accountCount: Int = boundedAccounts.count,
+            outgoingCount: Int = boundedOutgoing.count
+        ) -> CompanionSnapshot {
             let selectedFolders = Array(boundedFolders.prefix(folderCount))
             let folderLinks = Set(selectedFolders.map(\.canonicalLink))
             let selected = selectedMessages(
                 count: messageCount,
                 retainingBodies: retainingBodies
             ).filter { folderLinks.contains($0.folderLink) }
+            let selectedAccounts = Array(boundedAccounts.prefix(accountCount))
+            let emittedAccountLinks = Set(selectedAccounts.map(\.id))
+                .union(selectedFolders.map(\.accountLinkID))
+            let accountDisplayEntriesComplete =
+                allFacadeAccountLinks.isSubset(of: Set(selectedAccounts.map(\.id)))
             return CompanionSnapshot(
                 revision: revision,
                 phoneStoreEpoch: phoneStoreEpoch,
                 generatedAt: generatedAt,
                 lastSyncAt: generatedAt,
                 folders: selectedFolders,
-                messages: selected
+                messages: selected,
+                accounts: selectedAccounts,
+                outgoing: Array(boundedOutgoing.prefix(outgoingCount)),
+                accountsComplete: allFacadeAccountLinks.isSubset(of: emittedAccountLinks),
+                accountDisplayEntriesComplete: accountDisplayEntriesComplete
             )
         }
 
@@ -608,27 +924,67 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
             return encoded.count <= CompanionProtocol.maximumTransferBytes
         }
 
+        var accountCount = boundedAccounts.count
+        var outgoingCount = boundedOutgoing.count
         let allFoldersWithoutMessages = makeSnapshot(
             folderCount: boundedFolders.count,
             messageCount: 0,
             retainingBodies: 0
         )
-        guard fits(allFoldersWithoutMessages) else {
-            var lower = 0
-            var upper = boundedFolders.count
-            while lower < upper {
+        if !fits(allFoldersWithoutMessages) {
+            // Fixed metadata is reduced in a stable order: outgoing entries
+            // first, then account display entries. Folder-account identity is
+            // tracked separately, so this never means an account was removed.
+            while !fits(makeSnapshot(
+                folderCount: boundedFolders.count,
+                messageCount: 0,
+                retainingBodies: 0,
+                accountCount: accountCount,
+                outgoingCount: outgoingCount
+            )) {
                 guard !Task.isCancelled else { return nil }
-                let middle = (lower + upper + 1) / 2
-                if fits(makeSnapshot(folderCount: middle, messageCount: 0,
-                                     retainingBodies: 0)) {
-                    lower = middle
+                if outgoingCount > 0 {
+                    outgoingCount -= 1
+                } else if accountCount > 0 {
+                    accountCount -= 1
                 } else {
-                    upper = middle - 1
+                    break
                 }
             }
-            let result = makeSnapshot(folderCount: lower, messageCount: 0,
-                                      retainingBodies: 0)
-            return fits(result) ? result : nil
+            let reduced = makeSnapshot(
+                folderCount: boundedFolders.count,
+                messageCount: 0,
+                retainingBodies: 0,
+                accountCount: accountCount,
+                outgoingCount: outgoingCount
+            )
+            guard fits(reduced) else {
+                var lower = 0
+                var upper = boundedFolders.count
+                while lower < upper {
+                    guard !Task.isCancelled else { return nil }
+                    let middle = (lower + upper + 1) / 2
+                    if fits(makeSnapshot(
+                        folderCount: middle,
+                        messageCount: 0,
+                        retainingBodies: 0,
+                        accountCount: 0,
+                        outgoingCount: 0
+                    )) {
+                        lower = middle
+                    } else {
+                        upper = middle - 1
+                    }
+                }
+                let result = makeSnapshot(
+                    folderCount: lower,
+                    messageCount: 0,
+                    retainingBodies: 0,
+                    accountCount: 0,
+                    outgoingCount: 0
+                )
+                return fits(result) ? result : nil
+            }
         }
 
         var lower = 0
@@ -636,9 +992,13 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
         while lower < upper {
             guard !Task.isCancelled else { return nil }
             let middle = (lower + upper + 1) / 2
-            if fits(makeSnapshot(folderCount: boundedFolders.count,
-                                 messageCount: middle,
-                                 retainingBodies: 0)) {
+            if fits(makeSnapshot(
+                folderCount: boundedFolders.count,
+                messageCount: middle,
+                retainingBodies: 0,
+                accountCount: accountCount,
+                outgoingCount: outgoingCount
+            )) {
                 lower = middle
             } else {
                 upper = middle - 1
@@ -653,9 +1013,13 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
         while lower < upper {
             guard !Task.isCancelled else { return nil }
             let middle = (lower + upper + 1) / 2
-            if fits(makeSnapshot(folderCount: boundedFolders.count,
-                                 messageCount: maximumMessageCount,
-                                 retainingBodies: middle)) {
+            if fits(makeSnapshot(
+                folderCount: boundedFolders.count,
+                messageCount: maximumMessageCount,
+                retainingBodies: middle,
+                accountCount: accountCount,
+                outgoingCount: outgoingCount
+            )) {
                 lower = middle
             } else {
                 upper = middle - 1
@@ -664,7 +1028,9 @@ final class PhoneCompanionSession: NSObject, WCSessionDelegate {
         let result = makeSnapshot(
             folderCount: boundedFolders.count,
             messageCount: maximumMessageCount,
-            retainingBodies: lower
+            retainingBodies: lower,
+            accountCount: accountCount,
+            outgoingCount: outgoingCount
         )
         return fits(result) ? result : nil
     }

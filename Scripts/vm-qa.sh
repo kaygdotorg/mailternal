@@ -27,16 +27,17 @@ pidof_app() { pgrep -f "qa-container $STORE" | head -1 }
 winof() { $D call list_windows '{}' | jq -r ".windows[] | select(.pid==$1 and .bounds.height>100) | [(.bounds.width*.bounds.height), .window_id] | @tsv" | sort -rn | head -1 | cut -f2 }
 case $cmd in
   launch|launch-release)
+    APP_EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist") || exit 1
     pkill -f "qa-container $STORE" 2>/dev/null; sleep 0.5
     rm -rf "$RUN"; mkdir -p "$RUN"
     if [ "$cmd" = launch-release ]; then
       rm -rf "$STORE"; mkdir -p "$STORE" "${QA_CERT:h}"
       cp -R "$FIXTURE"/. "$STORE"/
       cp "$QA_CERT_SOURCE" "$QA_CERT"
-      MAILTERNAL_QA=1 MAILTERNAL_QA_CERT="$QA_CERT" "$APP/Contents/MacOS/Mailternal" -qa-account 127.0.0.1 1143 startTLS -qa-container "$STORE" -qa-gui > "$RUN/launch.log" 2>&1 &
+      MAILTERNAL_QA=1 MAILTERNAL_QA_CERT="$QA_CERT" "$APP/Contents/MacOS/$APP_EXECUTABLE" -qa-account 127.0.0.1 1143 startTLS -qa-container "$STORE" -qa-gui > "$RUN/launch.log" 2>&1 &
     else
       cp -R "$FIXTURE"/. "$STORE"/
-      MAILTERNAL_QA=1 "$APP/Contents/MacOS/Mailternal" -qa-account 127.0.0.1 1143 startTLS -qa-container "$STORE" -qa-gui > "$RUN/launch.log" 2>&1 &
+      MAILTERNAL_QA=1 "$APP/Contents/MacOS/$APP_EXECUTABLE" -qa-account 127.0.0.1 1143 startTLS -qa-container "$STORE" -qa-gui > "$RUN/launch.log" 2>&1 &
     fi
     for i in {1..60}; do sleep 0.25; P=$(pidof_app); [ -n "$P" ] && W=$(winof $P) && [ -n "$W" ] && break; done
     echo "P=$P W=$W"; sed -n '/launch phase/p' "$RUN/launch.log" ;;

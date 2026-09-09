@@ -766,21 +766,12 @@ final class UILogicTests: XCTestCase {
     func testSettingsDissolvePolicyUsesMeasuredH1OriginAndNoBottomRamp() {
         let settings = MailWindowDissolvePolicy.settings
 
-        // The settings window has no toolbar: its H1 sits close to the top.
-        XCTAssertEqual(PaneHeaderInsetPolicy.topInset(for: .settings), 46)
-        XCTAssertEqual(PaneHeaderInsetPolicy.settingsHeaderTopPadding, 46)
-        XCTAssertEqual(PaneHeaderInsetPolicy.headerTopPadding, 64)
-        XCTAssertEqual(PaneHeaderInsetPolicy.settingsTitleBottomPadding, 12)
-        XCTAssertEqual(settings.topOrigin, .windowTop)
-        XCTAssertEqual(settings.topReach, 24)
-        XCTAssertNil(settings.bottomReach)
-        XCTAssertEqual(settings.bottomReservedHeight, 0)
         XCTAssertFalse(settings.hasBottomRamp)
-        XCTAssertEqual(settings.restDepth(safeAreaTop: 52), 24)
 
-        let measured = settings.withTopOrigin(96)
-        XCTAssertEqual(measured.topOrigin, .measured(96))
-        XCTAssertEqual(measured.restDepth(safeAreaTop: 52), 120)
+        // A heading with comfortable top-frame spacing can end inside the
+        // toolbar band. Its fade must not clamp to the old 52-point edge.
+        let measured = settings.withTopOrigin(40)
+        XCTAssertEqual(measured.restDepth(safeAreaTop: 52), 64)
     }
 
     func testSidebarDissolveEndsBeforeAccountHeader() {
@@ -1287,6 +1278,40 @@ final class UILogicTests: XCTestCase {
             [.toggleFlag, .archive]
         )
     }
+
+    @MainActor
+    func testQueuedSwipeEditsApplyAgainstCurrentActions() throws {
+        let suiteName = "Mailternal.SwipeEditQueue.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let appearance = AppearanceSettings(defaults: defaults)
+        let actions = ActionSettings(defaults: defaults)
+        let first = try AutomationPreferences.encodedSwipeActionEdit(
+            index: 0,
+            action: .toggleFlag
+        )
+        let second = try AutomationPreferences.encodedSwipeActionEdit(
+            index: 2,
+            action: .toggleRead
+        )
+
+        try AutomationPreferences.apply(
+            key: AutomationPreferences.Keys.trailingSwipe,
+            value: first,
+            appearance: appearance,
+            actions: actions
+        )
+        try AutomationPreferences.apply(
+            key: AutomationPreferences.Keys.trailingSwipe,
+            value: second,
+            appearance: appearance,
+            actions: actions
+        )
+
+        XCTAssertEqual(actions.trailingSwipe, [.toggleFlag, .archive, .toggleRead])
+    }
+
     func testSwipeActionFactoryUsesMailPalette() {
         XCTAssertTrue(SwipeActionKind.archive.backgroundColor.isEqual(NSColor.systemYellow))
         XCTAssertTrue(SwipeActionKind.trash.backgroundColor.isEqual(NSColor.systemRed))
@@ -1709,11 +1734,11 @@ final class UILogicTests: XCTestCase {
     }
     func testAccountNameCommitTrimsAndFallsBackToEmail() {
         XCTAssertEqual(
-            AccountsListPolicy.committedName(input: "  Personal Mail  ", email: "ada@example.com"),
+            AccountTitlePolicy.committedName(input: "  Personal Mail  ", email: "ada@example.com"),
             "Personal Mail"
         )
         XCTAssertEqual(
-            AccountsListPolicy.committedName(input: " \n\t", email: "ada@example.com"),
+            AccountTitlePolicy.committedName(input: " \n\t", email: "ada@example.com"),
             "ada@example.com"
         )
     }
@@ -1727,16 +1752,6 @@ final class UILogicTests: XCTestCase {
         XCTAssertNil(AccountsListPolicy.nextExpandedID(current: second, requested: second))
     }
 
-    func testAccountsListPolicyCancelsOnlyTheBlankRow() {
-        let blank = AccountID(rawValue: "new-account")
-        XCTAssertTrue(AccountsListPolicy.removesBlankRow(rowID: blank, blankID: blank))
-        XCTAssertFalse(
-            AccountsListPolicy.removesBlankRow(
-                rowID: AccountID(rawValue: "existing"),
-                blankID: blank
-            )
-        )
-    }
     func testCacheTreePolicyDerivesTriStateFromFolderFlags() {
         XCTAssertEqual(CacheTreePolicy.state(forFlags: []), .unchecked)
         XCTAssertEqual(CacheTreePolicy.state(forFlags: [true, true]), .checked)

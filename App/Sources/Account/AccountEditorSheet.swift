@@ -4,7 +4,7 @@ import MailternalInterfaces
 struct AccountEditorSheet: View {
     @Bindable var model: AppModel
     let configuration: AccountConfig?
-    @Binding var displayName: String
+    @State private var displayName = ""
     let onCancel: () -> Void
     let onSaved: () -> Void
     let onRemove: (() -> Void)?
@@ -18,24 +18,27 @@ struct AccountEditorSheet: View {
     @State private var security: IMAPEndpoint.Security = .implicitTLS
     @State private var fieldError: String?
     @State private var isSaving = false
+    @State private var smtpSettings = SMTPSettingsDraft()
+    @State private var generatedAccountID: AccountID?
+    @State private var accountWasSaved = false
 
-    private var isEditing: Bool { configuration != nil }
+    private var isEditing: Bool { configuration != nil || accountWasSaved }
     private var presets: [IMAPProviderPreset] { ProviderPresets.all }
 
     var body: some View {
         VStack(spacing: 0) {
             Form {
                 Section("Provider") {
-                    Picker("Preset", selection: $presetName) {
+                    Picker("Preset", selection: Binding(
+                        get: { presetName },
+                        set: { presetName = $0; applyPreset(named: $0) }
+                    )) {
                         Text("Generic IMAP").tag("Generic IMAP")
                         ForEach(presets) { preset in
                             Text(preset.name).tag(preset.name)
                         }
                     }
                     .accessibilityIdentifier(UIIdentifier.accountEditorPreset)
-                    .onChange(of: presetName) { _, name in
-                        applyPreset(named: name)
-                    }
 
                     if let preset = presets.first(where: { $0.name == presetName }), !preset.guidance.isEmpty {
                         guidanceView(for: preset)
@@ -46,6 +49,19 @@ struct AccountEditorSheet: View {
                 }
 
                 Section("Account") {
+                    TextField("Account name", text: $displayName)
+                        .accessibilityIdentifier(UIIdentifier.accountEditorDisplayName)
+                    if let configuration {
+                        // Enablement is its own persisted command; Save Changes
+                        // updates account details without changing this state.
+                        Toggle("Enable this account", isOn: Binding(
+                            get: { configuration.isEnabled },
+                            set: { enabled in
+                                Task { await model.setAccountEnabled(configuration.id, enabled) }
+                            }
+                        ))
+                        .toggleStyle(.checkbox)
+                    }
                     TextField("Email Address", text: $email)
                         .textContentType(.username)
                         .accessibilityIdentifier(UIIdentifier.accountEditorEmail)
@@ -78,6 +94,8 @@ struct AccountEditorSheet: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                SMTPAccountFields(draft: $smtpSettings)
+
 
                 if let fieldError {
                     Section {
@@ -94,6 +112,7 @@ struct AccountEditorSheet: View {
                 Button("Cancel") { onCancel() }
                     .keyboardShortcut(.cancelAction)
                     .accessibilityIdentifier(UIIdentifier.accountEditorCancel)
+                    .disabled(isSaving)
 
                 if let onRemove {
                     Button("Remove", role: .destructive) { onRemove() }
@@ -103,7 +122,7 @@ struct AccountEditorSheet: View {
 
                 Spacer()
 
-                Button(isEditing ? "Save Changes" : "Add Account") {
+                Button(isSaving ? "Saving…" : isEditing ? "Save Changes" : "Add Account") {
                     Task { await submit() }
                 }
                 .keyboardShortcut(.defaultAction)
@@ -113,7 +132,8 @@ struct AccountEditorSheet: View {
             .padding(.horizontal, 12)
             .padding(.bottom, 12)
         }
-        .onExitCommand(perform: onCancel)
+        .onExitCommand { if !isSaving { onCancel() } }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier(UIIdentifier.accountEditorSheet)
         .onAppear(perform: loadFields)
     }
@@ -152,6 +172,7 @@ struct AccountEditorSheet: View {
         port = String(preset.port)
         security = preset.security
         if username.isEmpty { username = email }
+        smtpSettings.apply(preset, username: username)
     }
 
     private func loadFields() {
@@ -162,11 +183,13 @@ struct AccountEditorSheet: View {
         presetName = presets.first(where: {
             $0.host == config.imap.host && $0.port == config.imap.port && $0.security == config.imap.security
         })?.name ?? "Generic IMAP"
+        displayName = config.displayName
         email = config.emailAddress
         username = config.username
         host = config.imap.host
         port = String(config.imap.port)
         security = config.imap.security
+        smtpSettings.load(config.smtp)
         password = ""
         fieldError = nil
     }
@@ -193,9 +216,22 @@ struct AccountEditorSheet: View {
 
         let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
         displayName = AccountTitlePolicy.committedName(input: displayName, email: normalizedEmail)
+        let id = configuration?.id ?? generatedAccountID ?? AccountID(rawValue: UUID().uuidString.lowercased())
+        generatedAccountID = id
+        let existing = model.facade.accounts.first { $0.id == id } ?? configuration
+        let outgoing: SMTPConfiguration?
+        do {
+            outgoing = try smtpSettings.configuration(
+                existing: existing?.smtp,
+                accountUsername: username.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        } catch {
+            fieldError = error.localizedDescription
+            return
+        }
         let config = AccountConfig(
-            id: configuration?.id ?? AccountID(rawValue: UUID().uuidString),
-            accountLinkID: configuration?.accountLinkID ?? .random(),
+            id: id,
+            accountLinkID: existing?.accountLinkID ?? .random(),
             displayName: displayName,
             emailAddress: normalizedEmail,
             username: username.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -203,21 +239,31 @@ struct AccountEditorSheet: View {
                 host: host.trimmingCharacters(in: .whitespacesAndNewlines),
                 port: portNumber,
                 security: security
-            )
+            ),
+            smtp: existing?.smtp,
+            isEnabled: existing?.isEnabled ?? true
         )
 
         isSaving = true
         defer { isSaving = false }
+        var savedAccount = false
         do {
-            if configuration != nil {
-                try await model.updateAccount(config, password: password.isEmpty ? nil : password)
-            } else {
-                try await model.facade.addAccount(config, password: password)
-            }
+            try await model.updateAccount(config, password: password.isEmpty ? nil : password)
+            savedAccount = true
+            accountWasSaved = true
             password = ""
+            if outgoing != existing?.smtp || smtpSettings.replacementPassword != nil {
+                _ = try await model.dispatch(
+                    .configureSMTP(id, outgoing, hasPassword: smtpSettings.replacementPassword != nil),
+                    secret: smtpSettings.replacementPassword
+                )
+            }
+            smtpSettings.password = ""
             onSaved()
         } catch {
-            fieldError = error.localizedDescription
+            fieldError = savedAccount
+                ? "Account saved, but outgoing settings could not be saved: \(error.localizedDescription)"
+                : error.localizedDescription
         }
     }
 }

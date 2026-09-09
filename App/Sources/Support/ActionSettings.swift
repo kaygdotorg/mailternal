@@ -210,6 +210,17 @@ final class ActionSettings {
         defaults.set(String(decoding: data, as: UTF8.self), forKey: key)
     }
 
+    func resetLeadingSwipe() {
+        defaults.removeObject(forKey: Keys.leading)
+        leadingSwipe = Self.defaultLeadingSwipe
+    }
+
+    func resetTrailingSwipe() {
+        defaults.removeObject(forKey: Keys.trailing)
+        trailingSwipe = Self.defaultTrailingSwipe
+    }
+
+
     private enum Keys {
         static let leading = "mailternal.actions.swipe.leading"
         static let trailing = "mailternal.actions.swipe.trailing"

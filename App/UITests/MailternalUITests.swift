@@ -2,16 +2,21 @@ import XCTest
 
 final class MailternalUITests: XCTestCase {
     private var app: XCUIApplication!
+    private var containerURL: URL!
 
     override func setUp() {
         super.setUp()
         continueAfterFailure = false
         app = XCUIApplication()
-        app.launchArguments = ["-mock"]
+        containerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MailternalUITests-\(UUID().uuidString)", isDirectory: true)
+        app.launchArguments = ["-mock", "--mailternal-container", containerURL.path]
         app.launch()
     }
 
     override func tearDown() {
+        app?.terminate()
+        if let containerURL { try? FileManager.default.removeItem(at: containerURL) }
         app = nil
         super.tearDown()
     }
@@ -447,6 +452,54 @@ final class MailternalUITests: XCTestCase {
         XCTAssertEqual(readerTabLabels(in: topTabBar), tabsBefore, "restoring the layout must preserve reader tabs")
     }
 
+    func testInactiveTabPreviewAppearsAndDismissesWithoutChangingReader() {
+        signInToMock()
+        let table = messageTable()
+        let first = table.tableRows.element(boundBy: 1)
+        let second = table.tableRows.element(boundBy: 2)
+        XCTAssertTrue(second.waitForExistence(timeout: 10))
+        first.click()
+        let subject = element(UIIdentifier.messageSubject)
+        XCTAssertTrue(subject.waitForExistence(timeout: 8))
+        let firstSubject = subject.label
+        second.rightClick()
+        let openInTab = app.menuItems["Open in New Tab"]
+        XCTAssertTrue(openInTab.waitForExistence(timeout: 5))
+        openInTab.click()
+        XCTAssertTrue(waitUntil(timeout: 8) {
+            subject.exists && subject.label != firstSubject
+        })
+        let secondSubject = subject.label
+        let inactiveTab = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@ AND label == %@",
+                "reader-tab-", firstSubject
+            )
+        ).firstMatch
+        let preview = element(UIIdentifier.readerHoverCard)
+        defer {
+            if mainWindow.exists {
+                selectPaneLayout("Side by Side")
+            }
+        }
+
+        for layout in ["Side by Side", "List Above Reader"] {
+            selectPaneLayout(layout)
+            XCTAssertTrue(inactiveTab.waitForExistence(timeout: 8))
+            inactiveTab.hover()
+            XCTAssertTrue(preview.waitForExistence(timeout: 3),
+                          "Dwelling on an inactive tab should reveal its preview in \(layout)")
+            XCTAssertEqual(subject.label, secondSubject, "Previewing must not navigate the reader")
+            subject.hover()
+            XCTAssertTrue(waitUntil(timeout: 3) { !preview.exists },
+                          "Leaving both tab and preview should dismiss the card")
+        }
+
+        inactiveTab.click()
+        XCTAssertTrue(waitUntil(timeout: 8) { subject.label == firstSubject })
+        XCTAssertFalse(preview.exists, "Activating a tab must not leave its preview open")
+    }
+
     func testResizingWindowBackToStartingWidthRestoresReaderToolbar() {
         signInToMock()
         selectPaneLayout("Side by Side")
@@ -660,9 +713,9 @@ final class MailternalUITests: XCTestCase {
             XCTAssertTrue(element(UIIdentifier.sidebarFolder("INBOX")).waitForExistence(timeout: 10))
             return
         } else {
-            let toolbarAdd = app.buttons[UIIdentifier.accountsAdd]
-            XCTAssertTrue(toolbarAdd.waitForExistence(timeout: 5))
-            toolbarAdd.click()
+            let addAccount = app.buttons[UIIdentifier.accountsAdd]
+            XCTAssertTrue(addAccount.waitForExistence(timeout: 5))
+            addAccount.click()
         }
         app.activate()
         let table = settingsWindow.tables.firstMatch
@@ -672,17 +725,6 @@ final class MailternalUITests: XCTestCase {
         let host = settingsWindow.textFields[UIIdentifier.accountEditorHost]
         let username = settingsWindow.textFields[UIIdentifier.accountEditorUsername]
         let password = settingsWindow.secureTextFields[UIIdentifier.accountEditorPassword]
-        let newAccountRow = settingsWindow.descendants(matching: .any)[UIIdentifier.accountsRow("new-account")]
-        if newAccountRow.waitForExistence(timeout: 3) {
-            let disclosure = newAccountRow.descendants(matching: .any)[UIIdentifier.accountsRowDisclosure]
-            if disclosure.exists {
-                for _ in 0..<2 {
-                    guard !host.isHittable else { break }
-                    disclosure.click()
-                    _ = waitUntil(timeout: 2) { host.exists && host.isHittable }
-                }
-            }
-        }
         let accountList = settingsWindow.descendants(matching: .any)[UIIdentifier.accountsList]
         if host.exists && !host.isHittable, accountList.exists {
             accountList.scroll(byDeltaX: 0, deltaY: -400)

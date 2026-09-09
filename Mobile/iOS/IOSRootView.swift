@@ -3,7 +3,6 @@ import MailternalInterfaces
 
 struct IOSRootView: View {
     @Bindable var state: IOSAppState
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var isAccountEditorPresented = false
     @State private var editingAccount: AccountConfig?
@@ -11,10 +10,12 @@ struct IOSRootView: View {
     @State private var renameText = ""
     @State private var isMovePickerPresented = false
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
+        NavigationSplitView(
+            columnVisibility: $columnVisibility,
+            preferredCompactColumn: $state.preferredCompactColumn
+        ) {
             IOSFolderSidebar(
                 state: state,
-                columnVisibility: $columnVisibility,
                 onRename: { folder in
                     folderToRename = folder
                     renameText = folder.name
@@ -37,13 +38,27 @@ struct IOSRootView: View {
         } content: {
             IOSMessageListView(
                 state: state,
-                columnVisibility: $columnVisibility,
                 isMovePickerPresented: $isMovePickerPresented
             )
         } detail: {
             IOSReaderView(state: state)
         }
         .navigationSplitViewStyle(.balanced)
+        .modifier(MailComposerPresentation(controller: state.composer))
+        .toolbar {
+            if !state.isSelecting {
+                ToolbarItemGroup(placement: .bottomBar) {
+                    Button {
+                        Task { await state.composer.showLibrary() }
+                    } label: {
+                        Label("Drafts & Outbox", systemImage: "tray.and.arrow.up")
+                    }
+                    .disabled(state.launchPhase != .ready)
+                    Spacer()
+                    MailComposeButton(controller: state.composer, preferredAccountID: state.selectedFolder?.accountID)
+                }
+            }
+        }
         .disabled(state.isApplyingRemoteNavigation)
         .onChange(of: state.workspace.values) { _, _ in
             state.applyWorkspaceValues()
@@ -120,8 +135,6 @@ private struct IOSNoticeBanner: View {
 
 struct IOSFolderSidebar: View {
     @Bindable var state: IOSAppState
-    @Binding var columnVisibility: NavigationSplitViewVisibility
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     let onRename: (FolderSummary) -> Void
 
 
@@ -143,9 +156,7 @@ struct IOSFolderSidebar: View {
                         guard let folder else { return }
                         Task {
                             await state.selectFolder(folder)
-                            if horizontalSizeClass == .compact {
-                                columnVisibility = .doubleColumn
-                            }
+                            state.preferredCompactColumn = .content
                         }
                     }
                 )) {
@@ -248,9 +259,7 @@ private struct IOSFolderRow: View {
 
 struct IOSMessageListView: View {
     @Bindable var state: IOSAppState
-    @Binding var columnVisibility: NavigationSplitViewVisibility
     @Binding var isMovePickerPresented: Bool
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var searchText = ""
 
     private func open(_ row: MessageRow) {
@@ -258,13 +267,10 @@ struct IOSMessageListView: View {
             state.toggleSelection(row)
             return
         }
-        Task {
-            guard await state.open(row: row) else { return }
-            if horizontalSizeClass == .compact {
-                columnVisibility = .detailOnly
-            }
-        }
+        Task { await state.open(row: row) }
     }
+    /// Selection mode gives Done and core triage dedicated native toolbar
+    /// targets; less frequent status changes stay behind one labeled menu.
     var body: some View {
         VStack(spacing: 0) {
             if state.syncStatus.mode.isWindowed {
@@ -275,9 +281,6 @@ struct IOSMessageListView: View {
                     .padding(.horizontal)
                     .padding(.vertical, 7)
                     .background(.quaternary.opacity(0.45))
-            }
-            if state.isSelecting {
-                IOSSelectionToolbar(state: state, isMovePickerPresented: $isMovePickerPresented)
             }
             List {
                 if !state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -360,26 +363,112 @@ struct IOSMessageListView: View {
                 if state.isSearching { ProgressView().controlSize(.large) }
             }
         }
-        .navigationTitle(state.selectedFolder?.name ?? "Messages")
+        .navigationTitle(
+            state.isSelecting
+                ? "\(state.selectedMessageIDs.count) selected"
+                : (state.selectedFolder?.name ?? "Messages")
+        )
         .searchable(text: $searchText, placement: .toolbar, prompt: "Search all mail")
         .onChange(of: searchText) { _, text in
             Task { await state.search(text) }
         }
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                IOSListSortMenu(state: state)
-                if state.isSelecting {
+            if state.isSelecting {
+                ToolbarItem(placement: .topBarLeading) {
                     Button("Done") { state.clearSelection() }
-                } else {
+                        .accessibilityHint("Stops selecting messages")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        guard !state.selectedMessageIDs.isEmpty else { return }
+                        Task { await state.archiveSelected() }
+                    } label: {
+                        Label("Archive", systemImage: "archivebox")
+                    }
+                    .disabled(state.selectedMessageIDs.isEmpty)
+                    .accessibilityLabel("Archive selected messages")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        guard !state.selectedMessageIDs.isEmpty else { return }
+                        isMovePickerPresented = true
+                    } label: {
+                        Label("Move", systemImage: "folder")
+                    }
+                    .disabled(state.selectedMessageIDs.isEmpty)
+                    .accessibilityLabel("Move selected messages")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(role: .destructive) {
+                        guard !state.selectedMessageIDs.isEmpty else { return }
+                        Task { await state.trashSelected() }
+                    } label: {
+                        Label("Trash", systemImage: "trash")
+                    }
+                    .disabled(state.selectedMessageIDs.isEmpty)
+                    .accessibilityLabel("Trash selected messages")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    IOSSelectionActionsMenu(state: state)
+                }
+            } else {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    IOSListSortMenu(state: state)
                     Button { state.isSelecting = true } label: {
                         Label("Select", systemImage: "checkmark.circle")
                     }
-                }
-                Button { Task { await state.refresh() } } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
+                    Button { Task { await state.refresh() } } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
                 }
             }
         }
+        .sheet(isPresented: $isMovePickerPresented) {
+            IOSMoveFolderView(state: state)
+        }
+    }
+}
+
+/// Secondary selection actions remain a native labeled menu so compact
+/// toolbars keep full-size Archive, Move, and destructive Trash targets.
+private struct IOSSelectionActionsMenu: View {
+    @Bindable var state: IOSAppState
+
+    private var hasSelection: Bool {
+        !state.selectedMessageIDs.isEmpty
+    }
+
+    var body: some View {
+        Menu {
+            Section("Message status") {
+                Button {
+                    guard hasSelection else { return }
+                    Task { await state.markSelected(read: true) }
+                } label: {
+                    Label("Mark Read", systemImage: "envelope.open")
+                }
+                Button {
+                    guard hasSelection else { return }
+                    Task { await state.markSelected(read: false) }
+                } label: {
+                    Label("Mark Unread", systemImage: "envelope.badge")
+                }
+                Button {
+                    guard hasSelection else { return }
+                    Task { await state.setFlagged(!state.selectedMessagesAreAllFlagged) }
+                } label: {
+                    Label(
+                        state.selectedMessagesAreAllFlagged ? "Unflag" : "Flag",
+                        systemImage: state.selectedMessagesAreAllFlagged ? "flag.slash" : "flag"
+                    )
+                }
+            }
+        } label: {
+            Label("More actions", systemImage: "ellipsis.circle")
+        }
+        .disabled(!hasSelection)
+        .accessibilityLabel("More selection actions")
+        .accessibilityHint("Mark selected messages read or unread, or change their flag")
     }
 }
 
@@ -454,33 +543,6 @@ private struct IOSListSortMenu: View {
     }
 }
 
-private struct IOSSelectionToolbar: View {
-    @Bindable var state: IOSAppState
-    @Binding var isMovePickerPresented: Bool
-    var body: some View {
-        let unflag = state.selectedMessagesAreAllFlagged
-        HStack(spacing: 18) {
-            Text("\(state.selectedMessageIDs.count) selected")
-                .font(.subheadline.weight(.semibold))
-            Spacer()
-            Button { Task { await state.markSelected(read: true) } } label: { Label("Read", systemImage: "envelope.open") }
-            Button { Task { await state.setFlagged(!unflag) } } label: {
-                Label(unflag ? "Unflag" : "Flag", systemImage: unflag ? "flag.slash" : "flag")
-            }
-            .accessibilityLabel(unflag ? "Unflag selected messages" : "Flag selected messages")
-            Button { Task { await state.archiveSelected() } } label: { Label("Archive", systemImage: "archivebox") }
-            Button { Task { await state.trashSelected() } } label: { Label("Trash", systemImage: "trash") }
-            Button { isMovePickerPresented = true } label: { Label("Move", systemImage: "folder") }
-        }
-        .labelStyle(.iconOnly)
-        .padding(.horizontal)
-        .padding(.vertical, 9)
-        .background(.bar)
-        .sheet(isPresented: $isMovePickerPresented) {
-            IOSMoveFolderView(state: state)
-        }
-    }
-}
 private struct IOSMessageRow: View {
     let row: MessageRow
     let selected: Bool
@@ -554,7 +616,7 @@ private struct IOSMessageRow: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(row.from), \(row.subject.isEmpty ? "No subject" : row.subject)")
-        .accessibilityValue(row.isRead ? "Read" : "Unread")
+        .accessibilityValue(selected ? "\(row.isRead ? "Read" : "Unread"), Selected" : (row.isRead ? "Read" : "Unread"))
     }
 
     @ViewBuilder

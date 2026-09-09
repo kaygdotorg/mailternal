@@ -100,9 +100,15 @@ rationale → revisit-when.
     message-actions cluster with no extra gap. The reader-tabs toolbar item has
     no label or tooltip and toolbar customization is disabled. The strip is
     absent when the reader has no tabs or global search is presented.
-    Hovering immediately presents a non-activating 220×160 child panel with a
-    scrollable card and no entrance animation; a 150 ms grace period keeps it
-    open while the pointer moves between tab and card. Persisting the transient
+    Hovering an inactive tab for 500 ms presents a non-activating 220×160 system
+    popover with a scrollable card. Profiling measured AppKit's default entrance
+    at 512–541 ms even with plain text or pre-laid-out content. Disable that
+    spring and use the shared 120 ms ease-out opacity entrance on the whole
+    native window; content has no separate fade or blur. Reduce Motion skips
+    animation, not dwell; dismissal is immediate after the exit grace period.
+    Leaving, switching tabs, activation, and scrolling cancel pending previews.
+    A 150 ms grace period keeps a shown card open between tab and card.
+    Persisting the transient
     preserves the user's open reading context and its scroll position across
     launches rather than silently discarding a real tab. Persisted links that
     no longer resolve, or details removed before load, close silently and never
@@ -220,3 +226,20 @@ rationale → revisit-when.
     screenshot/coordinate automation. All surfaces use the same mail runtime and
     command contracts, not competing client implementations. Revisit: never reduce
     either standalone mail parity or explicit GUI automation coverage.
+
+35. **Automation state and command transport are versioned, local-first, and
+    runtime-owned. `AppState`/`Command` use explicit `mailternal.*.v1` schemas;
+    state subscriptions replay ordered revisions and emit a gap requiring a
+    snapshot. Responses carry trusted transport context rather than accepting
+    origin or grant metadata from the wire; paired snapshots/events are
+    account-scoped and GUI fields require GUI capability. A per-launch 0600
+    token and exclusive container lock protect the newline-delimited Unix
+    socket. App startup awaits the same ownership task before opening or
+    migrating the store and restoring account engines, so concurrent first
+    launches cannot race schema creation or start duplicate drainers. Command
+    metadata is retained durably without credentials, bodies, drafts, or search
+    text; completed history is bounded to 1000 and a separate 50-entry undo
+    journal stores only safe inverse command payloads. Ordinary
+    mail commands never control GUI state; only `ui` commands may do so. Revisit:
+    when paired remote grants and SMTP/composer commands land, extend the
+    exhaustive command and grant tables without weakening these boundaries.

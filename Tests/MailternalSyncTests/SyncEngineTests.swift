@@ -1040,11 +1040,14 @@ func engineIngestsOfflineMailOnReconnectWithoutRefetchingHistory(_ tokens: [Stri
             live.uidNext = 10
             live.highestModSeq = 12
         }
+        let eventTask = Task {
+            try await nextMailEvent(from: mail, timeout: .seconds(2))
+        }
         await second.refreshNow()
         try await waitUntil(timeout: .seconds(5)) {
             try await store.search("fresh", limit: 5).count == 1
         }
-        let event = try await nextMailEvent(from: mail, timeout: .seconds(2))
+        let event = try await eventTask.value
         #expect(event.subject == "live-new")
         await second.stop()
 
@@ -1618,12 +1621,13 @@ func staleQuarantineFallbackCannotResurrectExpungedUID(
             else { return false }
             return inbox.totalCount >= 2 && state.backfillPhase != .complete
         }
-
+        let selectsBeforeRestart = world.snapshotSelectCount()
         // Drop both live connections and let the engine reconnect while history
         // remains in flight.
         await factory.emitAll(.bye("scripted restart"))
         try await waitUntil(timeout: .seconds(5)) {
             world.snapshotConnectAttempts() >= 2
+                && world.snapshotSelectCount() > selectsBeforeRestart
         }
 
         // New UIDs arrive while the resumed backward walk is still active.

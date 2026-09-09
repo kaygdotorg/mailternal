@@ -90,7 +90,6 @@ final class ScriptedWorld: @unchecked Sendable {
         defer { lock.unlock() }
         return capabilities
     }
-
     func discovery() -> (folders: [IMAPMailbox], isGmail: Bool) {
         lock.lock()
         defer { lock.unlock() }
@@ -172,12 +171,16 @@ final class ScriptedWorld: @unchecked Sendable {
         }
     }
 
-    func applyArchiveMove(path: String, destination: String, uids: IMAPUIDSet) {
+    func applyArchiveMove(
+        path: String,
+        destination: String,
+        uids: IMAPUIDSet
+    ) -> IMAPCopyUIDMapping? {
         lock.lock()
         defer { lock.unlock() }
-        guard var source = mailboxes[path] else { return }
+        guard var source = mailboxes[path] else { return nil }
         var target = mailboxes[destination] ?? ScriptedMailbox(path: destination)
-        let selected = source.messages.keys.filter { SyncPolicy.contains(uids, uid: $0) }
+        let selected = source.messages.keys.filter { SyncPolicy.contains(uids, uid: $0) }.sorted()
         for uid in selected {
             guard let message = source.messages.removeValue(forKey: uid) else { continue }
             target.messages[uid] = message
@@ -187,8 +190,14 @@ final class ScriptedWorld: @unchecked Sendable {
             archiveFetchCounts.append(fetchCount)
         }
         target.uidNext = max(target.uidNext, target.messages.keys.max().map { $0 &+ 1 } ?? target.uidNext)
+        let mapping = IMAPCopyUIDMapping(
+            destinationUIDValidity: target.uidValidity,
+            sourceUIDs: selected.map { $0...$0 },
+            destinationUIDs: selected.map { $0...$0 }
+        )
         mailboxes[path] = source
         mailboxes[destination] = target
+        return mapping
     }
     func applyRename(from source: String, to destination: String) {
         lock.lock()
@@ -208,12 +217,16 @@ final class ScriptedWorld: @unchecked Sendable {
         }
     }
 
-    func applyArchiveCopy(path: String, destination: String, uids: IMAPUIDSet) {
+    func applyArchiveCopy(
+        path: String,
+        destination: String,
+        uids: IMAPUIDSet
+    ) -> IMAPCopyUIDMapping? {
         lock.lock()
         defer { lock.unlock() }
-        guard let source = mailboxes[path] else { return }
+        guard let source = mailboxes[path] else { return nil }
         var target = mailboxes[destination] ?? ScriptedMailbox(path: destination)
-        let selected = source.messages.keys.filter { SyncPolicy.contains(uids, uid: $0) }
+        let selected = source.messages.keys.filter { SyncPolicy.contains(uids, uid: $0) }.sorted()
         for uid in selected {
             guard let message = source.messages[uid] else { continue }
             target.messages[uid] = message
@@ -222,7 +235,13 @@ final class ScriptedWorld: @unchecked Sendable {
             archiveCommands.append("COPY \(path) \(destination) \(uidSetDescription(selected))")
         }
         target.uidNext = max(target.uidNext, target.messages.keys.max().map { $0 &+ 1 } ?? target.uidNext)
+        let mapping = IMAPCopyUIDMapping(
+            destinationUIDValidity: target.uidValidity,
+            sourceUIDs: selected.map { $0...$0 },
+            destinationUIDs: selected.map { $0...$0 }
+        )
         mailboxes[destination] = target
+        return mapping
     }
 
     func applyStoreDeleted(path: String, uids: IMAPUIDSet) {
@@ -738,6 +757,13 @@ final class ScriptedWorld: @unchecked Sendable {
         lock.unlock()
     }
 
+
+    func snapshotSelectCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return selectCount
+    }
+
 }
 
 enum ScriptedFetchError: Error {
@@ -953,11 +979,11 @@ actor ScriptedIMAPClient: IMAPClient {
         try await storeFlags(uids: uids, flag: .seen, set: true)
     }
  
-    func move(uids: IMAPUIDSet, to mailbox: String) async throws {
+    func move(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping? {
         try ensureOpen()
         if let error = world.mutationError("MOVE") { throw error }
-        guard let selectedPath else { return }
-        world.applyArchiveMove(path: selectedPath, destination: mailbox, uids: uids)
+        guard let selectedPath else { return nil }
+        return world.applyArchiveMove(path: selectedPath, destination: mailbox, uids: uids)
     }
     func renameMailbox(from source: String, to destination: String) async throws {
         try ensureOpen()
@@ -968,11 +994,11 @@ actor ScriptedIMAPClient: IMAPClient {
         }
     }
 
-    func copy(uids: IMAPUIDSet, to mailbox: String) async throws {
+    func copy(uids: IMAPUIDSet, to mailbox: String) async throws -> IMAPCopyUIDMapping? {
         try ensureOpen()
         if let error = world.mutationError("COPY") { throw error }
-        guard let selectedPath else { return }
-        world.applyArchiveCopy(path: selectedPath, destination: mailbox, uids: uids)
+        guard let selectedPath else { return nil }
+        return world.applyArchiveCopy(path: selectedPath, destination: mailbox, uids: uids)
     }
     func storeDeleted(uids: IMAPUIDSet) async throws {
         try ensureOpen()

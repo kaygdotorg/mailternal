@@ -12,7 +12,7 @@ enum Schema {
         progress: @escaping @Sendable (Int, Int, String) -> Void = { _, _, _ in },
         openProgress: @escaping @Sendable (String) -> Void = { _ in }
     ) -> DatabaseMigrator {
-        let total = 15
+        let total = 19
         var migrator = DatabaseMigrator()
         migrator.registerMigration("v1_initial") { db in
             progress(1, total, "v1_initial")
@@ -236,6 +236,385 @@ enum Schema {
                 t.column("completed_at", .double)
             }
             openProgress("migration-v15-end")
+        }
+
+        migrator.registerMigration("v16_operation_journal", foreignKeyChecks: .immediate) { db in
+            progress(16, total, "v16_operation_journal")
+            openProgress("migration-v16-begin")
+            // Journal rows are normalized so an undo request never depends on
+            // decoding a stale or guessed JSON inverse.
+            try db.create(table: "op_journal") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("kind", .text).notNull()
+                t.column("created_at", .double).notNull()
+                t.column("state", .text).notNull().defaults(to: "active")
+                t.column("undo_requested", .boolean).notNull().defaults(to: false)
+                t.column("completed_at", .double)
+            }
+            try db.execute(sql: """
+                CREATE INDEX op_journal_latest_idx
+                ON op_journal(created_at DESC, id DESC)
+                """)
+            try db.create(table: "op_journal_entries") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("journal_id", .integer).notNull()
+                    .references("op_journal", onDelete: .cascade)
+                t.column("account_id", .text).notNull()
+                    .references("accounts", onDelete: .cascade)
+                t.column("source_folder_id", .integer).notNull()
+                t.column("source_uid_validity", .integer).notNull()
+                t.column("source_uid", .integer).notNull()
+                t.column("destination_folder_id", .integer)
+                t.column("destination_uid_validity", .integer)
+                t.column("destination_uid", .integer)
+                t.column("old_is_read", .boolean).notNull()
+                t.column("old_is_flagged", .boolean).notNull()
+                t.column("flag", .text)
+                t.column("state", .text).notNull().defaults(to: "active")
+                t.uniqueKey(["journal_id", "source_folder_id", "source_uid_validity", "source_uid"])
+            }
+            try db.execute(sql: """
+                CREATE INDEX op_journal_entries_journal_idx
+                ON op_journal_entries(journal_id)
+                """)
+            try db.alter(table: "seen_queue") { t in
+                t.add(column: "journal_id", .integer)
+                    .references("op_journal", onDelete: .setNull)
+            }
+            try db.alter(table: "archive_queue") { t in
+                t.add(column: "journal_id", .integer)
+                    .references("op_journal", onDelete: .setNull)
+                t.add(column: "destination_uid_validity", .integer)
+                t.add(column: "destination_uid", .integer)
+                t.add(column: "claimed", .boolean).notNull().defaults(to: false)
+            }
+            try db.execute(sql: "CREATE INDEX seen_queue_journal_idx ON seen_queue(journal_id)")
+            try db.execute(sql: "CREATE INDEX archive_queue_journal_idx ON archive_queue(journal_id)")
+            openProgress("migration-v16-end")
+        }
+        migrator.registerMigration("v17_message_aliases", foreignKeyChecks: .immediate) { db in
+            progress(17, total, "v17_message_aliases")
+            openProgress("migration-v17-begin")
+            // A source local ID remains a valid reader handle after a
+            // destination collision. The target is the only retained cache
+            // row, so deleting it cascades the alias and cannot leave a
+            // dangling handle. The account column is checked by every writer
+            // and reader to prevent cross-account aliasing.
+            try db.create(table: "message_aliases") { t in
+                t.column("alias_id", .integer).primaryKey()
+                t.column("target_id", .integer).notNull()
+                    .references("messages", onDelete: .cascade)
+                t.column("account_id", .text).notNull()
+                    .references("accounts", onDelete: .cascade)
+            }
+            try db.execute(sql: """
+                CREATE INDEX message_aliases_target_idx
+                ON message_aliases(target_id)
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER message_aliases_live_id_insert
+                BEFORE INSERT ON message_aliases
+                WHEN EXISTS (
+                    SELECT 1 FROM messages WHERE id = NEW.alias_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'message alias ID is still live');
+                END;
+                CREATE TRIGGER message_aliases_live_id_update
+                BEFORE UPDATE OF alias_id, target_id, account_id ON message_aliases
+                WHEN EXISTS (
+                    SELECT 1 FROM messages WHERE id = NEW.alias_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'message alias ID is still live');
+                END;
+                CREATE TRIGGER message_aliases_message_id_insert
+                BEFORE INSERT ON messages
+                WHEN EXISTS (
+                    SELECT 1 FROM message_aliases WHERE alias_id = NEW.id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'message ID is reserved by an alias');
+                END;
+                CREATE TRIGGER message_aliases_message_id_update
+                BEFORE UPDATE OF id ON messages
+                WHEN EXISTS (
+                    SELECT 1 FROM message_aliases WHERE alias_id = NEW.id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'message ID is reserved by an alias');
+                END;
+                CREATE TRIGGER message_aliases_account_insert_scope
+                BEFORE INSERT ON message_aliases
+                WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM messages m
+                    JOIN generations g ON g.id = m.generation_id
+                    JOIN folders f ON f.id = g.folder_id
+                    WHERE m.id = NEW.target_id
+                      AND f.account_id = NEW.account_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'message alias account mismatch');
+                END;
+                CREATE TRIGGER message_aliases_account_update_scope
+                BEFORE UPDATE OF target_id, account_id ON message_aliases
+                WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM messages m
+                    JOIN generations g ON g.id = m.generation_id
+                    JOIN folders f ON f.id = g.folder_id
+                    WHERE m.id = NEW.target_id
+                      AND f.account_id = NEW.account_id
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'message alias account mismatch');
+                END;
+                """)
+            openProgress("migration-v17-end")
+        }
+        migrator.registerMigration("v18_outgoing", foreignKeyChecks: .immediate) { db in
+            progress(18, total, "v18_outgoing")
+            openProgress("migration-v18-begin")
+
+            // SMTP settings are routing metadata only. Passwords remain in the
+            // platform credential store and never enter this database.
+            try db.alter(table: "accounts") { t in
+                t.add(column: "smtp_host", .text)
+                t.add(column: "smtp_port", .integer)
+                t.add(column: "smtp_security", .text)
+                t.add(column: "smtp_username", .text)
+                t.add(column: "smtp_credential_reference", .text)
+            }
+            try db.create(table: "drafts") { t in
+                t.column("id", .text).primaryKey()
+                t.column("account_id", .text).notNull()
+                t.column("revision", .integer).notNull()
+                t.column("subject", .text).notNull()
+                t.column("attachment_count", .integer).notNull().defaults(to: 0)
+                t.column("content_json", .text).notNull()
+                t.column("updated_at", .double).notNull()
+                t.column("conflict_of", .text)
+            }
+            try db.execute(sql: """
+                CREATE INDEX drafts_account_updated_idx
+                ON drafts(account_id, updated_at DESC, id DESC)
+                """)
+
+            try db.create(table: "draft_attachments") { t in
+                t.column("id", .text).primaryKey()
+                t.column("account_id", .text).notNull()
+                t.column("filename", .text).notNull()
+                t.column("mime_type", .text).notNull()
+                t.column("byte_count", .integer).notNull()
+                t.column("created_at", .double).notNull()
+            }
+            try db.execute(sql: """
+                CREATE INDEX draft_attachments_account_idx
+                ON draft_attachments(account_id, created_at, id)
+                """)
+
+            try db.create(table: "outbox") { t in
+                t.column("id", .text).primaryKey()
+                t.column("account_id", .text).notNull()
+                t.column("draft_id", .text).notNull()
+                t.column("draft_revision", .integer).notNull()
+                t.column("subject", .text).notNull()
+                t.column("content_json", .text).notNull()
+                t.column("message_id", .text).notNull()
+                t.column("message_date", .double).notNull()
+                t.column("state", .text).notNull()
+                t.column("attempt_id", .text)
+                t.column("attempt_count", .integer).notNull().defaults(to: 0)
+                t.column("next_attempt_at", .double)
+                t.column("envelope_json", .text)
+                t.column("byte_count", .integer)
+                t.column("accepted_at", .double)
+                t.column("failure_json", .text)
+                t.column("created_at", .double).notNull()
+                t.uniqueKey(["draft_id", "draft_revision"])
+            }
+            try db.execute(sql: """
+                CREATE INDEX outbox_claim_idx
+                ON outbox(account_id, state, next_attempt_at, created_at, id)
+                """)
+            openProgress("migration-v18-end")
+        }
+        migrator.registerMigration("v19_outgoing_attachment_lifecycle", foreignKeyChecks: .immediate) { db in
+            progress(19, total, "v19_outgoing_attachment_lifecycle")
+            openProgress("migration-v19-begin")
+
+            // Attachment rows remain durable after import, but an unreferenced
+            // staging row may be collected after its last reference disappears.
+            try db.alter(table: "draft_attachments") { t in
+                t.add(column: "unreferenced_at", .double)
+                t.add(column: "reclaiming_at", .double)
+            }
+            try db.execute(sql: """
+                UPDATE draft_attachments
+                SET unreferenced_at = created_at
+                WHERE unreferenced_at IS NULL
+                """)
+
+            try db.create(table: "attachment_references") { t in
+                t.column("attachment_id", .text).notNull()
+                    .references("draft_attachments", onDelete: .cascade)
+                t.column("account_id", .text).notNull()
+                    .references("accounts", onDelete: .cascade)
+                t.column("source_kind", .text).notNull()
+                t.column("source_id", .text).notNull()
+                t.column("source_revision", .integer).notNull()
+                t.uniqueKey(["attachment_id", "source_kind", "source_id", "source_revision"])
+            }
+            try db.execute(sql: """
+                CREATE INDEX attachment_references_attachment_idx
+                ON attachment_references(attachment_id)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX attachment_references_account_idx
+                ON attachment_references(account_id, attachment_id)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX attachment_references_source_idx
+                ON attachment_references(source_kind, source_id, source_revision)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX draft_attachments_staging_idx
+                ON draft_attachments(account_id, unreferenced_at, reclaiming_at)
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER attachment_references_scope_insert
+                BEFORE INSERT ON attachment_references
+                WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM draft_attachments
+                    WHERE id = NEW.attachment_id
+                      AND account_id = NEW.account_id
+                      AND reclaiming_at IS NULL
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'attachment reference account mismatch');
+                END;
+                CREATE TRIGGER attachment_references_source_insert
+                BEFORE INSERT ON attachment_references
+                WHEN NEW.source_kind NOT IN ('draft', 'outbox')
+                OR (NEW.source_kind = 'draft' AND NOT EXISTS (
+                    SELECT 1 FROM drafts
+                    WHERE id = NEW.source_id
+                      AND account_id = NEW.account_id
+                      AND revision = NEW.source_revision
+                ))
+                OR (NEW.source_kind = 'outbox' AND NOT EXISTS (
+                    SELECT 1 FROM outbox
+                    WHERE id = NEW.source_id
+                      AND account_id = NEW.account_id
+                      AND draft_revision = NEW.source_revision
+                ))
+                BEGIN
+                    SELECT RAISE(ABORT, 'attachment reference source is unavailable');
+                END;
+                CREATE TRIGGER attachment_references_draft_delete
+                AFTER DELETE ON drafts
+                BEGIN
+                    DELETE FROM attachment_references
+                    WHERE source_kind = 'draft'
+                      AND source_id = OLD.id
+                      AND source_revision = OLD.revision;
+                    UPDATE draft_attachments
+                    SET unreferenced_at = COALESCE(unreferenced_at, strftime('%s', 'now'))
+                    WHERE id NOT IN (
+                        SELECT attachment_id FROM attachment_references
+                    );
+                END;
+                CREATE TRIGGER attachment_references_outbox_delete
+                AFTER DELETE ON outbox
+                BEGIN
+                    DELETE FROM attachment_references
+                    WHERE source_kind = 'outbox'
+                      AND source_id = OLD.id
+                      AND source_revision = OLD.draft_revision;
+                    UPDATE draft_attachments
+                    SET unreferenced_at = COALESCE(unreferenced_at, strftime('%s', 'now'))
+                    WHERE id NOT IN (
+                        SELECT attachment_id FROM attachment_references
+                    );
+                END;
+                """)
+
+            try db.create(table: "attachment_import_reservations") { t in
+                t.column("id", .text).primaryKey()
+                t.column("account_id", .text).notNull()
+                    .references("accounts", onDelete: .cascade)
+                t.column("byte_count", .integer).notNull()
+                t.column("started_at", .double).notNull()
+                t.column("owner_pid", .integer).notNull()
+            }
+            try db.execute(sql: """
+                CREATE INDEX attachment_import_reservations_account_idx
+                ON attachment_import_reservations(account_id, started_at, id)
+                """)
+
+            // Existing outgoing bodies are decoded once during migration so
+            // future import admission can use indexed references only.
+            let draftRows = try Row.fetchAll(
+                db,
+                sql: "SELECT id, account_id, revision, content_json FROM drafts"
+            )
+            for row in draftRows {
+                let content: DraftContent = try StoreJSON.decode(DraftContent.self, from: row["content_json"])
+                let sourceID: String = row["id"]
+                let accountID: String = row["account_id"]
+                let revision: Int64 = row["revision"]
+                for attachment in content.attachments {
+                    let attachmentID = attachment.id.uuidString.lowercased()
+                    try db.execute(
+                        sql: """
+                            INSERT OR IGNORE INTO attachment_references
+                            (attachment_id, account_id, source_kind, source_id, source_revision)
+                            SELECT ?, ?, 'draft', ?, ?
+                            WHERE EXISTS (
+                                SELECT 1 FROM draft_attachments
+                                WHERE id = ? AND account_id = ?
+                            )
+                            """,
+                        arguments: [attachmentID, accountID, sourceID, revision, attachmentID, accountID]
+                    )
+                }
+            }
+            let outboxRows = try Row.fetchAll(
+                db,
+                sql: "SELECT id, account_id, draft_revision, content_json FROM outbox"
+            )
+            for row in outboxRows {
+                let content: DraftContent = try StoreJSON.decode(DraftContent.self, from: row["content_json"])
+                let sourceID: String = row["id"]
+                let accountID: String = row["account_id"]
+                let revision: Int64 = row["draft_revision"]
+                for attachment in content.attachments {
+                    let attachmentID = attachment.id.uuidString.lowercased()
+                    try db.execute(
+                        sql: """
+                            INSERT OR IGNORE INTO attachment_references
+                            (attachment_id, account_id, source_kind, source_id, source_revision)
+                            SELECT ?, ?, 'outbox', ?, ?
+                            WHERE EXISTS (
+                                SELECT 1 FROM draft_attachments
+                                WHERE id = ? AND account_id = ?
+                            )
+                            """,
+                        arguments: [attachmentID, accountID, sourceID, revision, attachmentID, accountID]
+                    )
+                }
+            }
+            try db.execute(sql: """
+                UPDATE draft_attachments
+                SET unreferenced_at = NULL
+                WHERE EXISTS (
+                    SELECT 1 FROM attachment_references
+                    WHERE attachment_references.attachment_id = draft_attachments.id
+                )
+                """)
+            openProgress("migration-v19-end")
         }
 
         return migrator

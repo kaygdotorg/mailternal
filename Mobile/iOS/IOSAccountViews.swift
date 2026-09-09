@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 import MailternalInterfaces
-
+import MailternalAutomation
 struct IOSAccountEditorView: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var state: IOSAppState
@@ -19,8 +19,10 @@ struct IOSAccountEditorView: View {
     @State private var validationMessage: String?
     @State private var isSaving = false
     @State private var generatedAccountID: AccountID?
+    @State private var smtpSettings = SMTPSettingsDraft()
+    @State private var accountWasSaved = false
 
-    private var isEditing: Bool { account != nil }
+    private var isEditing: Bool { account != nil || accountWasSaved }
     private var presets: [IMAPProviderPreset] { ProviderPresets.all }
     private var selectedPreset: IMAPProviderPreset? {
         presets.first(where: { $0.name == provider })
@@ -30,7 +32,10 @@ struct IOSAccountEditorView: View {
         NavigationStack {
             Form {
                 Section("Account") {
-                    Picker("Provider", selection: $provider) {
+                    Picker("Provider", selection: Binding(
+                        get: { provider },
+                        set: { applyProvider($0) }
+                    )) {
                         Text("Generic IMAP").tag("Generic IMAP")
                         ForEach(presets) { preset in
                             Text(preset.name).tag(preset.name)
@@ -75,6 +80,7 @@ struct IOSAccountEditorView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                SMTPAccountFields(draft: $smtpSettings)
                 Section("Apple-device workspace") {
                     Toggle("Sync layout and appearance with iCloud", isOn: $syncParticipation)
                     Text("Mail content and passwords stay on this device. You can change this later in Settings → Sync.")
@@ -87,14 +93,15 @@ struct IOSAccountEditorView: View {
             }
             .navigationTitle(isEditing ? "Edit Account" : "Add Account")
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }.disabled(isSaving)
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(isSaving ? "Saving…" : "Save") { Task { await save() } }
                         .disabled(isSaving)
                 }
             }
             .onAppear(perform: loadAccount)
-            .onChange(of: provider) { _, value in applyProvider(value) }
         }
         .disabled(state.isApplyingRemoteNavigation)
         .interactiveDismissDisabled(isSaving)
@@ -108,6 +115,7 @@ struct IOSAccountEditorView: View {
         host = account.imap.host
         port = String(account.imap.port)
         security = account.imap.security
+        smtpSettings.load(account.smtp)
         provider = presets.first(where: {
             $0.host == host && $0.port == account.imap.port && $0.security == account.imap.security
         })?.name ?? "Generic IMAP"
@@ -121,6 +129,7 @@ struct IOSAccountEditorView: View {
         port = String(preset.port)
         security = preset.security
         if username.isEmpty, !email.isEmpty { username = email }
+        smtpSettings.apply(preset, username: username)
     }
 
     @ViewBuilder
@@ -149,7 +158,7 @@ struct IOSAccountEditorView: View {
             validationMessage = "Enter a port from 1 to 65535."
             return
         }
-        if account == nil && password.isEmpty {
+        if account == nil && !accountWasSaved && password.isEmpty {
             validationMessage = "Enter the account password."
             return
         }
@@ -163,18 +172,47 @@ struct IOSAccountEditorView: View {
             generatedAccountID = newID
             id = newID
         }
+        let existing = state.facade.accounts.first { $0.id == id } ?? account
+        let outgoing: SMTPConfiguration?
+        do {
+            outgoing = try smtpSettings.configuration(
+                existing: existing?.smtp,
+                accountUsername: username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? trimmedEmail : username
+            )
+        } catch {
+            validationMessage = error.localizedDescription
+            return
+        }
         let config = AccountConfig(
             id: id,
-            accountLinkID: account?.accountLinkID ?? .random(),
+            accountLinkID: existing?.accountLinkID ?? .random(),
             displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
             emailAddress: trimmedEmail,
             username: username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? trimmedEmail : username,
             imap: IMAPEndpoint(host: trimmedHost, port: parsedPort, security: security),
-            isEnabled: account?.isEnabled ?? true
+            smtp: existing?.smtp,
+            isEnabled: existing?.isEnabled ?? true
         )
         isSaving = true
-        let didSave = await state.updateAccount(config, password: password.isEmpty ? nil : password, isNew: account == nil)
+        let didSave = await state.updateAccount(
+            config, password: password.isEmpty ? nil : password, isNew: account == nil && !accountWasSaved
+        )
         if didSave {
+            accountWasSaved = true
+            password = ""
+            do {
+                if outgoing != existing?.smtp || smtpSettings.replacementPassword != nil {
+                    _ = try await state.dispatcher.submit(
+                        .configureSMTP(id, outgoing, hasPassword: smtpSettings.replacementPassword != nil),
+                        secret: smtpSettings.replacementPassword
+                    )
+                }
+                smtpSettings.password = ""
+            } catch {
+                validationMessage = "Account saved, but outgoing settings could not be saved: \(error.localizedDescription)"
+                isSaving = false
+                return
+            }
             do {
                 try await state.setWorkspaceParticipation(syncParticipation)
                 dismiss()
@@ -307,7 +345,9 @@ struct IOSSettingsView: View {
                         replaceExisting: replaceExisting,
                         importSettings: importSettings
                     )
-                }
+                },
+                bridge: state.pairingAutomation,
+                onCommand: state.performPairingAction
             )
         }
         .sheet(isPresented: Binding(
@@ -592,10 +632,18 @@ private struct IOSPendingCommandRow: View {
     @Bindable var state: IOSAppState
     let record: IOSCommandDispatcher.Record
     @State private var password = ""
+    private var reviewMessage: String {
+        switch record.command {
+        case .sendDraft, .retrySubmission, .cancelSubmission:
+            "Review Outbox before retrying; another submission could duplicate delivery."
+        default:
+            "This action may already have been applied. Review the affected state before retrying."
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(record.command.title)
+            Text(record.title)
                 .font(.subheadline.weight(.semibold))
             if let error = record.errorDescription {
                 Text(error)
@@ -606,17 +654,24 @@ private struct IOSPendingCommandRow: View {
                 SecureField("Account password", text: $password)
                     .textContentType(.password)
             }
+            if record.status == .needsReview {
+                Text(reviewMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
             HStack {
-                Button("Retry") {
-                    Task {
-                        await state.retry(
-                            record,
-                            password: record.command.requiresPassword ? password : nil
-                        )
+                if record.status == .failed {
+                    Button("Retry") {
+                        Task {
+                            await state.retry(
+                                record,
+                                password: record.command.requiresPassword ? password : nil
+                            )
+                        }
                     }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(record.command.requiresLivePairing || (record.command.requiresPassword && password.isEmpty))
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(record.command.requiresPassword && password.isEmpty)
                 Button("Discard", role: .destructive) { state.discard(record) }
             }
         }

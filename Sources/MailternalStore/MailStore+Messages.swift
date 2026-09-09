@@ -2,6 +2,27 @@ import Foundation
 import GRDB
 
 extension MailStore {
+    /// Resolves a local reader handle to the retained cache row. Alias rows
+    /// are flattened when written, but the bounded walk also makes malformed
+    /// legacy data fail closed instead of looping forever.
+    static func resolveMessageID(_ db: Database, id: MessageID) throws -> MessageID? {
+        var current = id
+        var visited = Set<Int64>()
+        visited.reserveCapacity(4)
+        for _ in 0..<64 {
+            guard visited.insert(current.rawValue).inserted else { return nil }
+            guard let target = try Int64.fetchOne(
+                db,
+                sql: "SELECT target_id FROM message_aliases WHERE alias_id = ?",
+                arguments: [current.rawValue]
+            ) else {
+                return current
+            }
+            current = MessageID(rawValue: target)
+        }
+        return nil
+    }
+
     /// Inserts or updates messages in bounded transactions (row count + decoded
     /// bytes). Cancellation is checked between batches; already-committed batches
     /// remain durable (spec: sync.md backfill).
@@ -165,14 +186,21 @@ extension MailStore {
     /// materialize or sort the mailbox in Swift.
     public func messageIDs(in folder: FolderID, sort: MailListSort) async throws -> [MessageID] {
         try await read { db in
-            let spec = MailStore.sortSpec(sort)
+            let spec = Self.sortSpec(sort)
             let values = try Int64.fetchAll(
                 db,
                 sql: """
                     SELECT m.id
                     FROM messages m
                     JOIN folders f ON f.live_generation_id = m.generation_id
+                    JOIN generations g ON g.id = m.generation_id
                     WHERE f.id = ? AND f.retired = 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM archive_queue q
+                          WHERE q.folder_id = f.id
+                            AND q.uid_validity = g.uid_validity
+                            AND q.uid = m.uid
+                      )
                     ORDER BY m.\(spec.column) \(spec.order), m.uid \(spec.order)
                     """,
                 arguments: [folder.rawValue]
@@ -226,11 +254,12 @@ extension MailStore {
             // Existing stores have NULL here until they are touched, but the
             // derived value above is already correct for this response.
             let remoteReferences = result.detail.hasRemoteImageReferences
+            let canonicalID = result.canonicalID
             Task { [self] in
                 try? await write { db in
                     try db.execute(
                         sql: "UPDATE messages SET has_remote_references = ? WHERE id = ?",
-                        arguments: [remoteReferences, id.rawValue]
+                        arguments: [remoteReferences, canonicalID.rawValue]
                     )
                 }
             }
@@ -288,7 +317,8 @@ extension MailStore {
         _ id: MessageID
     ) async throws -> (folder: FolderID, generation: MailboxGeneration, uid: IMAPUID)? {
         try await read { db in
-            guard let row = try Row.fetchOne(
+            guard let canonicalID = try MailStore.resolveMessageID(db, id: id),
+                  let row = try Row.fetchOne(
                 db,
                 sql: """
                     SELECT g.folder_id, g.uid_validity, m.uid
@@ -296,7 +326,7 @@ extension MailStore {
                     JOIN generations g ON g.id = m.generation_id
                     WHERE m.id = ?
                     """,
-                arguments: [id.rawValue]
+                arguments: [canonicalID.rawValue]
             ) else { return nil }
             let folderID: Int64 = row["folder_id"]
             let uidValidity: Int64 = row["uid_validity"]
@@ -314,7 +344,8 @@ extension MailStore {
     /// to the correct account engine.
     public func accountID(for message: MessageID) async throws -> AccountID? {
         try await read { db in
-            try String.fetchOne(
+            guard let canonicalID = try MailStore.resolveMessageID(db, id: message) else { return nil }
+            return try String.fetchOne(
                 db,
                 sql: """
                     SELECT f.account_id
@@ -323,7 +354,7 @@ extension MailStore {
                     JOIN folders f ON f.id = g.folder_id
                     WHERE m.id = ?
                     """,
-                arguments: [message.rawValue]
+                arguments: [canonicalID.rawValue]
             ).map(AccountID.init(rawValue:))
         }
     }
@@ -498,14 +529,21 @@ extension MailStore {
                    COALESCE(NULLIF(a.display_name, ''), a.email_address) AS account_name
             FROM messages m
             JOIN folders f ON f.live_generation_id = m.generation_id
+            JOIN generations g ON g.id = m.generation_id
             JOIN accounts a ON a.id = f.account_id
             WHERE f.id = ? AND f.retired = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM archive_queue q
+                  WHERE q.folder_id = f.id
+                    AND q.uid_validity = g.uid_validity
+                    AND q.uid = m.uid
+              )
             """
         var arguments: StatementArguments = [folder.rawValue]
         try addCursorPredicate(to: &sql, arguments: &arguments, cursor: cursor, sort: sort)
         let spec = sortSpec(sort)
         sql += " ORDER BY m.\(spec.column) \(spec.order), m.uid \(spec.order) LIMIT ?"
-        arguments += [cap + 1]
+        arguments += [cap == Int.max ? cap : cap + 1]
         let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
         let hasMore = rows.count > cap
         let slice = hasMore ? Array(rows.prefix(cap)) : rows
@@ -537,13 +575,20 @@ extension MailStore {
                        ELSE f.path END) AS folder_name
             FROM messages m
             JOIN folders f ON f.live_generation_id = m.generation_id
+            JOIN generations g ON g.id = m.generation_id
             WHERE f.id = ? AND f.retired = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM archive_queue q
+                  WHERE q.folder_id = f.id
+                    AND q.uid_validity = g.uid_validity
+                    AND q.uid = m.uid
+              )
             """
         var arguments: StatementArguments = [folder.rawValue]
         try addCursorPredicate(to: &sql, arguments: &arguments, cursor: cursor, sort: sort)
         let spec = sortSpec(sort)
         sql += " ORDER BY m.\(spec.column) \(spec.order), m.uid \(spec.order) LIMIT ?"
-        arguments += [cap + 1]
+        arguments += [cap == Int.max ? cap : cap + 1]
         let rows = try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
         return rows.map { row -> String in
             if let detail: String = row["detail"] { return detail }
@@ -577,8 +622,13 @@ extension MailStore {
     private static func fetchDetailWithStorage(
         _ db: Database,
         id: MessageID
-    ) throws -> (detail: MessageDetail, storedRemoteReferences: Bool?) {
-        guard let row = try Row.fetchOne(db, sql: "SELECT * FROM messages WHERE id = ?", arguments: [id.rawValue]) else {
+    ) throws -> (detail: MessageDetail, storedRemoteReferences: Bool?, canonicalID: MessageID) {
+        guard let canonicalID = try MailStore.resolveMessageID(db, id: id),
+              let row = try Row.fetchOne(
+            db,
+            sql: "SELECT * FROM messages WHERE id = ?",
+            arguments: [canonicalID.rawValue]
+        ) else {
             throw MailStoreError.messageNotFound
         }
         let from: [MailAddress] = try StoreJSON.decode([MailAddress].self, from: row["from_json"])
@@ -610,6 +660,9 @@ extension MailStore {
         let quarantined: Bool = row["is_quarantined"]
         return (
             MessageDetail(
+                // Keep the caller's local handle in the value returned to
+                // reader caches; the mutation-state seam exposes adoption of
+                // canonicalID separately.
                 id: id,
                 envelope: envelope,
                 bodyText: bodyText,
@@ -618,7 +671,8 @@ extension MailStore {
                 attachments: attachments,
                 isQuarantined: quarantined
             ),
-            storedRemoteReferences
+            storedRemoteReferences,
+            canonicalID
         )
     }
 

@@ -4,6 +4,8 @@ import SwiftUI
 /// The local preview shown while a pointer rests on a reader tab. The card is
 /// deliberately data-only: callers pass already available row/detail values,
 /// so presenting it never starts a fetch or changes reader state.
+/// Content renders immediately at its final opacity; only the whole native
+/// popover window fades in, so chrome and text never animate separately.
 struct ReaderTabHoverCard: View {
     let subject: String
     let preview: String

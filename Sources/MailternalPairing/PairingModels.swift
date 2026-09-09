@@ -2,19 +2,24 @@ import Foundation
 import MailternalInterfaces
 import MailternalWorkspace
 
-/// An account configuration and its Keychain credential for a one-time pairing handoff.
-///
-/// The credential is intentionally only represented in memory. Pairing callers are
-/// responsible for reading it from, and writing it to, the platform Keychain.
+/// An account configuration and its Keychain credentials for a one-time pairing
+/// handoff. Secrets exist only in the encrypted bundle and are never persisted
+/// in command metadata or account configuration.
 public struct PairingAccount: Codable, Sendable, Identifiable {
     public let config: AccountConfig
     public let credential: String
+    public let smtpCredential: String?
 
     public var id: AccountID { config.id }
 
-    public init(config: AccountConfig, credential: String) {
+    public init(
+        config: AccountConfig,
+        credential: String,
+        smtpCredential: String? = nil
+    ) {
         self.config = config
         self.credential = credential
+        self.smtpCredential = smtpCredential
     }
 }
 
