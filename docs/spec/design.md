@@ -126,6 +126,9 @@ window 24 · card 18 · toast 14 · row 12 · compact 8.
   a local 16 pt ramp and the same 12 pt glyph guard; it MUST NOT reserve the
   window titlebar again. The panes meet at the native split divider with no
   additional spacer. The sidebar toggle remains in the window titlebar.
+  In both layouts, the toggle stays at the trailing edge inside the sidebar,
+  immediately before its tracking boundary, with flexible space before it.
+  Resizing the sidebar must keep the toggle aligned with that edge.
 
 ## Component vocabulary (reuse the pattern, adapt to mail)
 - **Sidebar rows**: native `List` label rows with context menus, swipes, drag/drop

@@ -457,7 +457,6 @@ final class MainShellViewController: NSViewController {
 }
 
 private extension NSToolbarItem.Identifier {
-    static let sidebarToggle = NSToolbarItem.Identifier("Mailternal.sidebarToggle")
     static let readerTabs = NSToolbarItem.Identifier("Mailternal.readerTabs")
     static let messageArchive = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.archive.rawValue)
     static let messageTrash = NSToolbarItem.Identifier(MessageToolbarPolicy.Identifier.trash.rawValue)
@@ -618,7 +617,11 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
 
     private weak var toolbar: NSToolbar?
     private weak var layoutWindow: NSWindow?
-    private lazy var toggleItem = makeToggleItem()
+    private weak var toggleItem: NSToolbarItem?
+    /// The split view the sidebar tracking separator was built against. The
+    /// SwiftUI `NavigationSplitView` is rebuilt when the pane layout changes,
+    /// so this goes stale and the separator must be reissued.
+    private weak var trackedSplitView: NSSplitView?
     private lazy var readerTabsHosting = makeReaderTabsHosting()
     private lazy var readerTabsItem = makeReaderTabsItem()
     private lazy var archiveItem = makeMessageItem(
@@ -780,8 +783,16 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         }
     }
 
-    func makeToolbar(identifier: String = "Mailternal.MainToolbar") -> NSToolbar {
+    /// `window` resolves the standard sidebar tracking separator. AppKit only
+    /// binds `.sidebarTrackingSeparator` on its own when the content view
+    /// controller is an `NSSplitViewController`; the main window hosts a
+    /// SwiftUI `NavigationSplitView`, so the separator is built here against
+    /// the hosted `NSSplitView`. Without it the item degrades to a plain
+    /// divider and the flexible spaces centre the toggle instead of pinning
+    /// it to the sidebar's trailing edge.
+    func makeToolbar(identifier: String = "Mailternal.MainToolbar", in window: NSWindow? = nil) -> NSToolbar {
         UserDefaults.standard.removeObject(forKey: "NSToolbar Configuration \(identifier)")
+        if let window { layoutWindow = window }
         let toolbar = NSToolbar(identifier: identifier)
         self.toolbar = toolbar
         toolbar.delegate = self
@@ -858,7 +869,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         var identifiers: [NSToolbarItem.Identifier] = []
         if includesSidebarToggle {
-            identifiers += [.flexibleSpace, .sidebarToggle, .sidebarTrackingSeparator, .flexibleSpace, .readerTabs]
+            identifiers += [.flexibleSpace, .toggleSidebar, .sidebarTrackingSeparator, .flexibleSpace, .readerTabs]
         } else {
             identifiers += [.flexibleSpace]
         }
@@ -874,7 +885,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             .space,
         ]
         if includesSidebarToggle {
-            identifiers += [.sidebarToggle, .sidebarTrackingSeparator, .flexibleSpace, .readerTabs]
+            identifiers += [.toggleSidebar, .sidebarTrackingSeparator, .flexibleSpace, .readerTabs]
         }
         identifiers += MessageToolbarPolicy.allowedItemIdentifiers.map {
             NSToolbarItem.Identifier($0.rawValue)
@@ -886,16 +897,27 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         []
     }
 
+    func toolbarWillAddItem(_ notification: Notification) {
+        guard let item = notification.userInfo?["item"] as? NSToolbarItem,
+              item.itemIdentifier == .toggleSidebar else { return }
+        // AppKit owns the standard sidebar control's appearance and layout.
+        // Route its action through the existing persisted visibility binding.
+        toggleItem = item
+        item.target = self
+        item.action = #selector(toggleSidebar(_:))
+        item.autovalidates = false
+    }
+
     func toolbar(
         _ toolbar: NSToolbar,
         itemForItemIdentifier identifier: NSToolbarItem.Identifier,
         willBeInsertedIntoToolbar flag: Bool
     ) -> NSToolbarItem? {
         switch identifier {
-        case .sidebarToggle where includesSidebarToggle:
-            return toggleItem
         case .readerTabs where includesSidebarToggle:
             return readerTabsItem
+        case .sidebarTrackingSeparator where includesSidebarToggle:
+            return makeSidebarTrackingSeparator()
         case .messageArchive:
             return archiveItem
         case .messageTrash:
@@ -909,7 +931,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
 
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
         switch item.itemIdentifier {
-        case .sidebarToggle:
+        case .toggleSidebar:
             item.isHidden = !includesSidebarToggle || model.isSearchPresented
             item.isEnabled = includesSidebarToggle && !model.isSearchPresented
         case .readerTabs:
@@ -1010,28 +1032,12 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
             item.isHidden = hideActions
             item.isEnabled = !hideActions
         }
-        toggleItem.isHidden = !includesSidebarToggle || model.isSearchPresented
-        toggleItem.isEnabled = includesSidebarToggle && !model.isSearchPresented
+        toggleItem?.isHidden = !includesSidebarToggle || model.isSearchPresented
+        toggleItem?.isEnabled = includesSidebarToggle && !model.isSearchPresented
         // The cluster width feeds the strip viewport.
         scheduleReaderTabsWidthUpdate()
     }
 
-    private func makeToggleItem() -> NSToolbarItem {
-        let item = NSToolbarItem(itemIdentifier: .sidebarToggle)
-        item.image = NSImage(
-            systemSymbolName: "sidebar.left",
-            accessibilityDescription: "Sidebar"
-        )
-        item.label = "Sidebar"
-        item.paletteLabel = "Sidebar"
-        item.toolTip = "Show or hide the sidebar"
-        item.action = #selector(toggleSidebar(_:))
-        item.target = self
-        item.isBordered = true
-        item.isEnabled = includesSidebarToggle
-        item.autovalidates = false
-        return item
-    }
 
 
     private func makeReaderTabsHosting() -> ReaderTabsHostingView {
@@ -1065,6 +1071,52 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
         item.autovalidates = false
         item.visibilityPriority = .low
         return item
+    }
+
+    /// The tracking separator pins the toggle to the sidebar's trailing edge
+    /// and follows sidebar resizes. Divider 0 is the sidebar/content boundary
+    /// in both pane layouts. Returns nil before the hosted split view exists;
+    /// `refreshSidebarTracking` inserts the item once it does.
+    private func makeSidebarTrackingSeparator() -> NSTrackingSeparatorToolbarItem? {
+        guard let split = hostedSplitView() else { return nil }
+        trackedSplitView = split
+        return NSTrackingSeparatorToolbarItem(
+            identifier: .sidebarTrackingSeparator,
+            splitView: split,
+            dividerIndex: 0
+        )
+    }
+
+    /// Reissues the tracking separator when the `NavigationSplitView` was
+    /// rebuilt (pane layout change) or was not yet laid out at install time.
+    private func refreshSidebarTracking() {
+        guard includesSidebarToggle, let toolbar,
+              let split = hostedSplitView() else { return }
+        let index = toolbar.items.firstIndex { $0.itemIdentifier == .sidebarTrackingSeparator }
+        if let index {
+            guard trackedSplitView !== split else { return }
+            toolbar.removeItem(at: index)
+            toolbar.insertItem(withItemIdentifier: .sidebarTrackingSeparator, at: index)
+        } else if let toggleIndex = toolbar.items.firstIndex(where: { $0.itemIdentifier == .toggleSidebar }) {
+            toolbar.insertItem(withItemIdentifier: .sidebarTrackingSeparator, at: toggleIndex + 1)
+        }
+    }
+
+    /// The `NavigationSplitView`'s backing split view: the outermost vertical
+    /// `NSSplitView` under the content view. The list-above-reader layout's
+    /// `VSplitView` is horizontal and nested inside the detail column.
+    private func hostedSplitView() -> NSSplitView? {
+        guard let contentView = layoutWindow?.contentView else { return nil }
+        func find(in view: NSView) -> NSSplitView? {
+            if let split = view as? NSSplitView, split.isVertical, split.arrangedSubviews.count >= 2 {
+                return split
+            }
+            for subview in view.subviews {
+                if let split = find(in: subview) { return split }
+            }
+            return nil
+        }
+        return find(in: contentView)
     }
 
     private func configureReaderTabs() {
@@ -1194,6 +1246,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSToolbarItemVal
               let window = readerTabsHosting.window ?? layoutWindow,
               let contentView = window.contentView
         else { return }
+        refreshSidebarTracking()
         let actionWidth = messageActionsWidth
         let hostingFrame = readerTabsHosting.window === window
             ? readerTabsHosting.convert(readerTabsHosting.bounds, to: contentView)
@@ -1717,7 +1770,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         )
         self.toolbarController = toolbarController
         shellLaunchPhase("shell-toolbar-controller-ready")
-        window.toolbar = toolbarController.makeToolbar()
+        window.toolbar = toolbarController.makeToolbar(in: window)
         shellLaunchPhase("shell-toolbar-install-end")
     }
 
