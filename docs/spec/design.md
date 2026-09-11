@@ -352,12 +352,12 @@ choices are mutually exclusive:
   indicator. The popover supplies the chrome (the same as the QR-code
   popover); the card paints no background of its own. 14 pt horizontal and
   12 pt vertical padding.
-  Content MUST be laid out at its final opacity before presentation. Disable
-  AppKit's default popover spring; the whole native window (chrome and content)
-  enters together with the shared 120 ms ease-out hover opacity transition.
-  Do not independently fade or blur text after the chrome appears. The popover
-  does not reflow the tab strip. Dismissal is immediate after the exit grace
-  period; Reduce Motion skips the entrance animation, not the dwell.
+  Content MUST be laid out at its final opacity before presentation. The popover
+  uses AppKit's native entrance animation; do not independently fade or blur
+  text after the chrome appears. The popover does not reflow the tab strip.
+  Dismissal after the exit grace period fades the whole native window out over
+  the shared 120 ms ease-out hover duration; Reduce Motion skips both
+  animations, not the dwell.
 - If sender and received time are already available locally, the card MUST
   include them in a compact metadata line; otherwise it MUST omit them and MUST
   NOT fetch them. It MUST NEVER fetch remote content, mark the message read,

@@ -503,8 +503,9 @@ private final class ReaderTabsHostingView: NSHostingView<ReaderTabBar> {
 /// Tab hover preview: a system `NSPopover` (same chrome as the QR-code
 /// popover) anchored to the hovered tab. `.applicationDefined` behaviour keeps
 /// it open while the pointer is over the tab or the card; the owner dismisses
-/// it. Chrome and content enter together in the shared 120 ms hover motion;
-/// AppKit's half-second popover spring is disabled. Dismissal is immediate.
+/// it. AppKit supplies the native entrance animation, while dismissal fades
+/// the whole native window out over the shared 120 ms hover duration. Reduce
+/// Motion skips both animations while preserving the hover dwell.
 /// The content tracks pointer entry/exit so scrolling the preview works.
 @MainActor
 final class ReaderTabHoverPopover: NSPopover {
@@ -514,8 +515,7 @@ final class ReaderTabHoverPopover: NSPopover {
     init(card: ReaderTabHoverCard, cardHovered: Binding<Bool>) {
         hostingView = NSHostingView(rootView: card)
         super.init()
-        delegate = trackingView
-        animates = false
+        animates = true
         trackingView.onHoverChanged = { inside in
             cardHovered.wrappedValue = inside
         }
@@ -545,39 +545,63 @@ final class ReaderTabHoverPopover: NSPopover {
     func present(tabFrame: CGRect, in view: NSView) {
         var rect = tabFrame.intersection(view.bounds)
         if rect.isNull || rect.isEmpty { rect = view.bounds }
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if isDismissing {
+            closeImmediately()
+        }
         if isShown {
             positioningRect = rect
             return
         }
-        trackingView.shouldAnimateEntrance = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        animates = !reduceMotion
         show(relativeTo: rect, of: view, preferredEdge: .maxY)
     }
 
 
     func dismiss() {
-        if isShown { performClose(nil) }
-    }
-}
-
-@MainActor
-private final class ReaderTabHoverTrackingView: NSView, NSPopoverDelegate {
-    var onHoverChanged: ((Bool) -> Void)?
-    var shouldAnimateEntrance = false
-    private var trackingArea: NSTrackingArea?
-
-    func popoverWillShow(_ notification: Notification) {
-        // Fade the native window, including its chrome, rather than the text.
-        window?.alphaValue = shouldAnimateEntrance ? 0 : 1
-    }
-
-    func popoverDidShow(_ notification: Notification) {
-        guard shouldAnimateEntrance, let window else { return }
+        guard isShown, !isDismissing else { return }
+        isDismissing = true
+        dismissalGeneration &+= 1
+        let generation = dismissalGeneration
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        guard !reduceMotion, let window = contentViewController?.view.window else {
+            closeImmediately()
+            return
+        }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = MailMotion.hoverDuration
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().alphaValue = 1
+            window.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            guard let self,
+                  self.isDismissing,
+                  self.dismissalGeneration == generation else { return }
+            self.closeImmediately(window: window)
         }
     }
+
+    private var isDismissing = false
+    private var dismissalGeneration: UInt = 0
+
+    private func closeImmediately(window: NSWindow? = nil) {
+        let window = window ?? contentViewController?.view.window
+        let previousAnimates = animates
+        animates = false
+        if isShown {
+            performClose(nil)
+        }
+        animates = previousAnimates
+        window?.alphaValue = 1
+        dismissalGeneration &+= 1
+        isDismissing = false
+    }
+}
+
+
+@MainActor
+private final class ReaderTabHoverTrackingView: NSView {
+    var onHoverChanged: ((Bool) -> Void)?
+    private var trackingArea: NSTrackingArea?
 
     override func updateTrackingAreas() {
         if let trackingArea {

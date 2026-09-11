@@ -100,14 +100,14 @@ rationale → revisit-when.
     message-actions cluster with no extra gap. The reader-tabs toolbar item has
     no label or tooltip and toolbar customization is disabled. The strip is
     absent when the reader has no tabs or global search is presented.
-    Hovering an inactive tab for 500 ms presents a non-activating 220×160 system
-    popover with a scrollable card. Profiling measured AppKit's default entrance
-    at 512–541 ms even with plain text or pre-laid-out content. Disable that
-    spring and use the shared 120 ms ease-out opacity entrance on the whole
-    native window; content has no separate fade or blur. Reduce Motion skips
-    animation, not dwell; dismissal is immediate after the exit grace period.
-    Leaving, switching tabs, activation, and scrolling cancel pending previews.
-    A 150 ms grace period keeps a shown card open between tab and card.
+    Hovering an inactive tab after a 500 ms dwell presents a non-activating
+    220×160 system popover with a scrollable card and a 150 ms exit grace
+    period. Profiling measured AppKit's default entrance at 512–541 ms even
+    with plain text or pre-laid-out content; that earlier measurement led to
+    disabling the spring, but the owner chose to restore the native entrance
+    for feel while keeping the dwell and grace. Content has no separate fade or
+    blur; Reduce Motion skips both animations, not the dwell, and dismissal
+    fades the native window over the shared 120 ms ease-out hover duration.
     Persisting the transient
     preserves the user's open reading context and its scroll position across
     launches rather than silently discarding a real tab. Persisted links that
