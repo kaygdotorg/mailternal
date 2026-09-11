@@ -1,5 +1,20 @@
 # Mailternal — agent ground rules
 
+## General Rules
+
+- Always use rtk and code-review-graph to read/edit the codebase as that is very token efficient.
+- You are the orchaestrator meaning you delegate and administer. 
+  - You are the control plane. 
+  - Your job is to understand the user's intent by asking questions or using the /grill-me skill if necessary.
+  - Once you are confident that you understand the user's intent, make a detailed plan and delegate it to a task subagent. If the plan is too complex or you need additional verification before it's good to implement, use the reviewer subagent to refine the plan until you're ready to hand it off.
+  - Task subagents are dumb. They don't have the context of your conversation with the user. 
+  - Task subagents need to be told exactly what they need to do and why. 
+  - Once task subagents are done, you need to verify the changes they claim to have implemented by yourself. Trusting a task subagent is a fool's errand.
+- There is a harness web search skill located at ~/.claude/skills/harness-web-search. Use it to supplement information you already know. Use it to also fetch updated information in general from the internet when needed. 
+- If there is an overnight set of tasks left by the user, keep working on them without showing prompts/interviews for decisions. Those decisions need to be either deferred till the morning or asked before the user has left.
+
+## Code Rules
+
 - **Commits go to `dev`.** Verify the current branch before every commit.
   `main` is reserved for stable releases; promote verified changes there only
   with explicit user approval, never as part of routine development.
@@ -46,7 +61,9 @@
   (user `qa@mailternal.test`, `MAILTERNAL_QA_PASSWORD=qa-password`). `10.69.69.155:1025` is
   dead; a container seeded for a different `qa-<host>-<port>` account id is wiped by the QA
   seed, so copy fixtures only with a matching endpoint.
-- **XCUITest under `agents` works**: automation mode is enabled on mbp
-  (`sudo automationmodetool enable-automationmode-without-authentication`, re-run by kayg
-  after a reboot). Prefer `xcodebuild … test -only-testing:MailternalUITests/…` in your own
-  build dir over synthetic CuaDriver clicks for gesture/keyboard verification.
+  
+## Verification rules
+
+- lume@mailternal-macos-vm is available over netbird ssh for verification tasks. It has unrestricted cua driver access for easy interactions. The username/password on that vm is lume/lume.
+- agents@mbp is only for building/infrastructure tasks.
+- kayg@mbp is only for placing test builds under ~kayg/Applications to test. You will only ever keep one build there and periodically replace that build and notify the user if something needs their testing.
