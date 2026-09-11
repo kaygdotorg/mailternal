@@ -177,17 +177,15 @@ struct KeychainStore: Sendable {
     }
 
     private func deleteFromKeychain(account: AccountID) throws {
-        // Remove both generations. This handles an interrupted migration and
-        // keeps deletion semantics independent of which record was read.
-        var failure: OSStatus?
+        // Delete the shared generation before its legacy fallback. If the
+        // shared query fails (for example, missing signing entitlements), stop:
+        // deleting the legacy password would leave a retained account without
+        // its credential even though account removal reported failure.
         for query in [sharedQuery(account: account), legacyQuery(account: account)] {
             let status = SecItemDelete(query as CFDictionary)
-            if status != errSecSuccess && status != errSecItemNotFound && failure == nil {
-                failure = status
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw KeychainStoreError.osStatus(status)
             }
-        }
-        if let failure {
-            throw KeychainStoreError.osStatus(failure)
         }
     }
 
