@@ -80,6 +80,36 @@ final class MailternalUITests: XCTestCase {
         )
     }
 
+    func testSidebarRemainsInBoundsAfterComposerDismissal() {
+        signInToMock()
+        defer { selectPaneLayout("Side by Side") }
+        let sidebar = mainWindow.outlines[UIIdentifier.sidebar]
+
+        for layout in ["Side by Side", "List Above Reader"] {
+            selectPaneLayout(layout)
+            XCTAssertTrue(sidebar.waitForExistence(timeout: 8))
+            let originalFrame = sidebar.frame
+
+            app.menuBars.menuBarItems["File"].click()
+            app.menuItems["New Message"].click()
+            let send = app.buttons["composer-send"]
+            XCTAssertTrue(send.waitForExistence(timeout: 8), "composer must be presented")
+            app.buttons["Save Draft"].click()
+            XCTAssertTrue(
+                waitUntil(timeout: 8) {
+                    guard !send.exists, sidebar.exists else { return false }
+                    let frame = sidebar.frame
+                    let windowFrame = self.mainWindow.frame
+                    return frame.minX >= windowFrame.minX
+                        && frame.maxX <= windowFrame.maxX
+                        && abs(frame.minX - originalFrame.minX) <= 1
+                        && abs(frame.width - originalFrame.width) <= 1
+                },
+                "\(layout): dismissing the composer must not move or expand sidebar content"
+            )
+        }
+    }
+
     func testSelectingRowPopulatesViewer() {
         signInToMock()
         let table = messageTable()
